@@ -23,6 +23,7 @@ class TestRiskManager:
         self.mock_config.min_call_premium = 0.30
         self.mock_config.put_target_dte = 7
         self.mock_config.call_target_dte = 7
+        self.mock_config.max_exposure_per_ticker = 50000
         
         self.risk_manager = RiskManager(self.mock_config)
         

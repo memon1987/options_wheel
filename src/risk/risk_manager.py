@@ -84,8 +84,8 @@ class RiskManager:
             
             # Calculate new position exposure
             if opportunity['strategy'] == 'sell_put':
-                strike = float(opportunity['strike'])
-                contracts = int(opportunity['contracts'])
+                strike = float(opportunity.get('strike', opportunity.get('strike_price', 0)))
+                contracts = int(opportunity.get('contracts', 1))  # Default to 1 contract
                 new_exposure = strike * 100 * contracts
                 
                 total_exposure = current_exposure + new_exposure
