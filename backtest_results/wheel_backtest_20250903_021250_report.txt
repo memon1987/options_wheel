@@ -1,0 +1,54 @@
+
+BACKTEST RESULTS
+================
+Period: 2024-06-01 to 2024-09-01
+Initial Capital: $100,000.00
+Final Capital: $100,000.00
+Total Return: 0.00%
+Annualized Return: 0.00%
+Max Drawdown: 0.00%
+Sharpe Ratio: 0.00
+
+WHEEL STRATEGY METRICS
+======================
+Total Trades: 0
+Put Trades: 0
+Call Trades: 0
+Assignments: 0
+Assignment Rate: 0.0%
+Total Premium Collected: $0.00
+Win Rate: 0.0%
+
+BACKTEST RESULTS
+================
+Period: 2024-06-01 to 2024-09-01
+Initial Capital: $100,000.00
+Final Capital: $100,000.00
+Total Return: 0.00%
+Annualized Return: 0.00%
+Max Drawdown: 0.00%
+Sharpe Ratio: 0.00
+
+WHEEL STRATEGY METRICS
+======================
+Total Trades: 0
+Put Trades: 0
+Call Trades: 0
+Assignments: 0
+Assignment Rate: 0.0%
+Total Premium Collected: $0.00
+Win Rate: 0.0%
+
+RISK METRICS
+============
+Volatility: 0.00%
+Downside Volatility: 0.00%
+Calmar Ratio: 0.00
+Sortino Ratio: 0.00
+
+MONTHLY PERFORMANCE
+===================
+Best Month: 0.00%
+Worst Month: 0.00%
+Average Monthly: 0.00%
+Positive Months: 0/2 (0.0%)

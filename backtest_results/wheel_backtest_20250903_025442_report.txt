@@ -1,0 +1,54 @@
+
+BACKTEST RESULTS
+================
+Period: 2025-03-03 to 2025-03-10
+Initial Capital: $100,000.00
+Final Capital: $104,375.49
+Total Return: 4.38%
+Annualized Return: 834.21%
+Max Drawdown: 0.00%
+Sharpe Ratio: 126.61
+
+WHEEL STRATEGY METRICS
+======================
+Total Trades: 10
+Put Trades: 10
+Call Trades: 0
+Assignments: 0
+Assignment Rate: 0.0%
+Total Premium Collected: $4,380.49
+Win Rate: 100.0%
+
+BACKTEST RESULTS
+================
+Period: 2025-03-03 to 2025-03-10
+Initial Capital: $100,000.00
+Final Capital: $104,375.49
+Total Return: 4.38%
+Annualized Return: 834.21%
+Max Drawdown: 0.00%
+Sharpe Ratio: 126.61
+
+WHEEL STRATEGY METRICS
+======================
+Total Trades: 10
+Put Trades: 10
+Call Trades: 0
+Assignments: 0
+Assignment Rate: 0.0%
+Total Premium Collected: $4,380.49
+Win Rate: 100.0%
+
+RISK METRICS
+============
+Volatility: 1.71%
+Downside Volatility: 0.00%
+Calmar Ratio: 0.00
+Sortino Ratio: 0.00
+
+TRADE ANALYSIS
+==============
+Average Trade Size: $437.55
+Average Win: $876.54
+Average Loss: $nan
+Profit Factor: 0.00

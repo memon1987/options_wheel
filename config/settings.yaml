@@ -1,0 +1,110 @@
+# Options Wheel Strategy Configuration
+
+# Alpaca API Settings
+alpaca:
+  # Use paper trading by default for safety
+  paper_trading: true
+  # API credentials (use environment variables)
+  api_key_id: "${ALPACA_API_KEY}"
+  secret_key: "${ALPACA_SECRET_KEY}"
+  
+# Trading Strategy Parameters
+strategy:
+  # Target days to expiration for new positions
+  put_target_dte: 7
+  call_target_dte: 7
+  
+  # Delta thresholds for option selection
+  put_delta_range: [0.10, 0.20]
+  call_delta_range: [0.10, 0.20]
+  
+  # Minimum premium thresholds (in dollars)
+  min_put_premium: 0.50
+  min_call_premium: 0.30
+  
+  # Stock universe criteria
+  min_stock_price: 20.00
+  max_stock_price: 500.00
+  min_avg_volume: 1000000  # 1M shares daily average
+  
+  # Maximum positions
+  max_positions_per_stock: 1
+  max_total_positions: 10
+  
+  # Maximum exposure per ticker (dollar amount assuming assignment)
+  max_exposure_per_ticker: 50000  # $50,000 max exposure per ticker
+
+# Risk Management
+risk:
+  # Portfolio allocation limits
+  max_portfolio_allocation: 0.80  # 80% of portfolio
+  max_position_size: 0.10         # 10% per position
+  min_cash_reserve: 0.20          # 20% cash reserve
+  
+  # Stop loss settings (separate controls for puts vs calls)
+  use_put_stop_loss: false        # Take assignment instead of stopping out puts
+  use_call_stop_loss: true        # Still protect covered calls from adverse moves
+  put_stop_loss_percent: 0.50     # Put stop loss threshold (ignored if disabled)
+  call_stop_loss_percent: 0.50    # Call stop loss threshold
+  stop_loss_multiplier: 1.5       # Multiplier for short-term options (accounts for time decay)
+  
+  # Profit taking settings
+  profit_target_percent: 0.50     # 50% profit target for early closure
+  
+  # Volatility filters
+  max_iv_rank: 80                 # Maximum implied volatility rank
+  min_iv_rank: 20                 # Minimum implied volatility rank
+
+  # Gap risk management
+  gap_risk_controls:
+    enable_gap_detection: true    # Enable overnight gap monitoring
+    max_overnight_gap_percent: 5.0  # Max 5% overnight gap before position closure
+    gap_lookback_days: 30         # Days to analyze historical gap frequency
+    max_gap_frequency: 0.15       # Max 15% of days can have significant gaps
+    earnings_avoidance_days: 7    # Avoid new positions N days before earnings
+
+    # Real-time execution controls
+    max_execution_gap_percent: 2.0  # Don't execute trades if overnight gap >2%
+    execution_gap_lookback_hours: 16 # Check gap from previous close (market close to open)
+    significant_gap_threshold: 2.0  # Threshold for counting "significant gaps" in history
+
+    # Pre-market gap thresholds
+    premarket_gap_threshold: 2.0  # 2% pre-market gap triggers review
+    market_open_delay_minutes: 15 # Wait 15min after open if gap detected
+
+    # Historical volatility filters
+    max_historical_vol: 0.40      # 40% maximum annualized volatility
+    vol_lookback_days: 252        # 1 year lookback for volatility calculation
+
+# Stock Universe
+stocks:
+  # High-quality, liquid stocks suitable for wheel strategy
+  symbols:
+    - "AAPL"
+    - "MSFT"
+    - "GOOGL"
+    - "AMZN"
+    - "TSLA"
+    - "NVDA"
+    - "AMD"
+    - "QQQ"
+    - "SPY"
+    - "IWM"
+
+# Monitoring and Alerts
+monitoring:
+  # Check positions every N minutes during market hours
+  check_interval_minutes: 15
+  
+  # Alert thresholds
+  assignment_alert: true
+  profit_target_alert: true
+  loss_threshold_alert: true
+  
+# Logging Configuration
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_file: "logs/options_wheel.log"
+  max_log_size: "10MB"
+  backup_count: 5

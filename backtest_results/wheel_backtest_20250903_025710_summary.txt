@@ -1,0 +1,31 @@
+OPTIONS WHEEL BACKTEST SUMMARY
+===================================
+
+Period: 2025-03-01 to 2025-04-01
+Symbol(s): UNH
+Initial Capital: $100,000.00
+Final Capital: $101,207.38
+
+TRADING RESULTS
+---------------
+Net Premium Generated: $1,219.38
+Total Trades Executed: 24
+  • Put Trades: 24
+  • Call Trades: 0
+Assignments: 0
+Assignment Rate: 0.0%
+Win Rate: 100.0%
+
+AT-RISK CAPITAL
+---------------
+Maximum At-Risk Capital: $49,000.00
+Average At-Risk Capital: $25,545.45
+Peak At-Risk Percentage: 48.7%
+Capital Efficiency: 4.77%
+
+PERFORMANCE
+-----------
+Total Return: 1.21%
+Annualized Return: 15.19%
+Max Drawdown: -0.00%
+Sharpe Ratio: 15.80
