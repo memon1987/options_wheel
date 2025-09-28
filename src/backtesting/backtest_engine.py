@@ -1052,12 +1052,12 @@ class BacktestEngine:
             gap_percent = ((current_open - previous_close) / previous_close) * 100
 
             # Check against execution threshold
-            if abs(gap_percent) > self.config.max_execution_gap_percent:
+            if abs(gap_percent) > self.config.execution_gap_threshold:
                 return {
                     'can_execute': False,
                     'reason': 'execution_gap_exceeded',
                     'current_gap_percent': gap_percent,
-                    'threshold': self.config.max_execution_gap_percent,
+                    'threshold': self.config.execution_gap_threshold,
                     'previous_close': previous_close,
                     'current_open': current_open
                 }
@@ -1066,7 +1066,7 @@ class BacktestEngine:
                 'can_execute': True,
                 'reason': 'gap_within_limits',
                 'current_gap_percent': gap_percent,
-                'threshold': self.config.max_execution_gap_percent,
+                'threshold': self.config.execution_gap_threshold,
                 'previous_close': previous_close,
                 'current_open': current_open
             }

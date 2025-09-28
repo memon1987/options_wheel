@@ -239,19 +239,31 @@ class Config:
         return self._config["risk"]["gap_risk_controls"]["vol_lookback_days"]
 
     @property
-    def max_execution_gap_percent(self) -> float:
-        """Maximum gap allowed for trade execution."""
-        return self._config["risk"]["gap_risk_controls"]["max_execution_gap_percent"]
+    def quality_gap_threshold(self) -> float:
+        """Threshold for counting significant gaps in stock quality filtering."""
+        return self._config["risk"]["gap_risk_controls"]["quality_gap_threshold"]
+
+    @property
+    def execution_gap_threshold(self) -> float:
+        """Hard threshold for blocking trade execution due to gaps."""
+        return self._config["risk"]["gap_risk_controls"]["execution_gap_threshold"]
 
     @property
     def execution_gap_lookback_hours(self) -> int:
         """Hours to look back for execution gap calculation."""
         return self._config["risk"]["gap_risk_controls"]["execution_gap_lookback_hours"]
 
+    # Legacy property for backward compatibility
+    @property
+    def max_execution_gap_percent(self) -> float:
+        """Maximum gap allowed for trade execution (legacy name)."""
+        return self.execution_gap_threshold
+
+    # Legacy property for backward compatibility
     @property
     def significant_gap_threshold(self) -> float:
-        """Threshold for counting significant gaps in historical analysis."""
-        return self._config["risk"]["gap_risk_controls"]["significant_gap_threshold"]
+        """Threshold for counting significant gaps (legacy name)."""
+        return self.quality_gap_threshold
 
     def get(self, key: str, default=None):
         """Get configuration value by key path (e.g., 'alpaca.paper_trading')."""

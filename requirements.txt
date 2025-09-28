@@ -71,3 +71,10 @@ ta-lib>=0.4.28;platform_system!="Windows"
 
 # Notifications (optional)
 plyer>=2.1.0
+
+# Scheduling for cloud deployments
+schedule>=1.2.0
+
+# Web server for Cloud Run
+flask>=3.0.0
+gunicorn>=21.2.0

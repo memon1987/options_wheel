@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  options-wheel:
+    build: .
+    container_name: options-wheel-strategy
+    environment:
+      # Alpaca API Configuration
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      - ALPACA_PAPER_TRADING=${ALPACA_PAPER_TRADING:-true}
+
+      # Strategy Configuration
+      - STRATEGY_MODE=${STRATEGY_MODE:-scan}
+      - MAX_POSITIONS=${MAX_POSITIONS:-10}
+      - INITIAL_CAPITAL=${INITIAL_CAPITAL:-100000}
+
+      # Risk Management
+      - EXECUTION_GAP_THRESHOLD=${EXECUTION_GAP_THRESHOLD:-1.5}
+      - QUALITY_GAP_THRESHOLD=${QUALITY_GAP_THRESHOLD:-2.0}
+      - MAX_HISTORICAL_VOL=${MAX_HISTORICAL_VOL:-0.40}
+
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_TO_FILE=${LOG_TO_FILE:-true}
+
+    volumes:
+      - ./logs:/app/logs
+      - ./config:/app/config
+      - ./backtest_results:/app/backtest_results
+
+    restart: unless-stopped
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "from src.utils.config import Config; Config()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Redis for caching (if needed for scaling)
+  redis:
+    image: redis:7-alpine
+    container_name: options-wheel-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    profiles: ["with-cache"]
+
+  # Optional: PostgreSQL for trade logging (if needed)
+  postgres:
+    image: postgres:15-alpine
+    container_name: options-wheel-db
+    environment:
+      - POSTGRES_DB=options_wheel
+      - POSTGRES_USER=trader
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-secure_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    profiles: ["with-db"]
+
+volumes:
+  redis_data:
+  postgres_data:

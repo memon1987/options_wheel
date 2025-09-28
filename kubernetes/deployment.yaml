@@ -1,0 +1,205 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: options-wheel-strategy
+  labels:
+    app: options-wheel-strategy
+spec:
+  replicas: 1  # Single instance for trading strategy
+  selector:
+    matchLabels:
+      app: options-wheel-strategy
+  template:
+    metadata:
+      labels:
+        app: options-wheel-strategy
+    spec:
+      containers:
+      - name: options-wheel
+        image: options-wheel:latest
+        imagePullPolicy: Always
+
+        env:
+        - name: ALPACA_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: alpaca-credentials
+              key: api-key
+        - name: ALPACA_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: alpaca-credentials
+              key: secret-key
+        - name: ALPACA_PAPER_TRADING
+          value: "true"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: STRATEGY_MODE
+          value: "scheduled"
+
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        - name: logs-volume
+          mountPath: /app/logs
+
+        # Health checks
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "from src.utils.config import Config; Config()"
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+
+        readinessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "from src.utils.config import Config; Config()"
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+
+      volumes:
+      - name: config-volume
+        configMap:
+          name: options-wheel-config
+      - name: logs-volume
+        emptyDir: {}
+
+      # Security context
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      # Restart policy
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: options-wheel-config
+data:
+  settings.yaml: |
+    # Options Wheel Strategy Configuration
+
+    # Alpaca API Settings
+    alpaca:
+      paper_trading: true
+      api_key_id: "${ALPACA_API_KEY}"
+      secret_key: "${ALPACA_SECRET_KEY}"
+
+    # Trading Strategy Parameters
+    strategy:
+      put_target_dte: 7
+      call_target_dte: 7
+      put_delta_range: [0.10, 0.20]
+      call_delta_range: [0.10, 0.20]
+      min_put_premium: 0.50
+      min_call_premium: 0.30
+      min_stock_price: 20.00
+      max_stock_price: 500.00
+      min_avg_volume: 1000000
+      max_positions_per_stock: 1
+      max_total_positions: 10
+      max_exposure_per_ticker: 50000
+
+    # Risk Management
+    risk:
+      max_portfolio_allocation: 0.80
+      max_position_size: 0.10
+      min_cash_reserve: 0.20
+      use_put_stop_loss: false
+      use_call_stop_loss: true
+      put_stop_loss_percent: 0.50
+      call_stop_loss_percent: 0.50
+      stop_loss_multiplier: 1.5
+      profit_target_percent: 0.50
+      max_iv_rank: 80
+      min_iv_rank: 20
+
+      # Gap risk management
+      gap_risk_controls:
+        enable_gap_detection: true
+        max_overnight_gap_percent: 5.0
+        gap_lookback_days: 30
+        max_gap_frequency: 0.15
+        earnings_avoidance_days: 7
+        quality_gap_threshold: 2.0
+        execution_gap_threshold: 1.5
+        execution_gap_lookback_hours: 16
+        premarket_gap_threshold: 2.0
+        market_open_delay_minutes: 15
+        max_historical_vol: 0.40
+        vol_lookback_days: 252
+
+    # Stock Universe
+    stocks:
+      symbols:
+        - "AAPL"
+        - "MSFT"
+        - "GOOGL"
+        - "AMZN"
+        - "TSLA"
+        - "NVDA"
+        - "AMD"
+        - "QQQ"
+        - "SPY"
+        - "IWM"
+
+    # Monitoring and Alerts
+    monitoring:
+      check_interval_minutes: 15
+      assignment_alert: true
+      profit_target_alert: true
+      loss_threshold_alert: true
+
+    # Logging Configuration
+    logging:
+      level: "INFO"
+      log_to_file: true
+      log_file: "logs/options_wheel.log"
+      max_log_size: "10MB"
+      backup_count: 5
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alpaca-credentials
+type: Opaque
+data:
+  # Base64 encoded API credentials
+  # Replace with your actual encoded credentials
+  api-key: eW91cl9hcGlfa2V5X2hlcmU=
+  secret-key: eW91cl9zZWNyZXRfa2V5X2hlcmU=
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: options-wheel-service
+spec:
+  selector:
+    app: options-wheel-strategy
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: metrics
+  type: ClusterIP

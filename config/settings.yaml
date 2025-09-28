@@ -22,17 +22,17 @@ strategy:
   min_put_premium: 0.50
   min_call_premium: 0.30
   
-  # Stock universe criteria
-  min_stock_price: 20.00
-  max_stock_price: 500.00
-  min_avg_volume: 1000000  # 1M shares daily average
+  # Stock universe criteria (optimized for cloud execution)
+  min_stock_price: 30.00
+  max_stock_price: 400.00
+  min_avg_volume: 2000000  # 2M shares daily average for better liquidity
   
   # Maximum positions
   max_positions_per_stock: 1
   max_total_positions: 10
   
   # Maximum exposure per ticker (dollar amount assuming assignment)
-  max_exposure_per_ticker: 50000  # $50,000 max exposure per ticker
+  max_exposure_per_ticker: 25000  # $25,000 max exposure per ticker (conservative for cloud)
 
 # Risk Management
 risk:
@@ -63,10 +63,12 @@ risk:
     max_gap_frequency: 0.15       # Max 15% of days can have significant gaps
     earnings_avoidance_days: 7    # Avoid new positions N days before earnings
 
-    # Real-time execution controls
-    max_execution_gap_percent: 2.0  # Don't execute trades if overnight gap >2%
+    # Quality control thresholds (historical analysis)
+    quality_gap_threshold: 2.0    # Threshold for counting "significant gaps" in stock filtering
+
+    # Real-time execution controls (hard filter)
+    execution_gap_threshold: 2.0  # HARD STOP: Don't execute trades if overnight gap exceeds this
     execution_gap_lookback_hours: 16 # Check gap from previous close (market close to open)
-    significant_gap_threshold: 2.0  # Threshold for counting "significant gaps" in history
 
     # Pre-market gap thresholds
     premarket_gap_threshold: 2.0  # 2% pre-market gap triggers review
@@ -91,15 +93,20 @@ stocks:
     - "SPY"
     - "IWM"
 
-# Monitoring and Alerts
+# Monitoring and Alerts (Cloud-optimized)
 monitoring:
   # Check positions every N minutes during market hours
   check_interval_minutes: 15
-  
+
   # Alert thresholds
   assignment_alert: true
   profit_target_alert: true
   loss_threshold_alert: true
+
+  # Cloud-specific monitoring
+  enable_cloud_logging: true
+  max_execution_time_minutes: 5  # Cloud Run timeout consideration
+  enable_performance_metrics: true
   
 # Logging Configuration
 logging:

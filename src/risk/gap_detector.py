@@ -102,9 +102,9 @@ class GapDetector:
         if total_days == 0:
             return {'total_days': 0, 'gap_frequency': 0, 'avg_gap_size': 0}
 
-        # Count significant gaps using configurable threshold
-        threshold = self.config.significant_gap_threshold
-        significant_gaps = np.abs(gap_percentages) > threshold
+        # Count significant gaps using quality control threshold
+        quality_threshold = self.config.quality_gap_threshold
+        significant_gaps = np.abs(gap_percentages) > quality_threshold
         gap_frequency = significant_gaps.sum() / total_days
 
         # Large gaps (>5%)
@@ -116,9 +116,9 @@ class GapDetector:
         max_gap_size = np.abs(gap_percentages).max()
         gap_volatility = gap_percentages.std()
 
-        # Up vs down gaps using configurable threshold
-        up_gaps = (gap_percentages > threshold).sum()
-        down_gaps = (gap_percentages < -threshold).sum()
+        # Up vs down gaps using quality control threshold
+        up_gaps = (gap_percentages > quality_threshold).sum()
+        down_gaps = (gap_percentages < -quality_threshold).sum()
 
         return {
             'total_days': total_days,
@@ -367,12 +367,12 @@ class GapDetector:
             gap_percent = ((current_price - previous_close) / previous_close) * 100
 
             # Check against execution threshold
-            if abs(gap_percent) > self.config.max_execution_gap_percent:
+            if abs(gap_percent) > self.config.execution_gap_threshold:
                 return {
                     'can_execute': False,
                     'reason': 'execution_gap_exceeded',
                     'current_gap_percent': gap_percent,
-                    'threshold': self.config.max_execution_gap_percent,
+                    'threshold': self.config.execution_gap_threshold,
                     'previous_close': previous_close,
                     'current_price': current_price
                 }
@@ -381,7 +381,7 @@ class GapDetector:
                 'can_execute': True,
                 'reason': 'gap_within_limits',
                 'current_gap_percent': gap_percent,
-                'threshold': self.config.max_execution_gap_percent,
+                'threshold': self.config.execution_gap_threshold,
                 'previous_close': previous_close,
                 'current_price': current_price
             }

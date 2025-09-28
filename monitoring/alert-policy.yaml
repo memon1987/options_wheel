@@ -1,0 +1,31 @@
+displayName: "Options Wheel Strategy Alerts"
+documentation:
+  content: "Alert policy for monitoring the options wheel trading strategy"
+  mimeType: "text/markdown"
+conditions:
+  - displayName: "High Error Rate"
+    conditionThreshold:
+      filter: 'resource.type="cloud_run_revision" AND resource.labels.service_name="options-wheel-strategy"'
+      comparison: COMPARISON_GREATER_THAN
+      thresholdValue: 0.1
+      duration: 300s
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_RATE
+          crossSeriesReducer: REDUCE_MEAN
+          groupByFields:
+            - "resource.label.service_name"
+  - displayName: "Service Down"
+    conditionThreshold:
+      filter: 'resource.type="cloud_run_revision" AND resource.labels.service_name="options-wheel-strategy"'
+      comparison: COMPARISON_LESS_THAN
+      thresholdValue: 1
+      duration: 300s
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_MEAN
+          crossSeriesReducer: REDUCE_MEAN
+alertStrategy:
+  autoClose: 604800s
+enabled: true
+notificationChannels: []
