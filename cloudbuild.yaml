@@ -70,6 +70,9 @@ options:
   logging: CLOUD_LOGGING_ONLY
   machineType: 'E2_HIGHCPU_8'  # Fast builds
 
+# Service account for Cloud Build
+serviceAccount: 'projects/gen-lang-client-0607444019/serviceAccounts/799970961417@cloudbuild.gserviceaccount.com'
+
 # Timeout for the entire build
 timeout: '1200s'  # 20 minutes
 
