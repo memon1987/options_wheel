@@ -35,4 +35,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 EXPOSE 8080
 
 # Default command for Cloud Run (web server)
-CMD ["python", "cloud_run_server.py"]
+CMD ["python", "deploy/cloud_run_server.py"]
