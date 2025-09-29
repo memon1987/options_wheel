@@ -190,12 +190,21 @@ def run_backtest():
         # Import backtesting components
         try:
             from src.backtesting.cloud_storage import EnhancedHistoricalDataManager
-            from src.backtesting.backtest_engine import BacktestEngine
+            from src.backtesting.backtest_engine import BacktestEngine, BacktestConfig
             from src.backtesting.analysis import BacktestAnalyzer
 
+            # Create proper BacktestConfig
+            backtest_config = BacktestConfig(
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=100000.0,
+                symbols=[symbol] if symbol else ['SPY', 'AAPL', 'MSFT'],
+                commission_per_contract=1.00
+            )
+
             data_manager = EnhancedHistoricalDataManager(config)
-            backtest_engine = BacktestEngine(config, data_manager)
-            performance_analyzer = BacktestAnalyzer(None)  # Will be instantiated with results later
+            backtest_engine = BacktestEngine(config, backtest_config)
+            performance_analyzer = None  # Will be instantiated with results after backtest
 
         except ImportError as e:
             logger.error("Backtesting import error", error=str(e), traceback=traceback.format_exc())

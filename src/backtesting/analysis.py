@@ -24,8 +24,15 @@ class BacktestAnalyzer:
         """
         self.result = result
         
-        # Set up plotting style
-        plt.style.use('seaborn-v0_8')
+        # Set up plotting style (with fallback for older seaborn versions)
+        try:
+            plt.style.use('seaborn-v0_8')
+        except OSError:
+            try:
+                plt.style.use('seaborn')
+            except OSError:
+                # Fallback to default style
+                plt.style.use('default')
         sns.set_palette("husl")
     
     def plot_portfolio_performance(self, figsize: Tuple[int, int] = (15, 10)) -> plt.Figure:
