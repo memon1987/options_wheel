@@ -664,6 +664,180 @@ def get_performance_trends():
         logger.error(error_msg)
         return jsonify({'error': error_msg}), 500
 
+@app.route('/backtest/trades/<backtest_id>')
+def get_detailed_trades(backtest_id):
+    """Get detailed trade-by-trade breakdown for a backtest."""
+    try:
+        # Import cloud storage integration
+        from src.backtesting.cloud_storage import CloudStorageCache
+        config = Config()
+        cloud_storage = CloudStorageCache(config)
+
+        # Retrieve stored results
+        results = cloud_storage.get_stored_backtest_results(backtest_id)
+
+        if not results:
+            return jsonify({
+                'error': 'Backtest results not found',
+                'backtest_id': backtest_id
+            }), 404
+
+        trades = results.get('trades', [])
+
+        # Group trades by action for better analysis
+        trade_analysis = {
+            'backtest_id': backtest_id,
+            'total_trades': len(trades),
+            'trade_breakdown': {
+                'opened_positions': [t for t in trades if t.get('action') == 'open'],
+                'closed_positions': [t for t in trades if t.get('action') == 'close'],
+                'assignments': [t for t in trades if t.get('action') == 'assignment'],
+                'skipped_trades': [t for t in trades if t.get('action') == 'skipped']
+            },
+            'performance_by_symbol': {},
+            'execution_quality': {}
+        }
+
+        # Calculate performance by symbol
+        closed_trades = [t for t in trades if t.get('action') in ['close', 'assignment'] and t.get('realized_pnl')]
+        symbol_performance = {}
+
+        for trade in closed_trades:
+            symbol = trade.get('symbol')
+            if symbol not in symbol_performance:
+                symbol_performance[symbol] = {
+                    'trades': [],
+                    'total_pnl': 0,
+                    'win_count': 0,
+                    'loss_count': 0
+                }
+
+            pnl = trade.get('realized_pnl', 0)
+            symbol_performance[symbol]['trades'].append(trade)
+            symbol_performance[symbol]['total_pnl'] += pnl
+
+            if pnl > 0:
+                symbol_performance[symbol]['win_count'] += 1
+            elif pnl < 0:
+                symbol_performance[symbol]['loss_count'] += 1
+
+        # Calculate summary stats for each symbol
+        for symbol, data in symbol_performance.items():
+            total_trades = len(data['trades'])
+            if total_trades > 0:
+                data['win_rate'] = data['win_count'] / total_trades
+                data['avg_pnl'] = data['total_pnl'] / total_trades
+                data['total_trades'] = total_trades
+
+        trade_analysis['performance_by_symbol'] = symbol_performance
+
+        # Calculate execution quality metrics
+        open_trades = [t for t in trades if t.get('action') == 'open']
+        if open_trades:
+            spreads = [t.get('spread_pct', 0) for t in open_trades if t.get('spread_pct') is not None]
+            volumes = [t.get('volume', 0) for t in open_trades if t.get('volume') is not None]
+
+            if spreads:
+                trade_analysis['execution_quality']['avg_spread_pct'] = sum(spreads) / len(spreads)
+                trade_analysis['execution_quality']['tight_spreads_pct'] = sum(1 for s in spreads if s < 0.05) / len(spreads)
+
+            if volumes:
+                trade_analysis['execution_quality']['avg_volume'] = sum(volumes) / len(volumes)
+                trade_analysis['execution_quality']['high_volume_pct'] = sum(1 for v in volumes if v >= 100) / len(volumes)
+
+        return jsonify(trade_analysis)
+
+    except Exception as e:
+        logger.error(f"Failed to get detailed trades: {str(e)}")
+        return jsonify({'error': f'Failed to get trades: {str(e)}'}), 500
+
+@app.route('/backtest/analytics/<backtest_id>')
+def get_backtest_analytics(backtest_id):
+    """Get comprehensive analytics for a backtest."""
+    try:
+        # Import cloud storage integration
+        from src.backtesting.cloud_storage import CloudStorageCache
+        config = Config()
+        cloud_storage = CloudStorageCache(config)
+
+        # Retrieve stored results
+        results = cloud_storage.get_stored_backtest_results(backtest_id)
+
+        if not results:
+            return jsonify({
+                'error': 'Backtest results not found',
+                'backtest_id': backtest_id
+            }), 404
+
+        trades = results.get('trades', [])
+        config_data = results.get('config', {})
+        summary_metrics = results.get('summary_metrics', {})
+
+        # Generate comprehensive analytics
+        analytics = {
+            'backtest_id': backtest_id,
+            'timestamp': results.get('timestamp'),
+            'configuration': config_data,
+            'summary_metrics': summary_metrics,
+            'trade_timeline': [],
+            'risk_metrics': {},
+            'execution_analysis': {},
+            'strategy_effectiveness': {}
+        }
+
+        # Create trade timeline
+        sorted_trades = sorted(trades, key=lambda x: x.get('date', ''))
+        running_pnl = 0
+
+        for trade in sorted_trades:
+            pnl = trade.get('realized_pnl', 0)
+            if pnl:
+                running_pnl += pnl
+
+            analytics['trade_timeline'].append({
+                'date': trade.get('date'),
+                'action': trade.get('action'),
+                'symbol': trade.get('symbol'),
+                'type': trade.get('type'),
+                'pnl': pnl,
+                'running_pnl': running_pnl,
+                'description': trade.get('description', '')
+            })
+
+        # Risk analysis
+        completed_trades = [t for t in trades if t.get('realized_pnl') is not None]
+        if completed_trades:
+            pnls = [t['realized_pnl'] for t in completed_trades]
+            analytics['risk_metrics'] = {
+                'max_single_loss': min(pnls),
+                'max_single_gain': max(pnls),
+                'volatility': (sum((p - sum(pnls)/len(pnls))**2 for p in pnls) / len(pnls))**0.5,
+                'downside_deviation': (sum(min(0, p)**2 for p in pnls) / len(pnls))**0.5
+            }
+
+        # Strategy effectiveness
+        put_trades = [t for t in trades if t.get('type') == 'PUT']
+        call_trades = [t for t in trades if t.get('type') == 'CALL']
+
+        analytics['strategy_effectiveness'] = {
+            'put_strategy': {
+                'total_trades': len(put_trades),
+                'completed_trades': len([t for t in put_trades if t.get('realized_pnl') is not None]),
+                'total_pnl': sum(t.get('realized_pnl', 0) for t in put_trades if t.get('realized_pnl'))
+            },
+            'call_strategy': {
+                'total_trades': len(call_trades),
+                'completed_trades': len([t for t in call_trades if t.get('realized_pnl') is not None]),
+                'total_pnl': sum(t.get('realized_pnl', 0) for t in call_trades if t.get('realized_pnl'))
+            }
+        }
+
+        return jsonify(analytics)
+
+    except Exception as e:
+        logger.error(f"Failed to get backtest analytics: {str(e)}")
+        return jsonify({'error': f'Failed to get analytics: {str(e)}'}), 500
+
 def setup_logging():
     """Configure structured logging."""
     structlog.configure(

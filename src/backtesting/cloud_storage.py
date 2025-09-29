@@ -405,6 +405,110 @@ class CloudStorageCache:
 
         return stats
 
+    def _store_json_data(self, cloud_path: str, data: Dict[str, Any]):
+        """Store JSON data to cloud storage with local fallback."""
+        try:
+            if self.client and self.bucket:
+                # Store to GCS
+                blob = self.bucket.blob(cloud_path)
+                blob.upload_from_string(
+                    json.dumps(data, indent=2, default=str),
+                    content_type='application/json'
+                )
+                logger.info("Stored data to cloud storage", path=cloud_path, size_kb=len(json.dumps(data))/1024)
+            else:
+                # Store locally as fallback
+                local_path = self.local_cache_dir / cloud_path
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(local_path, 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+                logger.info("Stored data locally", path=str(local_path))
+
+        except Exception as e:
+            logger.error("Failed to store data", path=cloud_path, error=str(e))
+            # Fallback to local storage
+            try:
+                local_path = self.local_cache_dir / cloud_path
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(local_path, 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+                logger.info("Fallback: stored data locally", path=str(local_path))
+            except Exception as e2:
+                logger.error("Failed to store data locally", error=str(e2))
+
+    def get_stored_backtest_results(self, backtest_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve stored backtest results by ID."""
+        try:
+            cloud_path = f"backtest_results/{backtest_id}.json"
+
+            if self.client and self.bucket:
+                # Try cloud storage first
+                try:
+                    blob = self.bucket.blob(cloud_path)
+                    if blob.exists():
+                        data = json.loads(blob.download_as_text())
+                        logger.info("Retrieved backtest results from cloud", backtest_id=backtest_id)
+                        return data
+                except Exception as e:
+                    logger.debug("Failed to retrieve from cloud", error=str(e))
+
+            # Try local storage
+            local_path = self.local_cache_dir / cloud_path
+            if local_path.exists():
+                with open(local_path, 'r') as f:
+                    data = json.load(f)
+                logger.info("Retrieved backtest results locally", backtest_id=backtest_id)
+                return data
+
+            logger.warning("Backtest results not found", backtest_id=backtest_id)
+            return None
+
+        except Exception as e:
+            logger.error("Failed to retrieve backtest results", backtest_id=backtest_id, error=str(e))
+            return None
+
+    def list_stored_backtests(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """List stored backtest results with metadata."""
+        try:
+            results = []
+
+            if self.client and self.bucket:
+                # List from cloud storage
+                try:
+                    blobs = self.bucket.list_blobs(prefix="backtest_results/", max_results=limit)
+                    for blob in blobs:
+                        if blob.name.endswith('.json'):
+                            backtest_id = blob.name.split('/')[-1].replace('.json', '')
+                            results.append({
+                                'backtest_id': backtest_id,
+                                'created': blob.time_created.isoformat() if blob.time_created else None,
+                                'size_kb': round(blob.size / 1024, 2) if blob.size else 0,
+                                'storage': 'cloud'
+                            })
+                except Exception as e:
+                    logger.debug("Failed to list from cloud", error=str(e))
+
+            # Also check local storage
+            local_results_dir = self.local_cache_dir / "backtest_results"
+            if local_results_dir.exists():
+                for json_file in local_results_dir.glob("*.json"):
+                    backtest_id = json_file.stem
+                    if not any(r['backtest_id'] == backtest_id for r in results):
+                        results.append({
+                            'backtest_id': backtest_id,
+                            'created': datetime.fromtimestamp(json_file.stat().st_mtime).isoformat(),
+                            'size_kb': round(json_file.stat().st_size / 1024, 2),
+                            'storage': 'local'
+                        })
+
+            # Sort by creation date (newest first)
+            results.sort(key=lambda x: x['created'] or '', reverse=True)
+            return results[:limit]
+
+        except Exception as e:
+            logger.error("Failed to list stored backtests", error=str(e))
+            return []
+
 
 class EnhancedHistoricalDataManager:
     """Enhanced historical data manager with cloud storage integration."""
