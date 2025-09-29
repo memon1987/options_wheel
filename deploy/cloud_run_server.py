@@ -190,17 +190,25 @@ def run_backtest():
         # Import backtesting components
         try:
             from src.backtesting.cloud_storage import EnhancedHistoricalDataManager
-            from src.backtesting.backtesting_engine import BacktestingEngine
-            from src.backtesting.performance_analyzer import PerformanceAnalyzer
+            from src.backtesting.backtest_engine import BacktestEngine
+            from src.backtesting.analysis import BacktestAnalyzer
 
             data_manager = EnhancedHistoricalDataManager(config)
-            backtest_engine = BacktestingEngine(config, data_manager)
-            performance_analyzer = PerformanceAnalyzer()
+            backtest_engine = BacktestEngine(config, data_manager)
+            performance_analyzer = BacktestAnalyzer(None)  # Will be instantiated with results later
 
         except ImportError as e:
+            logger.error("Backtesting import error", error=str(e), traceback=traceback.format_exc())
             return jsonify({
                 'error': f'Backtesting components not available: {str(e)}',
-                'suggestion': 'This might be expected in a minimal deployment'
+                'suggestion': 'This might be expected in a minimal deployment',
+                'traceback': traceback.format_exc()
+            }), 503
+        except Exception as e:
+            logger.error("Backtesting initialization error", error=str(e), traceback=traceback.format_exc())
+            return jsonify({
+                'error': f'Backtesting initialization failed: {str(e)}',
+                'traceback': traceback.format_exc()
             }), 503
 
         # Run the backtest

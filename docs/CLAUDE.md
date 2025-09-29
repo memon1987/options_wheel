@@ -101,6 +101,18 @@ mypy src/                        # Type checking
 - Delta > 0.5 triggers immediate exit (likely ITM)
 - Prevents unlimited upside risk on covered positions
 
+## Data Analysis Policy
+
+**IMPORTANT: Cloud-First Data Analysis**
+- For ALL data analysis requests, ONLY use data stored on Google Cloud Platform
+- DO NOT analyze local files, local backtest results, or local cache data
+- Primary data sources for analysis:
+  - Google Cloud Storage: `gs://gen-lang-client-0607444019-options-data/`
+  - Cloud Run API endpoints: Dashboard and backtest history endpoints
+  - Cloud-based backtesting results and performance metrics
+- If cloud data is not available, request user to trigger cloud-based backtesting first
+- This ensures analysis reflects production-ready, persistent, and centralized data
+
 ## Development Notes
 
 **Alpaca Setup**: Requires options trading approval and paper trading endpoint
