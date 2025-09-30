@@ -197,12 +197,13 @@ class MarketDataManager:
         
         return suitable_puts[:5]  # Return top 5
     
-    def find_suitable_calls(self, symbol: str) -> List[Dict[str, Any]]:
+    def find_suitable_calls(self, symbol: str, min_strike_price: float = 0.0) -> List[Dict[str, Any]]:
         """Find call options suitable for selling in wheel strategy.
-        
+
         Args:
             symbol: Underlying stock symbol
-            
+            min_strike_price: Minimum strike price (typically cost basis to avoid guaranteed losses)
+
         Returns:
             List of suitable call options, sorted by attractiveness
         """
@@ -212,6 +213,14 @@ class MarketDataManager:
         suitable_calls = []
         
         for call in calls:
+            # CRITICAL: Cost basis protection - never sell calls below cost basis
+            if min_strike_price > 0 and call['strike_price'] < min_strike_price:
+                logger.debug("Call rejected: strike below cost basis",
+                           symbol=symbol,
+                           strike=call['strike_price'],
+                           cost_basis=min_strike_price)
+                continue
+
             # Filter by strategy criteria
             if not self._meets_call_criteria(call):
                 continue

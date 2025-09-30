@@ -48,8 +48,11 @@ class CallSeller:
             logger.info("Evaluating covered call opportunity", 
                        symbol=symbol, shares=shares_owned)
             
-            # Get suitable calls for this stock
-            suitable_calls = self.market_data.find_suitable_calls(symbol)
+            # Get cost basis per share for filtering
+            stock_cost_basis = float(stock_position['cost_basis']) / shares_owned
+
+            # Get suitable calls for this stock (with cost basis protection)
+            suitable_calls = self.market_data.find_suitable_calls(symbol, min_strike_price=stock_cost_basis)
             
             if not suitable_calls:
                 logger.info("No suitable calls found", symbol=symbol)
@@ -344,42 +347,71 @@ class CallSeller:
             logger.error("Failed to check call stop loss", error=str(e))
             return False
     
-    def handle_call_assignment(self, assignment_info: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_call_assignment(self, assignment_info: Dict[str, Any], wheel_state_manager=None) -> Dict[str, Any]:
         """Handle when a short call gets assigned (shares called away).
-        
+
         Args:
             assignment_info: Assignment details
-            
+            wheel_state_manager: Optional wheel state manager for proper state transitions
+
         Returns:
-            Assignment handling result
+            Assignment handling result with wheel state updates
         """
         try:
             symbol = assignment_info['symbol']
             shares_assigned = assignment_info.get('shares', 0)
             strike_price = assignment_info.get('strike_price', 0)
-            
-            logger.info("Handling call assignment", 
-                       symbol=symbol, 
+            assignment_date = assignment_info.get('date', datetime.now())
+
+            logger.info("Handling call assignment",
+                       symbol=symbol,
                        shares=shares_assigned,
                        strike=strike_price)
-            
+
+            # Update wheel state if manager provided
+            wheel_result = None
+            if wheel_state_manager:
+                wheel_result = wheel_state_manager.handle_call_assignment(
+                    symbol, shares_assigned, strike_price, assignment_date, assignment_info
+                )
+
             # Calculate realized profit/loss
             # This would include the premium received plus capital gain/loss
-            
+            realized_pnl = 0.0
+            if wheel_result and 'capital_gain' in wheel_result:
+                realized_pnl = wheel_result['capital_gain']
+
             result = {
                 'action_type': 'assignment_handled',
                 'strategy': 'call_assignment',
                 'symbol': symbol,
                 'shares_assigned': shares_assigned,
                 'assignment_price': strike_price,
-                'timestamp': datetime.now().isoformat(),
-                'next_action': 'look_for_new_put_opportunity'  # Start the wheel again
+                'realized_pnl': realized_pnl,
+                'timestamp': assignment_date.isoformat(),
+                'wheel_cycle_completed': wheel_result.get('wheel_cycle_completed', False) if wheel_result else False,
+                'next_action': 'look_for_new_put_opportunity' if wheel_result and wheel_result.get('wheel_cycle_completed') else 'continue_wheel_strategy'
             }
-            
-            logger.info("Call assignment handled", symbol=symbol)
-            
+
+            # Include wheel state information if available
+            if wheel_result:
+                result['wheel_state_transition'] = {
+                    'phase_before': wheel_result.get('phase_before', {}).value if hasattr(wheel_result.get('phase_before', {}), 'value') else None,
+                    'phase_after': wheel_result.get('phase_after', {}).value if hasattr(wheel_result.get('phase_after', {}), 'value') else None,
+                    'remaining_shares': wheel_result.get('remaining_shares', 0)
+                }
+
+                if wheel_result.get('completed_cycle'):
+                    result['completed_wheel_cycle'] = wheel_result['completed_cycle']
+
+            logger.info("Call assignment handled with wheel state management",
+                       symbol=symbol,
+                       shares_assigned=shares_assigned,
+                       wheel_cycle_completed=result['wheel_cycle_completed'],
+                       next_phase=result.get('wheel_state_transition', {}).get('phase_after'))
+
             return result
-            
+
         except Exception as e:
             logger.error("Failed to handle call assignment", error=str(e))
             return {'error': str(e)}

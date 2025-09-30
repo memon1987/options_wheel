@@ -16,7 +16,11 @@ strategy:
   
   # Delta thresholds for option selection
   put_delta_range: [0.10, 0.20]
-  call_delta_range: [0.10, 0.20]
+  call_delta_range: [0.30, 0.70]
+
+  # CRITICAL: Cost basis protection for covered calls
+  # Never sell calls below stock cost basis to avoid guaranteed losses
+  # This is automatically enforced in code - strikes below cost basis are rejected
   
   # Minimum premium thresholds (in dollars)
   min_put_premium: 0.50

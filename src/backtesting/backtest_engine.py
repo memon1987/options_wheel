@@ -12,6 +12,7 @@ from .portfolio import BacktestPortfolio
 from .trade_simulator import TradeSimulator
 from ..strategy.put_seller import PutSeller
 from ..strategy.call_seller import CallSeller
+from ..strategy.wheel_state_manager import WheelStateManager, WheelPhase
 from ..api.market_data import MarketDataManager
 from ..risk.risk_manager import RiskManager
 from ..risk.gap_detector import GapDetector
@@ -124,10 +125,13 @@ class BacktestEngine:
         temp_alpaca = AlpacaClient(config)
         self.gap_detector = GapDetector(config, temp_alpaca)
 
+        # Initialize wheel state manager for proper strategy logic
+        self.wheel_state = WheelStateManager()
+
         # We'll create mock market data manager and strategy classes
         self.put_seller = None
         self.call_seller = None
-        
+
         # Results tracking
         self.daily_history = []
         self.trade_history = []
@@ -484,8 +488,13 @@ class BacktestEngine:
             'market_value': shares * strike,
             'cost_basis': shares * strike
         }
-        
+
         self.portfolio.stock_positions.append(stock_position)
+
+        # Update wheel state for put assignment
+        self.wheel_state.handle_put_assignment(
+            underlying, shares, strike, date
+        )
         
         # Deduct cash
         cash_required = shares * strike
@@ -551,11 +560,17 @@ class BacktestEngine:
                 'description': f'Call assignment: sold {shares} shares at ${strike}'
             })
             
-            logger.info("Call assigned", 
-                       symbol=underlying, 
-                       shares=shares, 
+            # Update wheel state for call assignment
+            wheel_result = self.wheel_state.handle_call_assignment(
+                underlying, shares, strike, date
+            )
+
+            logger.info("Call assigned with wheel state update",
+                       symbol=underlying,
+                       shares=shares,
                        strike=strike,
-                       realized_pnl=realized_pnl)
+                       realized_pnl=realized_pnl,
+                       wheel_cycle_completed=wheel_result.get('wheel_cycle_completed', False))
 
     def _check_gap_risk(self, date: datetime):
         """Check for overnight gaps and close positions if necessary."""
@@ -752,6 +767,11 @@ class BacktestEngine:
             # Remove position
             self.portfolio.option_positions.remove(position)
 
+            # Update wheel state for position closure
+            self.wheel_state.remove_position(
+                underlying, option_type.lower(), quantity, reason
+            )
+
             logger.info("Position closed with realistic fill",
                        symbol=underlying,
                        type=option_type,
@@ -766,16 +786,17 @@ class BacktestEngine:
             logger.error("Failed to close position", error=str(e))
     
     def _find_new_opportunities(self, date: datetime):
-        """Look for new trading opportunities."""
+        """Look for new trading opportunities using proper wheel strategy logic."""
         # Check if we can open new positions
         if not self._can_open_new_positions():
             return
-        
-        # Look for put opportunities on stocks we don't own
-        self._scan_put_opportunities(date)
-        
-        # Look for call opportunities on stocks we own
+
+        # Prioritize covered calls over puts (proper wheel strategy)
+        # 1. First, look for call opportunities on stocks we own
         self._scan_call_opportunities(date)
+
+        # 2. Only then look for put opportunities (will be blocked if holding stock)
+        self._scan_put_opportunities(date)
     
     def _can_open_new_positions(self) -> bool:
         """Check if we can open new positions."""
@@ -788,8 +809,8 @@ class BacktestEngine:
         return available_cash > 10000  # Minimum cash needed for new position
     
     def _scan_put_opportunities(self, date: datetime):
-        """Scan for put selling opportunities."""
-        logger.debug("Scanning for put opportunities", date=date.date(), symbols=self.backtest_config.symbols)
+        """Scan for put selling opportunities using proper wheel strategy logic."""
+        logger.debug("Scanning for put opportunities with wheel state logic", date=date.date(), symbols=self.backtest_config.symbols)
 
         # Filter symbols by gap risk before scanning
         filtered_symbols = self.gap_detector.filter_stocks_by_gap_risk(
@@ -797,9 +818,16 @@ class BacktestEngine:
         )
 
         for symbol in filtered_symbols:
-            logger.debug("Checking symbol", symbol=symbol)
+            logger.debug("Checking symbol for put opportunities", symbol=symbol)
 
-            # Skip if we already have positions in this stock
+            # Check wheel state - only sell puts if not holding stock
+            if not self.wheel_state.can_sell_puts(symbol):
+                logger.debug("Skipping put opportunity - wheel state blocks puts",
+                           symbol=symbol,
+                           wheel_phase=self.wheel_state.get_wheel_phase(symbol).value)
+                continue
+
+            # Skip if we already have option positions in this stock
             if self._has_position(symbol):
                 logger.debug("Skipping symbol - already has position", symbol=symbol)
                 continue
@@ -824,24 +852,31 @@ class BacktestEngine:
                 logger.debug("No suitable put opportunity found", symbol=symbol)
     
     def _scan_call_opportunities(self, date: datetime):
-        """Scan for covered call opportunities."""
+        """Scan for covered call opportunities using proper wheel strategy logic."""
         for stock_pos in self.portfolio.stock_positions:
             symbol = stock_pos['symbol']
             shares = stock_pos['quantity']
-            
+
             # Need at least 100 shares for covered calls
             if shares < 100:
                 continue
-            
+
+            # Check wheel state - only sell calls if we can (have sufficient stock)
+            if not self.wheel_state.can_sell_calls(symbol):
+                logger.debug("Skipping call opportunity - wheel state blocks calls",
+                           symbol=symbol,
+                           wheel_phase=self.wheel_state.get_wheel_phase(symbol).value)
+                continue
+
             # Skip if we already have call positions on this stock
             if self._has_call_position(symbol):
                 continue
-            
+
             current_price = stock_pos['current_price']
-            
+
             # Find suitable call option
             call_opportunity = self._find_suitable_call(symbol, current_price, date)
-            
+
             if call_opportunity:
                 self._execute_call_trade(call_opportunity, date)
     
@@ -1111,6 +1146,11 @@ class BacktestEngine:
 
             self.portfolio.option_positions.append(position)
 
+            # Register with wheel state manager
+            self.wheel_state.add_put_position(
+                opportunity['underlying'], quantity, fill_price, date
+            )
+
             # Record detailed trade with all market data
             self.trade_history.append({
                 'date': date,
@@ -1212,7 +1252,12 @@ class BacktestEngine:
             }
             
             self.portfolio.option_positions.append(position)
-            
+
+            # Register with wheel state manager
+            self.wheel_state.add_call_position(
+                opportunity['underlying'], quantity, premium, date
+            )
+
             # Record trade
             self.trade_history.append({
                 'date': date,

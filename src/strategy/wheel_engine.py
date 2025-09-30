@@ -10,6 +10,7 @@ from ..risk.gap_detector import GapDetector
 from ..utils.config import Config
 from .put_seller import PutSeller
 from .call_seller import CallSeller
+from .wheel_state_manager import WheelStateManager, WheelPhase
 
 logger = structlog.get_logger(__name__)
 
@@ -19,7 +20,7 @@ class WheelEngine:
     
     def __init__(self, config: Config):
         """Initialize the wheel strategy engine.
-        
+
         Args:
             config: Configuration instance
         """
@@ -29,8 +30,9 @@ class WheelEngine:
         self.gap_detector = GapDetector(config, self.alpaca)
         self.put_seller = PutSeller(self.alpaca, self.market_data, config)
         self.call_seller = CallSeller(self.alpaca, self.market_data, config)
+        self.wheel_state = WheelStateManager()
 
-        logger.info("Wheel engine initialized")
+        logger.info("Wheel engine initialized with state management")
     
     def run_strategy_cycle(self) -> Dict[str, Any]:
         """Run one complete cycle of the wheel strategy.
@@ -59,6 +61,9 @@ class WheelEngine:
             positions = self.alpaca.get_positions()
             cycle_summary['positions_analyzed'] = len(positions)
             
+            # Sync wheel state with current positions
+            self._sync_wheel_state_with_positions(positions)
+
             # Analyze current positions and manage them
             position_actions = self._manage_existing_positions(positions)
             cycle_summary['actions'].extend(position_actions)
@@ -102,9 +107,22 @@ class WheelEngine:
         # Handle assigned stock positions (from put assignment)
         for stock_pos in stock_positions:
             if float(stock_pos['qty']) > 0:  # Long stock position
-                action = self.call_seller.evaluate_covered_call_opportunity(stock_pos)
-                if action:
-                    actions.append(action)
+                symbol = stock_pos['symbol']
+
+                # Only sell calls if wheel state allows it
+                if self.wheel_state.can_sell_calls(symbol):
+                    action = self.call_seller.evaluate_covered_call_opportunity(stock_pos)
+                    if action:
+                        actions.append(action)
+                        # Update wheel state to track new call position
+                        if action.get('contracts'):
+                            self.wheel_state.add_call_position(
+                                symbol, action['contracts'], action.get('premium', 0), datetime.now()
+                            )
+                else:
+                    logger.info("Covered call selling blocked by wheel state",
+                               symbol=symbol,
+                               wheel_phase=self.wheel_state.get_wheel_phase(symbol).value)
         
         # Handle existing option positions
         for option_pos in option_positions:
@@ -180,13 +198,13 @@ class WheelEngine:
         return True
     
     def _find_new_opportunities(self) -> List[Dict[str, Any]]:
-        """Find new options trading opportunities.
-        
+        """Find new options trading opportunities using proper wheel strategy logic.
+
         Returns:
             List of actions for new opportunities
         """
         actions = []
-        
+
         try:
             # Get suitable stocks for wheel strategy
             suitable_stocks = self.market_data.filter_suitable_stocks(self.config.stock_symbols)
@@ -201,17 +219,14 @@ class WheelEngine:
             gap_filtered_stocks = [stock for stock in suitable_stocks
                                  if stock['symbol'] in gap_filtered_symbols]
 
-            logger.info("Evaluating new opportunities",
+            logger.info("Evaluating new opportunities with wheel state logic",
                        suitable_stocks=len(suitable_stocks),
                        gap_filtered_stocks=len(gap_filtered_stocks))
 
-            # For each gap-filtered stock, look for put selling opportunities
+            # Process each stock according to wheel strategy phases
             for stock in gap_filtered_stocks[:5]:  # Limit to top 5 stocks
                 symbol = stock['symbol']
-
-                # Check if we already have positions in this stock
-                if self._has_existing_position(symbol):
-                    continue
+                wheel_phase = self.wheel_state.get_wheel_phase(symbol)
 
                 # Check execution gap before proceeding
                 execution_check = self.gap_detector.can_execute_trade(symbol, datetime.now())
@@ -222,45 +237,93 @@ class WheelEngine:
                                gap_percent=execution_check.get('current_gap_percent', 0))
                     continue
 
-                # Look for put selling opportunity
-                put_opportunity = self.put_seller.find_put_opportunity(symbol)
-                if put_opportunity:
-                    # Add gap check result to the opportunity
-                    put_opportunity['gap_check'] = execution_check
-                    actions.append(put_opportunity)
+                # Prioritize covered calls over puts when holding stock
+                opportunity_found = False
 
-                    # Only one new position per cycle to be conservative
+                # 1. If holding stock, prioritize covered calls
+                if self.wheel_state.can_sell_calls(symbol):
+                    call_opportunity = self.call_seller.evaluate_covered_call_opportunity(
+                        self._get_stock_position_for_symbol(symbol)
+                    )
+                    if call_opportunity:
+                        call_opportunity['gap_check'] = execution_check
+                        actions.append(call_opportunity)
+                        opportunity_found = True
+                        logger.info("Covered call opportunity found",
+                                   symbol=symbol,
+                                   wheel_phase=wheel_phase.value)
+
+                # 2. Only look for puts if no stock position (proper wheel logic)
+                if not opportunity_found and self.wheel_state.can_sell_puts(symbol):
+                    # Check if we already have option positions in this stock
+                    if self._has_existing_option_position(symbol):
+                        continue
+
+                    put_opportunity = self.put_seller.find_put_opportunity(symbol, self.wheel_state)
+                    if put_opportunity:
+                        put_opportunity['gap_check'] = execution_check
+                        actions.append(put_opportunity)
+                        opportunity_found = True
+                        logger.info("Put selling opportunity found",
+                                   symbol=symbol,
+                                   wheel_phase=wheel_phase.value)
+
+                # Only one new position per cycle to be conservative
+                if opportunity_found:
                     break
-            
+
         except Exception as e:
             logger.error("Failed to find new opportunities", error=str(e))
-        
+
         return actions
     
     def _has_existing_position(self, underlying_symbol: str) -> bool:
-        """Check if we already have positions in a given underlying stock.
-        
+        """Check if we already have any positions in a given underlying stock.
+
         Args:
             underlying_symbol: Stock symbol to check
-            
+
         Returns:
             True if we have existing positions
         """
         try:
             positions = self.alpaca.get_positions()
-            
+
             # Check for stock positions
-            stock_positions = [p for p in positions 
+            stock_positions = [p for p in positions
                              if p['symbol'] == underlying_symbol and p['asset_class'] == 'us_equity']
-            
+
             # Check for option positions on this underlying
-            option_positions = [p for p in positions 
+            option_positions = [p for p in positions
                               if p['asset_class'] == 'us_option' and underlying_symbol in p['symbol']]
-            
+
             return len(stock_positions) > 0 or len(option_positions) > 0
-            
+
         except Exception as e:
-            logger.error("Failed to check existing positions", 
+            logger.error("Failed to check existing positions",
+                        symbol=underlying_symbol, error=str(e))
+            return True  # Be conservative and assume we have positions
+
+    def _has_existing_option_position(self, underlying_symbol: str) -> bool:
+        """Check if we already have option positions in a given underlying stock.
+
+        Args:
+            underlying_symbol: Stock symbol to check
+
+        Returns:
+            True if we have existing option positions
+        """
+        try:
+            positions = self.alpaca.get_positions()
+
+            # Check for option positions on this underlying
+            option_positions = [p for p in positions
+                              if p['asset_class'] == 'us_option' and underlying_symbol in p['symbol']]
+
+            return len(option_positions) > 0
+
+        except Exception as e:
+            logger.error("Failed to check existing option positions",
                         symbol=underlying_symbol, error=str(e))
             return True  # Be conservative and assume we have positions
     
@@ -299,9 +362,114 @@ class WheelEngine:
                     'can_open_new_positions': self._can_open_new_positions(positions),
                     'positions_remaining': max(0, self.config.max_total_positions - len(option_positions))
                 },
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'wheel_state': {
+                    'symbols_in_put_phase': len(self.wheel_state.get_symbols_by_phase(WheelPhase.SELLING_PUTS)),
+                    'symbols_holding_stock': len(self.wheel_state.get_symbols_by_phase(WheelPhase.HOLDING_STOCK)),
+                    'symbols_selling_calls': len(self.wheel_state.get_symbols_by_phase(WheelPhase.SELLING_CALLS)),
+                    'completed_wheel_cycles': len(self.wheel_state.get_all_wheel_cycles())
+                }
             }
-            
+
         except Exception as e:
             logger.error("Failed to get strategy status", error=str(e))
             return {'error': str(e)}
+
+    def _sync_wheel_state_with_positions(self, positions: List[Dict[str, Any]]):
+        """Synchronize wheel state manager with current account positions.
+
+        Args:
+            positions: Current positions from account
+        """
+        try:
+            # Track symbols we've seen to identify removed positions
+            current_symbols = set()
+
+            # Process stock positions
+            stock_positions = [p for p in positions if p['asset_class'] == 'us_equity']
+            for stock_pos in stock_positions:
+                symbol = stock_pos['symbol']
+                shares = int(float(stock_pos['qty']))
+                cost_basis = float(stock_pos['avg_cost'])
+
+                if shares > 0:  # Long position
+                    current_symbols.add(symbol)
+                    # Update wheel state if not already tracked
+                    state_summary = self.wheel_state.get_position_summary(symbol)
+                    if state_summary['stock_shares'] != shares:
+                        logger.info("Syncing stock position with wheel state",
+                                   symbol=symbol, shares=shares, cost_basis=cost_basis)
+                        # This is a simplified sync - in practice might need more sophisticated handling
+                        self.wheel_state.handle_put_assignment(
+                            symbol, shares - state_summary['stock_shares'], cost_basis, datetime.now()
+                        )
+
+            # Process option positions to track active contracts
+            option_positions = [p for p in positions if p['asset_class'] == 'us_option']
+            for option_pos in option_positions:
+                option_symbol = option_pos['symbol']
+                qty = float(option_pos['qty'])
+
+                if qty < 0:  # Short position (sold option)
+                    # Extract underlying symbol from option symbol
+                    # This is simplified - you might need more robust option symbol parsing
+                    underlying = self._extract_underlying_from_option_symbol(option_symbol)
+                    if underlying:
+                        current_symbols.add(underlying)
+                        contracts = abs(int(qty))
+
+                        # Determine option type and update state accordingly
+                        if 'P' in option_symbol:  # Put option
+                            # Note: We don't automatically add puts here as they might violate wheel logic
+                            # This sync is primarily for existing positions
+                            pass
+                        elif 'C' in option_symbol:  # Call option
+                            # Update call position tracking
+                            pass
+
+            logger.debug("Wheel state synchronized with account positions",
+                        symbols_tracked=len(current_symbols))
+
+        except Exception as e:
+            logger.error("Failed to sync wheel state with positions", error=str(e))
+
+    def _extract_underlying_from_option_symbol(self, option_symbol: str) -> Optional[str]:
+        """Extract underlying stock symbol from option symbol.
+
+        Args:
+            option_symbol: Full option symbol
+
+        Returns:
+            Underlying stock symbol or None
+        """
+        try:
+            # Simple extraction - assumes format like "AAPL250117C00150000"
+            # Find the last letter before the date (P or C)
+            for i, char in enumerate(option_symbol):
+                if char.isdigit():
+                    return option_symbol[:i]
+            return None
+        except Exception:
+            return None
+
+    def _get_stock_position_for_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get stock position data for a specific symbol.
+
+        Args:
+            symbol: Stock symbol
+
+        Returns:
+            Stock position data or None
+        """
+        try:
+            positions = self.alpaca.get_positions()
+            stock_positions = [p for p in positions
+                             if p['symbol'] == symbol and p['asset_class'] == 'us_equity']
+
+            if stock_positions and float(stock_positions[0]['qty']) > 0:
+                return stock_positions[0]
+            return None
+
+        except Exception as e:
+            logger.error("Failed to get stock position", symbol=symbol, error=str(e))
+            return None
