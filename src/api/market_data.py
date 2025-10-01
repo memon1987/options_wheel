@@ -128,9 +128,14 @@ class MarketDataManager:
             for option in options_chain:
                 # Calculate days to expiration
                 exp_date = option['expiration_date']
+
+                # Skip options with missing expiration date
+                if exp_date is None:
+                    continue
+
                 if isinstance(exp_date, str):
                     exp_date = datetime.fromisoformat(exp_date.replace('Z', '+00:00'))
-                
+
                 dte = (exp_date - now).days
                 
                 # Calculate mid price
