@@ -9,6 +9,7 @@ import numpy as np
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
+from ..utils.logging_events import log_performance_metric, log_error_event
 
 logger = structlog.get_logger(__name__)
 
@@ -62,15 +63,37 @@ class OptionsScanner:
             
             # Sort by overall attractiveness score
             opportunities.sort(key=lambda x: x.get('attractiveness_score', 0), reverse=True)
-            
-            logger.info("Put scan completed", 
+
+            logger.info("Put scan completed",
                        total_opportunities=len(opportunities),
                        returning=min(max_results, len(opportunities)))
-            
+
+            # Enhanced logging for BigQuery analytics
+            log_performance_metric(
+                logger,
+                metric_name="put_opportunities_discovered",
+                metric_value=len(opportunities),
+                metric_unit="count",
+                symbols_scanned=len(self.config.stock_symbols),
+                suitable_stocks=len(suitable_stocks),
+                returning=min(max_results, len(opportunities)),
+                top_score=opportunities[0].get('attractiveness_score', 0) if opportunities else 0,
+                avg_score=sum(opp.get('attractiveness_score', 0) for opp in opportunities) / len(opportunities) if opportunities else 0,
+                avg_annual_return=sum(opp.get('annual_return_percent', 0) for opp in opportunities) / len(opportunities) if opportunities else 0
+            )
+
             return opportunities[:max_results]
             
         except Exception as e:
-            logger.error("Failed to scan for put opportunities", error=str(e))
+            # Enhanced error logging
+            log_error_event(
+                logger,
+                error_type="scan_failure",
+                error_message=str(e),
+                component="options_scanner",
+                recoverable=True,
+                scan_type="put"
+            )
             return []
     
     def scan_for_call_opportunities(self, max_results: int = 10) -> List[Dict[str, Any]]:
@@ -109,15 +132,37 @@ class OptionsScanner:
             
             # Sort by overall attractiveness score
             opportunities.sort(key=lambda x: x.get('attractiveness_score', 0), reverse=True)
-            
+
             logger.info("Call scan completed",
                        total_opportunities=len(opportunities),
                        returning=min(max_results, len(opportunities)))
-            
+
+            # Enhanced logging for BigQuery analytics
+            log_performance_metric(
+                logger,
+                metric_name="call_opportunities_discovered",
+                metric_value=len(opportunities),
+                metric_unit="count",
+                stock_positions=len(stock_positions),
+                positions_with_100_shares=len([p for p in stock_positions if int(float(p['qty'])) >= 100]),
+                returning=min(max_results, len(opportunities)),
+                top_score=opportunities[0].get('attractiveness_score', 0) if opportunities else 0,
+                avg_score=sum(opp.get('attractiveness_score', 0) for opp in opportunities) / len(opportunities) if opportunities else 0,
+                avg_annual_return=sum(opp.get('annual_premium_return_percent', 0) for opp in opportunities) / len(opportunities) if opportunities else 0
+            )
+
             return opportunities[:max_results]
             
         except Exception as e:
-            logger.error("Failed to scan for call opportunities", error=str(e))
+            # Enhanced error logging
+            log_error_event(
+                logger,
+                error_type="scan_failure",
+                error_message=str(e),
+                component="options_scanner",
+                recoverable=True,
+                scan_type="call"
+            )
             return []
     
     def scan_all_opportunities(self) -> Dict[str, List[Dict[str, Any]]]:
@@ -205,7 +250,16 @@ class OptionsScanner:
             return opportunity
             
         except Exception as e:
-            logger.error("Failed to create put opportunity", error=str(e))
+            # Enhanced error logging
+            log_error_event(
+                logger,
+                error_type="opportunity_creation_failed",
+                error_message=str(e),
+                component="options_scanner",
+                recoverable=True,
+                opportunity_type="put",
+                symbol=stock_info.get('symbol', 'unknown')
+            )
             return None
     
     def _create_call_opportunity(self, call_option: Dict[str, Any], stock_position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -300,7 +354,16 @@ class OptionsScanner:
             return opportunity
             
         except Exception as e:
-            logger.error("Failed to create call opportunity", error=str(e))
+            # Enhanced error logging
+            log_error_event(
+                logger,
+                error_type="opportunity_creation_failed",
+                error_message=str(e),
+                component="options_scanner",
+                recoverable=True,
+                opportunity_type="call",
+                symbol=stock_position.get('symbol', 'unknown')
+            )
             return None
     
     def _calculate_put_attractiveness_score(self, annual_return: float, delta: float, 
