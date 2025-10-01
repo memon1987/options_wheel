@@ -5,6 +5,8 @@ from datetime import datetime
 from enum import Enum
 import structlog
 
+from ..utils.logging_events import log_position_update
+
 logger = structlog.get_logger(__name__)
 
 
@@ -151,6 +153,22 @@ class WheelStateManager:
                    avg_cost_basis=state['stock_cost_basis'],
                    phase_transition=f"{old_phase.value} -> {new_phase.value}")
 
+        # Enhanced position update logging with phase transition
+        log_position_update(
+            logger,
+            event_type="put_assignment",
+            symbol=symbol,
+            position_type="put",
+            action="assignment",
+            shares=shares,
+            assignment_price=cost_basis,
+            total_shares=new_total_shares,
+            avg_cost_basis=state['stock_cost_basis'],
+            phase_before=old_phase.value,
+            phase_after=new_phase.value,
+            wheel_cycle_started=(current_shares == 0)
+        )
+
         return {
             'symbol': symbol,
             'action': 'put_assignment',
@@ -238,6 +256,25 @@ class WheelStateManager:
                    remaining_shares=remaining_shares,
                    wheel_cycle_completed=wheel_cycle_completed,
                    phase_transition=f"{old_phase.value} -> {new_phase.value}")
+
+        # Enhanced position update logging with phase transition
+        log_position_update(
+            logger,
+            event_type="call_assignment",
+            symbol=symbol,
+            position_type="call",
+            action="assignment",
+            shares=shares,
+            assignment_price=strike_price,
+            capital_gain=capital_gain,
+            remaining_shares=remaining_shares,
+            phase_before=old_phase.value,
+            phase_after=new_phase.value,
+            wheel_cycle_completed=wheel_cycle_completed,
+            total_premium_collected=state.get('total_premium_collected', 0) if not wheel_cycle_completed else cycle_data.get('total_premium', 0),
+            cycle_duration_days=cycle_data.get('duration_days', 0) if cycle_data else 0,
+            total_return=cycle_data.get('total_return', 0) if cycle_data else 0
+        )
 
         result = {
             'symbol': symbol,

@@ -7,6 +7,7 @@ import structlog
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
+from ..utils.logging_events import log_trade_event, log_error_event, log_position_update
 
 logger = structlog.get_logger(__name__)
 
@@ -198,30 +199,71 @@ class CallSeller:
                 order_type='limit',
                 limit_price=limit_price
             )
-            
-            if order_result:
+
+            # Handle order result (success or structured error)
+            if order_result and order_result.get('success', True):
                 result = {
                     'success': True,
-                    'order_id': order_result['order_id'],
+                    'order_id': order_result.get('order_id'),
                     'symbol': option_symbol,
                     'contracts': contracts,
                     'limit_price': limit_price,
                     'strategy': 'sell_call',
                     'timestamp': datetime.now().isoformat()
                 }
-                
-                logger.info("Covered call executed successfully", 
-                           order_id=order_result['order_id'],
-                           symbol=option_symbol)
-                
+
+                # Enhanced logging for BigQuery analytics
+                log_trade_event(
+                    logger,
+                    event_type="call_sale_executed",
+                    symbol=option_symbol,
+                    underlying=opportunity.get('symbol', ''),
+                    strategy="sell_call",
+                    success=True,
+                    strike_price=opportunity.get('strike_price', 0),
+                    premium=premium,
+                    contracts=contracts,
+                    limit_price=limit_price,
+                    order_id=order_result.get('order_id'),
+                    shares_covered=opportunity.get('shares_covered', 0),
+                    stock_cost_basis=opportunity.get('stock_cost_basis', 0),
+                    total_return_if_called=opportunity.get('total_return_if_called', 0),
+                    dte=opportunity.get('dte', 0)
+                )
+
                 return result
             else:
-                logger.error("Failed to place call order")
+                # Order failed - return structured error
+                error_type = order_result.get('error_type', 'unknown') if order_result else 'unknown'
+                error_msg = order_result.get('error_message', 'Unknown error') if order_result else 'No result returned'
+
+                # Enhanced error logging
+                log_error_event(
+                    logger,
+                    error_type=error_type,
+                    error_message=error_msg,
+                    component="call_seller",
+                    recoverable=True,
+                    symbol=option_symbol,
+                    underlying=opportunity.get('symbol', ''),
+                    strike_price=opportunity.get('strike_price', 0),
+                    contracts=contracts,
+                    limit_price=limit_price
+                )
+
                 return None
                 
         except Exception as e:
-            logger.error("Failed to execute covered call sale", 
-                        opportunity=opportunity, error=str(e))
+            # Enhanced error logging
+            log_error_event(
+                logger,
+                error_type="execution_exception",
+                error_message=str(e),
+                component="call_seller",
+                recoverable=False,
+                symbol=opportunity.get('option_symbol', ''),
+                underlying=opportunity.get('symbol', '')
+            )
             return None
     
     def evaluate_call_assignment_risk(self, call_position: Dict[str, Any]) -> Dict[str, Any]:
@@ -409,6 +451,21 @@ class CallSeller:
                        shares_assigned=shares_assigned,
                        wheel_cycle_completed=result['wheel_cycle_completed'],
                        next_phase=result.get('wheel_state_transition', {}).get('phase_after'))
+
+            # Enhanced position update logging
+            log_position_update(
+                logger,
+                event_type="call_assignment",
+                symbol=symbol,
+                position_type="call",
+                action="assignment",
+                shares=shares_assigned,
+                assignment_price=strike_price,
+                realized_pnl=realized_pnl,
+                wheel_cycle_completed=result['wheel_cycle_completed'],
+                phase_before=result.get('wheel_state_transition', {}).get('phase_before'),
+                phase_after=result.get('wheel_state_transition', {}).get('phase_after')
+            )
 
             return result
 
