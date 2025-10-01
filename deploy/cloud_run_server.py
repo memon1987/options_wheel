@@ -18,6 +18,7 @@ import sys
 sys.path.append('/app/src')
 
 from src.utils.config import Config
+from src.utils.logging_events import log_system_event, log_performance_metric, log_error_event
 
 logger = structlog.get_logger(__name__)
 
@@ -53,8 +54,16 @@ def get_status():
 def trigger_scan():
     """Trigger a market scan for opportunities."""
     with strategy_lock:
+        start_time = datetime.now()
         try:
             logger.info("Triggering market scan")
+
+            # Log system event for scan trigger
+            log_system_event(
+                logger,
+                event_type="market_scan_triggered",
+                status="starting"
+            )
 
             # Initialize trading components
             config = Config()
@@ -88,6 +97,29 @@ def trigger_scan():
                 'total_opportunities': len(put_opportunities) + len(call_opportunities)
             }
 
+            # Calculate scan duration
+            duration_seconds = (datetime.now() - start_time).total_seconds()
+
+            # Log completion event
+            log_system_event(
+                logger,
+                event_type="market_scan_completed",
+                status="completed",
+                duration_seconds=duration_seconds,
+                put_opportunities=len(put_opportunities),
+                call_opportunities=len(call_opportunities),
+                total_opportunities=scan_results['total_opportunities']
+            )
+
+            # Log performance metric
+            log_performance_metric(
+                logger,
+                metric_name="market_scan_duration",
+                metric_value=duration_seconds,
+                metric_unit="seconds",
+                opportunities_found=scan_results['total_opportunities']
+            )
+
             return jsonify({
                 'message': 'Market scan completed successfully',
                 'timestamp': datetime.now().isoformat(),
@@ -96,7 +128,16 @@ def trigger_scan():
 
         except Exception as e:
             error_msg = f"Scan failed: {str(e)}"
-            logger.error(error_msg, error=str(e), traceback=traceback.format_exc())
+
+            # Enhanced error logging
+            log_error_event(
+                logger,
+                error_type="market_scan_exception",
+                error_message=str(e),
+                component="cloud_run_server",
+                recoverable=True
+            )
+
             strategy_status['errors'].append({
                 'timestamp': datetime.now().isoformat(),
                 'error': error_msg
@@ -107,8 +148,16 @@ def trigger_scan():
 def trigger_strategy():
     """Trigger strategy execution."""
     with strategy_lock:
+        start_time = datetime.now()
         try:
             logger.info("Triggering strategy execution")
+
+            # Log system event for strategy trigger
+            log_system_event(
+                logger,
+                event_type="strategy_execution_triggered",
+                status="starting"
+            )
 
             # Initialize trading components
             config = Config()
@@ -139,9 +188,28 @@ def trigger_strategy():
                 strategy_status['positions'] = execution_results.get('positions_count', 0)
                 strategy_status['pnl'] = execution_results.get('total_pnl', 0.0)
 
-            logger.info("Strategy execution completed",
-                       actions_taken=len(execution_results.get('actions', [])),
-                       positions=execution_results.get('positions_count', 0))
+            # Calculate execution duration
+            duration_seconds = (datetime.now() - start_time).total_seconds()
+
+            # Log system event for completion
+            log_system_event(
+                logger,
+                event_type="strategy_execution_completed",
+                status="completed",
+                duration_seconds=duration_seconds,
+                actions_taken=len(execution_results.get('actions', [])),
+                new_positions=execution_results.get('new_positions', 0),
+                closed_positions=execution_results.get('closed_positions', 0)
+            )
+
+            # Log performance metric
+            log_performance_metric(
+                logger,
+                metric_name="strategy_execution_duration",
+                metric_value=duration_seconds,
+                metric_unit="seconds",
+                actions_taken=len(execution_results.get('actions', []))
+            )
 
             return jsonify({
                 'message': 'Strategy execution completed successfully',

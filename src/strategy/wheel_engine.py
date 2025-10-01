@@ -8,6 +8,7 @@ from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..risk.gap_detector import GapDetector
 from ..utils.config import Config
+from ..utils.logging_events import log_system_event, log_performance_metric, log_error_event
 from .put_seller import PutSeller
 from .call_seller import CallSeller
 from .wheel_state_manager import WheelStateManager, WheelPhase
@@ -36,14 +37,15 @@ class WheelEngine:
     
     def run_strategy_cycle(self) -> Dict[str, Any]:
         """Run one complete cycle of the wheel strategy.
-        
+
         Returns:
             Summary of actions taken
         """
+        start_time = datetime.now()
         logger.info("Starting strategy cycle")
-        
+
         cycle_summary = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': start_time.isoformat(),
             'actions': [],
             'errors': [],
             'account_info': {},
@@ -51,42 +53,70 @@ class WheelEngine:
             'new_positions': 0,
             'closed_positions': 0
         }
-        
+
         try:
             # Get account information
             account_info = self.alpaca.get_account()
             cycle_summary['account_info'] = account_info
-            
+
             # Get current positions
             positions = self.alpaca.get_positions()
             cycle_summary['positions_analyzed'] = len(positions)
-            
+
             # Sync wheel state with current positions
             self._sync_wheel_state_with_positions(positions)
 
             # Analyze current positions and manage them
             position_actions = self._manage_existing_positions(positions)
             cycle_summary['actions'].extend(position_actions)
-            
+
             # Look for new opportunities if we have capacity
             if self._can_open_new_positions(positions):
                 new_position_actions = self._find_new_opportunities()
                 cycle_summary['actions'].extend(new_position_actions)
-            
+
             # Count new and closed positions
             cycle_summary['new_positions'] = len([a for a in cycle_summary['actions'] if a['action_type'] == 'new_position'])
             cycle_summary['closed_positions'] = len([a for a in cycle_summary['actions'] if a['action_type'] == 'close_position'])
-            
-            logger.info("Strategy cycle completed", 
-                       actions_taken=len(cycle_summary['actions']),
-                       new_positions=cycle_summary['new_positions'],
-                       closed_positions=cycle_summary['closed_positions'])
-            
+
+            # Calculate cycle duration
+            end_time = datetime.now()
+            duration_seconds = (end_time - start_time).total_seconds()
+
+            # Enhanced system event logging
+            log_system_event(
+                logger,
+                event_type="strategy_cycle_completed",
+                status="completed",
+                duration_seconds=duration_seconds,
+                actions_taken=len(cycle_summary['actions']),
+                new_positions=cycle_summary['new_positions'],
+                closed_positions=cycle_summary['closed_positions'],
+                positions_analyzed=cycle_summary['positions_analyzed']
+            )
+
+            # Log performance metric
+            log_performance_metric(
+                logger,
+                metric_name="strategy_cycle_duration",
+                metric_value=duration_seconds,
+                metric_unit="seconds",
+                actions_taken=len(cycle_summary['actions'])
+            )
+
         except Exception as e:
             error_msg = f"Strategy cycle failed: {str(e)}"
-            logger.error(error_msg)
+
+            # Enhanced error logging
+            log_error_event(
+                logger,
+                error_type="strategy_cycle_exception",
+                error_message=str(e),
+                component="wheel_engine",
+                recoverable=False
+            )
             cycle_summary['errors'].append(error_msg)
-        
+
         return cycle_summary
     
     def _manage_existing_positions(self, positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -204,6 +234,7 @@ class WheelEngine:
             List of actions for new opportunities
         """
         actions = []
+        start_time = datetime.now()
 
         try:
             # Get suitable stocks for wheel strategy
@@ -222,6 +253,18 @@ class WheelEngine:
             logger.info("Evaluating new opportunities with wheel state logic",
                        suitable_stocks=len(suitable_stocks),
                        gap_filtered_stocks=len(gap_filtered_stocks))
+
+            # Log performance metric for market scan
+            scan_duration = (datetime.now() - start_time).total_seconds()
+            log_performance_metric(
+                logger,
+                metric_name="market_scan_duration",
+                metric_value=scan_duration,
+                metric_unit="seconds",
+                symbols_scanned=len(stock_symbols),
+                suitable_stocks=len(suitable_stocks),
+                gap_filtered_stocks=len(gap_filtered_stocks)
+            )
 
             # Process each stock according to wheel strategy phases
             for stock in gap_filtered_stocks[:5]:  # Limit to top 5 stocks

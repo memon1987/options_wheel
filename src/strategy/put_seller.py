@@ -7,6 +7,7 @@ import structlog
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
+from ..utils.logging_events import log_trade_event, log_error_event, log_risk_event
 
 logger = structlog.get_logger(__name__)
 
@@ -186,11 +187,19 @@ class PutSeller:
                 available_bp = account.get('options_buying_power', 0)
 
                 if collateral_required > available_bp:
-                    logger.warning("Insufficient buying power for put sale",
-                                 symbol=option_symbol,
-                                 required=collateral_required,
-                                 available=available_bp,
-                                 shortage=collateral_required - available_bp)
+                    # Enhanced error logging for BigQuery analytics
+                    log_error_event(
+                        logger,
+                        error_type="insufficient_buying_power",
+                        error_message=f'Need ${collateral_required:,.2f} but only ${available_bp:,.2f} available',
+                        component="put_seller",
+                        recoverable=True,
+                        symbol=option_symbol,
+                        underlying=opportunity.get('symbol', ''),
+                        required=collateral_required,
+                        available=available_bp,
+                        shortage=collateral_required - available_bp
+                    )
                     return {
                         'success': False,
                         'error': 'insufficient_buying_power',
@@ -239,9 +248,22 @@ class PutSeller:
                     'timestamp': datetime.now().isoformat()
                 }
 
-                logger.info("Put sale executed successfully",
-                           order_id=order_result.get('order_id'),
-                           symbol=option_symbol)
+                # Enhanced logging for BigQuery analytics
+                log_trade_event(
+                    logger,
+                    event_type="put_sale_executed",
+                    symbol=option_symbol,
+                    underlying=opportunity.get('symbol', ''),
+                    strategy="sell_put",
+                    success=True,
+                    strike_price=strike_price,
+                    premium=premium,
+                    contracts=contracts,
+                    limit_price=limit_price,
+                    order_id=order_result.get('order_id'),
+                    collateral_required=collateral_required,
+                    dte=opportunity.get('dte', 0)
+                )
 
                 return result
 
@@ -250,10 +272,19 @@ class PutSeller:
                 error_type = order_result.get('error_type', 'unknown') if order_result else 'unknown'
                 error_msg = order_result.get('error_message', 'Unknown error') if order_result else 'No result returned'
 
-                logger.error("Put order placement failed",
-                           symbol=option_symbol,
-                           error_type=error_type,
-                           error_message=error_msg)
+                # Enhanced error logging for BigQuery analytics
+                log_error_event(
+                    logger,
+                    error_type=error_type,
+                    error_message=error_msg,
+                    component="put_seller",
+                    recoverable=True,
+                    symbol=option_symbol,
+                    underlying=opportunity.get('symbol', ''),
+                    strike_price=strike_price,
+                    contracts=contracts,
+                    limit_price=limit_price
+                )
 
                 return {
                     'success': False,
@@ -265,8 +296,16 @@ class PutSeller:
                 }
                 
         except Exception as e:
-            logger.error("Failed to execute put sale", 
-                        opportunity=opportunity, error=str(e))
+            # Enhanced error logging for BigQuery analytics
+            log_error_event(
+                logger,
+                error_type="execution_exception",
+                error_message=str(e),
+                component="put_seller",
+                recoverable=False,
+                symbol=opportunity.get('option_symbol', ''),
+                underlying=opportunity.get('symbol', '')
+            )
             return None
     
     def evaluate_put_assignment(self, put_position: Dict[str, Any]) -> Dict[str, Any]:

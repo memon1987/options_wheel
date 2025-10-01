@@ -7,6 +7,7 @@ import numpy as np
 import structlog
 
 from ..utils.config import Config
+from ..utils.logging_events import log_risk_event, log_error_event
 from ..api.alpaca_client import AlpacaClient
 
 logger = structlog.get_logger(__name__)
@@ -321,9 +322,17 @@ class GapDetector:
             if gap_analysis.get('suitable_for_trading', False):
                 suitable_symbols.append(symbol)
             else:
-                logger.info("Symbol filtered out due to gap risk",
-                           symbol=symbol,
-                           risk_score=gap_analysis.get('gap_risk_score', 1.0))
+                # Enhanced risk event logging
+                log_risk_event(
+                    logger,
+                    event_type="stock_filtered_by_gap_risk",
+                    symbol=symbol,
+                    risk_type="gap_risk",
+                    action_taken="stock_excluded",
+                    gap_risk_score=gap_analysis.get('gap_risk_score', 1.0),
+                    gap_frequency=gap_analysis.get('historical_gaps', {}).get('gap_frequency', 0),
+                    historical_volatility=gap_analysis.get('historical_volatility', 0)
+                )
 
         logger.info("Gap risk filtering completed",
                    input_symbols=len(symbols),
@@ -368,6 +377,19 @@ class GapDetector:
 
             # Check against execution threshold
             if abs(gap_percent) > self.config.execution_gap_threshold:
+                # Enhanced risk event logging for blocked trade
+                log_risk_event(
+                    logger,
+                    event_type="execution_gap_exceeded",
+                    symbol=symbol,
+                    risk_type="gap_risk",
+                    action_taken="trade_blocked",
+                    gap_percent=gap_percent,
+                    threshold=self.config.execution_gap_threshold,
+                    previous_close=previous_close,
+                    current_price=current_price
+                )
+
                 return {
                     'can_execute': False,
                     'reason': 'execution_gap_exceeded',
@@ -387,7 +409,15 @@ class GapDetector:
             }
 
         except Exception as e:
-            logger.error("Failed to check execution gap", symbol=symbol, error=str(e))
+            # Enhanced error logging
+            log_error_event(
+                logger,
+                error_type="gap_check_error",
+                error_message=str(e),
+                component="gap_detector",
+                recoverable=True,
+                symbol=symbol
+            )
             return {
                 'can_execute': False,
                 'reason': 'gap_check_error',
