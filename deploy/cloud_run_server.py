@@ -56,19 +56,47 @@ def trigger_scan():
         try:
             logger.info("Triggering market scan")
 
-            # This would normally run the scan logic
-            # For now, just update status
+            # Initialize trading components
+            config = Config()
+
+            from src.api.alpaca_client import AlpacaClient
+            from src.api.market_data import MarketDataManager
+            from src.data.options_scanner import OptionsScanner
+
+            alpaca_client = AlpacaClient(config)
+            market_data = MarketDataManager(alpaca_client, config)
+            scanner = OptionsScanner(alpaca_client, market_data, config)
+
+            # Perform market scan
+            logger.info("Starting options market scan")
+
+            # Scan for put opportunities
+            put_opportunities = scanner.scan_put_opportunities()
+            logger.info("Put opportunities found", count=len(put_opportunities))
+
+            # Scan for call opportunities (if we have stock positions)
+            call_opportunities = scanner.scan_call_opportunities()
+            logger.info("Call opportunities found", count=len(call_opportunities))
+
+            # Update status with scan results
             strategy_status['last_scan'] = datetime.now().isoformat()
             strategy_status['status'] = 'scan_completed'
 
+            scan_results = {
+                'put_opportunities': len(put_opportunities),
+                'call_opportunities': len(call_opportunities),
+                'total_opportunities': len(put_opportunities) + len(call_opportunities)
+            }
+
             return jsonify({
-                'message': 'Market scan triggered successfully',
-                'timestamp': datetime.now().isoformat()
+                'message': 'Market scan completed successfully',
+                'timestamp': datetime.now().isoformat(),
+                'results': scan_results
             })
 
         except Exception as e:
             error_msg = f"Scan failed: {str(e)}"
-            logger.error(error_msg)
+            logger.error(error_msg, error=str(e), traceback=traceback.format_exc())
             strategy_status['errors'].append({
                 'timestamp': datetime.now().isoformat(),
                 'error': error_msg
@@ -82,19 +110,53 @@ def trigger_strategy():
         try:
             logger.info("Triggering strategy execution")
 
-            # This would normally run the strategy
-            # For now, just update status
+            # Initialize trading components
+            config = Config()
+
+            from src.api.alpaca_client import AlpacaClient
+            from src.api.market_data import MarketDataManager
+            from src.strategy.wheel_engine import WheelEngine
+            from src.data.portfolio_tracker import PortfolioTracker
+
+            alpaca_client = AlpacaClient(config)
+            market_data = MarketDataManager(alpaca_client, config)
+            portfolio_tracker = PortfolioTracker(alpaca_client, config)
+
+            # Initialize wheel engine with cost basis protection
+            wheel_engine = WheelEngine(alpaca_client, market_data, portfolio_tracker, config)
+
+            logger.info("Starting wheel strategy execution")
+
+            # Execute the strategy
+            execution_results = wheel_engine.execute_strategy()
+
+            # Update global status
             strategy_status['last_run'] = datetime.now().isoformat()
             strategy_status['status'] = 'execution_completed'
 
+            # Update portfolio metrics
+            if execution_results:
+                strategy_status['positions'] = execution_results.get('positions_count', 0)
+                strategy_status['pnl'] = execution_results.get('total_pnl', 0.0)
+
+            logger.info("Strategy execution completed",
+                       actions_taken=len(execution_results.get('actions', [])),
+                       positions=execution_results.get('positions_count', 0))
+
             return jsonify({
-                'message': 'Strategy execution triggered successfully',
-                'timestamp': datetime.now().isoformat()
+                'message': 'Strategy execution completed successfully',
+                'timestamp': datetime.now().isoformat(),
+                'results': {
+                    'actions_taken': len(execution_results.get('actions', [])),
+                    'positions_count': execution_results.get('positions_count', 0),
+                    'opportunities_evaluated': execution_results.get('opportunities_evaluated', 0),
+                    'dry_run': config.paper_trading
+                }
             })
 
         except Exception as e:
             error_msg = f"Strategy execution failed: {str(e)}"
-            logger.error(error_msg)
+            logger.error(error_msg, error=str(e), traceback=traceback.format_exc())
             strategy_status['errors'].append({
                 'timestamp': datetime.now().isoformat(),
                 'error': error_msg

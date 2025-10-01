@@ -156,39 +156,98 @@ class AlpacaClient:
     
     def get_options_chain(self, underlying_symbol: str) -> List[Dict[str, Any]]:
         """Get options chain for a stock.
-        
+
         Args:
             underlying_symbol: Underlying stock symbol
-            
+
         Returns:
             List of option contracts
         """
         try:
             request = OptionChainRequest(underlying_symbol=underlying_symbol)
             chain = self.option_data_client.get_option_chain(request)
-            
+
             options = []
-            for contract in chain:
+            # Chain is a dictionary with option symbols as keys and OptionsSnapshot data as values
+            for option_symbol, contract in chain.items():
+                # Parse option symbol to extract details
+                # Format: UNH251024C00185000 -> UNH 25/10/24 Call $185
+                try:
+                    # Extract option type and strike from symbol
+                    if 'C' in option_symbol:
+                        option_type = 'call'
+                        parts = option_symbol.split('C')
+                    elif 'P' in option_symbol:
+                        option_type = 'put'
+                        parts = option_symbol.split('P')
+                    else:
+                        option_type = 'unknown'
+                        parts = [option_symbol, '00000000']
+
+                    # Extract strike price (last 8 digits, divide by 1000)
+                    strike_str = parts[1] if len(parts) > 1 else '00000000'
+                    strike_price = float(strike_str) / 1000.0
+
+                    # Extract expiration date from symbol (6 digits after underlying)
+                    underlying_len = len(underlying_symbol)
+                    exp_str = option_symbol[underlying_len:underlying_len+6]
+                    if len(exp_str) == 6:
+                        # Format: YYMMDD
+                        year = 2000 + int(exp_str[:2])
+                        month = int(exp_str[2:4])
+                        day = int(exp_str[4:6])
+                        exp_date = f"{year:04d}-{month:02d}-{day:02d}"
+                    else:
+                        exp_date = None
+
+                except:
+                    option_type = 'unknown'
+                    strike_price = 0.0
+                    exp_date = None
+
+                # Extract quote data
+                quote = getattr(contract, 'latest_quote', None)
+                trade = getattr(contract, 'latest_trade', None)
+                greeks = getattr(contract, 'greeks', None)
+
+                bid = float(quote.bid_price) if quote and hasattr(quote, 'bid_price') and quote.bid_price else 0.0
+                ask = float(quote.ask_price) if quote and hasattr(quote, 'ask_price') and quote.ask_price else 0.0
+                bid_size = int(quote.bid_size) if quote and hasattr(quote, 'bid_size') and quote.bid_size else 0
+                ask_size = int(quote.ask_size) if quote and hasattr(quote, 'ask_size') and quote.ask_size else 0
+
+                last_price = float(trade.price) if trade and hasattr(trade, 'price') and trade.price else 0.0
+                volume = int(trade.size) if trade and hasattr(trade, 'size') and trade.size else 0
+
+                # Extract Greeks
+                delta = float(greeks.delta) if greeks and hasattr(greeks, 'delta') and greeks.delta else 0.0
+                gamma = float(greeks.gamma) if greeks and hasattr(greeks, 'gamma') and greeks.gamma else 0.0
+                theta = float(greeks.theta) if greeks and hasattr(greeks, 'theta') and greeks.theta else 0.0
+                vega = float(greeks.vega) if greeks and hasattr(greeks, 'vega') and greeks.vega else 0.0
+
+                implied_vol = float(contract.implied_volatility) if hasattr(contract, 'implied_volatility') and contract.implied_volatility else 0.0
+
                 options.append({
-                    'symbol': contract.symbol,
-                    'underlying_symbol': contract.underlying_symbol,
-                    'option_type': contract.option_type,
-                    'strike_price': float(contract.strike_price),
-                    'expiration_date': contract.expiration_date,
-                    'bid': float(contract.bid) if contract.bid else 0.0,
-                    'ask': float(contract.ask) if contract.ask else 0.0,
-                    'last_price': float(contract.last_price) if contract.last_price else 0.0,
-                    'volume': int(contract.volume) if contract.volume else 0,
-                    'open_interest': int(contract.open_interest) if contract.open_interest else 0,
-                    'implied_volatility': float(contract.implied_volatility) if contract.implied_volatility else 0.0,
-                    'delta': float(contract.delta) if contract.delta else 0.0,
-                    'gamma': float(contract.gamma) if contract.gamma else 0.0,
-                    'theta': float(contract.theta) if contract.theta else 0.0,
-                    'vega': float(contract.vega) if contract.vega else 0.0
+                    'symbol': option_symbol,
+                    'underlying_symbol': underlying_symbol,
+                    'option_type': option_type,
+                    'strike_price': strike_price,
+                    'expiration_date': exp_date,
+                    'bid': bid,
+                    'ask': ask,
+                    'bid_size': bid_size,
+                    'ask_size': ask_size,
+                    'last_price': last_price,
+                    'volume': volume,
+                    'open_interest': 0,  # Not available in snapshot data
+                    'implied_volatility': implied_vol,
+                    'delta': delta,
+                    'gamma': gamma,
+                    'theta': theta,
+                    'vega': vega
                 })
-            
+
             return options
-            
+
         except Exception as e:
             logger.error("Failed to get options chain", symbol=underlying_symbol, error=str(e))
             raise

@@ -26,17 +26,25 @@ class PutSeller:
         self.market_data = market_data
         self.config = config
         
-    def find_put_opportunity(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def find_put_opportunity(self, symbol: str, wheel_state_manager=None) -> Optional[Dict[str, Any]]:
         """Find the best put selling opportunity for a stock.
-        
+
         Args:
             symbol: Stock symbol
-            
+            wheel_state_manager: Optional wheel state manager for validation
+
         Returns:
             Put opportunity details or None
         """
         try:
             logger.info("Evaluating put opportunity", symbol=symbol)
+
+            # Check wheel state if manager provided
+            if wheel_state_manager and not wheel_state_manager.can_sell_puts(symbol):
+                logger.info("Put selling blocked by wheel state",
+                           symbol=symbol,
+                           wheel_phase=wheel_state_manager.get_wheel_phase(symbol).value)
+                return None
             
             # Get suitable puts for this stock
             suitable_puts = self.market_data.find_suitable_puts(symbol)
