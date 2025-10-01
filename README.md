@@ -36,25 +36,38 @@ python main.py --command scan --dry-run
 ## 📁 Project Structure
 
 ```
-├── src/                    # Core strategy code
+├── src/                    # Core strategy code (production)
 │   ├── strategy/          # Options wheel implementation
 │   ├── risk/              # Risk management and gap detection
 │   ├── api/               # Alpaca API integration
 │   ├── backtesting/       # Backtesting framework
+│   ├── data/              # Data management and scanning
 │   └── utils/             # Configuration and utilities
-├── deploy/                # Cloud deployment files
-│   ├── cloudbuild.yaml    # CI/CD pipeline
-│   ├── Dockerfile         # Container configuration
-│   ├── cloud_run_server.py # Web server wrapper
-│   └── monitoring/        # Health checks and alerts
-├── tools/                 # Development and maintenance tools
-│   ├── scripts/           # Deployment and maintenance scripts
-│   ├── test_deployment.py # Deployment testing
-│   └── monitor_build.py   # Build monitoring
+│
+├── deploy/                # Cloud deployment configuration
+│   ├── cloud_run_server.py # Production web server
+│   ├── monitoring/        # Health checks and performance dashboard
+│   └── kubernetes/        # K8s configs (optional)
+│
+├── scripts/               # Standalone utility scripts
+│   └── testing/           # Manual test scripts (test_*.py)
+│
+├── tools/                 # Operational tools
+│   ├── backtesting/       # Backtest runners
+│   ├── deployment/        # Deployment utilities
+│   ├── monitoring/        # Emergency stop, maintenance
+│   └── testing/           # Integration test utilities
+│
+├── tests/                 # Unit tests (pytest)
+├── config/                # Strategy configuration (settings.yaml)
 ├── docs/                  # Documentation
-├── tests/                 # Test suite
-├── config/                # Strategy configuration
-└── examples/              # Usage examples
+├── examples/              # Example usage and demos
+├── research/              # Experimental features
+│   └── experiments/       # Active research projects
+│
+├── main.py                # Local entry point
+├── setup.py               # Package setup
+└── cloudbuild.yaml        # CI/CD pipeline
 ```
 
 ## 🎯 Strategy Features
