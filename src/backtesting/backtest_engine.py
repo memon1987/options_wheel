@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
 import structlog
+import time
 
 from .historical_data import HistoricalDataManager
 from .portfolio import BacktestPortfolio
@@ -17,6 +18,7 @@ from ..api.market_data import MarketDataManager
 from ..risk.risk_manager import RiskManager
 from ..risk.gap_detector import GapDetector
 from ..utils.config import Config
+from ..utils.logging_events import log_backtest_event, log_performance_metric
 
 logger = structlog.get_logger(__name__)
 
@@ -149,15 +151,34 @@ class BacktestEngine:
     
     def run_backtest(self) -> BacktestResult:
         """Run the complete backtest.
-        
+
         Returns:
             BacktestResult with all metrics and data
         """
-        logger.info("Starting backtest", 
+        # Generate unique backtest ID
+        backtest_id = f"bt_{int(time.time())}_{self.backtest_config.start_date.strftime('%Y%m%d')}"
+        backtest_start_time = time.time()
+
+        logger.info("Starting backtest",
                    start=self.backtest_config.start_date,
                    end=self.backtest_config.end_date,
                    symbols=self.backtest_config.symbols)
-        
+
+        # Enhanced logging for backtest start
+        log_backtest_event(
+            logger,
+            event_type="backtest_started",
+            backtest_id=backtest_id,
+            start_date=self.backtest_config.start_date.isoformat(),
+            end_date=self.backtest_config.end_date.isoformat(),
+            initial_capital=self.backtest_config.initial_capital,
+            symbols=",".join(self.backtest_config.symbols),
+            symbol_count=len(self.backtest_config.symbols),
+            put_target_dte=self.config.put_target_dte,
+            call_target_dte=self.config.call_target_dte,
+            gap_detection_enabled=self.config.enable_gap_detection
+        )
+
         # Fetch all historical data first
         self._load_historical_data()
         
@@ -179,12 +200,67 @@ class BacktestEngine:
         
         # Calculate final results
         result = self._calculate_results()
-        
-        logger.info("Backtest completed", 
+
+        # Calculate backtest duration
+        backtest_duration = time.time() - backtest_start_time
+
+        logger.info("Backtest completed",
                    final_value=result.final_capital,
                    total_return=result.total_return,
                    trades=result.total_trades)
-        
+
+        # Enhanced logging for backtest completion
+        log_backtest_event(
+            logger,
+            event_type="backtest_completed",
+            backtest_id=backtest_id,
+            start_date=self.backtest_config.start_date.isoformat(),
+            end_date=self.backtest_config.end_date.isoformat(),
+            duration_seconds=backtest_duration,
+
+            # Capital metrics
+            initial_capital=result.initial_capital,
+            final_capital=result.final_capital,
+            total_return=result.total_return,
+            annualized_return=result.annualized_return,
+
+            # Risk metrics
+            max_drawdown=result.max_drawdown,
+            sharpe_ratio=result.sharpe_ratio,
+            max_at_risk_capital=result.max_at_risk_capital,
+            avg_at_risk_capital=result.avg_at_risk_capital,
+            peak_at_risk_percentage=result.peak_at_risk_percentage,
+
+            # Trading metrics
+            total_trades=result.total_trades,
+            put_trades=result.put_trades,
+            call_trades=result.call_trades,
+            assignments=result.assignments,
+            assignment_rate=result.assignment_rate,
+            win_rate=result.win_rate,
+            premium_collected=result.premium_collected,
+
+            # Configuration
+            symbols=",".join(self.backtest_config.symbols),
+            symbol_count=len(self.backtest_config.symbols),
+            trading_days=trading_days,
+
+            # Success indicator
+            success=True
+        )
+
+        # Log performance metric for backtest execution time
+        log_performance_metric(
+            logger,
+            metric_name="backtest_execution_time",
+            metric_value=backtest_duration,
+            metric_unit="seconds",
+            backtest_id=backtest_id,
+            trading_days=trading_days,
+            total_trades=result.total_trades,
+            days_per_second=trading_days / backtest_duration if backtest_duration > 0 else 0
+        )
+
         return result
     
     def _load_historical_data(self):

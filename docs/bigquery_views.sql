@@ -146,3 +146,51 @@ SELECT
   severity
 FROM `gen-lang-client-0607444019.options_wheel_logs.cloud_run_logs_*`
 WHERE jsonPayload.event_category = 'position_update';
+
+-- ================================================================
+-- 7. BACKTEST RESULTS VIEW - Historical backtesting analysis
+-- ================================================================
+CREATE OR REPLACE VIEW `gen-lang-client-0607444019.options_wheel_logs.backtest_results` AS
+SELECT
+  timestamp,
+  DATE(timestamp) as backtest_date,
+  jsonPayload.event_type,
+  jsonPayload.backtest_id,
+  jsonPayload.start_date,
+  jsonPayload.end_date,
+  CAST(jsonPayload.duration_seconds AS FLOAT64) as duration_seconds,
+
+  -- Capital metrics
+  CAST(jsonPayload.initial_capital AS FLOAT64) as initial_capital,
+  CAST(jsonPayload.final_capital AS FLOAT64) as final_capital,
+  CAST(jsonPayload.total_return AS FLOAT64) as total_return,
+  CAST(jsonPayload.annualized_return AS FLOAT64) as annualized_return,
+
+  -- Risk metrics
+  CAST(jsonPayload.max_drawdown AS FLOAT64) as max_drawdown,
+  CAST(jsonPayload.sharpe_ratio AS FLOAT64) as sharpe_ratio,
+  CAST(jsonPayload.max_at_risk_capital AS FLOAT64) as max_at_risk_capital,
+  CAST(jsonPayload.avg_at_risk_capital AS FLOAT64) as avg_at_risk_capital,
+  CAST(jsonPayload.peak_at_risk_percentage AS FLOAT64) as peak_at_risk_percentage,
+
+  -- Trading metrics
+  CAST(jsonPayload.total_trades AS INT64) as total_trades,
+  CAST(jsonPayload.put_trades AS INT64) as put_trades,
+  CAST(jsonPayload.call_trades AS INT64) as call_trades,
+  CAST(jsonPayload.assignments AS INT64) as assignments,
+  CAST(jsonPayload.assignment_rate AS FLOAT64) as assignment_rate,
+  CAST(jsonPayload.win_rate AS FLOAT64) as win_rate,
+  CAST(jsonPayload.premium_collected AS FLOAT64) as premium_collected,
+
+  -- Configuration
+  jsonPayload.symbols,
+  CAST(jsonPayload.symbol_count AS INT64) as symbol_count,
+  CAST(jsonPayload.trading_days AS INT64) as trading_days,
+  CAST(jsonPayload.gap_detection_enabled AS BOOL) as gap_detection_enabled,
+
+  -- Success indicator
+  CAST(jsonPayload.success AS BOOL) as success,
+  insertId,
+  severity
+FROM `gen-lang-client-0607444019.options_wheel_logs.cloud_run_logs_*`
+WHERE jsonPayload.event_category = 'backtest' AND jsonPayload.event_type = 'backtest_completed';

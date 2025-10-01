@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Script to create BigQuery views for Options Wheel Trading Strategy logs
-# Waits for log tables to appear, then creates all 6 views
+# Waits for log tables to appear, then creates all 7 views
 #
 
 set -e
@@ -131,7 +131,7 @@ echo "Step 4: Testing views with sample queries..."
 echo ""
 
 # Test each view with a simple count query
-VIEWS=("trades" "risk_events" "performance_metrics" "errors" "system_events" "position_updates")
+VIEWS=("trades" "risk_events" "performance_metrics" "errors" "system_events" "position_updates" "backtest_results")
 
 for VIEW in "${VIEWS[@]}"; do
     echo -n "Testing $VIEW... "
