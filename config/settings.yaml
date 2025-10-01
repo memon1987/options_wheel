@@ -27,7 +27,7 @@ strategy:
   min_call_premium: 0.30
   
   # Stock universe criteria (optimized for cloud execution)
-  min_stock_price: 30.00
+  min_stock_price: 10.00  # Lowered to allow high-volume stocks like Ford (F)
   max_stock_price: 400.00
   min_avg_volume: 2000000  # 2M shares daily average for better liquidity
   
@@ -86,6 +86,7 @@ risk:
 stocks:
   # High-quality, liquid stocks suitable for wheel strategy
   # TSLA removed due to extreme volatility and gap risk
+  # F (Ford) added - S&P 500 stock with excellent options liquidity at ~$12/share
   symbols:
     - "AAPL"
     - "MSFT"
@@ -97,6 +98,7 @@ stocks:
     - "SPY"
     - "IWM"
     - "UNH"
+    - "F"
 
 # Monitoring and Alerts (Cloud-optimized)
 monitoring:
