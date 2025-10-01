@@ -86,7 +86,14 @@ risk:
 stocks:
   # High-quality, liquid stocks suitable for wheel strategy
   # TSLA removed due to extreme volatility and gap risk
-  # F (Ford) added - S&P 500 stock with excellent options liquidity at ~$12/share
+  #
+  # Low-price candidates (under $30) for higher volume trading:
+  # - F (Ford): ~$12, automotive, excellent liquidity (2M+ OI)
+  # - PFE (Pfizer): ~$25, pharma, excellent liquidity
+  # - KMI (Kinder Morgan): ~$28, energy infrastructure, good liquidity
+  #
+  # Mid-price candidates ($30-50) for balanced exposure:
+  # - VZ (Verizon): ~$43, telecom, dividend aristocrat, excellent liquidity
   symbols:
     - "AAPL"
     - "MSFT"
@@ -98,7 +105,10 @@ stocks:
     - "SPY"
     - "IWM"
     - "UNH"
-    - "F"
+    - "F"      # Ford Motor - $12
+    - "PFE"    # Pfizer - $25
+    - "KMI"    # Kinder Morgan - $28
+    - "VZ"     # Verizon - $43
 
 # Monitoring and Alerts (Cloud-optimized)
 monitoring:
