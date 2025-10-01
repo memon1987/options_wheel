@@ -165,10 +165,10 @@ class PutSeller:
     
     def execute_put_sale(self, opportunity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Execute a put selling trade.
-        
+
         Args:
             opportunity: Put opportunity details
-            
+
         Returns:
             Trade execution result
         """
@@ -176,15 +176,47 @@ class PutSeller:
             option_symbol = opportunity['option_symbol']
             contracts = opportunity['contracts']
             premium = opportunity['premium']
-            
+            strike_price = opportunity.get('strike_price', 0)
+
+            # CRITICAL: Validate buying power before placing order
+            collateral_required = strike_price * 100 * contracts  # Cash-secured put
+
+            try:
+                account = self.alpaca.get_account()
+                available_bp = account.get('options_buying_power', 0)
+
+                if collateral_required > available_bp:
+                    logger.warning("Insufficient buying power for put sale",
+                                 symbol=option_symbol,
+                                 required=collateral_required,
+                                 available=available_bp,
+                                 shortage=collateral_required - available_bp)
+                    return {
+                        'success': False,
+                        'error': 'insufficient_buying_power',
+                        'message': f'Need ${collateral_required:,.2f} but only ${available_bp:,.2f} available',
+                        'symbol': option_symbol,
+                        'timestamp': datetime.now().isoformat()
+                    }
+
+                logger.info("Buying power check passed",
+                           required=collateral_required,
+                           available=available_bp,
+                           margin=available_bp - collateral_required)
+
+            except Exception as bp_error:
+                logger.error("Failed to check buying power", error=str(bp_error))
+                # Continue anyway - let Alpaca reject if needed
+
             # Calculate limit price (slightly below mid to improve fill probability)
             limit_price = round(premium * 0.95, 2)  # 5% below mid price
-            
-            logger.info("Executing put sale", 
+
+            logger.info("Executing put sale",
                        symbol=option_symbol,
                        contracts=contracts,
-                       limit_price=limit_price)
-            
+                       limit_price=limit_price,
+                       collateral_required=collateral_required)
+
             # Place the sell order
             order_result = self.alpaca.place_option_order(
                 symbol=option_symbol,
@@ -193,26 +225,44 @@ class PutSeller:
                 order_type='limit',
                 limit_price=limit_price
             )
-            
-            if order_result:
+
+            # Handle order result (success or structured error)
+            if order_result and order_result.get('success', True):
+                # Order placed successfully
                 result = {
                     'success': True,
-                    'order_id': order_result['order_id'],
+                    'order_id': order_result.get('order_id'),
                     'symbol': option_symbol,
                     'contracts': contracts,
                     'limit_price': limit_price,
                     'strategy': 'sell_put',
                     'timestamp': datetime.now().isoformat()
                 }
-                
-                logger.info("Put sale executed successfully", 
-                           order_id=order_result['order_id'],
+
+                logger.info("Put sale executed successfully",
+                           order_id=order_result.get('order_id'),
                            symbol=option_symbol)
-                
+
                 return result
+
             else:
-                logger.error("Failed to place put order")
-                return None
+                # Order failed - return structured error
+                error_type = order_result.get('error_type', 'unknown') if order_result else 'unknown'
+                error_msg = order_result.get('error_message', 'Unknown error') if order_result else 'No result returned'
+
+                logger.error("Put order placement failed",
+                           symbol=option_symbol,
+                           error_type=error_type,
+                           error_message=error_msg)
+
+                return {
+                    'success': False,
+                    'error': error_type,
+                    'message': error_msg,
+                    'symbol': option_symbol,
+                    'strategy': 'sell_put',
+                    'timestamp': datetime.now().isoformat()
+                }
                 
         except Exception as e:
             logger.error("Failed to execute put sale", 

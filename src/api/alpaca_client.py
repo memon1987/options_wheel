@@ -305,9 +305,35 @@ class AlpacaClient:
             }
             
         except Exception as e:
-            logger.error("Failed to place option order", 
-                        symbol=symbol, qty=qty, side=side, error=str(e))
-            raise
+            error_msg = str(e)
+
+            # Categorize error for better handling
+            error_type = "unknown"
+            if "insufficient" in error_msg.lower() or "buying power" in error_msg.lower():
+                error_type = "insufficient_funds"
+            elif "not found" in error_msg.lower() or "invalid symbol" in error_msg.lower():
+                error_type = "invalid_symbol"
+            elif "rejected" in error_msg.lower():
+                error_type = "order_rejected"
+            elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+                error_type = "connection_error"
+
+            logger.error("Failed to place option order",
+                        symbol=symbol,
+                        qty=qty,
+                        side=side,
+                        error=error_msg,
+                        error_type=error_type)
+
+            # Return structured error instead of raising for better handling upstream
+            return {
+                'success': False,
+                'error_type': error_type,
+                'error_message': error_msg,
+                'symbol': symbol,
+                'qty': qty,
+                'side': side
+            }
     
     def get_orders(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get order history.

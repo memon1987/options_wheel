@@ -42,7 +42,7 @@ strategy:
 risk:
   # Portfolio allocation limits
   max_portfolio_allocation: 0.80  # 80% of portfolio
-  max_position_size: 0.10         # 10% per position
+  max_position_size: 0.35         # 35% per position (allows up to $35k positions)
   min_cash_reserve: 0.20          # 20% cash reserve
   
   # Stop loss settings (separate controls for puts vs calls)
@@ -70,8 +70,8 @@ risk:
     # Quality control thresholds (historical analysis)
     quality_gap_threshold: 2.0    # Threshold for counting "significant gaps" in stock filtering
 
-    # Real-time execution controls (hard filter)
-    execution_gap_threshold: 2.0  # HARD STOP: Don't execute trades if overnight gap exceeds this
+    # Real-time execution controls (hard filter - more conservative)
+    execution_gap_threshold: 1.5  # HARD STOP: Don't execute trades if overnight gap exceeds this
     execution_gap_lookback_hours: 16 # Check gap from previous close (market close to open)
 
     # Pre-market gap thresholds
@@ -85,17 +85,18 @@ risk:
 # Stock Universe
 stocks:
   # High-quality, liquid stocks suitable for wheel strategy
+  # TSLA removed due to extreme volatility and gap risk
   symbols:
     - "AAPL"
     - "MSFT"
     - "GOOGL"
     - "AMZN"
-    - "TSLA"
     - "NVDA"
     - "AMD"
     - "QQQ"
     - "SPY"
     - "IWM"
+    - "UNH"
 
 # Monitoring and Alerts (Cloud-optimized)
 monitoring:
