@@ -71,11 +71,11 @@ def trigger_scan():
             logger.info("Starting options market scan")
 
             # Scan for put opportunities
-            put_opportunities = scanner.scan_put_opportunities()
+            put_opportunities = scanner.scan_for_put_opportunities()
             logger.info("Put opportunities found", count=len(put_opportunities))
 
             # Scan for call opportunities (if we have stock positions)
-            call_opportunities = scanner.scan_call_opportunities()
+            call_opportunities = scanner.scan_for_call_opportunities()
             logger.info("Call opportunities found", count=len(call_opportunities))
 
             # Update status with scan results
@@ -123,12 +123,12 @@ def trigger_strategy():
             portfolio_tracker = PortfolioTracker(alpaca_client, config)
 
             # Initialize wheel engine with cost basis protection
-            wheel_engine = WheelEngine(alpaca_client, market_data, portfolio_tracker, config)
+            wheel_engine = WheelEngine(config)
 
             logger.info("Starting wheel strategy execution")
 
             # Execute the strategy
-            execution_results = wheel_engine.execute_strategy()
+            execution_results = wheel_engine.run_strategy_cycle()
 
             # Update global status
             strategy_status['last_run'] = datetime.now().isoformat()
