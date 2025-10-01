@@ -163,6 +163,48 @@ def trigger_strategy():
             })
             return jsonify({'error': error_msg}), 500
 
+@app.route('/account', methods=['GET'])
+def get_account():
+    """Get Alpaca account information."""
+    try:
+        config = Config()
+        from src.api.alpaca_client import AlpacaClient
+
+        client = AlpacaClient(config)
+        account_info = client.get_account()
+
+        # Add timestamp
+        account_info['timestamp'] = datetime.now().isoformat()
+        account_info['paper_trading'] = config.paper_trading
+
+        return jsonify(account_info)
+
+    except Exception as e:
+        error_msg = f"Failed to get account info: {str(e)}"
+        logger.error(error_msg, error=str(e), traceback=traceback.format_exc())
+        return jsonify({'error': error_msg}), 500
+
+@app.route('/positions', methods=['GET'])
+def get_positions():
+    """Get current positions."""
+    try:
+        config = Config()
+        from src.api.alpaca_client import AlpacaClient
+
+        client = AlpacaClient(config)
+        positions = client.get_positions()
+
+        return jsonify({
+            'positions': positions,
+            'count': len(positions),
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        error_msg = f"Failed to get positions: {str(e)}"
+        logger.error(error_msg, error=str(e), traceback=traceback.format_exc())
+        return jsonify({'error': error_msg}), 500
+
 @app.route('/config', methods=['GET'])
 def get_config():
     """Get current configuration (sanitized)."""
