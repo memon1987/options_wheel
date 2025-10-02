@@ -77,14 +77,17 @@ class HistoricalDataManager:
         
         try:
             logger.info("Fetching stock data", symbol=symbol, start=start_date, end=end_date)
-            
+
+            # Note: No need for feed parameter or delay buffer in backtesting
+            # Backtests query historical data (old dates), not recent SIP data
+            # SIP feed is default and provides best quality historical data for free
             request = StockBarsRequest(
                 symbol_or_symbols=[symbol],
                 timeframe=timeframe,
                 start=start_date,
                 end=end_date
             )
-            
+
             bars = self.stock_client.get_stock_bars(request)
             df = bars.df
             

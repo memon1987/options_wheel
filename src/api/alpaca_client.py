@@ -86,19 +86,26 @@ class AlpacaClient:
     
     # Market Data
     def get_stock_quote(self, symbol: str) -> Dict[str, Any]:
-        """Get latest stock quote.
-        
+        """Get latest stock quote using IEX feed for real-time data.
+
+        IEX provides real-time quotes for free (no 15-min delay like SIP).
+        While IEX only covers ~3% of market volume, it's sufficient for
+        current price quotes in options wheel strategy.
+
         Args:
             symbol: Stock symbol
-            
+
         Returns:
             Latest quote data
         """
         try:
-            request = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+            request = StockLatestQuoteRequest(
+                symbol_or_symbols=[symbol],
+                feed='iex'  # Real-time quotes from IEX exchange (FREE)
+            )
             quotes = self.stock_data_client.get_stock_latest_quote(request)
             quote = quotes[symbol]
-            
+
             return {
                 'symbol': symbol,
                 'bid': float(quote.bid_price),
@@ -112,28 +119,39 @@ class AlpacaClient:
             raise
     
     def get_stock_bars(self, symbol: str, days: int = 30) -> pd.DataFrame:
-        """Get historical stock bars.
-        
+        """Get historical stock bars using SIP feed with 15-min delay buffer.
+
+        Uses SIP (Securities Information Processor) feed for best data quality:
+        - 100% market coverage (all 16 exchanges)
+        - NBBO (National Best Bid Offer) prices
+        - Free with 15-minute delay
+
+        The 20-minute buffer ensures we never query recent data that would
+        require a paid subscription. This is perfect for wheel strategy which
+        uses daily bars for gap analysis and doesn't need real-time bars.
+
         Args:
             symbol: Stock symbol
             days: Number of days of history
-            
+
         Returns:
             DataFrame with OHLCV data
         """
         try:
-            end_date = datetime.now()
+            # Account for 15-min SIP delay with 20-min buffer for safety
+            end_date = datetime.now() - timedelta(minutes=20)
             start_date = end_date - timedelta(days=days)
-            
+
             request = StockBarsRequest(
                 symbol_or_symbols=[symbol],
                 timeframe=TimeFrame.Day,
                 start=start_date,
                 end=end_date
+                # No feed parameter = defaults to SIP (best quality, 15-min delayed)
             )
-            
+
             bars = self.stock_data_client.get_stock_bars(request)
-            
+
             # Convert to DataFrame
             data = []
             for bar in bars[symbol]:
@@ -145,11 +163,11 @@ class AlpacaClient:
                     'close': float(bar.close),
                     'volume': int(bar.volume)
                 })
-            
+
             df = pd.DataFrame(data)
             df.set_index('timestamp', inplace=True)
             return df
-            
+
         except Exception as e:
             logger.error("Failed to get stock bars", symbol=symbol, error=str(e))
             raise
