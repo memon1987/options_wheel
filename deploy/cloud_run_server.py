@@ -216,7 +216,12 @@ def trigger_strategy():
             account_info = alpaca_client.get_account()
             available_buying_power = float(account_info.get('options_buying_power') or account_info['buying_power'])
             logger.info("Starting execution with buying power",
-                       initial_buying_power=available_buying_power)
+                       initial_buying_power=available_buying_power,
+                       buying_power=account_info.get('buying_power'),
+                       options_buying_power=account_info.get('options_buying_power'),
+                       cash=account_info.get('cash'),
+                       portfolio_value=account_info.get('portfolio_value'),
+                       equity=account_info.get('equity'))
 
             # Execute each opportunity
             execution_results = []
