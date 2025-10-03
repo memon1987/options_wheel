@@ -249,8 +249,8 @@ def trigger_strategy():
                                      tracked_buying_power=available_buying_power)
                         continue
 
-                # Execute the trade
-                result = put_seller.execute_put_sale(opp)
+                # Execute the trade (skip buying power check since we're tracking locally)
+                result = put_seller.execute_put_sale(opp, skip_buying_power_check=True)
                 execution_results.append(result)
 
                 if result and result.get('success'):

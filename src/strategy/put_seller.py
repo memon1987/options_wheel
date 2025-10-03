@@ -200,7 +200,7 @@ class PutSeller:
             logger.error("Failed to calculate position size", error=str(e))
             return None
     
-    def execute_put_sale(self, opportunity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def execute_put_sale(self, opportunity: Dict[str, Any], skip_buying_power_check: bool = False) -> Optional[Dict[str, Any]]:
         """Execute a put selling trade.
 
         Args:
@@ -218,40 +218,42 @@ class PutSeller:
             # CRITICAL: Validate buying power before placing order
             collateral_required = strike_price * 100 * contracts  # Cash-secured put
 
-            try:
-                account = self.alpaca.get_account()
-                available_bp = account.get('options_buying_power', 0)
+            # Skip buying power check if using local tracking (Alpaca API returns stale $0 after trades)
+            if not skip_buying_power_check:
+                try:
+                    account = self.alpaca.get_account()
+                    available_bp = account.get('options_buying_power', 0)
 
-                if collateral_required > available_bp:
-                    # Enhanced error logging for BigQuery analytics
-                    log_error_event(
-                        logger,
-                        error_type="insufficient_buying_power",
-                        error_message=f'Need ${collateral_required:,.2f} but only ${available_bp:,.2f} available',
-                        component="put_seller",
-                        recoverable=True,
-                        symbol=option_symbol,
-                        underlying=opportunity.get('symbol', ''),
-                        required=collateral_required,
-                        available=available_bp,
-                        shortage=collateral_required - available_bp
-                    )
-                    return {
-                        'success': False,
-                        'error': 'insufficient_buying_power',
-                        'message': f'Need ${collateral_required:,.2f} but only ${available_bp:,.2f} available',
-                        'symbol': option_symbol,
-                        'timestamp': datetime.now().isoformat()
-                    }
+                    if collateral_required > available_bp:
+                        # Enhanced error logging for BigQuery analytics
+                        log_error_event(
+                            logger,
+                            error_type="insufficient_buying_power",
+                            error_message=f'Need ${collateral_required:,.2f} but only ${available_bp:,.2f} available',
+                            component="put_seller",
+                            recoverable=True,
+                            symbol=option_symbol,
+                            underlying=opportunity.get('symbol', ''),
+                            required=collateral_required,
+                            available=available_bp,
+                            shortage=collateral_required - available_bp
+                        )
+                        return {
+                            'success': False,
+                            'error': 'insufficient_buying_power',
+                            'message': f'Need ${collateral_required:,.2f} but only ${available_bp:,.2f} available',
+                            'symbol': option_symbol,
+                            'timestamp': datetime.now().isoformat()
+                        }
 
-                logger.info("Buying power check passed",
-                           required=collateral_required,
-                           available=available_bp,
-                           margin=available_bp - collateral_required)
+                    logger.info("Buying power check passed",
+                               required=collateral_required,
+                               available=available_bp,
+                               margin=available_bp - collateral_required)
 
-            except Exception as bp_error:
-                logger.error("Failed to check buying power", error=str(bp_error))
-                # Continue anyway - let Alpaca reject if needed
+                except Exception as bp_error:
+                    logger.error("Failed to check buying power", error=str(bp_error))
+                    # Continue anyway - let Alpaca reject if needed
 
             # Calculate limit price: mid + 10% of spread (biased toward ask for premium collection)
             bid = opportunity.get('bid')
