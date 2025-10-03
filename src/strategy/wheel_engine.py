@@ -271,7 +271,7 @@ class WheelEngine:
             )
 
             # Process each stock according to wheel strategy phases
-            for stock in gap_filtered_stocks[:5]:  # Limit to top 5 stocks
+            for stock in gap_filtered_stocks:  # Evaluate all gap-filtered stocks
                 symbol = stock['symbol']
                 wheel_phase = self.wheel_state.get_wheel_phase(symbol)
 
@@ -315,9 +315,7 @@ class WheelEngine:
                                    symbol=symbol,
                                    wheel_phase=wheel_phase.value)
 
-                # Only one new position per cycle to be conservative
-                if opportunity_found:
-                    break
+                # No limit on positions per cycle - let other risk controls manage portfolio
 
         except Exception as e:
             logger.error("Failed to find new opportunities", error=str(e))

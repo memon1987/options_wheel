@@ -88,16 +88,10 @@ For each suitable stock, performs historical analysis:
 
 ---
 
-### STAGE 3: Position Limit Check
-**Component**: `wheel_engine._find_new_opportunities()`
-**Location**: [src/strategy/wheel_engine.py:274](../src/strategy/wheel_engine.py#L274)
-
-**Filter**:
-- **Limit**: Top 5 stocks only
-- Processes only first 5 stocks from `gap_filtered_stocks`
-- Conservative approach to limit simultaneous evaluations
-
-**Output**: At most 5 stocks evaluated per cycle
+### STAGE 3: ~~Position Limit Check~~ REMOVED
+**Previously**: Limited to top 5 stocks only
+**Now**: All gap-filtered stocks are evaluated
+**Rationale**: Let Stage 6 (existing positions) and Stage 8 (position sizing) control portfolio limits instead of arbitrary caps
 
 ---
 
@@ -218,14 +212,14 @@ After filtering, remaining puts are ranked by:
 
 ---
 
-### STAGE 9: Conservative Execution Limit
-**Component**: `wheel_engine._find_new_opportunities()`
-**Location**: [src/strategy/wheel_engine.py:318-320](../src/strategy/wheel_engine.py#L318-L320)
-
-**Final Limit**:
-- **Only 1 new position per cycle** (conservative)
-- After finding first valid opportunity → break loop
-- **Purpose**: Gradual portfolio buildup, risk management
+### STAGE 9: ~~Conservative Execution Limit~~ REMOVED
+**Previously**: Only 1 new position per cycle
+**Now**: Multiple positions can be opened per cycle (as many as pass all filters)
+**Rationale**:
+- Stage 8 position sizing already limits exposure ($25k per ticker, 80% portfolio max)
+- Stage 6 prevents duplicate positions in same underlying
+- Max 10 total positions enforced by config
+- Let portfolio limits and risk controls dictate capacity, not arbitrary per-cycle caps
 
 ---
 
@@ -241,8 +235,8 @@ STAGE 2: Gap Risk Analysis
     ├── Historical Volatility ≤ 40%
     └── Current Gap ≤ 5%
     ↓ (~7-10 stocks pass)
-STAGE 3: Top 5 Limit
-    ↓ (5 stocks evaluated)
+STAGE 3: [REMOVED - No arbitrary stock limit]
+    ↓ (ALL gap-filtered stocks evaluated)
 STAGE 4: Execution Gap Check (per stock)
     └── Real-time gap ≤ 1.5%
     ↓
@@ -261,12 +255,12 @@ STAGE 7: Options Chain Criteria (per contract)
 STAGE 8: Position Sizing (per opportunity)
     ├── Sufficient buying power?
     ├── ≤ $25k exposure per ticker?
-    └── ≤ 80% portfolio allocation?
+    ├── ≤ 80% portfolio allocation?
+    └── ≤ 10 total positions (config)
     ↓
-STAGE 9: Execution Limit
-    └── Only 1 position per cycle
+STAGE 9: [REMOVED - No per-cycle limit]
     ↓
-0-1 Trade Executed
+0-N Trades Executed (limited by buying power, position limits, and risk controls)
 ```
 
 ---
@@ -307,6 +301,11 @@ STAGE 9: Execution Limit
 - Insufficient buying power
 - Would exceed $25k single-ticker limit
 - Portfolio already at 80% allocation
+- Already at max 10 total positions
+
+**~~Stage 3 & 9~~** (REMOVED):
+- Previously limited to 5 stocks evaluated and 1 position per cycle
+- Now portfolio naturally limited by risk controls in Stages 6 & 8
 
 ---
 
