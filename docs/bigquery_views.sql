@@ -1,13 +1,16 @@
 -- BigQuery Views for Options Wheel Strategy Analytics
 -- These views flatten the log data for easy querying
+-- Note: Timestamps are provided in both UTC and Eastern Time (America/New_York)
 
 -- ================================================================
 -- 1. TRADES VIEW - All trading activity
 -- ================================================================
 CREATE OR REPLACE VIEW `gen-lang-client-0607444019.options_wheel_logs.trades` AS
 SELECT
-  timestamp,
-  DATE(timestamp) as trade_date,
+  timestamp as timestamp_utc,
+  DATETIME(timestamp, 'America/New_York') as timestamp_et,
+  DATE(timestamp) as date_utc,
+  DATE(timestamp, 'America/New_York') as date_et,
   jsonPayload.event_type,
   jsonPayload.symbol,
   jsonPayload.underlying,
@@ -33,8 +36,10 @@ WHERE jsonPayload.event_category = 'trade';
 -- ================================================================
 CREATE OR REPLACE VIEW `gen-lang-client-0607444019.options_wheel_logs.risk_events` AS
 SELECT
-  timestamp,
-  DATE(timestamp) as event_date,
+  timestamp as timestamp_utc,
+  DATETIME(timestamp, 'America/New_York') as timestamp_et,
+  DATE(timestamp) as date_utc,
+  DATE(timestamp, 'America/New_York') as date_et,
   jsonPayload.event_type,
   jsonPayload.symbol,
   jsonPayload.risk_type,
@@ -56,8 +61,10 @@ WHERE jsonPayload.event_category = 'risk';
 -- ================================================================
 CREATE OR REPLACE VIEW `gen-lang-client-0607444019.options_wheel_logs.performance_metrics` AS
 SELECT
-  timestamp,
-  DATE(timestamp) as metric_date,
+  timestamp as timestamp_utc,
+  DATETIME(timestamp, 'America/New_York') as timestamp_et,
+  DATE(timestamp) as date_utc,
+  DATE(timestamp, 'America/New_York') as date_et,
   jsonPayload.metric_name,
   CAST(jsonPayload.metric_value AS FLOAT64) as metric_value,
   jsonPayload.metric_unit,
@@ -77,8 +84,10 @@ WHERE jsonPayload.event_category = 'performance';
 -- ================================================================
 CREATE OR REPLACE VIEW `gen-lang-client-0607444019.options_wheel_logs.errors` AS
 SELECT
-  timestamp,
-  DATE(timestamp) as error_date,
+  timestamp as timestamp_utc,
+  DATETIME(timestamp, 'America/New_York') as timestamp_et,
+  DATE(timestamp) as date_utc,
+  DATE(timestamp, 'America/New_York') as date_et,
   jsonPayload.error_type,
   jsonPayload.error_message,
   jsonPayload.component,
@@ -100,8 +109,10 @@ WHERE jsonPayload.event_category = 'error';
 -- ================================================================
 CREATE OR REPLACE VIEW `gen-lang-client-0607444019.options_wheel_logs.system_events` AS
 SELECT
-  timestamp,
-  DATE(timestamp) as event_date,
+  timestamp as timestamp_utc,
+  DATETIME(timestamp, 'America/New_York') as timestamp_et,
+  DATE(timestamp) as date_utc,
+  DATE(timestamp, 'America/New_York') as date_et,
   jsonPayload.event_type,
   jsonPayload.status,
   CAST(jsonPayload.duration_seconds AS FLOAT64) as duration_seconds,
@@ -122,8 +133,10 @@ WHERE jsonPayload.event_category = 'system';
 -- ================================================================
 CREATE OR REPLACE VIEW `gen-lang-client-0607444019.options_wheel_logs.position_updates` AS
 SELECT
-  timestamp,
-  DATE(timestamp) as update_date,
+  timestamp as timestamp_utc,
+  DATETIME(timestamp, 'America/New_York') as timestamp_et,
+  DATE(timestamp) as date_utc,
+  DATE(timestamp, 'America/New_York') as date_et,
   jsonPayload.event_type,
   jsonPayload.symbol,
   jsonPayload.position_type,
@@ -152,8 +165,10 @@ WHERE jsonPayload.event_category = 'position_update';
 -- ================================================================
 CREATE OR REPLACE VIEW `gen-lang-client-0607444019.options_wheel_logs.backtest_results` AS
 SELECT
-  timestamp,
-  DATE(timestamp) as backtest_date,
+  timestamp as timestamp_utc,
+  DATETIME(timestamp, 'America/New_York') as timestamp_et,
+  DATE(timestamp) as date_utc,
+  DATE(timestamp, 'America/New_York') as date_et,
   jsonPayload.event_type,
   jsonPayload.backtest_id,
   jsonPayload.start_date,
