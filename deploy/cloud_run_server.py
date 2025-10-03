@@ -211,6 +211,13 @@ def trigger_strategy():
             # Initialize put seller for execution
             put_seller = PutSeller(alpaca_client, market_data, config)
 
+            # Get initial buying power and track locally during execution
+            # (Alpaca's API returns stale/incorrect data immediately after trades)
+            account_info = alpaca_client.get_account()
+            available_buying_power = float(account_info.get('options_buying_power') or account_info['buying_power'])
+            logger.info("Starting execution with buying power",
+                       initial_buying_power=available_buying_power)
+
             # Execute each opportunity
             execution_results = []
             trades_executed = 0
@@ -221,7 +228,8 @@ def trigger_strategy():
                            event_type="opportunity_evaluation",
                            symbol=opp.get('symbol'),
                            strike=opp.get('strike_price'),
-                           premium=opp.get('premium'))
+                           premium=opp.get('premium'),
+                           tracked_buying_power=available_buying_power)
 
                 # Calculate position size if not already present
                 if 'contracts' not in opp:
@@ -230,13 +238,15 @@ def trigger_strategy():
                     if 'premium' in opp and 'mid_price' not in opp:
                         opp['mid_price'] = opp['premium']
 
-                    position_size = put_seller._calculate_position_size(opp)
+                    # Use locally tracked buying power instead of querying Alpaca
+                    position_size = put_seller._calculate_position_size(opp, override_buying_power=available_buying_power)
                     if position_size:
                         opp['contracts'] = position_size['contracts']
                     else:
                         logger.warning("Position sizing failed, skipping opportunity",
                                      symbol=opp.get('symbol'),
-                                     option_symbol=opp.get('option_symbol'))
+                                     option_symbol=opp.get('option_symbol'),
+                                     tracked_buying_power=available_buying_power)
                         continue
 
                 # Execute the trade
@@ -245,6 +255,16 @@ def trigger_strategy():
 
                 if result and result.get('success'):
                     trades_executed += 1
+
+                    # Update local buying power tracking
+                    # Subtract collateral required for this trade
+                    collateral_used = opp.get('strike_price', 0) * 100 * opp.get('contracts', 0)
+                    available_buying_power -= collateral_used
+
+                    logger.info("Trade executed, updating tracked buying power",
+                               symbol=opp.get('symbol'),
+                               collateral_used=collateral_used,
+                               remaining_buying_power=available_buying_power)
 
                     # Log successful trade
                     log_system_event(
@@ -258,11 +278,6 @@ def trigger_strategy():
                         strike_price=opp.get('strike_price'),
                         order_id=result.get('order_id')
                     )
-
-                    # Brief delay to allow Alpaca's account data to update
-                    # (buying power can temporarily show $0 immediately after trade)
-                    import time
-                    time.sleep(2)
                 else:
                     # Log failed trade
                     log_error_event(

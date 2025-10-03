@@ -96,12 +96,13 @@ class PutSeller:
             logger.error("Failed to find put opportunity", symbol=symbol, error=str(e))
             return None
     
-    def _calculate_position_size(self, put_option: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _calculate_position_size(self, put_option: Dict[str, Any], override_buying_power: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Calculate appropriate position size for put selling.
-        
+
         Args:
             put_option: Put option details
-            
+            override_buying_power: Optional buying power override (for tracking during execution loop)
+
         Returns:
             Position sizing details or None if invalid
         """
@@ -109,9 +110,15 @@ class PutSeller:
             # Get account info
             account_info = self.alpaca.get_account()
             portfolio_value = float(account_info['portfolio_value'])
-            # Use options_buying_power for options trading (more accurate for options margin)
-            # Fall back to regular buying_power if not available
-            buying_power = float(account_info.get('options_buying_power') or account_info['buying_power'])
+
+            # Use override if provided (for local tracking during execution),
+            # otherwise get from Alpaca API
+            if override_buying_power is not None:
+                buying_power = override_buying_power
+            else:
+                # Use options_buying_power for options trading (more accurate for options margin)
+                # Fall back to regular buying_power if not available
+                buying_power = float(account_info.get('options_buying_power') or account_info['buying_power'])
             
             # Calculate maximum position size based on portfolio allocation
             max_position_value = portfolio_value * self.config.max_position_size
