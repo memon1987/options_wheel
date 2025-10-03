@@ -223,6 +223,17 @@ def trigger_strategy():
                            strike=opp.get('strike_price'),
                            premium=opp.get('premium'))
 
+                # Calculate position size if not already present
+                if 'contracts' not in opp:
+                    position_size = put_seller.calculate_position_size(opp)
+                    if position_size:
+                        opp['contracts'] = position_size['contracts']
+                    else:
+                        logger.warning("Position sizing failed, skipping opportunity",
+                                     symbol=opp.get('symbol'),
+                                     option_symbol=opp.get('option_symbol'))
+                        continue
+
                 # Execute the trade
                 result = put_seller.execute_put_sale(opp)
                 execution_results.append(result)
