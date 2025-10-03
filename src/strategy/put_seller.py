@@ -109,7 +109,9 @@ class PutSeller:
             # Get account info
             account_info = self.alpaca.get_account()
             portfolio_value = float(account_info['portfolio_value'])
-            buying_power = float(account_info['buying_power'])
+            # Use options_buying_power for options trading (more accurate for options margin)
+            # Fall back to regular buying_power if not available
+            buying_power = float(account_info.get('options_buying_power') or account_info['buying_power'])
             
             # Calculate maximum position size based on portfolio allocation
             max_position_value = portfolio_value * self.config.max_position_size
