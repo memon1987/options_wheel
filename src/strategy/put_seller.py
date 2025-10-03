@@ -244,12 +244,24 @@ class PutSeller:
                 logger.error("Failed to check buying power", error=str(bp_error))
                 # Continue anyway - let Alpaca reject if needed
 
-            # Calculate limit price (slightly below mid to improve fill probability)
-            limit_price = round(premium * 0.95, 2)  # 5% below mid price
+            # Calculate limit price: mid + 10% of spread (biased toward ask for premium collection)
+            bid = opportunity.get('bid')
+            ask = opportunity.get('ask')
+
+            if bid and ask:
+                spread = ask - bid
+                limit_price = round(premium + (spread * 0.10), 2)
+            else:
+                # Fallback if bid/ask not available
+                limit_price = round(premium * 0.95, 2)
 
             logger.info("Executing put sale",
                        symbol=option_symbol,
                        contracts=contracts,
+                       premium=premium,
+                       bid=bid,
+                       ask=ask,
+                       spread=round(ask - bid, 2) if bid and ask else None,
                        limit_price=limit_price,
                        collateral_required=collateral_required)
 
