@@ -258,6 +258,11 @@ def trigger_strategy():
                         strike_price=opp.get('strike_price'),
                         order_id=result.get('order_id')
                     )
+
+                    # Brief delay to allow Alpaca's account data to update
+                    # (buying power can temporarily show $0 immediately after trade)
+                    import time
+                    time.sleep(2)
                 else:
                     # Log failed trade
                     log_error_event(
