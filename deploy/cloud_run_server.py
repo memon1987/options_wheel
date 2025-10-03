@@ -172,10 +172,12 @@ def trigger_strategy():
             config = Config()
 
             from src.api.alpaca_client import AlpacaClient
+            from src.api.market_data import MarketDataManager
             from src.data.opportunity_store import OpportunityStore
             from src.strategy.put_seller import PutSeller
 
             alpaca_client = AlpacaClient(config)
+            market_data = MarketDataManager(alpaca_client, config)
             opportunity_store = OpportunityStore(config)
 
             # Retrieve pending opportunities from Cloud Storage
@@ -207,7 +209,7 @@ def trigger_strategy():
                        execution_time=start_time.isoformat())
 
             # Initialize put seller for execution
-            put_seller = PutSeller(alpaca_client, config)
+            put_seller = PutSeller(alpaca_client, market_data, config)
 
             # Execute each opportunity
             execution_results = []
