@@ -3,8 +3,17 @@
 This module provides consistent logging functions for key trading events,
 making it easy to query and analyze logs in BigQuery.
 
+🚨 CRITICAL: ALL LOGS MUST INCLUDE event_category FOR BIGQUERY EXPORT! 🚨
+
+Cloud Logging Sink Filter:
+    resource.labels.service_name="options-wheel-strategy"
+    jsonPayload.event_category=*
+
+This means: Logs WITHOUT event_category will NOT be exported to BigQuery!
+
 All events are logged with standardized fields for easy aggregation:
-- event_category: High-level category (trade, risk, system, error)
+- event_category: High-level category (trade, risk, system, error, filtering, etc.)
+  ⚠️ REQUIRED - Without this, logs won't reach BigQuery!
 - event_type: Specific event name
 - timestamp_ms: Unix milliseconds for precise timing
 - Symbol, strategy, and other contextual data
@@ -13,6 +22,22 @@ BigQuery Integration:
 - All fields are logged at the top level of jsonPayload
 - This ensures they're automatically unpacked into separate columns
 - No nested JSON = easier SQL queries
+
+Available Event Categories:
+- "trade" - Trading activity, orders
+- "risk" - Gap detection, filtering, blocking
+- "system" - Strategy cycles, service events
+- "performance" - Timing, metrics
+- "error" - Errors, failures
+- "position" - Wheel state transitions
+- "backtest" - Backtesting events
+- "filtering" - Filter stage logging (STAGE 1-9)
+
+For direct logger.info() calls (not using these functions):
+    ❌ WRONG: logger.info("Some event", metric=123)
+    ✅ CORRECT: logger.info("Some event", event_category="filtering", metric=123)
+
+See docs/LOGGING_GUIDELINES.md for complete guide.
 """
 
 import time
@@ -335,6 +360,77 @@ def log_position_update(
         event_type=event_type,
         symbol=symbol,
         position_status=position_status,
+        timestamp_ms=int(time.time() * 1000),
+        timestamp_iso=datetime.now().isoformat(),
+        **kwargs
+    )
+
+
+def log_filtering_event(
+    logger: Any,
+    stage_number: int,
+    event_type: str,
+    status: str,
+    **kwargs
+) -> None:
+    """Log a risk filtering stage event (STAGE 1-9).
+
+    This function ensures filtering logs are exported to BigQuery with proper categorization.
+
+    Args:
+        logger: structlog logger instance
+        stage_number: Filter stage number (1-9)
+        event_type: Type of event (e.g., 'complete', 'passed', 'blocked')
+        status: Status (e.g., 'complete', 'passed', 'blocked')
+        **kwargs: Additional context (symbol, metrics, reasons, etc.)
+
+    Example:
+        # Stage completion
+        log_filtering_event(
+            logger,
+            stage_number=1,
+            event_type="stage_complete",
+            status="complete",
+            total_analyzed=14,
+            passed=12,
+            rejected=2,
+            passed_symbols=["AAPL", "MSFT"],
+            rejected_symbols=["XYZ"]
+        )
+
+        # Individual stock pass
+        log_filtering_event(
+            logger,
+            stage_number=4,
+            event_type="execution_gap_check",
+            status="passed",
+            symbol="AAPL",
+            gap_percent=0.45
+        )
+
+        # Individual stock block
+        log_filtering_event(
+            logger,
+            stage_number=2,
+            event_type="gap_risk_check",
+            status="blocked",
+            symbol="AMD",
+            reason="high_gap_frequency",
+            gap_frequency=0.206
+        )
+
+    BigQuery Result:
+        SELECT stage_number, status, COUNT(*) as count
+        FROM logs
+        WHERE event_category = 'filtering'
+        GROUP BY stage_number, status
+    """
+    logger.info(
+        f"STAGE {stage_number}: {event_type} - {status.upper()}",
+        event_category="filtering",
+        event_type=f"stage_{stage_number}_{event_type}",
+        stage_number=stage_number,
+        status=status,
         timestamp_ms=int(time.time() * 1000),
         timestamp_iso=datetime.now().isoformat(),
         **kwargs

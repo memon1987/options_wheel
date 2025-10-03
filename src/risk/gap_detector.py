@@ -350,6 +350,8 @@ class GapDetector:
                 )
 
         logger.info("STAGE 2 COMPLETE: Gap risk analysis",
+                   event_category="filtering",
+                   event_type="stage_2_complete",
                    input_symbols=len(symbols),
                    passed=len(suitable_symbols),
                    rejected=len(rejected_symbols),

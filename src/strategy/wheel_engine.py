@@ -276,12 +276,16 @@ class WheelEngine:
 
             if max_stocks:
                 logger.info("STAGE 3: Stock evaluation limit applied",
+                           event_category="filtering",
+                           event_type="stage_3_limit_applied",
                            max_stocks=max_stocks,
                            total_available=len(gap_filtered_stocks),
                            evaluating=len(stocks_to_evaluate),
                            symbols_to_evaluate=[s['symbol'] for s in stocks_to_evaluate])
             else:
                 logger.info("STAGE 3: No stock evaluation limit (evaluating all gap-filtered stocks)",
+                           event_category="filtering",
+                           event_type="stage_3_no_limit",
                            stocks_to_evaluate=len(stocks_to_evaluate),
                            symbols_to_evaluate=[s['symbol'] for s in stocks_to_evaluate])
 
@@ -294,12 +298,16 @@ class WheelEngine:
                 execution_check = self.gap_detector.can_execute_trade(symbol, datetime.now())
                 if not execution_check['can_execute']:
                     logger.info("STAGE 4: Execution gap check BLOCKED",
+                               event_category="filtering",
+                               event_type="stage_4_blocked",
                                symbol=symbol,
                                reason=execution_check['reason'],
                                gap_percent=execution_check.get('current_gap_percent', 0))
                     continue
                 else:
                     logger.info("STAGE 4: Execution gap check PASSED",
+                               event_category="filtering",
+                               event_type="stage_4_passed",
                                symbol=symbol,
                                gap_percent=execution_check.get('current_gap_percent', 0))
 
@@ -311,6 +319,8 @@ class WheelEngine:
                 can_sell_puts = self.wheel_state.can_sell_puts(symbol)
 
                 logger.info("STAGE 5: Wheel state check",
+                           event_category="filtering",
+                           event_type="stage_5_check",
                            symbol=symbol,
                            wheel_phase=wheel_phase.value,
                            can_sell_calls=can_sell_calls,
@@ -334,11 +344,15 @@ class WheelEngine:
                     # Check if we already have option positions in this stock (Stage 6)
                     if self._has_existing_option_position(symbol):
                         logger.info("STAGE 6: Existing position check BLOCKED",
+                                   event_category="filtering",
+                                   event_type="stage_6_blocked",
                                    symbol=symbol,
                                    reason="already_has_option_position")
                         continue
                     else:
                         logger.info("STAGE 6: Existing position check PASSED",
+                                   event_category="filtering",
+                                   event_type="stage_6_passed",
                                    symbol=symbol)
 
                     put_opportunity = self.put_seller.find_put_opportunity(symbol, self.wheel_state)
@@ -354,6 +368,8 @@ class WheelEngine:
                 max_positions = self.config.max_new_positions_per_cycle
                 if max_positions and len(actions) >= max_positions:
                     logger.info("STAGE 9: Max new positions per cycle limit REACHED",
+                               event_category="filtering",
+                               event_type="stage_9_limit_reached",
                                max_positions=max_positions,
                                positions_found=len(actions),
                                stopping_evaluation=True)

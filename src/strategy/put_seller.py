@@ -128,6 +128,8 @@ class PutSeller:
             max_contracts = min(max_contracts_by_position, max_contracts_by_buying_power, 10)  # Cap at 10 contracts
 
             logger.info("STAGE 8: Position sizing calculation",
+                       event_category="filtering",
+                       event_type="stage_8_calculation",
                        symbol=put_option['symbol'],
                        strike=strike_price,
                        portfolio_value=portfolio_value,
@@ -139,6 +141,8 @@ class PutSeller:
 
             if max_contracts <= 0:
                 logger.warning("STAGE 8 BLOCKED: Position sizing - insufficient capital",
+                              event_category="filtering",
+                              event_type="stage_8_blocked",
                               strike=strike_price,
                               capital_per_contract=capital_per_contract,
                               buying_power=buying_power,
@@ -158,12 +162,16 @@ class PutSeller:
             portfolio_allocation = capital_required / portfolio_value
             if portfolio_allocation > self.config.max_position_size:
                 logger.warning("STAGE 8 BLOCKED: Position size exceeds allocation limit",
+                              event_category="filtering",
+                              event_type="stage_8_blocked",
                               allocation=portfolio_allocation,
                               max_allowed=self.config.max_position_size,
                               reason="portfolio_allocation_exceeded")
                 return None
 
             logger.info("STAGE 8 PASSED: Position sizing approved",
+                       event_category="filtering",
+                       event_type="stage_8_passed",
                        symbol=put_option['symbol'],
                        contracts=contracts,
                        capital_required=capital_required,

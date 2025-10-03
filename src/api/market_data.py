@@ -115,6 +115,8 @@ class MarketDataManager:
         suitable_stocks.sort(key=lambda x: (-x['avg_volume'], x['price_volatility']))
 
         logger.info("STAGE 1 COMPLETE: Price/Volume filtering",
+                   event_category="filtering",
+                   event_type="stage_1_complete",
                    total_analyzed=len(symbols),
                    passed=len(suitable_stocks),
                    rejected=len(rejected_stocks),
@@ -201,6 +203,8 @@ class MarketDataManager:
         puts = options_data['puts']
 
         logger.info("STAGE 7: Options chain criteria - starting put scan",
+                   event_category="filtering",
+                   event_type="stage_7_start",
                    symbol=symbol,
                    total_puts_in_chain=len(puts),
                    target_dte=self.config.put_target_dte,
@@ -230,6 +234,8 @@ class MarketDataManager:
         if suitable_puts:
             best_put = suitable_puts[0]
             logger.info("STAGE 7 COMPLETE: Options chain criteria - puts found",
+                       event_category="filtering",
+                       event_type="stage_7_complete_found",
                        symbol=symbol,
                        total_puts=len(puts),
                        rejected=rejected_count,
@@ -240,6 +246,8 @@ class MarketDataManager:
                        best_put_delta=best_put.get('delta', 0))
         else:
             logger.info("STAGE 7 COMPLETE: Options chain criteria - NO suitable puts",
+                       event_category="filtering",
+                       event_type="stage_7_complete_not_found",
                        symbol=symbol,
                        total_puts=len(puts),
                        rejected=rejected_count,
