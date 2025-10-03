@@ -2,8 +2,9 @@
 
 # Alpaca API Settings
 alpaca:
-  # Use paper trading by default for safety
-  paper_trading: true
+  # Paper vs live trading controlled by Alpaca account configuration
+  # Set to false to enable trade execution (account type determines paper vs live)
+  paper_trading: false
   # API credentials (use environment variables)
   api_key_id: "${ALPACA_API_KEY}"
   secret_key: "${ALPACA_SECRET_KEY}"
