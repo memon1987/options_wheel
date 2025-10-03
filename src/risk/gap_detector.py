@@ -171,13 +171,16 @@ class GapDetector:
 
             # Get today's data if available
             target_date = date.date()
-            df_dates = pd.Series([idx.date() for idx in df.index])
+
+            # Create boolean mask with same index as df
+            df_dates = pd.Series([idx.date() for idx in df.index], index=df.index)
 
             if target_date in df_dates.values:
-                today_data = df[df_dates == target_date].iloc[0]
+                # Use .loc with boolean indexer that has matching index
+                today_data = df.loc[df_dates == target_date].iloc[0]
 
                 # Get previous trading day close
-                previous_data = df[df_dates < target_date].iloc[-1]
+                previous_data = df.loc[df_dates < target_date].iloc[-1]
 
                 gap_percent = ((today_data['open'] - previous_data['close']) /
                               previous_data['close']) * 100
