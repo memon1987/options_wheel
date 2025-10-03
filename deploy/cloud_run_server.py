@@ -324,6 +324,11 @@ def trigger_strategy():
                             result = execution_data['result']
 
                             # Log successful trade
+                            # Convert UUID to string if present
+                            order_id = result.get('order_id')
+                            if order_id is not None:
+                                order_id = str(order_id)
+
                             log_system_event(
                                 logger,
                                 event_type="trade_executed",
@@ -333,7 +338,7 @@ def trigger_strategy():
                                 contracts=opp.get('contracts'),
                                 premium=opp.get('premium'),
                                 strike_price=opp.get('strike_price'),
-                                order_id=result.get('order_id')
+                                order_id=order_id
                             )
                         else:
                             # Log failed trade
