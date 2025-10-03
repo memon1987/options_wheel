@@ -223,77 +223,134 @@ def trigger_strategy():
                        portfolio_value=account_info.get('portfolio_value'),
                        equity=account_info.get('equity'))
 
-            # Execute each opportunity
+            # BATCH ORDER STRATEGY: Select all opportunities that fit within buying power
+            # Sort by premium/exposure ratio (ROI) to maximize returns
+            # Submit all orders concurrently to avoid Alpaca's sequential execution bug
+
+            # Calculate ROI for each opportunity and add position sizing
+            opportunities_with_metrics = []
+            for opp in opportunities:
+                # Transform scanner format to position sizing format
+                if 'premium' in opp and 'mid_price' not in opp:
+                    opp['mid_price'] = opp['premium']
+
+                # Calculate position size
+                position_size = put_seller._calculate_position_size(opp, override_buying_power=available_buying_power)
+                if not position_size:
+                    continue
+
+                opp['contracts'] = position_size['contracts']
+                collateral = opp['strike_price'] * 100 * opp['contracts']
+                premium_collected = opp['premium'] * 100 * opp['contracts']
+                roi = premium_collected / collateral if collateral > 0 else 0
+
+                opportunities_with_metrics.append({
+                    'opportunity': opp,
+                    'collateral': collateral,
+                    'premium': premium_collected,
+                    'roi': roi
+                })
+
+            # Sort by ROI (highest first)
+            opportunities_with_metrics.sort(key=lambda x: x['roi'], reverse=True)
+
+            # Select opportunities that fit within buying power (greedy algorithm)
+            selected_opportunities = []
+            remaining_bp = available_buying_power
+
+            for item in opportunities_with_metrics:
+                if item['collateral'] <= remaining_bp:
+                    selected_opportunities.append(item['opportunity'])
+                    remaining_bp -= item['collateral']
+                    logger.info("Selected opportunity for batch execution",
+                               symbol=item['opportunity'].get('symbol'),
+                               collateral=item['collateral'],
+                               premium=item['premium'],
+                               roi=f"{item['roi']:.4f}",
+                               remaining_bp=remaining_bp)
+
+            logger.info("Batch order selection complete",
+                       total_opportunities=len(opportunities),
+                       selected_count=len(selected_opportunities),
+                       initial_bp=available_buying_power,
+                       bp_to_use=available_buying_power - remaining_bp)
+
+            # Execute all selected orders concurrently using ThreadPoolExecutor
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def execute_single_order(opp):
+                """Execute a single order and return result with opportunity info."""
+                try:
+                    # Execute the trade (skip buying power check since we already validated)
+                    result = put_seller.execute_put_sale(opp, skip_buying_power_check=True)
+                    return {
+                        'opportunity': opp,
+                        'result': result,
+                        'success': result and result.get('success', False)
+                    }
+                except Exception as e:
+                    logger.error("Exception during order execution",
+                                symbol=opp.get('symbol'),
+                                error=str(e))
+                    return {
+                        'opportunity': opp,
+                        'result': {'success': False, 'message': str(e)},
+                        'success': False
+                    }
+
+            logger.info("Submitting batch orders concurrently",
+                       order_count=len(selected_opportunities))
+
             execution_results = []
             trades_executed = 0
 
-            for idx, opp in enumerate(opportunities):
-                logger.info(f"Evaluating opportunity {idx+1}/{len(opportunities)}",
-                           event_category="execution",
-                           event_type="opportunity_evaluation",
-                           symbol=opp.get('symbol'),
-                           strike=opp.get('strike_price'),
-                           premium=opp.get('premium'),
-                           tracked_buying_power=available_buying_power)
+            # Submit all orders concurrently
+            with ThreadPoolExecutor(max_workers=min(10, len(selected_opportunities))) as executor:
+                # Submit all orders
+                future_to_opp = {
+                    executor.submit(execute_single_order, opp): opp
+                    for opp in selected_opportunities
+                }
 
-                # Calculate position size if not already present
-                if 'contracts' not in opp:
-                    # Transform scanner format to position sizing format
-                    # Scanner uses 'premium', position sizing expects 'mid_price'
-                    if 'premium' in opp and 'mid_price' not in opp:
-                        opp['mid_price'] = opp['premium']
+                # Process results as they complete
+                for future in as_completed(future_to_opp):
+                    opp = future_to_opp[future]
+                    try:
+                        execution_data = future.result()
+                        execution_results.append(execution_data)
 
-                    # Use locally tracked buying power instead of querying Alpaca
-                    position_size = put_seller._calculate_position_size(opp, override_buying_power=available_buying_power)
-                    if position_size:
-                        opp['contracts'] = position_size['contracts']
-                    else:
-                        logger.warning("Position sizing failed, skipping opportunity",
-                                     symbol=opp.get('symbol'),
-                                     option_symbol=opp.get('option_symbol'),
-                                     tracked_buying_power=available_buying_power)
-                        continue
+                        if execution_data['success']:
+                            trades_executed += 1
+                            result = execution_data['result']
 
-                # Execute the trade (skip buying power check since we're tracking locally)
-                result = put_seller.execute_put_sale(opp, skip_buying_power_check=True)
-                execution_results.append(result)
-
-                if result and result.get('success'):
-                    trades_executed += 1
-
-                    # Update local buying power tracking
-                    # Subtract collateral required for this trade
-                    collateral_used = opp.get('strike_price', 0) * 100 * opp.get('contracts', 0)
-                    available_buying_power -= collateral_used
-
-                    logger.info("Trade executed, updating tracked buying power",
-                               symbol=opp.get('symbol'),
-                               collateral_used=collateral_used,
-                               remaining_buying_power=available_buying_power)
-
-                    # Log successful trade
-                    log_system_event(
-                        logger,
-                        event_type="trade_executed",
-                        status="success",
-                        symbol=opp.get('symbol'),
-                        option_symbol=opp.get('option_symbol'),
-                        contracts=opp.get('contracts'),
-                        premium=opp.get('premium'),
-                        strike_price=opp.get('strike_price'),
-                        order_id=result.get('order_id')
-                    )
-                else:
-                    # Log failed trade
-                    log_error_event(
-                        logger,
-                        error_type="trade_execution_failed",
-                        error_message=result.get('message', 'Unknown error') if result else 'No result returned',
-                        component="execution_engine",
-                        recoverable=True,
-                        symbol=opp.get('symbol'),
-                        option_symbol=opp.get('option_symbol')
-                    )
+                            # Log successful trade
+                            log_system_event(
+                                logger,
+                                event_type="trade_executed",
+                                status="success",
+                                symbol=opp.get('symbol'),
+                                option_symbol=opp.get('option_symbol'),
+                                contracts=opp.get('contracts'),
+                                premium=opp.get('premium'),
+                                strike_price=opp.get('strike_price'),
+                                order_id=result.get('order_id')
+                            )
+                        else:
+                            # Log failed trade
+                            result = execution_data['result']
+                            log_error_event(
+                                logger,
+                                error_type="trade_execution_failed",
+                                error_message=result.get('message', 'Unknown error'),
+                                component="execution_engine",
+                                recoverable=True,
+                                symbol=opp.get('symbol'),
+                                option_symbol=opp.get('option_symbol')
+                            )
+                    except Exception as e:
+                        logger.error("Error processing execution result",
+                                   symbol=opp.get('symbol'),
+                                   error=str(e))
 
             # Mark opportunities as executed in Cloud Storage
             opportunity_store.mark_executed(
