@@ -126,14 +126,25 @@ class PutSeller:
             
             # Take the minimum to ensure we don't exceed limits
             max_contracts = min(max_contracts_by_position, max_contracts_by_buying_power, 10)  # Cap at 10 contracts
-            
+
+            logger.info("STAGE 8: Position sizing calculation",
+                       symbol=put_option['symbol'],
+                       strike=strike_price,
+                       portfolio_value=portfolio_value,
+                       buying_power=buying_power,
+                       capital_per_contract=capital_per_contract,
+                       max_by_position=max_contracts_by_position,
+                       max_by_buying_power=max_contracts_by_buying_power,
+                       max_contracts_allowed=max_contracts)
+
             if max_contracts <= 0:
-                logger.warning("No contracts can be traded", 
+                logger.warning("STAGE 8 BLOCKED: Position sizing - insufficient capital",
                               strike=strike_price,
                               capital_per_contract=capital_per_contract,
-                              buying_power=buying_power)
+                              buying_power=buying_power,
+                              reason="max_contracts_zero")
                 return None
-            
+
             # Conservative sizing - start with 1 contract for new positions
             contracts = 1
             
@@ -146,11 +157,19 @@ class PutSeller:
             # Validate against risk limits
             portfolio_allocation = capital_required / portfolio_value
             if portfolio_allocation > self.config.max_position_size:
-                logger.warning("Position size exceeds allocation limit",
+                logger.warning("STAGE 8 BLOCKED: Position size exceeds allocation limit",
                               allocation=portfolio_allocation,
-                              max_allowed=self.config.max_position_size)
+                              max_allowed=self.config.max_position_size,
+                              reason="portfolio_allocation_exceeded")
                 return None
-            
+
+            logger.info("STAGE 8 PASSED: Position sizing approved",
+                       symbol=put_option['symbol'],
+                       contracts=contracts,
+                       capital_required=capital_required,
+                       portfolio_allocation=round(portfolio_allocation, 3),
+                       max_profit=max_profit)
+
             return {
                 'contracts': contracts,
                 'capital_required': capital_required,

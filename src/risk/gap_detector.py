@@ -324,12 +324,19 @@ class GapDetector:
             return symbols
 
         suitable_symbols = []
+        rejected_symbols = []
 
         for symbol in symbols:
             gap_analysis = self.analyze_gap_risk(symbol, analysis_date)
             if gap_analysis.get('suitable_for_trading', False):
                 suitable_symbols.append(symbol)
+                logger.info("Stock passed gap risk filter",
+                           symbol=symbol,
+                           gap_risk_score=round(gap_analysis.get('gap_risk_score', 0), 3),
+                           gap_frequency=round(gap_analysis.get('historical_gaps', {}).get('gap_frequency', 0), 3),
+                           volatility=round(gap_analysis.get('historical_volatility', 0), 3))
             else:
+                rejected_symbols.append(symbol)
                 # Enhanced risk event logging
                 log_risk_event(
                     logger,
@@ -342,9 +349,12 @@ class GapDetector:
                     historical_volatility=gap_analysis.get('historical_volatility', 0)
                 )
 
-        logger.info("Gap risk filtering completed",
+        logger.info("STAGE 2 COMPLETE: Gap risk analysis",
                    input_symbols=len(symbols),
-                   output_symbols=len(suitable_symbols))
+                   passed=len(suitable_symbols),
+                   rejected=len(rejected_symbols),
+                   passed_symbols=suitable_symbols,
+                   rejected_symbols=rejected_symbols)
 
         return suitable_symbols
 

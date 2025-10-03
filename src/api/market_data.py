@@ -77,27 +77,50 @@ class MarketDataManager:
     
     def filter_suitable_stocks(self, symbols: List[str]) -> List[Dict[str, Any]]:
         """Filter stocks suitable for wheel strategy.
-        
+
         Args:
             symbols: List of stock symbols to evaluate
-            
+
         Returns:
             List of suitable stocks with metrics
         """
         suitable_stocks = []
-        
+        rejected_stocks = []
+
         for symbol in symbols:
             metrics = self.get_stock_metrics(symbol)
             if metrics and metrics.get('suitable_for_wheel', False):
                 suitable_stocks.append(metrics)
-        
+                logger.info("Stock passed price/volume filter",
+                           symbol=symbol,
+                           price=metrics['current_price'],
+                           avg_volume=int(metrics['avg_volume']),
+                           volatility=round(metrics['price_volatility'], 3))
+            elif metrics:
+                # Log rejection reason
+                rejection_reasons = []
+                if not metrics.get('meets_price_criteria'):
+                    rejection_reasons.append(f"price ${metrics['current_price']:.2f} outside ${self.config.min_stock_price}-${self.config.max_stock_price}")
+                if not metrics.get('meets_volume_criteria'):
+                    rejection_reasons.append(f"volume {int(metrics['avg_volume']):,} < {self.config.min_avg_volume:,}")
+
+                logger.info("Stock rejected by price/volume filter",
+                           symbol=symbol,
+                           reasons=rejection_reasons,
+                           price=metrics['current_price'],
+                           avg_volume=int(metrics['avg_volume']))
+                rejected_stocks.append(symbol)
+
         # Sort by liquidity (volume) and low volatility preference
         suitable_stocks.sort(key=lambda x: (-x['avg_volume'], x['price_volatility']))
-        
-        logger.info("Filtered suitable stocks", 
-                   total_analyzed=len(symbols), 
-                   suitable_count=len(suitable_stocks))
-        
+
+        logger.info("STAGE 1 COMPLETE: Price/Volume filtering",
+                   total_analyzed=len(symbols),
+                   passed=len(suitable_stocks),
+                   rejected=len(rejected_stocks),
+                   passed_symbols=[s['symbol'] for s in suitable_stocks],
+                   rejected_symbols=rejected_stocks)
+
         return suitable_stocks
     
     def get_option_chain_with_analysis(self, symbol: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -176,30 +199,52 @@ class MarketDataManager:
         """
         options_data = self.get_option_chain_with_analysis(symbol)
         puts = options_data['puts']
-        
+
+        logger.info("STAGE 7: Options chain criteria - starting put scan",
+                   symbol=symbol,
+                   total_puts_in_chain=len(puts),
+                   target_dte=self.config.put_target_dte,
+                   min_premium=self.config.min_put_premium,
+                   delta_range=self.config.put_delta_range)
+
         suitable_puts = []
-        
+        rejected_count = 0
+
         for put in puts:
             # Filter by strategy criteria
             if not self._meets_put_criteria(put):
+                rejected_count += 1
                 continue
-            
+
             # Calculate annualized return
             if put['dte'] > 0 and put['mid_price'] > 0:
                 annual_return = (put['mid_price'] / put['strike_price']) * (365 / put['dte'])
                 put['annual_return'] = annual_return
                 put['return_score'] = annual_return * (1 - abs(put.get('delta', 0)))  # Prefer lower delta
-                
+
                 suitable_puts.append(put)
-        
+
         # Sort by return score (higher is better)
         suitable_puts.sort(key=lambda x: x.get('return_score', 0), reverse=True)
-        
-        logger.info("Found suitable puts", 
-                   symbol=symbol, 
-                   total_puts=len(puts), 
-                   suitable_count=len(suitable_puts))
-        
+
+        if suitable_puts:
+            best_put = suitable_puts[0]
+            logger.info("STAGE 7 COMPLETE: Options chain criteria - puts found",
+                       symbol=symbol,
+                       total_puts=len(puts),
+                       rejected=rejected_count,
+                       suitable_count=len(suitable_puts),
+                       best_put_strike=best_put['strike_price'],
+                       best_put_premium=best_put['mid_price'],
+                       best_put_dte=best_put['dte'],
+                       best_put_delta=best_put.get('delta', 0))
+        else:
+            logger.info("STAGE 7 COMPLETE: Options chain criteria - NO suitable puts",
+                       symbol=symbol,
+                       total_puts=len(puts),
+                       rejected=rejected_count,
+                       reason="no_puts_met_criteria")
+
         return suitable_puts[:5]  # Return top 5
     
     def find_suitable_calls(self, symbol: str, min_strike_price: float = 0.0) -> List[Dict[str, Any]]:

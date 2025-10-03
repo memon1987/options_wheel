@@ -275,30 +275,49 @@ class WheelEngine:
             stocks_to_evaluate = gap_filtered_stocks[:max_stocks] if max_stocks else gap_filtered_stocks
 
             if max_stocks:
-                logger.info("Applying stock evaluation limit",
+                logger.info("STAGE 3: Stock evaluation limit applied",
                            max_stocks=max_stocks,
                            total_available=len(gap_filtered_stocks),
-                           evaluating=len(stocks_to_evaluate))
+                           evaluating=len(stocks_to_evaluate),
+                           symbols_to_evaluate=[s['symbol'] for s in stocks_to_evaluate])
+            else:
+                logger.info("STAGE 3: No stock evaluation limit (evaluating all gap-filtered stocks)",
+                           stocks_to_evaluate=len(stocks_to_evaluate),
+                           symbols_to_evaluate=[s['symbol'] for s in stocks_to_evaluate])
 
             # Process each stock according to wheel strategy phases
             for stock in stocks_to_evaluate:
                 symbol = stock['symbol']
                 wheel_phase = self.wheel_state.get_wheel_phase(symbol)
 
-                # Check execution gap before proceeding
+                # Check execution gap before proceeding (Stage 4)
                 execution_check = self.gap_detector.can_execute_trade(symbol, datetime.now())
                 if not execution_check['can_execute']:
-                    logger.info("Trade execution blocked by gap check",
+                    logger.info("STAGE 4: Execution gap check BLOCKED",
                                symbol=symbol,
                                reason=execution_check['reason'],
                                gap_percent=execution_check.get('current_gap_percent', 0))
                     continue
+                else:
+                    logger.info("STAGE 4: Execution gap check PASSED",
+                               symbol=symbol,
+                               gap_percent=execution_check.get('current_gap_percent', 0))
 
                 # Prioritize covered calls over puts when holding stock
                 opportunity_found = False
 
+                # Stage 5: Wheel State Check
+                can_sell_calls = self.wheel_state.can_sell_calls(symbol)
+                can_sell_puts = self.wheel_state.can_sell_puts(symbol)
+
+                logger.info("STAGE 5: Wheel state check",
+                           symbol=symbol,
+                           wheel_phase=wheel_phase.value,
+                           can_sell_calls=can_sell_calls,
+                           can_sell_puts=can_sell_puts)
+
                 # 1. If holding stock, prioritize covered calls
-                if self.wheel_state.can_sell_calls(symbol):
+                if can_sell_calls:
                     call_opportunity = self.call_seller.evaluate_covered_call_opportunity(
                         self._get_stock_position_for_symbol(symbol)
                     )
@@ -311,10 +330,16 @@ class WheelEngine:
                                    wheel_phase=wheel_phase.value)
 
                 # 2. Only look for puts if no stock position (proper wheel logic)
-                if not opportunity_found and self.wheel_state.can_sell_puts(symbol):
-                    # Check if we already have option positions in this stock
+                if not opportunity_found and can_sell_puts:
+                    # Check if we already have option positions in this stock (Stage 6)
                     if self._has_existing_option_position(symbol):
+                        logger.info("STAGE 6: Existing position check BLOCKED",
+                                   symbol=symbol,
+                                   reason="already_has_option_position")
                         continue
+                    else:
+                        logger.info("STAGE 6: Existing position check PASSED",
+                                   symbol=symbol)
 
                     put_opportunity = self.put_seller.find_put_opportunity(symbol, self.wheel_state)
                     if put_opportunity:
@@ -328,9 +353,10 @@ class WheelEngine:
                 # Apply configurable position limit (Stage 9)
                 max_positions = self.config.max_new_positions_per_cycle
                 if max_positions and len(actions) >= max_positions:
-                    logger.info("Reached max new positions per cycle limit",
+                    logger.info("STAGE 9: Max new positions per cycle limit REACHED",
                                max_positions=max_positions,
-                               positions_found=len(actions))
+                               positions_found=len(actions),
+                               stopping_evaluation=True)
                     break
 
         except Exception as e:
