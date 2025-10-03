@@ -225,7 +225,12 @@ def trigger_strategy():
 
                 # Calculate position size if not already present
                 if 'contracts' not in opp:
-                    position_size = put_seller.calculate_position_size(opp)
+                    # Transform scanner format to position sizing format
+                    # Scanner uses 'premium', position sizing expects 'mid_price'
+                    if 'premium' in opp and 'mid_price' not in opp:
+                        opp['mid_price'] = opp['premium']
+
+                    position_size = put_seller._calculate_position_size(opp)
                     if position_size:
                         opp['contracts'] = position_size['contracts']
                     else:
