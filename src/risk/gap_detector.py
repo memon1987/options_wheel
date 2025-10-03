@@ -196,8 +196,23 @@ class GapDetector:
                 return {'has_gap': False, 'gap_percent': 0.0}
 
         except Exception as e:
-            logger.error("Failed to detect current gap", symbol=symbol, error=str(e))
-            return {'has_gap': False, 'gap_percent': 0.0}
+            # Conservative fallback: assume large gap to block trading on error
+            # This prevents trading when we can't verify gap safety
+            log_error_event(
+                logger,
+                error_type="current_gap_detection_failed",
+                error_message=str(e),
+                component="gap_detector",
+                recoverable=True,
+                symbol=symbol,
+                fallback_behavior="blocking_assumed_large_gap"
+            )
+            return {
+                'has_gap': True,  # Assume gap exists (conservative)
+                'gap_percent': 999.0,  # Large value to trigger blocking
+                'detection_failed': True,
+                'error': str(e)
+            }
 
     def _calculate_gap_risk_score(self, gaps_analysis: Dict, volatility: float,
                                  current_gap: Dict) -> float:
@@ -258,8 +273,21 @@ class GapDetector:
         if current_gap.get('has_gap', False):
             gap_size = abs(current_gap.get('gap_percent', 0))
             if gap_size > self.config.max_overnight_gap_percent:
-                logger.info("Stock rejected due to current large gap",
-                           gap=gap_size, limit=self.config.max_overnight_gap_percent)
+                # Check if this was due to detection failure (fallback behavior)
+                if current_gap.get('detection_failed', False):
+                    log_risk_event(
+                        logger,
+                        event_type="stock_blocked_gap_detection_failure",
+                        symbol=current_gap.get('symbol', 'unknown'),
+                        risk_type="gap_detection_error",
+                        action_taken="stock_excluded_conservative_fallback",
+                        gap_percent=gap_size,
+                        threshold=self.config.max_overnight_gap_percent,
+                        detection_error=current_gap.get('error', 'unknown')
+                    )
+                else:
+                    logger.info("Stock rejected due to current large gap",
+                               gap=gap_size, limit=self.config.max_overnight_gap_percent)
                 return False
 
         return True
