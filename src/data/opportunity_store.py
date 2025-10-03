@@ -106,6 +106,10 @@ class OpportunityStore:
     def get_pending_opportunities(self, execution_time: datetime) -> List[Dict[str, Any]]:
         """Retrieve pending opportunities for execution.
 
+        Finds the most recent scan file within the max age window,
+        regardless of when it was created. This decouples execution from
+        hard-coded time schedules.
+
         Args:
             execution_time: Current execution time
 
@@ -113,44 +117,81 @@ class OpportunityStore:
             List of valid, unexpired opportunities
         """
         try:
-            # Find the most recent scan file (should be from :00 of current hour)
-            blob_path = self._get_scan_blob_path(execution_time)
-
             bucket = self.storage_client.bucket(self.bucket_name)
-            blob = bucket.blob(blob_path)
 
-            if not blob.exists():
-                logger.info("No opportunities found for execution window",
-                           path=blob_path,
+            # Get all opportunity files from today
+            date_str = execution_time.strftime('%Y-%m-%d')
+            prefix = f"opportunities/{date_str}/"
+
+            # List all blobs for today and sort by creation time (most recent first)
+            blobs = sorted(
+                bucket.list_blobs(prefix=prefix),
+                key=lambda b: b.time_created,
+                reverse=True
+            )
+
+            if not blobs:
+                logger.info("No opportunity scans found for today",
+                           date=date_str,
                            execution_time=execution_time.isoformat())
                 return []
 
-            # Download and parse
-            content = blob.download_as_string()
-            data = json.loads(content)
+            # Find the most recent valid scan
+            max_age_minutes = self.config.opportunity_max_age_minutes
+            max_age_delta = timedelta(minutes=max_age_minutes)
 
-            # Check expiration
-            expires_at = datetime.fromisoformat(data['expires_at'].replace('Z', '+00:00'))
-            if execution_time > expires_at:
-                logger.warning("Opportunities expired",
-                              expires_at=data['expires_at'],
-                              execution_time=execution_time.isoformat())
-                return []
+            for blob in blobs:
+                try:
+                    # Download and parse
+                    content = blob.download_as_string()
+                    data = json.loads(content)
 
-            # Check if already executed
-            if data.get('status') == 'executed':
-                logger.info("Opportunities already executed",
-                           path=blob_path)
-                return []
+                    # Parse scan time
+                    scan_time = datetime.fromisoformat(data['scan_time'].replace('Z', '+00:00'))
+                    if scan_time.tzinfo is None:
+                        scan_time = scan_time.replace(tzinfo=execution_time.tzinfo)
 
-            opportunities = data.get('opportunities', [])
+                    # Check if scan is too old (based on configurable max age)
+                    age = execution_time - scan_time
+                    if age > max_age_delta:
+                        logger.info("Scan too old, skipping",
+                                   scan_time=data['scan_time'],
+                                   age_minutes=age.total_seconds() / 60,
+                                   max_age_minutes=max_age_minutes,
+                                   path=blob.name)
+                        continue
 
-            logger.info("Retrieved opportunities for execution",
-                       count=len(opportunities),
-                       scan_time=data['scan_time'],
-                       path=blob_path)
+                    # Check if already executed
+                    if data.get('status') == 'executed':
+                        logger.info("Scan already executed, checking next",
+                                   path=blob.name,
+                                   scan_time=data['scan_time'])
+                        continue
 
-            return opportunities
+                    # Found valid scan!
+                    opportunities = data.get('opportunities', [])
+
+                    logger.info("Retrieved most recent valid scan",
+                               count=len(opportunities),
+                               scan_time=data['scan_time'],
+                               age_minutes=round(age.total_seconds() / 60, 1),
+                               max_age_minutes=max_age_minutes,
+                               path=blob.name)
+
+                    return opportunities
+
+                except Exception as e:
+                    logger.warning("Failed to process scan file, trying next",
+                                  path=blob.name,
+                                  error=str(e))
+                    continue
+
+            # No valid scans found
+            logger.info("No valid scans found within age window",
+                       execution_time=execution_time.isoformat(),
+                       max_age_minutes=max_age_minutes,
+                       scans_checked=len(blobs))
+            return []
 
         except Exception as e:
             log_error_event(
@@ -165,25 +206,62 @@ class OpportunityStore:
 
     def mark_executed(self, execution_time: datetime,
                      executed_count: int,
-                     results: List[Dict[str, Any]]) -> bool:
+                     results: List[Dict[str, Any]],
+                     scan_blob_path: Optional[str] = None) -> bool:
         """Mark opportunities as executed.
 
         Args:
             execution_time: When execution occurred
             executed_count: Number of opportunities executed
             results: Execution results for each opportunity
+            scan_blob_path: Optional path to the scan file that was executed.
+                          If not provided, will find the most recent scan.
 
         Returns:
             True if marked successfully
         """
         try:
-            blob_path = self._get_scan_blob_path(execution_time)
+            # If scan path not provided, find the most recent one
+            if not scan_blob_path:
+                # Re-use same logic as get_pending_opportunities
+                bucket = self.storage_client.bucket(self.bucket_name)
+                date_str = execution_time.strftime('%Y-%m-%d')
+                prefix = f"opportunities/{date_str}/"
+
+                blobs = sorted(
+                    bucket.list_blobs(prefix=prefix),
+                    key=lambda b: b.time_created,
+                    reverse=True
+                )
+
+                if not blobs:
+                    logger.warning("Cannot mark executed - no scans found", date=date_str)
+                    return False
+
+                # Find the most recent non-executed scan
+                max_age_delta = timedelta(minutes=self.config.opportunity_max_age_minutes)
+                for blob in blobs:
+                    try:
+                        content = blob.download_as_string()
+                        data = json.loads(content)
+                        scan_time = datetime.fromisoformat(data['scan_time'].replace('Z', '+00:00'))
+                        age = execution_time - scan_time
+
+                        if age <= max_age_delta and data.get('status') != 'executed':
+                            scan_blob_path = blob.name
+                            break
+                    except:
+                        continue
+
+            if not scan_blob_path:
+                logger.warning("Cannot mark executed - no valid scan found")
+                return False
 
             bucket = self.storage_client.bucket(self.bucket_name)
-            blob = bucket.blob(blob_path)
+            blob = bucket.blob(scan_blob_path)
 
             if not blob.exists():
-                logger.warning("Cannot mark executed - blob not found", path=blob_path)
+                logger.warning("Cannot mark executed - blob not found", path=scan_blob_path)
                 return False
 
             # Update status
@@ -206,7 +284,7 @@ class OpportunityStore:
                 event_type="opportunities_marked_executed",
                 status="success",
                 executed_count=executed_count,
-                blob_path=blob_path
+                blob_path=scan_blob_path
             )
 
             return True

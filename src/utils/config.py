@@ -75,6 +75,11 @@ class Config:
     
     # Strategy Parameters
     @property
+    def opportunity_max_age_minutes(self) -> int:
+        """Maximum age in minutes for opportunities to be considered valid."""
+        return self._config["strategy"].get("opportunity_max_age_minutes", 30)
+
+    @property
     def put_target_dte(self) -> int:
         """Target days to expiration for puts."""
         return self._config["strategy"]["put_target_dte"]

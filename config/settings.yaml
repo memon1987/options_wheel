@@ -12,6 +12,11 @@ alpaca:
   
 # Trading Strategy Parameters
 strategy:
+  # Scan-to-execution coordination
+  # Maximum age (in minutes) for opportunities to be considered valid for execution
+  # Prevents execution of stale scans that may have outdated prices
+  opportunity_max_age_minutes: 30
+
   # Target days to expiration for new positions
   put_target_dte: 7
   call_target_dte: 7
