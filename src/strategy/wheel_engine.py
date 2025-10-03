@@ -250,9 +250,13 @@ class WheelEngine:
             gap_filtered_stocks = [stock for stock in suitable_stocks
                                  if stock['symbol'] in gap_filtered_symbols]
 
+            # Enhanced logging for debugging
+            filtered_out = [s['symbol'] for s in suitable_stocks if s['symbol'] not in gap_filtered_symbols]
             logger.info("Evaluating new opportunities with wheel state logic",
                        suitable_stocks=len(suitable_stocks),
-                       gap_filtered_stocks=len(gap_filtered_stocks))
+                       gap_filtered_stocks=len(gap_filtered_stocks),
+                       gap_filtered_symbols=gap_filtered_symbols,
+                       filtered_out_symbols=filtered_out)
 
             # Log performance metric for market scan
             scan_duration = (datetime.now() - start_time).total_seconds()
@@ -317,6 +321,12 @@ class WheelEngine:
 
         except Exception as e:
             logger.error("Failed to find new opportunities", error=str(e))
+
+        # Log summary of opportunities found
+        logger.info("New opportunities search completed",
+                   opportunities_found=len(actions),
+                   put_opportunities=len([a for a in actions if 'put' in a.get('action_type', '').lower()]),
+                   call_opportunities=len([a for a in actions if 'call' in a.get('action_type', '').lower()]))
 
         return actions
     

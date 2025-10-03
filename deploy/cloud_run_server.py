@@ -1012,6 +1012,17 @@ def get_backtest_analytics(backtest_id):
 
 def setup_logging():
     """Configure structured logging."""
+    import logging
+    import sys
+
+    # Configure Python's logging module to output to stderr (Cloud Run captures this)
+    logging.basicConfig(
+        format="%(message)s",
+        stream=sys.stderr,
+        level=logging.INFO
+    )
+
+    # Configure structlog to use Python logging
     structlog.configure(
         processors=[
             structlog.stdlib.filter_by_level,
