@@ -88,10 +88,22 @@ For each suitable stock, performs historical analysis:
 
 ---
 
-### STAGE 3: ~~Position Limit Check~~ REMOVED
-**Previously**: Limited to top 5 stocks only
-**Now**: All gap-filtered stocks are evaluated
-**Rationale**: Let Stage 6 (existing positions) and Stage 8 (position sizing) control portfolio limits instead of arbitrary caps
+### STAGE 3: Stock Evaluation Limit (Configurable)
+**Component**: `wheel_engine._find_new_opportunities()`
+**Location**: [src/strategy/wheel_engine.py:273-281](../src/strategy/wheel_engine.py#L273-L281)
+
+**Configurable Limit**:
+- **Parameter**: `max_stocks_evaluated_per_cycle`
+- **Config**: [config/settings.yaml:39](../config/settings.yaml#L39)
+- **Default**: `null` (no limit - evaluate all gap-filtered stocks)
+- **Can be set to**: Any positive integer to limit evaluation (e.g., 5, 10)
+
+**Purpose**:
+- Control computational load per cycle
+- Focus on highest-ranked opportunities when needed
+- Fully configurable: set to number or `null` to disable
+
+**Current Setting**: `null` (no limit applied)
 
 ---
 
@@ -212,14 +224,27 @@ After filtering, remaining puts are ranked by:
 
 ---
 
-### STAGE 9: ~~Conservative Execution Limit~~ REMOVED
-**Previously**: Only 1 new position per cycle
-**Now**: Multiple positions can be opened per cycle (as many as pass all filters)
-**Rationale**:
-- Stage 8 position sizing already limits exposure ($25k per ticker, 80% portfolio max)
-- Stage 6 prevents duplicate positions in same underlying
-- Max 10 total positions enforced by config
-- Let portfolio limits and risk controls dictate capacity, not arbitrary per-cycle caps
+### STAGE 9: New Positions Per Cycle Limit (Configurable)
+**Component**: `wheel_engine._find_new_opportunities()`
+**Location**: [src/strategy/wheel_engine.py:328-334](../src/strategy/wheel_engine.py#L328-L334)
+
+**Configurable Limit**:
+- **Parameter**: `max_new_positions_per_cycle`
+- **Config**: [config/settings.yaml:40](../config/settings.yaml#L40)
+- **Default**: `null` (no limit - open as many positions as pass all filters)
+- **Can be set to**: Any positive integer to limit new positions per cycle (e.g., 1, 2, 3)
+
+**Purpose**:
+- Control rate of portfolio buildup
+- Conservative gradual entry when needed
+- Fully configurable: set to number or `null` to disable
+
+**Current Setting**: `null` (no limit - portfolio controlled by Stage 6 & 8)
+
+**Note**: Even with no limit, natural portfolio constraints still apply:
+- Stage 6: No duplicate positions in same underlying
+- Stage 8: $25k per ticker, 80% portfolio max, 10 total positions
+- Buying power availability
 
 ---
 
@@ -235,8 +260,10 @@ STAGE 2: Gap Risk Analysis
     ├── Historical Volatility ≤ 40%
     └── Current Gap ≤ 5%
     ↓ (~7-10 stocks pass)
-STAGE 3: [REMOVED - No arbitrary stock limit]
-    ↓ (ALL gap-filtered stocks evaluated)
+STAGE 3: Stock Evaluation Limit (CONFIGURABLE)
+    └── Default: null (no limit)
+    └── Can set: e.g., 5 stocks max
+    ↓ (Currently: ALL gap-filtered stocks evaluated)
 STAGE 4: Execution Gap Check (per stock)
     └── Real-time gap ≤ 1.5%
     ↓
@@ -258,9 +285,11 @@ STAGE 8: Position Sizing (per opportunity)
     ├── ≤ 80% portfolio allocation?
     └── ≤ 10 total positions (config)
     ↓
-STAGE 9: [REMOVED - No per-cycle limit]
-    ↓
-0-N Trades Executed (limited by buying power, position limits, and risk controls)
+STAGE 9: New Positions Per Cycle Limit (CONFIGURABLE)
+    └── Default: null (no limit)
+    └── Can set: e.g., 1, 2, 3 positions max
+    ↓ (Currently: no limit)
+0-N Trades Executed (limited by config, buying power, and risk controls)
 ```
 
 ---
@@ -303,9 +332,13 @@ STAGE 9: [REMOVED - No per-cycle limit]
 - Portfolio already at 80% allocation
 - Already at max 10 total positions
 
-**~~Stage 3 & 9~~** (REMOVED):
-- Previously limited to 5 stocks evaluated and 1 position per cycle
-- Now portfolio naturally limited by risk controls in Stages 6 & 8
+**Stage 3 - Stock Evaluation Limit** (CONFIGURABLE):
+- Currently disabled (`null`)
+- Can limit to N stocks if set (e.g., 5 stocks/cycle)
+
+**Stage 9 - New Positions Limit** (CONFIGURABLE):
+- Currently disabled (`null`)
+- Can limit to N positions if set (e.g., 1 position/cycle for conservative entry)
 
 ---
 
@@ -318,6 +351,8 @@ All thresholds are configurable in [config/settings.yaml](../config/settings.yam
 | Price Range | min_stock_price | $10.00 | 30 |
 | Price Range | max_stock_price | $400.00 | 31 |
 | Volume | min_avg_volume | 2M shares | 32 |
+| **Stock Eval Limit** | **max_stocks_evaluated_per_cycle** | **null (no limit)** | **39** |
+| **Position Limit** | **max_new_positions_per_cycle** | **null (no limit)** | **40** |
 | Gap Frequency | max_gap_frequency | 15% | 67 |
 | Historical Vol | max_historical_vol | 40% | 82 |
 | Current Gap | max_overnight_gap_percent | 5.0% | 65 |
@@ -326,8 +361,8 @@ All thresholds are configurable in [config/settings.yaml](../config/settings.yam
 | Put DTE | put_target_dte | 7 days | 14 |
 | Put Premium | min_put_premium | $0.50 | 26 |
 | Put Delta | put_delta_range | [0.10, 0.20] | 18 |
-| Max Exposure | max_exposure_per_ticker | $25,000 | 39 |
-| Portfolio Limit | max_portfolio_allocation | 80% | 44 |
+| Max Exposure | max_exposure_per_ticker | $25,000 | 43 |
+| Portfolio Limit | max_portfolio_allocation | 80% | 47 |
 
 ---
 
@@ -355,6 +390,16 @@ All thresholds are configurable in [config/settings.yaml](../config/settings.yam
 }
 ```
 
+**Stage 3 (if limit enabled)**:
+```json
+{
+  "event": "Applying stock evaluation limit",
+  "max_stocks": 5,
+  "total_available": 10,
+  "evaluating": 5
+}
+```
+
 **Stage 2 Rejections**:
 ```json
 {
@@ -373,6 +418,15 @@ All thresholds are configurable in [config/settings.yaml](../config/settings.yam
   "symbol": "AAPL",
   "reason": "execution_gap_exceeded",
   "gap_percent": 1.8
+}
+```
+
+**Stage 9 (if limit enabled)**:
+```json
+{
+  "event": "Reached max new positions per cycle limit",
+  "max_positions": 1,
+  "positions_found": 1
 }
 ```
 

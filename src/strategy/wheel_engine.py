@@ -270,8 +270,18 @@ class WheelEngine:
                 gap_filtered_stocks=len(gap_filtered_stocks)
             )
 
+            # Apply configurable stock evaluation limit (Stage 3)
+            max_stocks = self.config.max_stocks_evaluated_per_cycle
+            stocks_to_evaluate = gap_filtered_stocks[:max_stocks] if max_stocks else gap_filtered_stocks
+
+            if max_stocks:
+                logger.info("Applying stock evaluation limit",
+                           max_stocks=max_stocks,
+                           total_available=len(gap_filtered_stocks),
+                           evaluating=len(stocks_to_evaluate))
+
             # Process each stock according to wheel strategy phases
-            for stock in gap_filtered_stocks:  # Evaluate all gap-filtered stocks
+            for stock in stocks_to_evaluate:
                 symbol = stock['symbol']
                 wheel_phase = self.wheel_state.get_wheel_phase(symbol)
 
@@ -315,7 +325,13 @@ class WheelEngine:
                                    symbol=symbol,
                                    wheel_phase=wheel_phase.value)
 
-                # No limit on positions per cycle - let other risk controls manage portfolio
+                # Apply configurable position limit (Stage 9)
+                max_positions = self.config.max_new_positions_per_cycle
+                if max_positions and len(actions) >= max_positions:
+                    logger.info("Reached max new positions per cycle limit",
+                               max_positions=max_positions,
+                               positions_found=len(actions))
+                    break
 
         except Exception as e:
             logger.error("Failed to find new opportunities", error=str(e))

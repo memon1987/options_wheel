@@ -4,7 +4,7 @@ import os
 import yaml
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -133,7 +133,17 @@ class Config:
     def max_exposure_per_ticker(self) -> float:
         """Maximum exposure per ticker (dollar amount assuming assignment)."""
         return self._config["strategy"]["max_exposure_per_ticker"]
-    
+
+    @property
+    def max_stocks_evaluated_per_cycle(self) -> Optional[int]:
+        """Maximum stocks to evaluate per cycle (None = no limit)."""
+        return self._config["strategy"].get("max_stocks_evaluated_per_cycle")
+
+    @property
+    def max_new_positions_per_cycle(self) -> Optional[int]:
+        """Maximum new positions to open per cycle (None = no limit)."""
+        return self._config["strategy"].get("max_new_positions_per_cycle")
+
     # Risk Management
     @property
     def max_portfolio_allocation(self) -> float:
