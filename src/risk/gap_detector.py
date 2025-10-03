@@ -164,12 +164,20 @@ class GapDetector:
             Dict with current gap information
         """
         try:
+            # Convert date to timezone-aware if needed
+            if date.tzinfo is None:
+                import pytz
+                date = pytz.UTC.localize(date)
+
             # Get today's data if available
-            if date.date() in df.index.date:
-                today_data = df[df.index.date == date.date()].iloc[0]
+            target_date = date.date()
+            df_dates = pd.Series([idx.date() for idx in df.index])
+
+            if target_date in df_dates.values:
+                today_data = df[df_dates == target_date].iloc[0]
 
                 # Get previous trading day close
-                previous_data = df[df.index.date < date.date()].iloc[-1]
+                previous_data = df[df_dates < target_date].iloc[-1]
 
                 gap_percent = ((today_data['open'] - previous_data['close']) /
                               previous_data['close']) * 100
@@ -443,6 +451,11 @@ class GapDetector:
             df = self.alpaca.get_stock_bars(symbol, days=5)
             if df.empty:
                 return None
+
+            # Ensure current_time is timezone-aware for comparison with df.index
+            if current_time.tzinfo is None:
+                import pytz
+                current_time = pytz.UTC.localize(current_time)
 
             # Find the most recent close before current time
             recent_data = df[df.index < current_time]
