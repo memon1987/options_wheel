@@ -250,7 +250,6 @@ def trigger_strategy():
                     log_system_event(
                         logger,
                         event_type="trade_executed",
-                        event_category="trade",
                         status="success",
                         symbol=opp.get('symbol'),
                         option_symbol=opp.get('option_symbol'),

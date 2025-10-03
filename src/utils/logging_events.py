@@ -270,7 +270,6 @@ def log_system_event(
     logger.info(
         event_type,
         event_category="system",
-        event_type=event_type,
         status=status,
         timestamp_ms=int(time.time() * 1000),
         timestamp_iso=datetime.now().isoformat(),
