@@ -271,7 +271,29 @@ class OpportunityStore:
             data['status'] = 'executed'
             data['executed_at'] = execution_time.isoformat()
             data['executed_count'] = executed_count
-            data['execution_results'] = results
+
+            # Convert any UUID objects in results to strings for JSON serialization
+            serializable_results = []
+            for result in results:
+                serializable_result = {}
+                for key, value in result.items():
+                    # Convert UUID objects to strings
+                    if hasattr(value, '__class__') and value.__class__.__name__ == 'UUID':
+                        serializable_result[key] = str(value)
+                    # Handle nested dicts that might contain UUIDs
+                    elif isinstance(value, dict):
+                        nested_dict = {}
+                        for nested_key, nested_value in value.items():
+                            if hasattr(nested_value, '__class__') and nested_value.__class__.__name__ == 'UUID':
+                                nested_dict[nested_key] = str(nested_value)
+                            else:
+                                nested_dict[nested_key] = nested_value
+                        serializable_result[key] = nested_dict
+                    else:
+                        serializable_result[key] = value
+                serializable_results.append(serializable_result)
+
+            data['execution_results'] = serializable_results
 
             # Save updated data
             blob.upload_from_string(
