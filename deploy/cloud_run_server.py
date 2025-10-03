@@ -87,6 +87,13 @@ def trigger_scan():
             call_opportunities = scanner.scan_for_call_opportunities()
             logger.info("Call opportunities found", count=len(call_opportunities))
 
+            # Store opportunities for execution
+            from src.data.opportunity_store import OpportunityStore
+            opportunity_store = OpportunityStore(config)
+
+            all_opportunities = put_opportunities + call_opportunities
+            stored = opportunity_store.store_opportunities(all_opportunities, start_time)
+
             # Update status with scan results
             strategy_status['last_scan'] = datetime.now().isoformat()
             strategy_status['status'] = 'scan_completed'
@@ -94,7 +101,8 @@ def trigger_scan():
             scan_results = {
                 'put_opportunities': len(put_opportunities),
                 'call_opportunities': len(call_opportunities),
-                'total_opportunities': len(put_opportunities) + len(call_opportunities)
+                'total_opportunities': len(all_opportunities),
+                'stored_for_execution': stored
             }
 
             # Calculate scan duration
@@ -108,7 +116,8 @@ def trigger_scan():
                 duration_seconds=duration_seconds,
                 put_opportunities=len(put_opportunities),
                 call_opportunities=len(call_opportunities),
-                total_opportunities=scan_results['total_opportunities']
+                total_opportunities=scan_results['total_opportunities'],
+                stored_for_execution=stored
             )
 
             # Log performance metric
@@ -163,30 +172,97 @@ def trigger_strategy():
             config = Config()
 
             from src.api.alpaca_client import AlpacaClient
-            from src.api.market_data import MarketDataManager
-            from src.strategy.wheel_engine import WheelEngine
-            from src.data.portfolio_tracker import PortfolioTracker
+            from src.data.opportunity_store import OpportunityStore
+            from src.strategy.put_seller import PutSeller
 
             alpaca_client = AlpacaClient(config)
-            market_data = MarketDataManager(alpaca_client, config)
-            portfolio_tracker = PortfolioTracker(alpaca_client, config)
+            opportunity_store = OpportunityStore(config)
 
-            # Initialize wheel engine with cost basis protection
-            wheel_engine = WheelEngine(config)
+            # Retrieve pending opportunities from Cloud Storage
+            opportunities = opportunity_store.get_pending_opportunities(start_time)
 
-            logger.info("Starting wheel strategy execution")
+            if not opportunities:
+                logger.info("No pending opportunities found for execution",
+                           execution_time=start_time.isoformat())
 
-            # Execute the strategy
-            execution_results = wheel_engine.run_strategy_cycle()
+                log_system_event(
+                    logger,
+                    event_type="strategy_execution_completed",
+                    status="no_opportunities",
+                    duration_seconds=(datetime.now() - start_time).total_seconds(),
+                    opportunities_found=0
+                )
+
+                return jsonify({
+                    'message': 'No opportunities to execute',
+                    'timestamp': datetime.now().isoformat(),
+                    'results': {
+                        'opportunities_found': 0,
+                        'trades_executed': 0
+                    }
+                })
+
+            logger.info("Retrieved opportunities for execution",
+                       count=len(opportunities),
+                       execution_time=start_time.isoformat())
+
+            # Initialize put seller for execution
+            put_seller = PutSeller(alpaca_client, config)
+
+            # Execute each opportunity
+            execution_results = []
+            trades_executed = 0
+
+            for idx, opp in enumerate(opportunities):
+                logger.info(f"Evaluating opportunity {idx+1}/{len(opportunities)}",
+                           event_category="execution",
+                           event_type="opportunity_evaluation",
+                           symbol=opp.get('symbol'),
+                           strike=opp.get('strike_price'),
+                           premium=opp.get('premium'))
+
+                # Execute the trade
+                result = put_seller.execute_put_sale(opp)
+                execution_results.append(result)
+
+                if result and result.get('success'):
+                    trades_executed += 1
+
+                    # Log successful trade
+                    log_system_event(
+                        logger,
+                        event_type="trade_executed",
+                        event_category="trade",
+                        status="success",
+                        symbol=opp.get('symbol'),
+                        option_symbol=opp.get('option_symbol'),
+                        contracts=opp.get('contracts'),
+                        premium=opp.get('premium'),
+                        strike_price=opp.get('strike_price'),
+                        order_id=result.get('order_id')
+                    )
+                else:
+                    # Log failed trade
+                    log_error_event(
+                        logger,
+                        error_type="trade_execution_failed",
+                        error_message=result.get('message', 'Unknown error') if result else 'No result returned',
+                        component="execution_engine",
+                        recoverable=True,
+                        symbol=opp.get('symbol'),
+                        option_symbol=opp.get('option_symbol')
+                    )
+
+            # Mark opportunities as executed in Cloud Storage
+            opportunity_store.mark_executed(
+                execution_time=start_time,
+                executed_count=trades_executed,
+                results=execution_results
+            )
 
             # Update global status
             strategy_status['last_run'] = datetime.now().isoformat()
             strategy_status['status'] = 'execution_completed'
-
-            # Update portfolio metrics
-            if execution_results:
-                strategy_status['positions'] = execution_results.get('positions_count', 0)
-                strategy_status['pnl'] = execution_results.get('total_pnl', 0.0)
 
             # Calculate execution duration
             duration_seconds = (datetime.now() - start_time).total_seconds()
@@ -197,9 +273,9 @@ def trigger_strategy():
                 event_type="strategy_execution_completed",
                 status="completed",
                 duration_seconds=duration_seconds,
-                actions_taken=len(execution_results.get('actions', [])),
-                new_positions=execution_results.get('new_positions', 0),
-                closed_positions=execution_results.get('closed_positions', 0)
+                opportunities_evaluated=len(opportunities),
+                trades_executed=trades_executed,
+                trades_failed=len(opportunities) - trades_executed
             )
 
             # Log performance metric
@@ -208,17 +284,18 @@ def trigger_strategy():
                 metric_name="strategy_execution_duration",
                 metric_value=duration_seconds,
                 metric_unit="seconds",
-                actions_taken=len(execution_results.get('actions', []))
+                opportunities_evaluated=len(opportunities),
+                trades_executed=trades_executed
             )
 
             return jsonify({
                 'message': 'Strategy execution completed successfully',
                 'timestamp': datetime.now().isoformat(),
                 'results': {
-                    'actions_taken': len(execution_results.get('actions', [])),
-                    'positions_count': execution_results.get('positions_count', 0),
-                    'opportunities_evaluated': execution_results.get('opportunities_evaluated', 0),
-                    'dry_run': config.paper_trading
+                    'opportunities_evaluated': len(opportunities),
+                    'trades_executed': trades_executed,
+                    'trades_failed': len(opportunities) - trades_executed,
+                    'execution_results': execution_results
                 }
             })
 
