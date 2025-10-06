@@ -629,66 +629,149 @@ def run_backtest():
         }), 500
 
 def run_quick_backtest(backtest_engine, performance_analyzer, symbol, start_date, end_date, strategy_params, backtest_id):
-    """Run a quick backtest with simplified analysis."""
+    """Run a quick backtest with real historical data."""
+    try:
+        logger.info("Running quick backtest with real engine",
+                   symbol=symbol,
+                   start_date=start_date.date(),
+                   end_date=end_date.date())
 
-    # Simulate some basic metrics for quick analysis
-    # In reality, this would run actual backtesting logic
+        # Run the actual backtest engine
+        result = backtest_engine.run_backtest()
 
-    # Mock performance data
-    total_days = (end_date - start_date).days
-    trades_count = max(1, total_days // 7)  # Assume ~1 trade per week
+        # Extract key metrics from BacktestResult
+        return {
+            'performance_summary': {
+                'total_return': round(result.total_return, 4),
+                'annualized_return': round(result.annualized_return, 4),
+                'total_trades': result.total_trades,
+                'win_rate': round(result.win_rate, 3),
+                'avg_return_per_trade': round(result.total_return / max(result.total_trades, 1), 4),
+                'max_drawdown': round(result.max_drawdown, 4),
+                'sharpe_ratio': round(result.sharpe_ratio, 2),
+                'premium_collected': round(result.premium_collected, 2)
+            },
+            'trade_metrics': {
+                'put_trades': result.put_trades,
+                'call_trades': result.call_trades,
+                'assignments': result.assignments,
+                'assignment_rate': round(result.assignment_rate, 3)
+            },
+            'risk_metrics': {
+                'max_at_risk_capital': round(result.max_at_risk_capital, 2),
+                'avg_at_risk_capital': round(result.avg_at_risk_capital, 2),
+                'peak_at_risk_percentage': round(result.peak_at_risk_percentage, 3)
+            },
+            'analysis_type': 'quick_real_data',
+            'backtest_id': backtest_id
+        }
 
-    # Simulate results
-    win_rate = 0.75 + (hash(symbol) % 100) / 1000  # Deterministic but varied
-    avg_return_per_trade = 0.02 + (hash(backtest_id) % 50) / 10000
-    total_return = trades_count * avg_return_per_trade * win_rate
-    max_drawdown = -total_return * 0.3  # Assume max drawdown is 30% of gains
-
-    return {
-        'performance_summary': {
-            'total_return': round(total_return, 4),
-            'total_trades': trades_count,
-            'win_rate': round(win_rate, 3),
-            'avg_return_per_trade': round(avg_return_per_trade, 4),
-            'max_drawdown': round(max_drawdown, 4),
-            'sharpe_ratio': round(total_return / max(abs(max_drawdown), 0.01), 2)
-        },
-        'risk_metrics': {
-            'volatility': round(abs(max_drawdown) * 2, 4),
-            'max_consecutive_losses': max(1, trades_count // 10),
-            'avg_days_in_trade': 7
-        },
-        'analysis_type': 'quick_simulation'
-    }
+    except Exception as e:
+        logger.error("Quick backtest failed", error=str(e), traceback=traceback.format_exc())
+        # Return error with details
+        return {
+            'error': str(e),
+            'analysis_type': 'quick_real_data_failed',
+            'traceback': traceback.format_exc()
+        }
 
 def run_full_backtest(backtest_engine, performance_analyzer, symbol, start_date, end_date, strategy_params, backtest_id):
-    """Run a comprehensive backtest with full analysis."""
+    """Run a comprehensive backtest with full analysis and detailed trade history."""
+    try:
+        logger.info("Running comprehensive backtest with real engine",
+                   symbol=symbol,
+                   start_date=start_date.date(),
+                   end_date=end_date.date())
 
-    # This would implement the full backtesting logic
-    # For now, return enhanced simulated data
+        # Run the actual backtest engine
+        result = backtest_engine.run_backtest()
 
-    quick_results = run_quick_backtest(backtest_engine, performance_analyzer, symbol, start_date, end_date, strategy_params, backtest_id)
-
-    # Add additional full analysis metrics
-    full_results = quick_results.copy()
-    full_results.update({
-        'detailed_analysis': {
-            'monthly_returns': generate_monthly_returns(start_date, end_date),
-            'option_chain_analysis': {
-                'avg_iv_sold': 0.25,
-                'avg_delta_sold': 0.15,
-                'assignment_rate': 0.12
+        # Get base metrics
+        base_results = {
+            'performance_summary': {
+                'initial_capital': round(result.initial_capital, 2),
+                'final_capital': round(result.final_capital, 2),
+                'total_return': round(result.total_return, 4),
+                'annualized_return': round(result.annualized_return, 4),
+                'total_trades': result.total_trades,
+                'win_rate': round(result.win_rate, 3),
+                'avg_return_per_trade': round(result.total_return / max(result.total_trades, 1), 4),
+                'max_drawdown': round(result.max_drawdown, 4),
+                'sharpe_ratio': round(result.sharpe_ratio, 2),
+                'premium_collected': round(result.premium_collected, 2)
             },
-            'gap_risk_analysis': {
-                'gaps_detected': 3,
-                'trades_blocked': 1,
-                'gap_protection_effective': True
+            'trade_metrics': {
+                'put_trades': result.put_trades,
+                'call_trades': result.call_trades,
+                'assignments': result.assignments,
+                'assignment_rate': round(result.assignment_rate, 3)
+            },
+            'risk_metrics': {
+                'max_at_risk_capital': round(result.max_at_risk_capital, 2),
+                'avg_at_risk_capital': round(result.avg_at_risk_capital, 2),
+                'peak_at_risk_percentage': round(result.peak_at_risk_percentage, 3)
             }
-        },
-        'analysis_type': 'comprehensive'
-    })
+        }
 
-    return full_results
+        # Add comprehensive analysis with portfolio and trade history
+        base_results['detailed_analysis'] = {
+            'portfolio_history_sample': extract_portfolio_sample(result.portfolio_history),
+            'trade_history_sample': extract_trade_sample(result.trade_history),
+            'total_portfolio_snapshots': len(result.portfolio_history),
+            'total_trades_logged': len(result.trade_history)
+        }
+
+        base_results['analysis_type'] = 'comprehensive_real_data'
+        base_results['backtest_id'] = backtest_id
+
+        return base_results
+
+    except Exception as e:
+        logger.error("Comprehensive backtest failed", error=str(e), traceback=traceback.format_exc())
+        return {
+            'error': str(e),
+            'analysis_type': 'comprehensive_real_data_failed',
+            'traceback': traceback.format_exc()
+        }
+
+def extract_portfolio_sample(portfolio_df, sample_size=10):
+    """Extract a sample of portfolio history for response."""
+    if portfolio_df is None or portfolio_df.empty:
+        return []
+
+    # Get evenly spaced samples
+    step = max(1, len(portfolio_df) // sample_size)
+    sample = portfolio_df.iloc[::step].head(sample_size)
+
+    return [
+        {
+            'date': row.name.isoformat() if hasattr(row.name, 'isoformat') else str(row.name),
+            'total_value': round(row.get('total_value', 0), 2),
+            'cash': round(row.get('cash', 0), 2),
+            'positions_value': round(row.get('positions_value', 0), 2)
+        }
+        for _, row in sample.iterrows()
+    ]
+
+def extract_trade_sample(trade_df, sample_size=20):
+    """Extract a sample of trade history for response."""
+    if trade_df is None or trade_df.empty:
+        return []
+
+    # Get most recent trades
+    sample = trade_df.tail(sample_size)
+
+    return [
+        {
+            'date': row.get('date').isoformat() if hasattr(row.get('date'), 'isoformat') else str(row.get('date')),
+            'symbol': row.get('symbol', 'N/A'),
+            'action': row.get('action', 'N/A'),
+            'strike': row.get('strike', 0),
+            'premium': round(row.get('premium', 0), 2),
+            'profit_loss': round(row.get('profit_loss', 0), 2)
+        }
+        for _, row in sample.iterrows()
+    ]
 
 def generate_monthly_returns(start_date, end_date):
     """Generate simulated monthly returns for the period."""
