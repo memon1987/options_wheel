@@ -212,12 +212,35 @@ class MarketDataManager:
                    delta_range=self.config.put_delta_range)
 
         suitable_puts = []
-        rejected_count = 0
+
+        # Track rejection reasons for detailed logging
+        rejection_stats = {
+            'dte_too_high': 0,
+            'premium_too_low': 0,
+            'delta_out_of_range': 0,
+            'no_liquidity': 0,
+            'total_rejected': 0
+        }
+
+        # Track min/max values of rejected puts for analysis
+        rejected_puts_data = {
+            'premiums': [],
+            'deltas': [],
+            'dtes': []
+        }
 
         for put in puts:
-            # Filter by strategy criteria
-            if not self._meets_put_criteria(put):
-                rejected_count += 1
+            # Filter by strategy criteria with detailed rejection tracking
+            rejection_reason = self._check_put_criteria_detailed(put)
+
+            if rejection_reason:
+                rejection_stats['total_rejected'] += 1
+                rejection_stats[rejection_reason] += 1
+
+                # Collect data for rejected puts
+                rejected_puts_data['premiums'].append(put['mid_price'])
+                rejected_puts_data['deltas'].append(abs(put.get('delta', 0)))
+                rejected_puts_data['dtes'].append(put['dte'])
                 continue
 
             # Calculate annualized return
@@ -238,20 +261,42 @@ class MarketDataManager:
                        event_type="stage_7_complete_found",
                        symbol=symbol,
                        total_puts=len(puts),
-                       rejected=rejected_count,
+                       rejected=rejection_stats['total_rejected'],
                        suitable_count=len(suitable_puts),
                        best_put_strike=best_put['strike_price'],
                        best_put_premium=best_put['mid_price'],
                        best_put_dte=best_put['dte'],
-                       best_put_delta=best_put.get('delta', 0))
+                       best_put_delta=best_put.get('delta', 0),
+                       # Detailed rejection breakdown
+                       rejected_dte_too_high=rejection_stats['dte_too_high'],
+                       rejected_premium_too_low=rejection_stats['premium_too_low'],
+                       rejected_delta_out_of_range=rejection_stats['delta_out_of_range'],
+                       rejected_no_liquidity=rejection_stats['no_liquidity'])
         else:
+            # Calculate stats for rejected puts
+            avg_premium = sum(rejected_puts_data['premiums']) / len(rejected_puts_data['premiums']) if rejected_puts_data['premiums'] else 0
+            avg_delta = sum(rejected_puts_data['deltas']) / len(rejected_puts_data['deltas']) if rejected_puts_data['deltas'] else 0
+            max_premium = max(rejected_puts_data['premiums']) if rejected_puts_data['premiums'] else 0
+            min_dte = min(rejected_puts_data['dtes']) if rejected_puts_data['dtes'] else 0
+            max_dte = max(rejected_puts_data['dtes']) if rejected_puts_data['dtes'] else 0
+
             logger.info("STAGE 7 COMPLETE: Options chain criteria - NO suitable puts",
                        event_category="filtering",
                        event_type="stage_7_complete_not_found",
                        symbol=symbol,
                        total_puts=len(puts),
-                       rejected=rejected_count,
-                       reason="no_puts_met_criteria")
+                       rejected=rejection_stats['total_rejected'],
+                       reason="no_puts_met_criteria",
+                       # Detailed rejection breakdown
+                       rejected_dte_too_high=rejection_stats['dte_too_high'],
+                       rejected_premium_too_low=rejection_stats['premium_too_low'],
+                       rejected_delta_out_of_range=rejection_stats['delta_out_of_range'],
+                       rejected_no_liquidity=rejection_stats['no_liquidity'],
+                       # Stats on rejected puts
+                       rejected_avg_premium=round(avg_premium, 2),
+                       rejected_avg_delta=round(avg_delta, 4),
+                       rejected_max_premium=round(max_premium, 2),
+                       rejected_dte_range=f"{min_dte}-{max_dte}")
 
         return suitable_puts[:5]  # Return top 5
     
@@ -267,100 +312,201 @@ class MarketDataManager:
         """
         options_data = self.get_option_chain_with_analysis(symbol)
         calls = options_data['calls']
-        
+
+        logger.info("STAGE 8: Call options criteria - starting call scan",
+                   event_category="filtering",
+                   event_type="stage_8_start",
+                   symbol=symbol,
+                   total_calls_in_chain=len(calls),
+                   target_dte=self.config.call_target_dte,
+                   min_premium=self.config.min_call_premium,
+                   delta_range=self.config.call_delta_range,
+                   min_strike_price=min_strike_price)
+
         suitable_calls = []
-        
+
+        # Track rejection reasons for detailed logging
+        rejection_stats = {
+            'below_cost_basis': 0,
+            'dte_too_high': 0,
+            'premium_too_low': 0,
+            'delta_out_of_range': 0,
+            'no_liquidity': 0,
+            'total_rejected': 0
+        }
+
+        # Track min/max values of rejected calls for analysis
+        rejected_calls_data = {
+            'premiums': [],
+            'deltas': [],
+            'dtes': [],
+            'strikes': []
+        }
+
         for call in calls:
             # CRITICAL: Cost basis protection - never sell calls below cost basis
             if min_strike_price > 0 and call['strike_price'] < min_strike_price:
-                logger.debug("Call rejected: strike below cost basis",
-                           symbol=symbol,
-                           strike=call['strike_price'],
-                           cost_basis=min_strike_price)
+                rejection_stats['total_rejected'] += 1
+                rejection_stats['below_cost_basis'] += 1
+                rejected_calls_data['strikes'].append(call['strike_price'])
+                rejected_calls_data['premiums'].append(call['mid_price'])
+                rejected_calls_data['deltas'].append(abs(call.get('delta', 0)))
+                rejected_calls_data['dtes'].append(call['dte'])
                 continue
 
-            # Filter by strategy criteria
-            if not self._meets_call_criteria(call):
+            # Filter by strategy criteria with detailed rejection tracking
+            rejection_reason = self._check_call_criteria_detailed(call)
+
+            if rejection_reason:
+                rejection_stats['total_rejected'] += 1
+                rejection_stats[rejection_reason] += 1
+
+                # Collect data for rejected calls
+                rejected_calls_data['premiums'].append(call['mid_price'])
+                rejected_calls_data['deltas'].append(abs(call.get('delta', 0)))
+                rejected_calls_data['dtes'].append(call['dte'])
+                rejected_calls_data['strikes'].append(call['strike_price'])
                 continue
-            
+
             # Calculate annualized return
             if call['dte'] > 0 and call['mid_price'] > 0:
                 annual_return = (call['mid_price'] / call['strike_price']) * (365 / call['dte'])
                 call['annual_return'] = annual_return
                 call['return_score'] = annual_return * (1 - abs(call.get('delta', 0)))  # Prefer lower delta
-                
+
                 suitable_calls.append(call)
-        
+
         # Sort by return score (higher is better)
         suitable_calls.sort(key=lambda x: x.get('return_score', 0), reverse=True)
-        
-        logger.info("Found suitable calls", 
-                   symbol=symbol, 
-                   total_calls=len(calls), 
-                   suitable_count=len(suitable_calls))
-        
+
+        if suitable_calls:
+            best_call = suitable_calls[0]
+            logger.info("STAGE 8 COMPLETE: Call options criteria - calls found",
+                       event_category="filtering",
+                       event_type="stage_8_complete_found",
+                       symbol=symbol,
+                       total_calls=len(calls),
+                       rejected=rejection_stats['total_rejected'],
+                       suitable_count=len(suitable_calls),
+                       best_call_strike=best_call['strike_price'],
+                       best_call_premium=best_call['mid_price'],
+                       best_call_dte=best_call['dte'],
+                       best_call_delta=best_call.get('delta', 0),
+                       # Detailed rejection breakdown
+                       rejected_below_cost_basis=rejection_stats['below_cost_basis'],
+                       rejected_dte_too_high=rejection_stats['dte_too_high'],
+                       rejected_premium_too_low=rejection_stats['premium_too_low'],
+                       rejected_delta_out_of_range=rejection_stats['delta_out_of_range'],
+                       rejected_no_liquidity=rejection_stats['no_liquidity'])
+        else:
+            # Calculate stats for rejected calls
+            avg_premium = sum(rejected_calls_data['premiums']) / len(rejected_calls_data['premiums']) if rejected_calls_data['premiums'] else 0
+            avg_delta = sum(rejected_calls_data['deltas']) / len(rejected_calls_data['deltas']) if rejected_calls_data['deltas'] else 0
+            max_premium = max(rejected_calls_data['premiums']) if rejected_calls_data['premiums'] else 0
+            min_dte = min(rejected_calls_data['dtes']) if rejected_calls_data['dtes'] else 0
+            max_dte = max(rejected_calls_data['dtes']) if rejected_calls_data['dtes'] else 0
+
+            logger.info("STAGE 8 COMPLETE: Call options criteria - NO suitable calls",
+                       event_category="filtering",
+                       event_type="stage_8_complete_not_found",
+                       symbol=symbol,
+                       total_calls=len(calls),
+                       rejected=rejection_stats['total_rejected'],
+                       reason="no_calls_met_criteria",
+                       # Detailed rejection breakdown
+                       rejected_below_cost_basis=rejection_stats['below_cost_basis'],
+                       rejected_dte_too_high=rejection_stats['dte_too_high'],
+                       rejected_premium_too_low=rejection_stats['premium_too_low'],
+                       rejected_delta_out_of_range=rejection_stats['delta_out_of_range'],
+                       rejected_no_liquidity=rejection_stats['no_liquidity'],
+                       # Stats on rejected calls
+                       rejected_avg_premium=round(avg_premium, 2),
+                       rejected_avg_delta=round(avg_delta, 4),
+                       rejected_max_premium=round(max_premium, 2),
+                       rejected_dte_range=f"{min_dte}-{max_dte}")
+
         return suitable_calls[:5]  # Return top 5
     
-    def _meets_put_criteria(self, put_option: Dict[str, Any]) -> bool:
-        """Check if put option meets wheel strategy criteria.
-        
+    def _check_put_criteria_detailed(self, put_option: Dict[str, Any]) -> Optional[str]:
+        """Check if put option meets criteria and return specific rejection reason.
+
         Args:
             put_option: Put option data
-            
+
         Returns:
-            True if option meets criteria
+            Rejection reason key if rejected, None if passes all criteria
         """
-        # DTE criteria - less than or equal to target
+        # DTE criteria - check first as it's most common
         max_dte = self.config.put_target_dte
-        
         if put_option['dte'] > max_dte:
-            return False
-        
+            return 'dte_too_high'
+
         # Premium criteria
         if put_option['mid_price'] < self.config.min_put_premium:
-            return False
-        
+            return 'premium_too_low'
+
         # Delta criteria
         delta = abs(put_option.get('delta', 0))
         delta_range = self.config.put_delta_range
-        
         if not (delta_range[0] <= delta <= delta_range[1]):
-            return False
-        
+            return 'delta_out_of_range'
+
         # Liquidity criteria (basic)
         if put_option['volume'] == 0 and put_option['open_interest'] < 10:
-            return False
-        
-        return True
-    
-    def _meets_call_criteria(self, call_option: Dict[str, Any]) -> bool:
-        """Check if call option meets wheel strategy criteria.
-        
+            return 'no_liquidity'
+
+        return None  # Passes all criteria
+
+    def _meets_put_criteria(self, put_option: Dict[str, Any]) -> bool:
+        """Check if put option meets wheel strategy criteria.
+
         Args:
-            call_option: Call option data
-            
+            put_option: Put option data
+
         Returns:
             True if option meets criteria
         """
-        # DTE criteria - less than or equal to target
+        # Use detailed checker
+        return self._check_put_criteria_detailed(put_option) is None
+
+    def _check_call_criteria_detailed(self, call_option: Dict[str, Any]) -> Optional[str]:
+        """Check if call option meets criteria and return specific rejection reason.
+
+        Args:
+            call_option: Call option data
+
+        Returns:
+            Rejection reason key if rejected, None if passes all criteria
+        """
+        # DTE criteria - check first as it's most common
         max_dte = self.config.call_target_dte
-        
         if call_option['dte'] > max_dte:
-            return False
-        
+            return 'dte_too_high'
+
         # Premium criteria
         if call_option['mid_price'] < self.config.min_call_premium:
-            return False
-        
+            return 'premium_too_low'
+
         # Delta criteria
         delta = abs(call_option.get('delta', 0))
         delta_range = self.config.call_delta_range
-        
         if not (delta_range[0] <= delta <= delta_range[1]):
-            return False
-        
+            return 'delta_out_of_range'
+
         # Liquidity criteria (basic)
         if call_option['volume'] == 0 and call_option['open_interest'] < 10:
-            return False
-        
-        return True
+            return 'no_liquidity'
+
+        return None  # Passes all criteria
+
+    def _meets_call_criteria(self, call_option: Dict[str, Any]) -> bool:
+        """Check if call option meets wheel strategy criteria.
+
+        Args:
+            call_option: Call option data
+
+        Returns:
+            True if option meets criteria
+        """
+        # Use detailed checker
+        return self._check_call_criteria_detailed(call_option) is None
