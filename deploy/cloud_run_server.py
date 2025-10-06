@@ -255,15 +255,30 @@ def trigger_strategy():
             opportunities_with_metrics.sort(key=lambda x: x['roi'], reverse=True)
 
             # Select opportunities that fit within buying power (greedy algorithm)
+            # IMPORTANT: Only one position per underlying stock (risk management rule)
             selected_opportunities = []
+            selected_underlyings = set()  # Track which stocks we've already selected
             remaining_bp = available_buying_power
 
             for item in opportunities_with_metrics:
+                underlying = item['opportunity'].get('symbol')
+
+                # Skip if we already have a position for this underlying
+                if underlying in selected_underlyings:
+                    logger.info("Skipping duplicate underlying in batch selection",
+                               symbol=underlying,
+                               collateral=item['collateral'],
+                               premium=item['premium'],
+                               roi=f"{item['roi']:.4f}",
+                               reason="already_selected_for_execution")
+                    continue
+
                 if item['collateral'] <= remaining_bp:
                     selected_opportunities.append(item['opportunity'])
+                    selected_underlyings.add(underlying)
                     remaining_bp -= item['collateral']
                     logger.info("Selected opportunity for batch execution",
-                               symbol=item['opportunity'].get('symbol'),
+                               symbol=underlying,
                                collateral=item['collateral'],
                                premium=item['premium'],
                                roi=f"{item['roi']:.4f}",
