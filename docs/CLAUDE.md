@@ -89,6 +89,25 @@ mypy src/                        # Type checking
 **Assignment Strategy**: Take assignment on puts (no stop losses), protect calls
 **Position Sizing**: Maximum 1 contract per new position, 10% portfolio allocation
 
+## Wheel Strategy Symmetry Principle
+
+**CRITICAL DEVELOPMENT RULE**: The options wheel has two phases that must be treated symmetrically:
+
+1. **Put Selling Phase** - Initial entry via `find_suitable_puts()` and `put_seller.py`
+2. **Call Selling Phase** - Position management via `find_suitable_calls()` and `call_seller.py`
+
+**When making changes to one side (puts OR calls), ALWAYS apply equivalent changes to the other side:**
+- Logging enhancements → Apply to both puts and calls
+- Filtering improvements → Apply to both puts and calls
+- Error handling → Apply to both puts and calls
+- Performance metrics → Apply to both puts and calls
+
+**Why**: The wheel is a complete lifecycle (sell put → assignment → sell call → called away → repeat). Both phases need equal observability, consistent logging, and symmetric filtering for effective debugging and analysis.
+
+**Key Files**:
+- Filtering: `src/api/market_data.py` (find_suitable_puts/calls, _check_put/call_criteria_detailed)
+- Execution: `src/strategy/put_seller.py` and `src/strategy/call_seller.py`
+
 ## Risk Management Philosophy
 
 **Puts**: No stop losses - designed to take assignment on quality stocks
