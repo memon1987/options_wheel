@@ -56,7 +56,7 @@ def trigger_scan():
     with strategy_lock:
         start_time = datetime.now()
         try:
-            logger.info("Triggering market scan")
+            # Removed duplicate - already logged below with log_system_event()
 
             # Log system event for scan trigger
             log_system_event(
@@ -77,15 +77,23 @@ def trigger_scan():
             scanner = OptionsScanner(alpaca_client, market_data, config)
 
             # Perform market scan
-            logger.info("Starting options market scan")
+            logger.info("Starting options market scan",
+                       event_category="system",
+                       event_type="market_scan_starting")
 
             # Scan for put opportunities
             put_opportunities = scanner.scan_for_put_opportunities()
-            logger.info("Put opportunities found", count=len(put_opportunities))
+            logger.info("Put opportunities found",
+                       event_category="system",
+                       event_type="put_scan_completed",
+                       count=len(put_opportunities))
 
             # Scan for call opportunities (if we have stock positions)
             call_opportunities = scanner.scan_for_call_opportunities()
-            logger.info("Call opportunities found", count=len(call_opportunities))
+            logger.info("Call opportunities found",
+                       event_category="system",
+                       event_type="call_scan_completed",
+                       count=len(call_opportunities))
 
             # Store opportunities for execution
             from src.data.opportunity_store import OpportunityStore
@@ -159,7 +167,7 @@ def trigger_strategy():
     with strategy_lock:
         start_time = datetime.now()
         try:
-            logger.info("Triggering strategy execution")
+            # Removed duplicate - already logged below with log_system_event()
 
             # Log system event for strategy trigger
             log_system_event(
@@ -185,6 +193,8 @@ def trigger_strategy():
 
             if not opportunities:
                 logger.info("No pending opportunities found for execution",
+                           event_category="system",
+                           event_type="no_opportunities_for_execution",
                            execution_time=start_time.isoformat())
 
                 log_system_event(
@@ -205,6 +215,8 @@ def trigger_strategy():
                 })
 
             logger.info("Retrieved opportunities for execution",
+                       event_category="system",
+                       event_type="opportunities_retrieved",
                        count=len(opportunities),
                        execution_time=start_time.isoformat())
 
@@ -216,6 +228,8 @@ def trigger_strategy():
             account_info = alpaca_client.get_account()
             available_buying_power = float(account_info.get('options_buying_power') or account_info['buying_power'])
             logger.info("Starting execution with buying power",
+                       event_category="system",
+                       event_type="execution_buying_power_check",
                        initial_buying_power=available_buying_power,
                        buying_power=account_info.get('buying_power'),
                        options_buying_power=account_info.get('options_buying_power'),
@@ -266,6 +280,8 @@ def trigger_strategy():
                 # Skip if we already have a position for this underlying
                 if underlying in selected_underlyings:
                     logger.info("Skipping duplicate underlying in batch selection",
+                               event_category="filtering",
+                               event_type="duplicate_underlying_skipped",
                                symbol=underlying,
                                collateral=item['collateral'],
                                premium=item['premium'],
@@ -278,6 +294,8 @@ def trigger_strategy():
                     selected_underlyings.add(underlying)
                     remaining_bp -= item['collateral']
                     logger.info("Selected opportunity for batch execution",
+                               event_category="system",
+                               event_type="opportunity_selected_for_execution",
                                symbol=underlying,
                                collateral=item['collateral'],
                                premium=item['premium'],
@@ -285,6 +303,8 @@ def trigger_strategy():
                                remaining_bp=remaining_bp)
 
             logger.info("Batch order selection complete",
+                       event_category="system",
+                       event_type="batch_selection_completed",
                        total_opportunities=len(opportunities),
                        selected_count=len(selected_opportunities),
                        initial_bp=available_buying_power,
@@ -305,6 +325,8 @@ def trigger_strategy():
                     }
                 except Exception as e:
                     logger.error("Exception during order execution",
+                                event_category="error",
+                                event_type="order_execution_exception",
                                 symbol=opp.get('symbol'),
                                 error=str(e))
                     return {
@@ -314,6 +336,8 @@ def trigger_strategy():
                     }
 
             logger.info("Submitting batch orders concurrently",
+                       event_category="system",
+                       event_type="batch_orders_submitting",
                        order_count=len(selected_opportunities))
 
             execution_results = []
@@ -369,6 +393,8 @@ def trigger_strategy():
                             )
                     except Exception as e:
                         logger.error("Error processing execution result",
+                                   event_category="error",
+                                   event_type="execution_result_processing_error",
                                    symbol=opp.get('symbol'),
                                    error=str(e))
 
@@ -420,7 +446,11 @@ def trigger_strategy():
 
         except Exception as e:
             error_msg = f"Strategy execution failed: {str(e)}"
-            logger.error(error_msg, error=str(e), traceback=traceback.format_exc())
+            logger.error(error_msg,
+                        event_category="error",
+                        event_type="strategy_execution_exception",
+                        error=str(e),
+                        traceback=traceback.format_exc())
             strategy_status['errors'].append({
                 'timestamp': datetime.now().isoformat(),
                 'error': error_msg
@@ -445,7 +475,11 @@ def get_account():
 
     except Exception as e:
         error_msg = f"Failed to get account info: {str(e)}"
-        logger.error(error_msg, error=str(e), traceback=traceback.format_exc())
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="account_info_failed",
+                    error=str(e),
+                    traceback=traceback.format_exc())
         return jsonify({'error': error_msg}), 500
 
 @app.route('/positions', methods=['GET'])
@@ -466,7 +500,11 @@ def get_positions():
 
     except Exception as e:
         error_msg = f"Failed to get positions: {str(e)}"
-        logger.error(error_msg, error=str(e), traceback=traceback.format_exc())
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="positions_fetch_failed",
+                    error=str(e),
+                    traceback=traceback.format_exc())
         return jsonify({'error': error_msg}), 500
 
 @app.route('/config', methods=['GET'])
@@ -490,7 +528,9 @@ def get_config():
 
     except Exception as e:
         error_msg = f"Config retrieval failed: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="config_retrieval_failed")
         return jsonify({'error': error_msg}), 500
 
 @app.route('/health')
@@ -533,7 +573,9 @@ def detailed_health():
 def run_backtest():
     """Run a backtesting analysis."""
     try:
-        logger.info("Starting backtest analysis")
+        logger.info("Starting backtest analysis",
+                   event_category="backtest",
+                   event_type="backtest_analysis_started")
 
         # Parse request parameters
         data = request.get_json() or {}
@@ -575,14 +617,22 @@ def run_backtest():
             performance_analyzer = None  # Will be instantiated with results after backtest
 
         except ImportError as e:
-            logger.error("Backtesting import error", error=str(e), traceback=traceback.format_exc())
+            logger.error("Backtesting import error",
+                        event_category="error",
+                        event_type="backtest_import_error",
+                        error=str(e),
+                        traceback=traceback.format_exc())
             return jsonify({
                 'error': f'Backtesting components not available: {str(e)}',
                 'suggestion': 'This might be expected in a minimal deployment',
                 'traceback': traceback.format_exc()
             }), 503
         except Exception as e:
-            logger.error("Backtesting initialization error", error=str(e), traceback=traceback.format_exc())
+            logger.error("Backtesting initialization error",
+                        event_category="error",
+                        event_type="backtest_initialization_error",
+                        error=str(e),
+                        traceback=traceback.format_exc())
             return jsonify({
                 'error': f'Backtesting initialization failed: {str(e)}',
                 'traceback': traceback.format_exc()
@@ -603,7 +653,10 @@ def run_backtest():
                 symbol, start_date, end_date, strategy_params, backtest_id
             )
 
-        logger.info("Backtest completed successfully", backtest_id=backtest_id)
+        logger.info("Backtest completed successfully",
+                   event_category="backtest",
+                   event_type="backtest_completed",
+                   backtest_id=backtest_id)
 
         return jsonify({
             'backtest_id': backtest_id,
@@ -621,7 +674,11 @@ def run_backtest():
 
     except Exception as e:
         error_msg = f"Backtest failed: {str(e)}"
-        logger.error("Backtest execution failed", error=error_msg, traceback=traceback.format_exc())
+        logger.error("Backtest execution failed",
+                    event_category="error",
+                    event_type="backtest_execution_failed",
+                    error=error_msg,
+                    traceback=traceback.format_exc())
 
         return jsonify({
             'error': error_msg,
@@ -632,6 +689,8 @@ def run_quick_backtest(backtest_engine, performance_analyzer, symbol, start_date
     """Run a quick backtest with real historical data."""
     try:
         logger.info("Running quick backtest with real engine",
+                   event_category="backtest",
+                   event_type="quick_backtest_started",
                    symbol=symbol,
                    start_date=start_date.date(),
                    end_date=end_date.date())
@@ -667,7 +726,11 @@ def run_quick_backtest(backtest_engine, performance_analyzer, symbol, start_date
         }
 
     except Exception as e:
-        logger.error("Quick backtest failed", error=str(e), traceback=traceback.format_exc())
+        logger.error("Quick backtest failed",
+                    event_category="error",
+                    event_type="quick_backtest_failed",
+                    error=str(e),
+                    traceback=traceback.format_exc())
         # Return error with details
         return {
             'error': str(e),
@@ -679,6 +742,8 @@ def run_full_backtest(backtest_engine, performance_analyzer, symbol, start_date,
     """Run a comprehensive backtest with full analysis and detailed trade history."""
     try:
         logger.info("Running comprehensive backtest with real engine",
+                   event_category="backtest",
+                   event_type="comprehensive_backtest_started",
                    symbol=symbol,
                    start_date=start_date.date(),
                    end_date=end_date.date())
@@ -727,7 +792,11 @@ def run_full_backtest(backtest_engine, performance_analyzer, symbol, start_date,
         return base_results
 
     except Exception as e:
-        logger.error("Comprehensive backtest failed", error=str(e), traceback=traceback.format_exc())
+        logger.error("Comprehensive backtest failed",
+                    event_category="error",
+                    event_type="comprehensive_backtest_failed",
+                    error=str(e),
+                    traceback=traceback.format_exc())
         return {
             'error': str(e),
             'analysis_type': 'comprehensive_real_data_failed',
@@ -814,7 +883,9 @@ def get_backtest_results(backtest_id):
 
     except Exception as e:
         error_msg = f"Failed to retrieve backtest results: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="backtest_results_retrieval_failed")
         return jsonify({'error': error_msg}), 500
 
 @app.route('/backtest/history')
@@ -844,7 +915,9 @@ def get_backtest_history():
 
     except Exception as e:
         error_msg = f"Failed to retrieve backtest history: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="backtest_history_retrieval_failed")
         return jsonify({'error': error_msg}), 500
 
 @app.route('/backtest/performance-comparison', methods=['POST'])
@@ -889,7 +962,9 @@ def performance_comparison():
 
     except Exception as e:
         error_msg = f"Performance comparison failed: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="performance_comparison_failed")
         return jsonify({'error': error_msg}), 500
 
 @app.route('/cache/stats')
@@ -917,7 +992,9 @@ def get_cache_stats():
 
     except Exception as e:
         error_msg = f"Failed to get cache stats: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="cache_stats_failed")
         return jsonify({'error': error_msg}), 500
 
 @app.route('/cache/cleanup', methods=['POST'])
@@ -948,7 +1025,9 @@ def cleanup_cache():
 
     except Exception as e:
         error_msg = f"Cache cleanup failed: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="cache_cleanup_failed")
         return jsonify({'error': error_msg}), 500
 
 # ============================================================================
@@ -984,7 +1063,9 @@ def performance_dashboard():
 
     except Exception as e:
         error_msg = f"Dashboard generation failed: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="dashboard_generation_failed")
         return jsonify({'error': error_msg}), 500
 
 @app.route('/dashboard/alerts')
@@ -1017,7 +1098,9 @@ def get_active_alerts():
 
     except Exception as e:
         error_msg = f"Alert check failed: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="alert_check_failed")
         return jsonify({'error': error_msg}), 500
 
 @app.route('/dashboard/metrics/export')
@@ -1046,7 +1129,9 @@ def export_metrics():
 
     except Exception as e:
         error_msg = f"Metrics export failed: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="metrics_export_failed")
         return jsonify({'error': error_msg}), 500
 
 @app.route('/dashboard/health')
@@ -1082,7 +1167,9 @@ def system_health_check():
 
     except Exception as e:
         error_msg = f"Health check failed: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="health_check_failed")
         return jsonify({'error': error_msg}), 500
 
 @app.route('/dashboard/trends')
@@ -1112,7 +1199,9 @@ def get_performance_trends():
 
     except Exception as e:
         error_msg = f"Trend analysis failed: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg,
+                    event_category="error",
+                    event_type="trend_analysis_failed")
         return jsonify({'error': error_msg}), 500
 
 @app.route('/backtest/trades/<backtest_id>')
@@ -1199,7 +1288,9 @@ def get_detailed_trades(backtest_id):
         return jsonify(trade_analysis)
 
     except Exception as e:
-        logger.error(f"Failed to get detailed trades: {str(e)}")
+        logger.error(f"Failed to get detailed trades: {str(e)}",
+                    event_category="error",
+                    event_type="detailed_trades_fetch_failed")
         return jsonify({'error': f'Failed to get trades: {str(e)}'}), 500
 
 @app.route('/backtest/analytics/<backtest_id>')
@@ -1286,7 +1377,9 @@ def get_backtest_analytics(backtest_id):
         return jsonify(analytics)
 
     except Exception as e:
-        logger.error(f"Failed to get backtest analytics: {str(e)}")
+        logger.error(f"Failed to get backtest analytics: {str(e)}",
+                    event_category="error",
+                    event_type="backtest_analytics_fetch_failed")
         return jsonify({'error': f'Failed to get analytics: {str(e)}'}), 500
 
 def setup_logging():
@@ -1326,14 +1419,22 @@ if __name__ == '__main__':
     # Get port from environment (Cloud Run sets this)
     port = int(os.environ.get('PORT', 8080))
 
-    logger.info("Starting Options Wheel Strategy Cloud Run server", port=port)
+    logger.info("Starting Options Wheel Strategy Cloud Run server",
+               event_category="system",
+               event_type="server_starting",
+               port=port)
 
     # Initialize configuration to verify everything works
     try:
         config = Config()
-        logger.info("Configuration loaded successfully")
+        logger.info("Configuration loaded successfully",
+                   event_category="system",
+                   event_type="config_loaded")
     except Exception as e:
-        logger.error("Failed to load configuration", error=str(e))
+        logger.error("Failed to load configuration",
+                    event_category="error",
+                    event_type="config_load_failed",
+                    error=str(e))
 
     # Run the Flask app
     app.run(
