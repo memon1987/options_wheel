@@ -18,7 +18,7 @@ logger = structlog.get_logger(__name__)
 
 class WheelEngine:
     """Main engine for executing options wheel strategy."""
-    
+
     def __init__(self, config: Config):
         """Initialize the wheel strategy engine.
 
@@ -33,6 +33,9 @@ class WheelEngine:
         self.call_seller = CallSeller(self.alpaca, self.market_data, config)
         self.wheel_state = WheelStateManager()
 
+        # Track pending orders within current execution cycle to prevent duplicates
+        self._pending_underlyings = set()
+
         logger.info("Wheel engine initialized with state management")
     
     def run_strategy_cycle(self) -> Dict[str, Any]:
@@ -43,6 +46,9 @@ class WheelEngine:
         """
         start_time = datetime.now()
         logger.info("Starting strategy cycle")
+
+        # Clear pending underlyings from previous cycle
+        self._pending_underlyings.clear()
 
         cycle_summary = {
             'timestamp': start_time.isoformat(),
@@ -416,24 +422,82 @@ class WheelEngine:
     def _has_existing_option_position(self, underlying_symbol: str) -> bool:
         """Check if we already have option positions in a given underlying stock.
 
+        This checks THREE sources to prevent duplicate positions:
+        1. Pending orders in current execution cycle (tracked locally)
+        2. Open/pending orders from Alpaca API (not yet filled)
+        3. Filled positions from Alpaca API
+
         Args:
             underlying_symbol: Stock symbol to check
 
         Returns:
-            True if we have existing option positions
+            True if we have existing option positions OR pending/open orders
         """
         try:
+            # Check 1: Pending order in current cycle (local tracking)
+            if underlying_symbol in self._pending_underlyings:
+                logger.info("STAGE 6: Existing position check BLOCKED - pending order in current cycle",
+                           event_category="filtering",
+                           event_type="stage_6_blocked",
+                           symbol=underlying_symbol,
+                           reason="pending_order_in_current_cycle")
+                return True
+
+            # Check 2: Open/pending orders from Alpaca API
+            # This catches orders that were placed but not yet filled (race condition fix)
+            try:
+                open_orders = self.alpaca.get_orders(status='open')
+                pending_orders = self.alpaca.get_orders(status='pending_new')
+                all_pending = open_orders + pending_orders
+
+                # Check if any pending orders are for options on this underlying
+                for order in all_pending:
+                    # Option symbols contain the underlying (e.g., AMD251017P00207500 contains AMD)
+                    if underlying_symbol in order['symbol']:
+                        logger.info("STAGE 6: Existing position check BLOCKED - open order exists",
+                                   event_category="filtering",
+                                   event_type="stage_6_blocked",
+                                   symbol=underlying_symbol,
+                                   reason="open_order_exists",
+                                   order_id=order['order_id'],
+                                   order_status=order['status'],
+                                   order_symbol=order['symbol'])
+                        return True
+            except Exception as order_error:
+                logger.warning("Failed to check open orders, continuing to position check",
+                             symbol=underlying_symbol,
+                             error=str(order_error))
+
+            # Check 3: Filled positions from Alpaca
             positions = self.alpaca.get_positions()
 
             # Check for option positions on this underlying
             option_positions = [p for p in positions
                               if p['asset_class'] == 'us_option' and underlying_symbol in p['symbol']]
 
-            return len(option_positions) > 0
+            has_filled_position = len(option_positions) > 0
+
+            if has_filled_position:
+                logger.info("STAGE 6: Existing position check BLOCKED - filled position exists",
+                           event_category="filtering",
+                           event_type="stage_6_blocked",
+                           symbol=underlying_symbol,
+                           reason="filled_position_exists",
+                           position_count=len(option_positions))
+                return True
+
+            # No existing positions or orders found - safe to proceed
+            logger.info("STAGE 6: Existing position check PASSED - no positions or orders",
+                       event_category="filtering",
+                       event_type="stage_6_passed",
+                       symbol=underlying_symbol)
+            return False
 
         except Exception as e:
             logger.error("Failed to check existing option positions",
-                        symbol=underlying_symbol, error=str(e))
+                        event_category="error",
+                        symbol=underlying_symbol,
+                        error=str(e))
             return True  # Be conservative and assume we have positions
     
     def get_strategy_status(self) -> Dict[str, Any]:
