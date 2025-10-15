@@ -457,6 +457,156 @@ def trigger_strategy():
             })
             return jsonify({'error': error_msg}), 500
 
+@app.route('/monitor', methods=['POST'])
+def monitor_positions():
+    """Monitor existing positions and close profitable ones."""
+    with strategy_lock:
+        start_time = datetime.now()
+        try:
+            log_system_event(
+                logger,
+                event_type="position_monitoring_triggered",
+                status="starting"
+            )
+
+            # Initialize trading components
+            config = Config()
+
+            from src.api.alpaca_client import AlpacaClient
+            from src.api.market_data import MarketDataManager
+            from src.strategy.put_seller import PutSeller
+            from src.strategy.call_seller import CallSeller
+
+            alpaca_client = AlpacaClient(config)
+            market_data = MarketDataManager(alpaca_client, config)
+            put_seller = PutSeller(alpaca_client, market_data, config)
+            call_seller = CallSeller(alpaca_client, market_data, config)
+
+            # Get current positions
+            positions = alpaca_client.get_positions()
+            option_positions = [p for p in positions if p.get('asset_class') == 'us_option']
+
+            logger.info("Monitoring positions for early close",
+                       event_category="system",
+                       event_type="position_monitoring_started",
+                       total_positions=len(positions),
+                       option_positions=len(option_positions))
+
+            closed_positions = []
+            errors = []
+
+            # Evaluate each option position
+            for position in option_positions:
+                try:
+                    symbol = position['symbol']
+                    qty = int(position['qty'])
+
+                    # Determine if it's a put or call
+                    is_put = 'P' in symbol
+                    is_call = 'C' in symbol
+
+                    # Check if position should be closed early
+                    should_close = False
+
+                    if is_put:
+                        should_close = put_seller.should_close_put_early(position)
+                        position_type = 'PUT'
+                    elif is_call:
+                        should_close = call_seller.should_close_call_early(position)
+                        position_type = 'CALL'
+                    else:
+                        logger.warning("Unknown option type", symbol=symbol)
+                        continue
+
+                    if should_close:
+                        logger.info("Position reached profit target - closing",
+                                   event_category="execution",
+                                   event_type="early_close_triggered",
+                                   symbol=symbol,
+                                   type=position_type,
+                                   unrealized_pl=position.get('unrealized_pl'),
+                                   market_value=position.get('market_value'))
+
+                        # Place buy-to-close order
+                        close_result = alpaca_client.place_option_order(
+                            symbol=symbol,
+                            qty=abs(qty),
+                            side='buy',
+                            order_type='market'
+                        )
+
+                        closed_positions.append({
+                            'symbol': symbol,
+                            'type': position_type,
+                            'qty': abs(qty),
+                            'unrealized_pl': float(position.get('unrealized_pl', 0)),
+                            'close_result': close_result
+                        })
+
+                        logger.info("Position closed successfully",
+                                   event_category="execution",
+                                   event_type="position_closed_early",
+                                   symbol=symbol,
+                                   type=position_type,
+                                   unrealized_pl=position.get('unrealized_pl'),
+                                   order_id=close_result.get('order_id'))
+
+                except Exception as pos_error:
+                    error_msg = f"Failed to evaluate position {position.get('symbol')}: {str(pos_error)}"
+                    logger.error("Position monitoring error",
+                                event_category="error",
+                                event_type="position_monitoring_error",
+                                symbol=position.get('symbol'),
+                                error=str(pos_error))
+                    errors.append(error_msg)
+
+            # Calculate monitoring duration
+            duration_seconds = (datetime.now() - start_time).total_seconds()
+
+            # Log completion
+            log_system_event(
+                logger,
+                event_type="position_monitoring_completed",
+                status="completed",
+                duration_seconds=duration_seconds,
+                positions_evaluated=len(option_positions),
+                positions_closed=len(closed_positions),
+                errors=len(errors)
+            )
+
+            # Update global status
+            strategy_status['last_monitor'] = datetime.now().isoformat()
+            strategy_status['status'] = 'monitor_completed'
+
+            return jsonify({
+                'message': 'Position monitoring completed',
+                'timestamp': datetime.now().isoformat(),
+                'results': {
+                    'positions_evaluated': len(option_positions),
+                    'positions_closed': len(closed_positions),
+                    'closed_positions': closed_positions,
+                    'errors': errors
+                }
+            })
+
+        except Exception as e:
+            error_msg = f"Position monitoring failed: {str(e)}"
+            logger.error("Position monitoring exception",
+                        event_category="error",
+                        event_type="position_monitoring_exception",
+                        error=str(e),
+                        traceback=traceback.format_exc())
+
+            log_system_event(
+                logger,
+                event_type="position_monitoring_failed",
+                status="error",
+                error=str(e),
+                duration_seconds=(datetime.now() - start_time).total_seconds()
+            )
+
+            return jsonify({'error': error_msg}), 500
+
 @app.route('/account', methods=['GET'])
 def get_account():
     """Get Alpaca account information."""
