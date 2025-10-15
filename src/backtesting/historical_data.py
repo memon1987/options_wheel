@@ -78,14 +78,15 @@ class HistoricalDataManager:
         try:
             logger.info("Fetching stock data", symbol=symbol, start=start_date, end=end_date)
 
-            # Note: No need for feed parameter or delay buffer in backtesting
-            # Backtests query historical data (old dates), not recent SIP data
-            # SIP feed is default and provides best quality historical data for free
+            # Use IEX feed for backtesting to avoid SIP subscription requirements
+            # IEX provides free historical data without needing paid SIP access
+            # This matches the hybrid approach used in live trading
             request = StockBarsRequest(
                 symbol_or_symbols=[symbol],
                 timeframe=timeframe,
                 start=start_date,
-                end=end_date
+                end=end_date,
+                feed='iex'  # Free IEX feed for historical data
             )
 
             bars = self.stock_client.get_stock_bars(request)
@@ -156,14 +157,15 @@ class HistoricalDataManager:
                 symbols = [opt['symbol'] for opt in batch]
                 
                 try:
-                    # Request historical bars for this batch
+                    # Request historical bars for this batch using IEX feed
                     bars_request = OptionBarsRequest(
                         symbol_or_symbols=symbols,
                         timeframe=TimeFrame.Day,
                         start=date,
-                        end=date + timedelta(days=1)
+                        end=date + timedelta(days=1),
+                        feed='iex'  # Free IEX feed for historical data
                     )
-                    
+
                     bars_response = self.option_client.get_option_bars(bars_request)
                     
                     if hasattr(bars_response, 'df') and not bars_response.df.empty:
@@ -393,14 +395,15 @@ class HistoricalDataManager:
         
         try:
             logger.info("Fetching option data", symbol=option_symbol)
-            
+
             request = OptionBarsRequest(
                 symbol_or_symbols=[option_symbol],
                 timeframe=TimeFrame.Day,
                 start=start_date,
-                end=end_date
+                end=end_date,
+                feed='iex'  # Free IEX feed for historical data
             )
-            
+
             bars = self.option_client.get_option_bars(request)
             df = bars.df
             
