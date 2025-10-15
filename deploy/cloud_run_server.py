@@ -18,7 +18,7 @@ import sys
 sys.path.append('/app/src')
 
 from src.utils.config import Config
-from src.utils.logging_events import log_system_event, log_performance_metric, log_error_event
+from src.utils.logging_events import log_system_event, log_performance_metric, log_error_event, log_trade_event
 
 logger = structlog.get_logger(__name__)
 
@@ -527,6 +527,13 @@ def monitor_positions():
                                    unrealized_pl=position.get('unrealized_pl'),
                                    market_value=position.get('market_value'))
 
+                        # Extract underlying symbol from option symbol
+                        # Option symbols format: AMD251017P00330000
+                        # Extract underlying by removing date and option details
+                        import re
+                        underlying_match = re.match(r'^([A-Z]+)', symbol)
+                        underlying = underlying_match.group(1) if underlying_match else symbol[:symbol.find('2') if '2' in symbol else len(symbol)]
+
                         # Place buy-to-close order
                         close_result = alpaca_client.place_option_order(
                             symbol=symbol,
@@ -535,20 +542,46 @@ def monitor_positions():
                             order_type='market'
                         )
 
+                        # Calculate profit/loss percentage
+                        unrealized_pl = float(position.get('unrealized_pl', 0))
+                        market_value = abs(float(position.get('market_value', 0)))
+                        profit_pct = (unrealized_pl / market_value * 100) if market_value > 0 else 0
+
                         closed_positions.append({
                             'symbol': symbol,
                             'type': position_type,
                             'qty': abs(qty),
-                            'unrealized_pl': float(position.get('unrealized_pl', 0)),
+                            'unrealized_pl': unrealized_pl,
+                            'profit_pct': profit_pct,
                             'close_result': close_result
                         })
+
+                        # Log trade event for BigQuery analytics
+                        log_trade_event(
+                            logger,
+                            event_type="early_close_executed",
+                            symbol=symbol,
+                            strategy=f"close_{position_type.lower()}",
+                            success=close_result.get('success', True),
+                            underlying=underlying,
+                            option_type=position_type,
+                            contracts=abs(qty),
+                            unrealized_pl=unrealized_pl,
+                            profit_pct=round(profit_pct, 2),
+                            order_id=close_result.get('order_id'),
+                            reason="profit_target_reached",
+                            market_value=market_value,
+                            entry_price=float(position.get('avg_entry_price', 0)),
+                            exit_price=float(position.get('current_price', 0))
+                        )
 
                         logger.info("Position closed successfully",
                                    event_category="execution",
                                    event_type="position_closed_early",
                                    symbol=symbol,
                                    type=position_type,
-                                   unrealized_pl=position.get('unrealized_pl'),
+                                   unrealized_pl=unrealized_pl,
+                                   profit_pct=round(profit_pct, 2),
                                    order_id=close_result.get('order_id'))
 
                 except Exception as pos_error:
