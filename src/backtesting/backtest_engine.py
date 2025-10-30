@@ -162,7 +162,7 @@ class BacktestEngine:
         logger.info("Starting backtest",
                    start=self.backtest_config.start_date,
                    end=self.backtest_config.end_date,
-                   symbols=self.backtest_config.symbols)
+                   symbols=",".join(self.backtest_config.symbols))
 
         # Enhanced logging for backtest start
         log_backtest_event(
