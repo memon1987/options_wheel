@@ -192,9 +192,40 @@ class Config:
     
     @property
     def profit_target_percent(self) -> float:
-        """Profit target percentage for early closure."""
+        """Profit target percentage for early closure (legacy - use profit_taking config instead)."""
         return self._config["risk"]["profit_target_percent"]
-    
+
+    # Profit Taking Configuration (Dynamic DTE-based)
+    @property
+    def use_dynamic_profit_target(self) -> bool:
+        """Whether to use dynamic DTE-based profit targets."""
+        return self._config["risk"]["profit_taking"]["use_dynamic_profit_target"]
+
+    @property
+    def profit_taking_static_target(self) -> float:
+        """Fallback static profit target when dynamic is disabled."""
+        return self._config["risk"]["profit_taking"]["static_profit_target"]
+
+    @property
+    def profit_taking_dte_bands(self) -> List[Dict[str, Any]]:
+        """DTE-based profit target bands."""
+        return self._config["risk"]["profit_taking"]["dte_bands"]
+
+    @property
+    def profit_taking_min_target(self) -> float:
+        """Minimum profit target (safety bound)."""
+        return self._config["risk"]["profit_taking"]["min_profit_target"]
+
+    @property
+    def profit_taking_max_target(self) -> float:
+        """Maximum profit target (safety bound)."""
+        return self._config["risk"]["profit_taking"]["max_profit_target"]
+
+    @property
+    def profit_taking_default_long_dte(self) -> float:
+        """Default profit target for DTE > 7."""
+        return self._config["risk"]["profit_taking"]["default_long_dte_target"]
+
     # Stock Universe
     @property
     def stock_symbols(self) -> List[str]:

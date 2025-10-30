@@ -310,36 +310,133 @@ class CallSeller:
             logger.error("Failed to evaluate call assignment", error=str(e))
             return {'assignment_risk': 'unknown'}
     
+    def _parse_dte_from_option_symbol(self, option_symbol: str) -> int:
+        """
+        Extract DTE (Days to Expiration) from option symbol.
+
+        Option symbol format: AMD251031C00350000
+                              ^^^YYMMDD = 251031 = 2025-10-31
+
+        Args:
+            option_symbol: Option symbol string
+
+        Returns:
+            Days to expiration (0-N), or 7 as fallback if parse fails
+        """
+        try:
+            import re
+            from datetime import datetime, timezone
+
+            # Extract date portion (6 digits after ticker, before P/C)
+            match = re.search(r'(\d{6})[PC]', option_symbol)
+            if not match:
+                logger.warning("Could not parse expiration date from option symbol",
+                              symbol=option_symbol)
+                return 7  # Default fallback
+
+            date_str = match.group(1)
+
+            # Parse YYMMDD format
+            year = 2000 + int(date_str[0:2])
+            month = int(date_str[2:4])
+            day = int(date_str[4:6])
+
+            exp_date = datetime(year, month, day, tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+
+            dte = (exp_date.date() - now.date()).days
+
+            return max(0, dte)  # Never negative
+
+        except Exception as e:
+            logger.error("Failed to parse DTE from option symbol",
+                        symbol=option_symbol,
+                        error=str(e))
+            return 7  # Default fallback
+
+    def _get_profit_target_for_dte(self, dte: int) -> float:
+        """
+        Get profit target based on DTE using configured bands.
+
+        Args:
+            dte: Days to expiration
+
+        Returns:
+            Profit target percentage (0.0-1.0)
+        """
+        # If dynamic profit targets disabled, use static target
+        if not self.config.use_dynamic_profit_target:
+            return self.config.profit_taking_static_target
+
+        # Find matching DTE band
+        for band in self.config.profit_taking_dte_bands:
+            if band['dte'] == dte:
+                target = band['profit_target']
+
+                logger.debug("Using DTE band profit target",
+                            dte=dte,
+                            target=f"{target*100:.0f}%",
+                            description=band.get('description', ''))
+
+                # Apply safety bounds
+                return max(
+                    self.config.profit_taking_min_target,
+                    min(target, self.config.profit_taking_max_target)
+                )
+
+        # No exact match - check if long-dated (DTE > 7)
+        if dte > 7:
+            target = self.config.profit_taking_default_long_dte
+            logger.debug("Using long DTE default profit target",
+                        dte=dte,
+                        target=f"{target*100:.0f}%")
+            return target
+
+        # Fallback to static target
+        logger.warning("No DTE band found, using static profit target",
+                      dte=dte,
+                      static_target=f"{self.config.profit_taking_static_target*100:.0f}%")
+        return self.config.profit_taking_static_target
+
     def should_close_call_early(self, call_position: Dict[str, Any], current_option_data: Dict[str, Any] = None) -> bool:
         """Determine if a short call should be closed early for profit or stop loss.
-        
+
+        Uses dynamic DTE-based profit targets optimized for theta decay curves.
+
         Args:
             call_position: Short call position details
-            current_option_data: Current option market data with delta, etc.
-            
+            current_option_data: Current option market data with delta, etc. (unused in Phase 1)
+
         Returns:
             True if position should be closed early
         """
         try:
             unrealized_pl = float(call_position['unrealized_pl'])
             position_value = abs(float(call_position['market_value']))
-            
-            # Profit target: If we've captured target % of the premium, consider closing
+
+            # Profit target: Dynamic based on DTE (theta-optimized)
             if unrealized_pl > 0 and position_value > 0:
                 profit_percentage = unrealized_pl / position_value
-                
-                if profit_percentage >= self.config.profit_target_percent:
-                    logger.info("Call position reached profit target", 
-                               symbol=call_position['symbol'],
-                               profit_pct=profit_percentage)
+
+                # Get dynamic profit target based on DTE
+                option_symbol = call_position['symbol']
+                dte = self._parse_dte_from_option_symbol(option_symbol)
+                profit_target = self._get_profit_target_for_dte(dte)
+
+                if profit_percentage >= profit_target:
+                    logger.info("Call position reached dynamic profit target",
+                               symbol=option_symbol,
+                               dte=dte,
+                               profit_pct=f"{profit_percentage*100:.1f}%",
+                               target_pct=f"{profit_target*100:.1f}%")
                     return True
-            
+
             # Stop loss logic for short-term options (enabled for calls)
             if self.config.use_call_stop_loss and unrealized_pl < 0:
                 return self._check_call_stop_loss(call_position, current_option_data)
-            
+
             return False
-            
+
         except Exception as e:
             logger.error("Failed to evaluate early close", error=str(e))
             return False

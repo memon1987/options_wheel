@@ -63,8 +63,58 @@ risk:
   call_stop_loss_percent: 0.50    # Call stop loss threshold
   stop_loss_multiplier: 1.5       # Multiplier for short-term options (accounts for time decay)
   
-  # Profit taking settings
-  profit_target_percent: 0.50     # 50% profit target for early closure
+  # Profit taking settings - Dynamic DTE-based targets
+  profit_taking:
+    # Enable dynamic DTE-based profit targets (vs static 50%)
+    use_dynamic_profit_target: true
+
+    # Fallback to this if dynamic is disabled or DTE cannot be determined
+    static_profit_target: 0.50
+
+    # DTE-based profit target bands (optimized for 7 DTE options)
+    # EASILY TUNABLE - just edit these percentages and redeploy
+    dte_bands:
+      - dte: 7
+        profit_target: 0.20
+        description: "Day 0: Just opened, 3% daily theta (slow decay)"
+
+      - dte: 6
+        profit_target: 0.25
+        description: "Day 1: 5% daily theta (still slow, exit if profitable)"
+
+      - dte: 5
+        profit_target: 0.30
+        description: "Day 2: 6% daily theta (moderate decay)"
+
+      - dte: 4
+        profit_target: 0.40
+        description: "Day 3: 8% daily theta (acceleration begins)"
+
+      - dte: 3
+        profit_target: 0.50
+        description: "Day 4: 9% daily theta (inflection point)"
+
+      - dte: 2
+        profit_target: 0.60
+        description: "Day 5: 12% daily theta (rapid decay zone)"
+
+      - dte: 1
+        profit_target: 0.70
+        description: "Day 6: 17% daily theta (extreme decay, peak theta)"
+
+      - dte: 0
+        profit_target: 0.80
+        description: "Day 7: Expiration day (close by 3:45pm ET to avoid risk)"
+
+    # Safety bounds (prevent extreme targets)
+    min_profit_target: 0.15   # Never exit below 15% profit
+    max_profit_target: 0.85   # Never wait beyond 85% profit
+
+    # Default for DTE > 7 (if ever selling longer-dated options)
+    default_long_dte_target: 0.20
+
+  # Legacy profit target (deprecated - use profit_taking.static_profit_target instead)
+  profit_target_percent: 0.50
   
   # Volatility filters
   max_iv_rank: 80                 # Maximum implied volatility rank
