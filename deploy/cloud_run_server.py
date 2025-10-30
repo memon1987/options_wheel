@@ -310,93 +310,76 @@ def trigger_strategy():
                        initial_bp=available_buying_power,
                        bp_to_use=available_buying_power - remaining_bp)
 
-            # Execute all selected orders concurrently using ThreadPoolExecutor
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            # Execute orders SEQUENTIALLY (not concurrently) to prevent race conditions
+            # BUG FIX (Oct 2025): Concurrent execution was causing buying power race conditions.
+            # When the first trade consumed BP, subsequent concurrent trades didn't know about it
+            # and would fail with "insufficient buying power" errors (84.5% failure rate).
+            # Sequential execution with real-time BP checks prevents this race condition.
 
-            def execute_single_order(opp):
-                """Execute a single order and return result with opportunity info."""
+            logger.info("Executing batch orders sequentially",
+                       event_category="system",
+                       event_type="batch_orders_executing",
+                       order_count=len(selected_opportunities))
+
+            execution_results = []
+            trades_executed = 0
+
+            # Execute each order sequentially with real-time buying power validation
+            for opp in selected_opportunities:
                 try:
-                    # Execute the trade (skip buying power check since we already validated)
-                    result = put_seller.execute_put_sale(opp, skip_buying_power_check=True)
-                    return {
+                    # Execute with buying power check (DO NOT skip - prevents race conditions)
+                    # Each order will check current buying power before executing
+                    result = put_seller.execute_put_sale(opp, skip_buying_power_check=False)
+
+                    execution_data = {
                         'opportunity': opp,
                         'result': result,
                         'success': result and result.get('success', False)
                     }
+                    execution_results.append(execution_data)
+
+                    if execution_data['success']:
+                        trades_executed += 1
+
+                        # Log successful trade
+                        # Convert UUID to string if present
+                        order_id = result.get('order_id')
+                        if order_id is not None:
+                            order_id = str(order_id)
+
+                        log_system_event(
+                            logger,
+                            event_type="trade_executed",
+                            status="success",
+                            symbol=opp.get('symbol'),
+                            option_symbol=opp.get('option_symbol'),
+                            contracts=opp.get('contracts'),
+                            premium=opp.get('premium'),
+                            strike_price=opp.get('strike_price'),
+                            order_id=order_id
+                        )
+                    else:
+                        # Log failed trade
+                        log_error_event(
+                            logger,
+                            error_type="trade_execution_failed",
+                            error_message=result.get('message', 'Unknown error'),
+                            component="execution_engine",
+                            recoverable=True,
+                            symbol=opp.get('symbol'),
+                            option_symbol=opp.get('option_symbol')
+                        )
                 except Exception as e:
                     logger.error("Exception during order execution",
                                 event_category="error",
                                 event_type="order_execution_exception",
                                 symbol=opp.get('symbol'),
                                 error=str(e))
-                    return {
+                    execution_results.append({
                         'opportunity': opp,
                         'result': {'success': False, 'message': str(e)},
                         'success': False
-                    }
-
-            logger.info("Submitting batch orders concurrently",
-                       event_category="system",
-                       event_type="batch_orders_submitting",
-                       order_count=len(selected_opportunities))
-
-            execution_results = []
-            trades_executed = 0
-
-            # Submit all orders concurrently
-            with ThreadPoolExecutor(max_workers=min(10, len(selected_opportunities))) as executor:
-                # Submit all orders
-                future_to_opp = {
-                    executor.submit(execute_single_order, opp): opp
-                    for opp in selected_opportunities
-                }
-
-                # Process results as they complete
-                for future in as_completed(future_to_opp):
-                    opp = future_to_opp[future]
-                    try:
-                        execution_data = future.result()
-                        execution_results.append(execution_data)
-
-                        if execution_data['success']:
-                            trades_executed += 1
-                            result = execution_data['result']
-
-                            # Log successful trade
-                            # Convert UUID to string if present
-                            order_id = result.get('order_id')
-                            if order_id is not None:
-                                order_id = str(order_id)
-
-                            log_system_event(
-                                logger,
-                                event_type="trade_executed",
-                                status="success",
-                                symbol=opp.get('symbol'),
-                                option_symbol=opp.get('option_symbol'),
-                                contracts=opp.get('contracts'),
-                                premium=opp.get('premium'),
-                                strike_price=opp.get('strike_price'),
-                                order_id=order_id
-                            )
-                        else:
-                            # Log failed trade
-                            result = execution_data['result']
-                            log_error_event(
-                                logger,
-                                error_type="trade_execution_failed",
-                                error_message=result.get('message', 'Unknown error'),
-                                component="execution_engine",
-                                recoverable=True,
-                                symbol=opp.get('symbol'),
-                                option_symbol=opp.get('option_symbol')
-                            )
-                    except Exception as e:
-                        logger.error("Error processing execution result",
-                                   event_category="error",
-                                   event_type="execution_result_processing_error",
-                                   symbol=opp.get('symbol'),
-                                   error=str(e))
+                    })
 
             # Mark opportunities as executed in Cloud Storage
             opportunity_store.mark_executed(
