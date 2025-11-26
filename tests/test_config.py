@@ -120,14 +120,15 @@ class TestConfig:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
             yaml.dump(self.test_config_data, f)
             config_path = f.name
-        
+
         try:
-            config = Config(config_path)
-            
-            assert config.get('alpaca.paper_trading') == True
-            assert config.get('strategy.put_target_dte') == 7
-            assert config.get('nonexistent.key', 'default') == 'default'
-            assert config.get('strategy.nonexistent', 42) == 42
+            with patch.dict(os.environ, {'TEST_API_KEY': 'test_key', 'TEST_SECRET_KEY': 'test_secret'}):
+                config = Config(config_path)
+
+                assert config.get('alpaca.paper_trading') == True
+                assert config.get('strategy.put_target_dte') == 7
+                assert config.get('nonexistent.key', 'default') == 'default'
+                assert config.get('strategy.nonexistent', 42) == 42
         finally:
             os.unlink(config_path)
     
