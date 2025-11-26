@@ -25,14 +25,28 @@ logger = structlog.get_logger(__name__)
 
 @dataclass
 class BacktestConfig:
-    """Configuration for backtesting."""
+    """Configuration for backtesting.
+
+    Note on Look-Ahead Bias:
+        This backtester uses historical realized volatility to estimate option prices
+        when actual historical option data is unavailable. In live trading, options
+        are priced using implied volatility (IV) which may differ significantly from
+        realized volatility. This limitation means:
+        - Premium estimates may be optimistic during low-IV periods
+        - Premium estimates may be pessimistic during high-IV regimes
+        - Results should be interpreted as directional indicators, not exact predictions
+
+        For more accurate backtesting, consider using historical option price data
+        from a vendor like CBOE or OptionMetrics.
+    """
     start_date: datetime
     end_date: datetime
     initial_capital: float = 100000.0
     symbols: List[str] = field(default_factory=lambda: ['AAPL', 'MSFT', 'GOOGL'])
     commission_per_contract: float = 1.00
     slippage_bps: int = 5  # Basis points of slippage
-    
+    risk_free_rate: float = 0.05  # Annual risk-free rate for Sharpe ratio calculation
+
     # Strategy parameters (can override config.yaml)
     put_target_dte: Optional[int] = None
     call_target_dte: Optional[int] = None
@@ -1703,11 +1717,14 @@ class BacktestEngine:
         portfolio_df['drawdown'] = (portfolio_df['total_value'] - portfolio_df['cummax']) / portfolio_df['cummax']
         max_drawdown = portfolio_df['drawdown'].min()
         
-        # Sharpe ratio
+        # Sharpe ratio (using configurable risk-free rate)
+        # Formula: (annualized_return - risk_free_rate) / annualized_volatility
         portfolio_df['daily_return'] = portfolio_df['total_value'].pct_change()
         daily_returns = portfolio_df['daily_return'].dropna()
         if len(daily_returns) > 0 and daily_returns.std() > 0:
-            sharpe_ratio = (daily_returns.mean() * 252) / (daily_returns.std() * np.sqrt(252))
+            daily_rf_rate = self.backtest_config.risk_free_rate / 252  # Daily risk-free rate
+            excess_returns = daily_returns - daily_rf_rate
+            sharpe_ratio = (excess_returns.mean() * 252) / (daily_returns.std() * np.sqrt(252))
         else:
             sharpe_ratio = 0.0
         
