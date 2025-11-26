@@ -245,15 +245,28 @@ class PortfolioTracker:
             else:
                 annualized_return = 0
             
-            # Calculate volatility (if we have enough data points)
+            # Calculate volatility and Sharpe ratio (if we have enough data points)
             if len(recent_snapshots) >= 10:
                 values = [s['account']['portfolio_value'] for s in recent_snapshots]
+                # Calculate daily returns in decimal form
                 returns = [((values[i] - values[i-1]) / values[i-1]) for i in range(1, len(values)) if values[i-1] > 0]
-                
+
                 if returns:
                     import numpy as np
-                    volatility = np.std(returns) * np.sqrt(365) * 100  # Annualized volatility
-                    sharpe_ratio = annualized_return / volatility if volatility > 0 else 0
+                    # Keep volatility in decimal form for Sharpe calculation
+                    daily_volatility = np.std(returns)
+                    annualized_volatility_decimal = daily_volatility * np.sqrt(365)
+                    volatility = annualized_volatility_decimal * 100  # Convert to percentage for display
+
+                    # Sharpe ratio: (annualized return - risk-free rate) / annualized volatility
+                    # Both in decimal form for correct calculation
+                    # Assume 5% risk-free rate
+                    risk_free_rate = 0.05
+                    annualized_return_decimal = annualized_return / 100
+                    if annualized_volatility_decimal > 0:
+                        sharpe_ratio = (annualized_return_decimal - risk_free_rate) / annualized_volatility_decimal
+                    else:
+                        sharpe_ratio = 0
                 else:
                     volatility = 0
                     sharpe_ratio = 0

@@ -89,10 +89,15 @@ class PositionSizer:
                 max_loss = total_capital_required - total_premium_income  # If stock goes to 0
                 max_return_percent = (total_premium_income / total_capital_required) * 100
                 
-                # Calculate annual return estimate
+                # Calculate annual return estimate using compound formula
+                # Correct annualization: (1 + r)^(365/dte) - 1
                 dte = put_option.get('dte', 30)
-                if dte > 0:
-                    annualized_return = (total_premium_income / total_capital_required) * (365 / dte) * 100
+                if dte > 0 and total_capital_required > 0:
+                    period_return = total_premium_income / total_capital_required
+                    # Compound annualization (corrected formula)
+                    annualized_return = ((1 + period_return) ** (365 / dte) - 1) * 100
+                    # Cap at reasonable maximum (500% annualized)
+                    annualized_return = min(annualized_return, 500)
                 else:
                     annualized_return = 0
             else:
@@ -186,10 +191,15 @@ class PositionSizer:
                 return_percent_if_called = 0
                 premium_return_percent = 0
             
-            # Annual return estimate
+            # Annual return estimate using compound formula
+            # Correct annualization: (1 + r)^(365/dte) - 1
             dte = call_option.get('dte', 30)
-            if dte > 0:
-                annualized_premium_return = premium_return_percent * (365 / dte)
+            if dte > 0 and premium_return_percent > 0:
+                period_return = premium_return_percent / 100  # Convert to decimal
+                # Compound annualization (corrected formula)
+                annualized_premium_return = ((1 + period_return) ** (365 / dte) - 1) * 100
+                # Cap at reasonable maximum (500% annualized)
+                annualized_premium_return = min(annualized_premium_return, 500)
             else:
                 annualized_premium_return = 0
             

@@ -230,6 +230,15 @@ class MarketDataManager:
         }
 
         for put in puts:
+            # First validate option data integrity
+            is_valid, validation_reason = self._validate_option_data(put)
+            if not is_valid:
+                rejection_stats['total_rejected'] += 1
+                logger.debug("Put option failed data validation",
+                            symbol=put.get('symbol', 'unknown'),
+                            reason=validation_reason)
+                continue
+
             # Filter by strategy criteria with detailed rejection tracking
             rejection_reason = self._check_put_criteria_detailed(put)
 
@@ -351,6 +360,15 @@ class MarketDataManager:
         }
 
         for call in calls:
+            # First validate option data integrity
+            is_valid, validation_reason = self._validate_option_data(call)
+            if not is_valid:
+                rejection_stats['total_rejected'] += 1
+                logger.debug("Call option failed data validation",
+                            symbol=call.get('symbol', 'unknown'),
+                            reason=validation_reason)
+                continue
+
             # CRITICAL: Cost basis protection - never sell calls below cost basis
             if min_strike_price > 0 and call['strike_price'] < min_strike_price:
                 rejection_stats['total_rejected'] += 1
@@ -433,7 +451,49 @@ class MarketDataManager:
                        rejected_dte_range=f"{min_dte}-{max_dte}")
 
         return suitable_calls[:5]  # Return top 5
-    
+
+    def _validate_option_data(self, option: Dict[str, Any]) -> tuple:
+        """Validate option data before processing.
+
+        Args:
+            option: Option data dictionary
+
+        Returns:
+            Tuple of (is_valid: bool, reason: str)
+        """
+        # Check required quote fields exist
+        bid = option.get('bid')
+        ask = option.get('ask')
+
+        if bid is None or ask is None:
+            return False, "missing_quotes"
+
+        # Validate quote values are sensible
+        if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)):
+            return False, "invalid_quote_type"
+
+        if bid < 0 or ask < 0:
+            return False, "negative_quotes"
+
+        if bid > ask:
+            return False, "inverted_spread"
+
+        # Check delta exists (critical for options trading)
+        delta = option.get('delta')
+        if delta is None:
+            return False, "missing_delta"
+
+        # Check DTE is valid
+        dte = option.get('dte')
+        if dte is None or dte < 0:
+            return False, "invalid_dte"
+
+        # Check volume/open_interest exist (for liquidity assessment)
+        if option.get('volume') is None or option.get('open_interest') is None:
+            return False, "missing_liquidity_data"
+
+        return True, "valid"
+
     def _check_put_criteria_detailed(self, put_option: Dict[str, Any]) -> Optional[str]:
         """Check if put option meets criteria and return specific rejection reason.
 

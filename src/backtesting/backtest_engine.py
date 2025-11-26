@@ -699,6 +699,36 @@ class BacktestEngine:
         for position in positions_to_close:
             self._close_position(position, date, 'early_close')
     
+    def _get_profit_target_for_dte(self, dte: int) -> float:
+        """Get profit target based on DTE using configured bands.
+
+        Args:
+            dte: Days to expiration
+
+        Returns:
+            Profit target percentage (0.0-1.0)
+        """
+        # If dynamic profit targets disabled, use static target
+        if not self.config.use_dynamic_profit_target:
+            return self.config.profit_taking_static_target
+
+        # Find matching DTE band
+        for band in self.config.profit_taking_dte_bands:
+            if band['dte'] == dte:
+                target = band['profit_target']
+                # Apply safety bounds
+                return max(
+                    self.config.profit_taking_min_target,
+                    min(target, self.config.profit_taking_max_target)
+                )
+
+        # No exact match - check if long-dated (DTE > 7)
+        if dte > 7:
+            return self.config.profit_taking_default_long_dte
+
+        # Fallback to static target
+        return self.config.profit_taking_static_target
+
     def _should_close_position(self, position: Dict, date: datetime) -> bool:
         """Determine if position should be closed early."""
         try:
@@ -706,28 +736,35 @@ class BacktestEngine:
             current_price = position['current_price']
             option_type = position['type']
             quantity = position['quantity']
-            
+
             if quantity >= 0:  # Long position (shouldn't happen in wheel)
                 return False
-            
+
             # For short positions, profit is when option price decreases
             unrealized_pnl = (entry_price - current_price) * abs(quantity) * 100
             position_value = entry_price * abs(quantity) * 100
-            
+
             if position_value > 0:
                 profit_pct = unrealized_pnl / position_value
-                
-                # Profit target
-                if profit_pct >= self.config.profit_target_percent:
+
+                # Dynamic profit target based on DTE (matches live trading logic)
+                expiration = position.get('expiration')
+                if expiration:
+                    dte = (expiration - date.date()).days if hasattr(expiration, '__sub__') else 7
+                else:
+                    dte = 7  # Default fallback
+
+                profit_target = self._get_profit_target_for_dte(dte)
+                if profit_pct >= profit_target:
                     return True
-                
+
                 # Stop loss (only for calls in our strategy)
                 if option_type == 'CALL' and self.config.use_call_stop_loss:
                     loss_pct = -profit_pct
                     threshold = self.config.call_stop_loss_percent * self.config.stop_loss_multiplier
                     if loss_pct >= threshold:
                         return True
-            
+
             return False
             
         except Exception as e:
@@ -1425,20 +1462,40 @@ class BacktestEngine:
         return False
     
     def _calculate_at_risk_capital(self) -> float:
-        """Calculate total at-risk capital (cash secured for puts + stock positions)."""
+        """Calculate total at-risk capital (cash secured for puts + stock positions).
+
+        Note: This avoids double-counting by tracking symbols that have stock positions.
+        If a put was assigned, the stock position represents the capital at risk,
+        not the original put collateral.
+        """
         at_risk_capital = 0.0
-        
+
+        # Track symbols with stock positions to avoid double-counting
+        symbols_with_stock = set()
+
         # Add stock positions value (capital tied up in assigned shares)
         for pos in self.portfolio.stock_positions:
             at_risk_capital += pos['market_value']
-        
+            # Track this symbol as having stock
+            symbol = pos.get('underlying', pos.get('symbol'))
+            if symbol:
+                symbols_with_stock.add(symbol)
+
         # Add cash secured for active short put positions
+        # BUT skip puts for symbols where we already have stock (would be double-counting)
         for pos in self.portfolio.option_positions:
             if pos['type'] == 'PUT' and pos['quantity'] < 0:  # Short put position
+                underlying = pos.get('underlying')
+                # Skip if we already have stock for this symbol
+                if underlying in symbols_with_stock:
+                    continue
                 # Cash secured = strike price * 100 * number of contracts
+                # Subtract premium received as it reduces max loss
                 cash_secured = pos['strike'] * 100 * abs(pos['quantity'])
-                at_risk_capital += cash_secured
-        
+                premium_received = pos.get('entry_price', 0) * 100 * abs(pos['quantity'])
+                max_loss = max(0, cash_secured - premium_received)
+                at_risk_capital += max_loss
+
         return at_risk_capital
     
     def _calculate_current_exposure(self, symbol: str) -> float:
