@@ -408,37 +408,38 @@ class PutSeller:
     
     def evaluate_put_assignment(self, put_position: Dict[str, Any]) -> Dict[str, Any]:
         """Evaluate if a short put position might get assigned.
-        
+
         Args:
             put_position: Short put position details
-            
+
         Returns:
             Assignment evaluation
         """
         try:
-            # Extract underlying symbol from option symbol
-            # This would need proper parsing based on option symbol format
-            underlying_symbol = put_position['symbol'].split()[0]  # Simplified extraction
-            
+            option_symbol = put_position['symbol']
+
+            # Parse option symbol: format AMD251031P00330000
+            # Extract underlying (letters before date), strike (last 8 digits / 1000)
+            underlying_symbol, strike_price, dte = self._parse_option_symbol(option_symbol)
+
             # Get current stock price
             stock_metrics = self.market_data.get_stock_metrics(underlying_symbol)
             current_price = stock_metrics.get('current_price', 0)
-            
-            # Extract strike price (this would need proper option symbol parsing)
-            strike_price = 0  # Would extract from option symbol or position data
-            
+
+            # Calculate assignment risk based on moneyness
             assignment_risk = "low"
-            if current_price <= strike_price * 1.02:  # Within 2% of strike
-                assignment_risk = "high"
-            elif current_price <= strike_price * 1.05:  # Within 5% of strike
-                assignment_risk = "medium"
-            
+            if strike_price > 0 and current_price > 0:
+                if current_price <= strike_price * 1.02:  # Within 2% of strike (ITM or near)
+                    assignment_risk = "high"
+                elif current_price <= strike_price * 1.05:  # Within 5% of strike
+                    assignment_risk = "medium"
+
             return {
                 'symbol': underlying_symbol,
                 'current_price': current_price,
                 'strike_price': strike_price,
                 'assignment_risk': assignment_risk,
-                'days_to_expiration': 0,  # Would calculate from expiration date
+                'days_to_expiration': dte,
                 'position_value': float(put_position['market_value'])
             }
             
@@ -496,6 +497,61 @@ class PutSeller:
                         symbol=option_symbol,
                         error=str(e))
             return 7  # Default fallback
+
+    def _parse_option_symbol(self, option_symbol: str) -> tuple:
+        """
+        Parse option symbol to extract underlying, strike, and DTE.
+
+        Option symbol format: AMD251031P00330000
+        - Underlying: AMD (letters before date)
+        - Date: 251031 (YYMMDD)
+        - Type: P (Put) or C (Call)
+        - Strike: 00330000 (last 8 digits / 1000 = $330.00)
+
+        Args:
+            option_symbol: Full option symbol
+
+        Returns:
+            Tuple of (underlying_symbol, strike_price, dte)
+        """
+        import re
+        from datetime import datetime, timezone
+
+        try:
+            # Extract underlying symbol (letters at start)
+            underlying_match = re.match(r'^([A-Z]+)', option_symbol)
+            underlying = underlying_match.group(1) if underlying_match else option_symbol[:3]
+
+            # Extract date portion (6 digits after ticker, before P/C)
+            date_match = re.search(r'(\d{6})[PC]', option_symbol)
+            if date_match:
+                date_str = date_match.group(1)
+                year = 2000 + int(date_str[0:2])
+                month = int(date_str[2:4])
+                day = int(date_str[4:6])
+                exp_date = datetime(year, month, day, tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                dte = max(0, (exp_date.date() - now.date()).days)
+            else:
+                dte = 7  # Default fallback
+
+            # Extract strike price (last 8 digits / 1000)
+            strike_match = re.search(r'[PC](\d{8})$', option_symbol)
+            if strike_match:
+                strike_price = float(strike_match.group(1)) / 1000.0
+            else:
+                strike_price = 0
+
+            return underlying, strike_price, dte
+
+        except Exception as e:
+            logger.debug("Failed to parse option symbol",
+                        event_category="data",
+                        event_type="option_symbol_parse_debug",
+                        symbol=option_symbol,
+                        error=str(e))
+            # Return safe defaults
+            return option_symbol[:3] if len(option_symbol) >= 3 else option_symbol, 0, 7
 
     def _get_profit_target_for_dte(self, dte: int) -> float:
         """

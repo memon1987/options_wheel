@@ -219,7 +219,7 @@ class OptionsScanner:
             delta = abs(put_option.get('delta', 0))
             
             # Calculate returns
-            if dte > 0:
+            if dte > 0 and strike > 0:
                 annual_return = (premium / strike) * (365 / dte) * 100
             else:
                 annual_return = 0
@@ -287,7 +287,7 @@ class OptionsScanner:
         try:
             symbol = stock_position['symbol']
             shares_owned = int(float(stock_position['qty']))
-            cost_basis_per_share = float(stock_position['cost_basis']) / shares_owned
+            cost_basis_per_share = float(stock_position['cost_basis']) / shares_owned if shares_owned > 0 else 0
             
             # Get current stock price
             stock_metrics = self.market_data.get_stock_metrics(symbol)
@@ -402,8 +402,10 @@ class OptionsScanner:
             
             # Delta component (20 points max) - prefer 0.15-0.25 delta
             target_delta = 0.20
-            delta_penalty = abs(delta - target_delta) * 100  # Penalty for deviation
-            delta_score = max(0, 20 - delta_penalty)
+            # Ensure delta is in valid range [0, 1]
+            delta_capped = max(0, min(1, delta))
+            delta_penalty = abs(delta_capped - target_delta) * 100  # Penalty for deviation
+            delta_score = max(0, min(20, 20 - delta_penalty))  # Cap between 0 and 20
             score += delta_score
             
             # OTM component (15 points max) - prefer 5-15% OTM
@@ -458,10 +460,12 @@ class OptionsScanner:
             
             # Delta component (20 points max) - prefer 0.15-0.25 delta
             target_delta = 0.20
-            delta_penalty = abs(delta - target_delta) * 100
-            delta_score = max(0, 20 - delta_penalty)
+            # Ensure delta is in valid range [0, 1]
+            delta_capped = max(0, min(1, delta))
+            delta_penalty = abs(delta_capped - target_delta) * 100
+            delta_score = max(0, min(20, 20 - delta_penalty))  # Cap between 0 and 20
             score += delta_score
-            
+
             # OTM component (15 points max) - prefer 2-10% OTM
             if 2 <= otm_percentage <= 10:
                 otm_score = 15

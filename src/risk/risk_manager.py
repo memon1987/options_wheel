@@ -42,7 +42,7 @@ class RiskManager:
             else:  # sell_call
                 capital_required = 0  # Covered call doesn't require additional capital
             
-            if capital_required > 0:
+            if capital_required > 0 and portfolio_value > 0:
                 position_allocation = capital_required / portfolio_value
                 if position_allocation > self.config.max_position_size:
                     return False, f"Position allocation {position_allocation:.2%} exceeds limit {self.config.max_position_size:.2%}"

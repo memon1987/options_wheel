@@ -405,10 +405,17 @@ class AlpacaClient:
             order_list = []
             for order in orders:
                 if status is None or order.status.value.lower() == status.lower():
+                    qty = int(order.qty)
+                    filled_qty = int(order.filled_qty) if order.filled_qty else 0
+                    is_partial_fill = filled_qty > 0 and filled_qty < qty
+
                     order_list.append({
                         'order_id': order.id,
                         'symbol': order.symbol,
-                        'qty': int(order.qty),
+                        'qty': qty,
+                        'filled_qty': filled_qty,
+                        'remaining_qty': qty - filled_qty,
+                        'is_partial_fill': is_partial_fill,
                         'side': order.side.value,
                         'status': order.status.value,
                         'order_type': order.order_type.value,
