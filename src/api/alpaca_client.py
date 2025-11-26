@@ -92,7 +92,34 @@ class AlpacaClient:
                         event_type="positions_error",
                         error=str(e))
             raise
-    
+
+    def get_option_positions(self) -> List[Dict[str, Any]]:
+        """Get all current option positions.
+
+        Filters positions to only return US options (excluding stock positions).
+        Used for idempotency checks to prevent duplicate option trades.
+
+        Returns:
+            List of option position dictionaries
+        """
+        try:
+            positions = self.get_positions()
+            option_positions = [
+                p for p in positions
+                if p.get('asset_class') == AssetClass.US_OPTION
+            ]
+            logger.debug("Retrieved option positions",
+                        event_category="system",
+                        event_type="option_positions_retrieved",
+                        count=len(option_positions))
+            return option_positions
+        except Exception as e:
+            logger.error("Failed to get option positions",
+                        event_category="error",
+                        event_type="option_positions_error",
+                        error=str(e))
+            raise
+
     # Market Data
     def get_stock_quote(self, symbol: str) -> Dict[str, Any]:
         """Get latest stock quote using IEX feed for real-time data.

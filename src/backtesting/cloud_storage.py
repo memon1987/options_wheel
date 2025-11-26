@@ -4,7 +4,7 @@ import json
 import pickle
 import gzip
 from typing import Dict, List, Optional, Any, Union
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pandas as pd
 import structlog
@@ -193,7 +193,7 @@ class CloudStorageCache:
                 'start_date': start_date.isoformat(),
                 'end_date': end_date.isoformat(),
                 'timeframe': timeframe,
-                'cached_at': datetime.now().isoformat()
+                'cached_at': datetime.now(timezone.utc).isoformat()
             }
 
             # Compress data
@@ -306,7 +306,7 @@ class CloudStorageCache:
                 'underlying': underlying,
                 'date': date.isoformat(),
                 'max_dte': max_dte,
-                'cached_at': datetime.now().isoformat()
+                'cached_at': datetime.now(timezone.utc).isoformat()
             }
 
             compressed_data = gzip.compress(pickle.dumps(cache_data))
@@ -387,7 +387,7 @@ class CloudStorageCache:
         Returns:
             Dictionary with cleanup statistics
         """
-        cutoff_date = datetime.now() - timedelta(days=days_old)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_old)
         stats = {'local_deleted': 0, 'cloud_deleted': 0}
 
         # Clean local cache
@@ -496,7 +496,7 @@ class CloudStorageCache:
                     if not any(r['backtest_id'] == backtest_id for r in results):
                         results.append({
                             'backtest_id': backtest_id,
-                            'created': datetime.fromtimestamp(json_file.stat().st_mtime).isoformat(),
+                            'created': datetime.fromtimestamp(json_file.stat().st_mtime, tz=timezone.utc).isoformat(),
                             'size_kb': round(json_file.stat().st_size / 1024, 2),
                             'storage': 'local'
                         })

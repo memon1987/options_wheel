@@ -703,6 +703,7 @@ class CallSeller:
                 logger,
                 event_type="call_assignment",
                 symbol=symbol,
+                position_status="assigned",
                 position_type="call",
                 action="assignment",
                 shares=shares_assigned,
