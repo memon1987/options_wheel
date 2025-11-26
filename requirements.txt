@@ -66,8 +66,9 @@ yfinance>=0.2.18
 # Memory profiling (development)
 memory-profiler>=0.61.0
 
-# API rate limiting
+# API rate limiting and retry logic
 ratelimit>=2.2.1
+tenacity>=8.2.0
 
 # Time series analysis
 ta-lib>=0.4.28;platform_system!="Windows"

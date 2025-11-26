@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 import pandas as pd
 import structlog
+from functools import wraps
 
 from alpaca.trading.client import TradingClient
 from alpaca.data import OptionHistoricalDataClient, StockHistoricalDataClient
@@ -12,9 +13,79 @@ from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
 from alpaca.data.requests import StockLatestQuoteRequest, OptionChainRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+    RetryError
+)
+import requests.exceptions
+
 from ..utils.config import Config
 
 logger = structlog.get_logger(__name__)
+
+
+def is_rate_limit_error(exception: Exception) -> bool:
+    """Check if exception is a rate limit error (HTTP 429)."""
+    error_str = str(exception).lower()
+    return '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str
+
+
+def is_retryable_error(exception: Exception) -> bool:
+    """Check if exception is retryable (network issues, timeouts, rate limits)."""
+    error_str = str(exception).lower()
+    retryable_patterns = [
+        'timeout', 'connection', 'network', '429', 'rate limit',
+        'too many requests', 'service unavailable', '503', '502', '504'
+    ]
+    return any(pattern in error_str for pattern in retryable_patterns)
+
+
+def api_retry(func):
+    """Decorator to add retry logic with exponential backoff for API calls.
+
+    Retries on:
+    - Network timeouts and connection errors
+    - Rate limit errors (429)
+    - Service unavailable (503, 502, 504)
+
+    Does NOT retry on:
+    - Authentication errors
+    - Invalid request errors
+    - Business logic errors (insufficient funds, invalid symbol)
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=30),
+            retry=retry_if_exception_type((
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                ConnectionError,
+                TimeoutError
+            )) | (lambda e: is_retryable_error(e)),
+            before_sleep=before_sleep_log(logger, log_level=20),  # INFO level
+            reraise=True
+        )
+        def inner():
+            return func(*args, **kwargs)
+
+        try:
+            return inner()
+        except RetryError as e:
+            # Log final failure after all retries exhausted
+            logger.error("API call failed after all retries",
+                        event_category="error",
+                        event_type="api_retry_exhausted",
+                        function=func.__name__,
+                        error=str(e.last_attempt.exception()) if e.last_attempt else str(e))
+            raise e.last_attempt.exception() if e.last_attempt else e
+
+    return wrapper
 
 
 class AlpacaClient:
@@ -51,6 +122,7 @@ class AlpacaClient:
                    paper_trading=config.paper_trading)
     
     # Account Information
+    @api_retry
     def get_account(self) -> Dict[str, Any]:
         """Get account information."""
         try:
@@ -70,6 +142,7 @@ class AlpacaClient:
                         error=str(e))
             raise
     
+    @api_retry
     def get_positions(self) -> List[Dict[str, Any]]:
         """Get all current positions."""
         try:
@@ -121,6 +194,7 @@ class AlpacaClient:
             raise
 
     # Market Data
+    @api_retry
     def get_stock_quote(self, symbol: str) -> Dict[str, Any]:
         """Get latest stock quote using IEX feed for real-time data.
 
@@ -158,6 +232,7 @@ class AlpacaClient:
                         error=str(e))
             raise
     
+    @api_retry
     def get_stock_bars(self, symbol: str, days: int = 30) -> pd.DataFrame:
         """Get historical stock bars using SIP feed with 15-min delay buffer.
 
@@ -216,6 +291,7 @@ class AlpacaClient:
                         error=str(e))
             raise
     
+    @api_retry
     def get_options_chain(self, underlying_symbol: str) -> List[Dict[str, Any]]:
         """Get options chain for a stock.
 
@@ -417,12 +493,13 @@ class AlpacaClient:
                 'side': side
             }
     
+    @api_retry
     def get_orders(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get order history.
-        
+
         Args:
             status: Filter by order status
-            
+
         Returns:
             List of orders
         """

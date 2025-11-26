@@ -78,13 +78,37 @@ class GapDetector:
                 'analysis_date': analysis_date
             }
 
+        except (KeyError, IndexError, ValueError) as e:
+            # Data-related errors - log as warning, use conservative defaults
+            logger.warning("Gap analysis data error, using conservative defaults",
+                          event_category="data",
+                          event_type="gap_analysis_data_error",
+                          symbol=symbol,
+                          error=str(e),
+                          error_type=type(e).__name__)
+            return {
+                'gap_risk_score': 1.0,
+                'suitable_for_trading': False,
+                'error': str(e),
+                'error_type': 'data_error'
+            }
         except Exception as e:
-            logger.error("Failed to analyze gap risk",
-                        event_category="error",
-                        event_type="gap_risk_analysis_error",
-                        symbol=symbol,
-                        error=str(e))
-            return {'gap_risk_score': 1.0, 'suitable_for_trading': False}
+            # Unexpected errors - log as error, block trading (conservative)
+            log_error_event(
+                logger,
+                error_type="gap_risk_analysis_failed",
+                error_message=str(e),
+                component="gap_detector",
+                recoverable=True,
+                symbol=symbol,
+                fallback_behavior="trading_blocked_conservative"
+            )
+            return {
+                'gap_risk_score': 1.0,
+                'suitable_for_trading': False,
+                'error': str(e),
+                'error_type': 'unexpected_error'
+            }
 
     def _calculate_overnight_gaps(self, df: pd.DataFrame) -> Dict:
         """Calculate overnight gap statistics from historical data.

@@ -247,56 +247,117 @@ class PositionSizer:
         return adjustment
     
     def _calculate_kelly_sizing(self, option: Dict[str, Any], portfolio_value: float) -> int:
-        """Calculate Kelly optimal position size.
-        
+        """Calculate Kelly optimal position size with safety guards.
+
+        Uses fractional Kelly (25% of full Kelly) with additional caps to prevent
+        dangerous position sizes from edge cases in the formula.
+
         Args:
             option: Option details
             portfolio_value: Total portfolio value
-            
+
         Returns:
-            Optimal number of contracts
+            Optimal number of contracts (minimum 1, capped by safety limits)
         """
+        # Safety constants
+        MAX_KELLY_FRACTION = 0.15  # Never exceed 15% of portfolio regardless of Kelly output
+        MAX_CONTRACTS_PER_POSITION = 10  # Hard cap on contracts per position
+        MIN_PORTFOLIO_VALUE = 10000  # Don't apply Kelly for small portfolios
+
         try:
-            # Simplified Kelly criterion for options
-            # This assumes some probability estimates - in practice, these would be
-            # derived from historical data or more sophisticated models
-            
-            premium = option['mid_price']
-            strike = option['strike_price']
-            
+            # Validate inputs
+            if portfolio_value <= 0 or portfolio_value < MIN_PORTFOLIO_VALUE:
+                logger.debug("Portfolio too small for Kelly sizing",
+                            event_category="risk",
+                            event_type="kelly_sizing_skip",
+                            portfolio_value=portfolio_value,
+                            minimum=MIN_PORTFOLIO_VALUE)
+                return 1
+
+            premium = option.get('mid_price', 0)
+            strike = option.get('strike_price', 0)
+
+            # Input validation - must have positive values
+            if premium <= 0 or strike <= 0:
+                logger.warning("Invalid option data for Kelly sizing",
+                             event_category="risk",
+                             event_type="kelly_invalid_input",
+                             premium=premium,
+                             strike=strike)
+                return 1
+
             # Rough probability estimates (these should be calibrated with real data)
             # Assume 70% probability of profit for 0.20 delta options
             prob_profit = 0.70
             prob_loss = 1 - prob_profit
-            
+
             # Win/loss amounts per contract
             max_win = premium * 100  # Premium collected
             max_loss = (strike * 100) - (premium * 100)  # Strike minus premium
-            
+
+            # Safety check: max_loss must be positive and material
             if max_loss <= 0:
-                return 1  # Conservative fallback
-            
+                logger.warning("Non-positive max loss in Kelly calculation",
+                             event_category="risk",
+                             event_type="kelly_invalid_loss",
+                             max_loss=max_loss)
+                return 1
+
             # Kelly formula: f = (bp - q) / b
             # where b = odds received, p = probability of win, q = probability of loss
             b = max_win / max_loss  # Reward to risk ratio
-            
+
             if b <= 0:
                 return 1
-            
+
             kelly_fraction = (b * prob_profit - prob_loss) / b
-            
-            # Be very conservative with Kelly - use 25% of Kelly recommendation
-            conservative_kelly_fraction = max(0, kelly_fraction * 0.25)
-            
+
+            # Apply multiple safety layers:
+            # 1. Ensure non-negative
+            kelly_fraction = max(0, kelly_fraction)
+
+            # 2. Use fractional Kelly (25% of full Kelly)
+            conservative_kelly_fraction = kelly_fraction * 0.25
+
+            # 3. Cap at MAX_KELLY_FRACTION (15% of portfolio)
+            conservative_kelly_fraction = min(conservative_kelly_fraction, MAX_KELLY_FRACTION)
+
             # Convert to number of contracts
             capital_per_contract = strike * 100
+
+            if capital_per_contract <= 0:
+                return 1
+
             kelly_capital = portfolio_value * conservative_kelly_fraction
             kelly_contracts = int(kelly_capital // capital_per_contract)
-            
-            return max(1, kelly_contracts)
-            
+
+            # Apply hard cap
+            kelly_contracts = min(kelly_contracts, MAX_CONTRACTS_PER_POSITION)
+
+            # Minimum of 1 contract if any allocation
+            result = max(1, kelly_contracts) if kelly_contracts > 0 else 1
+
+            logger.debug("Kelly sizing calculated",
+                        event_category="risk",
+                        event_type="kelly_sizing_result",
+                        raw_kelly=round(kelly_fraction, 4),
+                        conservative_kelly=round(conservative_kelly_fraction, 4),
+                        contracts=result)
+
+            return result
+
+        except (ZeroDivisionError, ValueError) as e:
+            logger.warning("Kelly sizing calculation error",
+                          event_category="risk",
+                          event_type="kelly_calculation_error",
+                          error=str(e),
+                          error_type=type(e).__name__)
+            return 1  # Conservative fallback
         except Exception as e:
-            logger.error("Kelly sizing calculation failed", error=str(e))
+            logger.error("Kelly sizing calculation failed",
+                        event_category="error",
+                        event_type="kelly_sizing_error",
+                        error=str(e))
             return 1  # Conservative fallback
     
     def validate_position_size(self, 
