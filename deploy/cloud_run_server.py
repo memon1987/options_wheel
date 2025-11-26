@@ -220,6 +220,46 @@ def trigger_strategy():
                        count=len(opportunities),
                        execution_time=start_time.isoformat())
 
+            # IDEMPOTENCY CHECK: Filter out opportunities where positions already exist
+            # This prevents duplicate trades if execution runs twice (e.g., mark_executed failed)
+            try:
+                existing_positions = alpaca_client.get_option_positions()
+                existing_symbols = {pos.get('symbol') for pos in existing_positions if pos.get('symbol')}
+
+                original_count = len(opportunities)
+                opportunities = [
+                    opp for opp in opportunities
+                    if opp.get('option_symbol') not in existing_symbols
+                ]
+
+                if len(opportunities) < original_count:
+                    filtered_count = original_count - len(opportunities)
+                    logger.warning("Idempotency check: filtered out opportunities with existing positions",
+                                  event_category="system",
+                                  event_type="idempotency_filter_applied",
+                                  original_count=original_count,
+                                  filtered_count=filtered_count,
+                                  remaining_count=len(opportunities))
+
+                    if not opportunities:
+                        logger.info("All opportunities already have positions - likely duplicate execution",
+                                   event_category="system",
+                                   event_type="duplicate_execution_prevented")
+                        return jsonify({
+                            'message': 'All opportunities already executed (idempotency check)',
+                            'timestamp': datetime.now().isoformat(),
+                            'results': {
+                                'opportunities_found': original_count,
+                                'already_executed': filtered_count,
+                                'trades_executed': 0
+                            }
+                        })
+            except Exception as e:
+                logger.warning("Idempotency check failed, proceeding with caution",
+                              event_category="warning",
+                              event_type="idempotency_check_failed",
+                              error=str(e))
+
             # Initialize put seller for execution
             put_seller = PutSeller(alpaca_client, market_data, config)
 
@@ -382,11 +422,29 @@ def trigger_strategy():
                     })
 
             # Mark opportunities as executed in Cloud Storage
-            opportunity_store.mark_executed(
+            # CRITICAL: If this fails, opportunities remain pending and could re-execute
+            mark_success = opportunity_store.mark_executed(
                 execution_time=start_time,
                 executed_count=trades_executed,
                 results=execution_results
             )
+
+            if not mark_success:
+                log_error_event(
+                    logger,
+                    error_type="mark_executed_failed",
+                    error_message="Failed to mark opportunities as executed - risk of re-execution",
+                    component="execution_engine",
+                    recoverable=False,
+                    trades_executed=trades_executed,
+                    execution_results_count=len(execution_results)
+                )
+                return jsonify({
+                    'error': 'mark_executed_failed',
+                    'message': 'Trades executed but failed to mark complete - manual intervention required',
+                    'trades_executed': trades_executed,
+                    'timestamp': datetime.now().isoformat()
+                }), 500
 
             # Update global status
             strategy_status['last_run'] = datetime.now().isoformat()

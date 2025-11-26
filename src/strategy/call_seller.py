@@ -277,8 +277,16 @@ class CallSeller:
                     limit_price=limit_price
                 )
 
-                return None
-                
+                # Return structured error dict instead of None for consistent return type
+                return {
+                    'success': False,
+                    'error': error_type,
+                    'message': error_msg,
+                    'symbol': option_symbol,
+                    'strategy': 'sell_call',
+                    'timestamp': datetime.now().isoformat()
+                }
+
         except Exception as e:
             # Enhanced error logging
             log_error_event(
@@ -290,7 +298,15 @@ class CallSeller:
                 symbol=opportunity.get('option_symbol', ''),
                 underlying=opportunity.get('symbol', '')
             )
-            return None
+            # Return structured error dict instead of None for consistent return type
+            return {
+                'success': False,
+                'error': 'execution_exception',
+                'message': str(e),
+                'symbol': opportunity.get('option_symbol', ''),
+                'strategy': 'sell_call',
+                'timestamp': datetime.now().isoformat()
+            }
     
     def evaluate_call_assignment_risk(self, call_position: Dict[str, Any]) -> Dict[str, Any]:
         """Evaluate if a short call position might get assigned.

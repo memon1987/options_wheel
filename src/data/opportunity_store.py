@@ -250,7 +250,12 @@ class OpportunityStore:
                         if age <= max_age_delta and data.get('status') != 'executed':
                             scan_blob_path = blob.name
                             break
-                    except:
+                    except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
+                        logger.warning("Failed to process scan file, skipping",
+                                      event_category="error",
+                                      event_type="scan_file_parse_error",
+                                      path=blob.name,
+                                      error=str(e))
                         continue
 
             if not scan_blob_path:

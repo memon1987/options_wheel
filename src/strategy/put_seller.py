@@ -252,8 +252,24 @@ class PutSeller:
                                margin=available_bp - collateral_required)
 
                 except Exception as bp_error:
-                    logger.error("Failed to check buying power", error=str(bp_error))
-                    # Continue anyway - let Alpaca reject if needed
+                    # Don't silently continue - return structured error
+                    log_error_event(
+                        logger,
+                        error_type="buying_power_check_failed",
+                        error_message=str(bp_error),
+                        component="put_seller",
+                        recoverable=True,
+                        symbol=option_symbol,
+                        collateral_required=collateral_required
+                    )
+                    return {
+                        'success': False,
+                        'error': 'buying_power_check_failed',
+                        'message': f'Could not validate buying power: {str(bp_error)}',
+                        'symbol': option_symbol,
+                        'strategy': 'sell_put',
+                        'timestamp': datetime.now().isoformat()
+                    }
 
             # Calculate limit price: mid + 10% of spread (biased toward ask for premium collection)
             bid = opportunity.get('bid')
@@ -356,7 +372,15 @@ class PutSeller:
                 symbol=opportunity.get('option_symbol', ''),
                 underlying=opportunity.get('symbol', '')
             )
-            return None
+            # Return structured error dict instead of None for consistent return type
+            return {
+                'success': False,
+                'error': 'execution_exception',
+                'message': str(e),
+                'symbol': opportunity.get('option_symbol', ''),
+                'strategy': 'sell_put',
+                'timestamp': datetime.now().isoformat()
+            }
     
     def evaluate_put_assignment(self, put_position: Dict[str, Any]) -> Dict[str, Any]:
         """Evaluate if a short put position might get assigned.

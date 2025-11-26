@@ -308,18 +308,28 @@ class AlpacaClient:
                 )
             
             order = self.trading_client.submit_order(order_data)
-            
-            logger.info("Option order placed", 
-                       symbol=symbol, qty=qty, side=side, 
-                       order_type=order_type, order_id=order.id)
-            
+
+            # Validate order response - handle potential None values
+            order_id = str(order.id) if order and order.id else None
+            order_status = str(order.status) if order and order.status else 'unknown'
+            submitted_at = order.submitted_at.isoformat() if order and order.submitted_at else None
+
+            if not order_id:
+                logger.warning("Order submitted but no order ID returned",
+                              symbol=symbol, qty=qty, side=side)
+
+            logger.info("Option order placed",
+                       symbol=symbol, qty=qty, side=side,
+                       order_type=order_type, order_id=order_id)
+
             return {
-                'order_id': order.id,
+                'success': True,
+                'order_id': order_id,
                 'symbol': symbol,
                 'qty': qty,
                 'side': side,
-                'status': order.status,
-                'submitted_at': order.submitted_at
+                'status': order_status,
+                'submitted_at': submitted_at
             }
             
         except Exception as e:
