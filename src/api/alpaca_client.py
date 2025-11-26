@@ -18,6 +18,7 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
+    retry_if_exception,
     before_sleep_log,
     RetryError
 )
@@ -67,7 +68,7 @@ def api_retry(func):
                 requests.exceptions.ConnectionError,
                 ConnectionError,
                 TimeoutError
-            )) | (lambda e: is_retryable_error(e)),
+            )) | retry_if_exception(is_retryable_error),
             before_sleep=before_sleep_log(logger, log_level=20),  # INFO level
             reraise=True
         )
