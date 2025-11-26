@@ -453,8 +453,8 @@ class CallSeller:
                     logger.info("Call position reached dynamic profit target",
                                symbol=option_symbol,
                                dte=dte,
-                               profit_pct=f"{profit_percentage*100:.1f}%",
-                               target_pct=f"{profit_target*100:.1f}%")
+                               profit_pct=round(profit_percentage * 100, 1),
+                               target_pct=round(profit_target * 100, 1))
                     return True
 
             # Stop loss logic for short-term options (enabled for calls)

@@ -886,7 +886,7 @@ class BacktestEngine:
     
     def _scan_put_opportunities(self, date: datetime):
         """Scan for put selling opportunities using proper wheel strategy logic."""
-        logger.debug("Scanning for put opportunities with wheel state logic", date=date.date(), symbols=self.backtest_config.symbols)
+        logger.debug("Scanning for put opportunities with wheel state logic", date=date.date(), symbols=",".join(self.backtest_config.symbols))
 
         # Filter symbols by gap risk before scanning
         filtered_symbols = self.gap_detector.filter_stocks_by_gap_risk(
