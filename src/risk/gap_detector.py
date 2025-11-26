@@ -46,7 +46,10 @@ class GapDetector:
             df = self.alpaca.get_stock_bars(symbol, days=self.config.gap_lookback_days + 20)
 
             if df.empty:
-                logger.warning("No data for gap analysis", symbol=symbol)
+                logger.warning("No data for gap analysis",
+                              event_category="data",
+                              event_type="no_gap_analysis_data",
+                              symbol=symbol)
                 return {'gap_risk_score': 1.0, 'suitable_for_trading': False}
 
             # Calculate overnight gaps
@@ -76,7 +79,11 @@ class GapDetector:
             }
 
         except Exception as e:
-            logger.error("Failed to analyze gap risk", symbol=symbol, error=str(e))
+            logger.error("Failed to analyze gap risk",
+                        event_category="error",
+                        event_type="gap_risk_analysis_error",
+                        symbol=symbol,
+                        error=str(e))
             return {'gap_risk_score': 1.0, 'suitable_for_trading': False}
 
     def _calculate_overnight_gaps(self, df: pd.DataFrame) -> Dict:
@@ -260,13 +267,19 @@ class GapDetector:
         gap_freq = gaps_analysis.get('gap_frequency', 0)
         if gap_freq > self.config.max_gap_frequency:
             logger.info("Stock rejected due to high gap frequency",
-                       frequency=gap_freq, limit=self.config.max_gap_frequency)
+                       event_category="filtering",
+                       event_type="rejected_high_gap_frequency",
+                       frequency=gap_freq,
+                       limit=self.config.max_gap_frequency)
             return False
 
         # Check historical volatility
         if volatility > self.config.max_historical_vol:
             logger.info("Stock rejected due to high volatility",
-                       volatility=volatility, limit=self.config.max_historical_vol)
+                       event_category="filtering",
+                       event_type="rejected_high_volatility",
+                       volatility=volatility,
+                       limit=self.config.max_historical_vol)
             return False
 
         # Check current gap
@@ -287,7 +300,10 @@ class GapDetector:
                     )
                 else:
                     logger.info("Stock rejected due to current large gap",
-                               gap=gap_size, limit=self.config.max_overnight_gap_percent)
+                               event_category="filtering",
+                               event_type="rejected_large_gap",
+                               gap=gap_size,
+                               limit=self.config.max_overnight_gap_percent)
                 return False
 
         return True
@@ -312,6 +328,8 @@ class GapDetector:
 
         if gap_percent > self.config.max_overnight_gap_percent:
             logger.warning("Large overnight gap detected",
+                          event_category="risk",
+                          event_type="large_overnight_gap",
                           gap_percent=gap_percent,
                           threshold=self.config.max_overnight_gap_percent,
                           position=position['symbol'])
@@ -362,6 +380,8 @@ class GapDetector:
             if gap_analysis.get('suitable_for_trading', False):
                 suitable_symbols.append(symbol)
                 logger.info("Stock passed gap risk filter",
+                           event_category="filtering",
+                           event_type="stock_passed_gap_filter",
                            symbol=symbol,
                            gap_risk_score=round(gap_analysis.get('gap_risk_score', 0), 3),
                            gap_frequency=round(gap_analysis.get('historical_gaps', {}).get('gap_frequency', 0), 3),
@@ -386,8 +406,8 @@ class GapDetector:
                    input_symbols=len(symbols),
                    passed=len(suitable_symbols),
                    rejected=len(rejected_symbols),
-                   passed_symbols=suitable_symbols,
-                   rejected_symbols=rejected_symbols)
+                   passed_symbols=", ".join(suitable_symbols),
+                   rejected_symbols=", ".join(rejected_symbols))
 
         return suitable_symbols
 
@@ -416,7 +436,10 @@ class GapDetector:
             # Get previous trading day close
             previous_close = self._get_previous_close(symbol, execution_time)
             if previous_close is None:
-                logger.warning("Cannot determine previous close for gap check", symbol=symbol)
+                logger.warning("Cannot determine previous close for gap check",
+                              event_category="data",
+                              event_type="no_previous_close",
+                              symbol=symbol)
                 return {
                     'can_execute': False,
                     'reason': 'no_previous_close_data',
@@ -508,7 +531,11 @@ class GapDetector:
             return recent_data['close'].iloc[-1]
 
         except Exception as e:
-            logger.error("Failed to get previous close", symbol=symbol, error=str(e))
+            logger.error("Failed to get previous close",
+                        event_category="error",
+                        event_type="previous_close_error",
+                        symbol=symbol,
+                        error=str(e))
             return None
 
     def get_execution_delay_recommendation(self, symbol: str, current_time: datetime) -> Dict:

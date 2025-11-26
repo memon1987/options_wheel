@@ -38,30 +38,41 @@ class PutSeller:
             Put opportunity details or None
         """
         try:
-            logger.info("Evaluating put opportunity", symbol=symbol)
+            logger.info("Evaluating put opportunity",
+                       event_category="trade",
+                       event_type="put_opportunity_evaluation",
+                       symbol=symbol)
 
             # Check wheel state if manager provided
             if wheel_state_manager and not wheel_state_manager.can_sell_puts(symbol):
                 logger.info("Put selling blocked by wheel state",
+                           event_category="trade",
+                           event_type="put_blocked_by_wheel_state",
                            symbol=symbol,
                            wheel_phase=wheel_state_manager.get_wheel_phase(symbol).value)
                 return None
-            
+
             # Get suitable puts for this stock
             suitable_puts = self.market_data.find_suitable_puts(symbol)
-            
+
             if not suitable_puts:
-                logger.info("No suitable puts found", symbol=symbol)
+                logger.info("No suitable puts found",
+                           event_category="trade",
+                           event_type="no_suitable_puts",
+                           symbol=symbol)
                 return None
-            
+
             # Select the best put (first in sorted list)
             best_put = suitable_puts[0]
-            
+
             # Calculate position size and validate
             position_details = self._calculate_position_size(best_put)
-            
+
             if not position_details:
-                logger.info("Position size validation failed", symbol=symbol)
+                logger.info("Position size validation failed",
+                           event_category="trade",
+                           event_type="position_size_validation_failed",
+                           symbol=symbol)
                 return None
             
             # Create opportunity
@@ -83,7 +94,9 @@ class PutSeller:
                 'timestamp': datetime.now().isoformat()
             }
             
-            logger.info("Put opportunity identified", 
+            logger.info("Put opportunity identified",
+                       event_category="trade",
+                       event_type="put_opportunity_found",
                        symbol=symbol,
                        strike=best_put['strike_price'],
                        premium=best_put['mid_price'],
@@ -93,7 +106,11 @@ class PutSeller:
             return opportunity
             
         except Exception as e:
-            logger.error("Failed to find put opportunity", symbol=symbol, error=str(e))
+            logger.error("Failed to find put opportunity",
+                        event_category="error",
+                        event_type="put_opportunity_error",
+                        symbol=symbol,
+                        error=str(e))
             return None
     
     def _calculate_position_size(self, put_option: Dict[str, Any], override_buying_power: Optional[float] = None) -> Optional[Dict[str, Any]]:
@@ -197,7 +214,10 @@ class PutSeller:
             }
             
         except Exception as e:
-            logger.error("Failed to calculate position size", error=str(e))
+            logger.error("Failed to calculate position size",
+                        event_category="error",
+                        event_type="position_size_calculation_error",
+                        error=str(e))
             return None
     
     def execute_put_sale(self, opportunity: Dict[str, Any], skip_buying_power_check: bool = False) -> Optional[Dict[str, Any]]:
@@ -247,6 +267,8 @@ class PutSeller:
                         }
 
                     logger.info("Buying power check passed",
+                               event_category="trade",
+                               event_type="buying_power_validated",
                                required=collateral_required,
                                available=available_bp,
                                margin=available_bp - collateral_required)
@@ -283,6 +305,8 @@ class PutSeller:
                 limit_price = round(premium * 0.95, 2)
 
             logger.info("Executing put sale",
+                       event_category="trade",
+                       event_type="put_sale_executing",
                        symbol=option_symbol,
                        contracts=contracts,
                        premium=premium,
@@ -419,7 +443,10 @@ class PutSeller:
             }
             
         except Exception as e:
-            logger.error("Failed to evaluate put assignment", error=str(e))
+            logger.error("Failed to evaluate put assignment",
+                        event_category="error",
+                        event_type="put_assignment_evaluation_error",
+                        error=str(e))
             return {'assignment_risk': 'unknown'}
     
     def _parse_dte_from_option_symbol(self, option_symbol: str) -> int:
@@ -443,6 +470,8 @@ class PutSeller:
             match = re.search(r'(\d{6})[PC]', option_symbol)
             if not match:
                 logger.warning("Could not parse expiration date from option symbol",
+                              event_category="data",
+                              event_type="option_symbol_parse_warning",
                               symbol=option_symbol)
                 return 7  # Default fallback
 
@@ -462,6 +491,8 @@ class PutSeller:
 
         except Exception as e:
             logger.error("Failed to parse DTE from option symbol",
+                        event_category="error",
+                        event_type="dte_parse_error",
                         symbol=option_symbol,
                         error=str(e))
             return 7  # Default fallback
@@ -486,6 +517,8 @@ class PutSeller:
                 target = band['profit_target']
 
                 logger.debug("Using DTE band profit target",
+                            event_category="trade",
+                            event_type="profit_target_dte_band",
                             dte=dte,
                             target=f"{target*100:.0f}%",
                             description=band.get('description', ''))
@@ -500,12 +533,16 @@ class PutSeller:
         if dte > 7:
             target = self.config.profit_taking_default_long_dte
             logger.debug("Using long DTE default profit target",
+                        event_category="trade",
+                        event_type="profit_target_long_dte",
                         dte=dte,
                         target=f"{target*100:.0f}%")
             return target
 
         # Fallback to static target
         logger.warning("No DTE band found, using static profit target",
+                      event_category="trade",
+                      event_type="profit_target_static_fallback",
                       dte=dte,
                       static_target=f"{self.config.profit_taking_static_target*100:.0f}%")
         return self.config.profit_taking_static_target
@@ -537,6 +574,8 @@ class PutSeller:
 
                 if profit_percentage >= profit_target:
                     logger.info("Put position reached dynamic profit target",
+                               event_category="trade",
+                               event_type="put_profit_target_reached",
                                symbol=option_symbol,
                                dte=dte,
                                profit_pct=round(profit_percentage * 100, 1),
@@ -550,7 +589,10 @@ class PutSeller:
             return False
 
         except Exception as e:
-            logger.error("Failed to evaluate early close", error=str(e))
+            logger.error("Failed to evaluate early close",
+                        event_category="error",
+                        event_type="early_close_evaluation_error",
+                        error=str(e))
             return False
 
     def _check_put_stop_loss(self, put_position: Dict[str, Any], current_option_data: Dict[str, Any] = None) -> bool:
@@ -575,10 +617,12 @@ class PutSeller:
                 stop_loss_threshold = self.config.put_stop_loss_percent * self.config.stop_loss_multiplier
                 
                 if loss_percentage >= stop_loss_threshold:
-                    logger.warning("Put position hit premium stop loss", 
-                                 symbol=put_position['symbol'],
-                                 loss_pct=loss_percentage,
-                                 threshold=stop_loss_threshold)
+                    logger.warning("Put position hit premium stop loss",
+                                  event_category="risk",
+                                  event_type="put_premium_stop_loss",
+                                  symbol=put_position['symbol'],
+                                  loss_pct=loss_percentage,
+                                  threshold=stop_loss_threshold)
                     return True
             
             # Method 2: Delta-based stop loss (if current option data available)
@@ -588,9 +632,11 @@ class PutSeller:
                 # If delta has doubled, the underlying has moved significantly against us
                 # This is more reliable than premium-based for short-term options
                 if current_delta > 0.5:  # Delta > 0.5 means we're likely ITM
-                    logger.warning("Put position hit delta stop loss", 
-                                 symbol=put_position['symbol'],
-                                 current_delta=current_delta)
+                    logger.warning("Put position hit delta stop loss",
+                                  event_category="risk",
+                                  event_type="put_delta_stop_loss",
+                                  symbol=put_position['symbol'],
+                                  current_delta=current_delta)
                     return True
             
             # Method 3: Intrinsic value stop loss (if we can calculate it)
@@ -600,5 +646,8 @@ class PutSeller:
             return False
             
         except Exception as e:
-            logger.error("Failed to check put stop loss", error=str(e))
+            logger.error("Failed to check put stop loss",
+                        event_category="error",
+                        event_type="put_stop_loss_check_error",
+                        error=str(e))
             return False

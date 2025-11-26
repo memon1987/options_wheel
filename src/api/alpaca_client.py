@@ -45,7 +45,10 @@ class AlpacaClient:
             secret_key=config.alpaca_secret_key
         )
         
-        logger.info("Alpaca client initialized", paper_trading=config.paper_trading)
+        logger.info("Alpaca client initialized",
+                   event_category="system",
+                   event_type="client_initialized",
+                   paper_trading=config.paper_trading)
     
     # Account Information
     def get_account(self) -> Dict[str, Any]:
@@ -61,7 +64,10 @@ class AlpacaClient:
                 'options_approved_level': getattr(account, 'options_approved_level', 0)
             }
         except Exception as e:
-            logger.error("Failed to get account info", error=str(e))
+            logger.error("Failed to get account info",
+                        event_category="error",
+                        event_type="account_info_error",
+                        error=str(e))
             raise
     
     def get_positions(self) -> List[Dict[str, Any]]:
@@ -81,7 +87,10 @@ class AlpacaClient:
                 for pos in positions
             ]
         except Exception as e:
-            logger.error("Failed to get positions", error=str(e))
+            logger.error("Failed to get positions",
+                        event_category="error",
+                        event_type="positions_error",
+                        error=str(e))
             raise
     
     # Market Data
@@ -115,7 +124,11 @@ class AlpacaClient:
                 'timestamp': quote.timestamp
             }
         except Exception as e:
-            logger.error("Failed to get stock quote", symbol=symbol, error=str(e))
+            logger.error("Failed to get stock quote",
+                        event_category="error",
+                        event_type="stock_quote_error",
+                        symbol=symbol,
+                        error=str(e))
             raise
     
     def get_stock_bars(self, symbol: str, days: int = 30) -> pd.DataFrame:
@@ -169,7 +182,11 @@ class AlpacaClient:
             return df
 
         except Exception as e:
-            logger.error("Failed to get stock bars", symbol=symbol, error=str(e))
+            logger.error("Failed to get stock bars",
+                        event_category="error",
+                        event_type="stock_bars_error",
+                        symbol=symbol,
+                        error=str(e))
             raise
     
     def get_options_chain(self, underlying_symbol: str) -> List[Dict[str, Any]]:
@@ -267,7 +284,11 @@ class AlpacaClient:
             return options
 
         except Exception as e:
-            logger.error("Failed to get options chain", symbol=underlying_symbol, error=str(e))
+            logger.error("Failed to get options chain",
+                        event_category="error",
+                        event_type="options_chain_error",
+                        symbol=underlying_symbol,
+                        error=str(e))
             raise
     
     # Trading Operations
@@ -316,9 +337,13 @@ class AlpacaClient:
 
             if not order_id:
                 logger.warning("Order submitted but no order ID returned",
+                              event_category="trade",
+                              event_type="order_missing_id",
                               symbol=symbol, qty=qty, side=side)
 
             logger.info("Option order placed",
+                       event_category="trade",
+                       event_type="order_placed",
                        symbol=symbol, qty=qty, side=side,
                        order_type=order_type, order_id=order_id)
 
@@ -347,6 +372,8 @@ class AlpacaClient:
                 error_type = "connection_error"
 
             logger.error("Failed to place option order",
+                        event_category="error",
+                        event_type="order_placement_error",
                         symbol=symbol,
                         qty=qty,
                         side=side,
@@ -393,7 +420,10 @@ class AlpacaClient:
             return order_list
             
         except Exception as e:
-            logger.error("Failed to get orders", error=str(e))
+            logger.error("Failed to get orders",
+                        event_category="error",
+                        event_type="orders_error",
+                        error=str(e))
             raise
     
     def cancel_order(self, order_id: str) -> bool:
@@ -407,8 +437,15 @@ class AlpacaClient:
         """
         try:
             self.trading_client.cancel_order_by_id(order_id)
-            logger.info("Order cancelled", order_id=order_id)
+            logger.info("Order cancelled",
+                       event_category="trade",
+                       event_type="order_cancelled",
+                       order_id=order_id)
             return True
         except Exception as e:
-            logger.error("Failed to cancel order", order_id=order_id, error=str(e))
+            logger.error("Failed to cancel order",
+                        event_category="error",
+                        event_type="cancel_order_error",
+                        order_id=order_id,
+                        error=str(e))
             return False

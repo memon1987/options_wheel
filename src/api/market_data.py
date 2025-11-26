@@ -43,7 +43,10 @@ class MarketDataManager:
             bars = self.alpaca.get_stock_bars(symbol, days=30)
             
             if bars.empty:
-                logger.warning("No historical data available", symbol=symbol)
+                logger.warning("No historical data available",
+                              event_category="data",
+                              event_type="no_historical_data",
+                              symbol=symbol)
                 return {}
             
             # Calculate metrics
@@ -72,7 +75,11 @@ class MarketDataManager:
             }
             
         except Exception as e:
-            logger.error("Failed to get stock metrics", symbol=symbol, error=str(e))
+            logger.error("Failed to get stock metrics",
+                        event_category="error",
+                        event_type="stock_metrics_error",
+                        symbol=symbol,
+                        error=str(e))
             return {}
     
     def filter_suitable_stocks(self, symbols: List[str]) -> List[Dict[str, Any]]:
@@ -92,6 +99,8 @@ class MarketDataManager:
             if metrics and metrics.get('suitable_for_wheel', False):
                 suitable_stocks.append(metrics)
                 logger.info("Stock passed price/volume filter",
+                           event_category="filtering",
+                           event_type="stock_passed_filter",
                            symbol=symbol,
                            price=metrics['current_price'],
                            avg_volume=int(metrics['avg_volume']),
@@ -105,8 +114,10 @@ class MarketDataManager:
                     rejection_reasons.append(f"volume {int(metrics['avg_volume']):,} < {self.config.min_avg_volume:,}")
 
                 logger.info("Stock rejected by price/volume filter",
+                           event_category="filtering",
+                           event_type="stock_rejected_filter",
                            symbol=symbol,
-                           reasons=rejection_reasons,
+                           reasons=", ".join(rejection_reasons),
                            price=metrics['current_price'],
                            avg_volume=int(metrics['avg_volume']))
                 rejected_stocks.append(symbol)
@@ -120,8 +131,8 @@ class MarketDataManager:
                    total_analyzed=len(symbols),
                    passed=len(suitable_stocks),
                    rejected=len(rejected_stocks),
-                   passed_symbols=[s['symbol'] for s in suitable_stocks],
-                   rejected_symbols=rejected_stocks)
+                   passed_symbols=", ".join([s['symbol'] for s in suitable_stocks]),
+                   rejected_symbols=", ".join(rejected_stocks))
 
         return suitable_stocks
     
@@ -138,7 +149,10 @@ class MarketDataManager:
             options_chain = self.alpaca.get_options_chain(symbol)
             
             if not options_chain:
-                logger.warning("No options chain data", symbol=symbol)
+                logger.warning("No options chain data",
+                              event_category="data",
+                              event_type="no_options_chain",
+                              symbol=symbol)
                 return {'puts': [], 'calls': []}
             
             # Get current stock price
@@ -187,7 +201,11 @@ class MarketDataManager:
             return {'puts': puts, 'calls': calls}
             
         except Exception as e:
-            logger.error("Failed to get options chain", symbol=symbol, error=str(e))
+            logger.error("Failed to get options chain",
+                        event_category="error",
+                        event_type="options_chain_error",
+                        symbol=symbol,
+                        error=str(e))
             return {'puts': [], 'calls': []}
     
     def find_suitable_puts(self, symbol: str) -> List[Dict[str, Any]]:
@@ -235,6 +253,8 @@ class MarketDataManager:
             if not is_valid:
                 rejection_stats['total_rejected'] += 1
                 logger.debug("Put option failed data validation",
+                            event_category="filtering",
+                            event_type="put_validation_failed",
                             symbol=put.get('symbol', 'unknown'),
                             reason=validation_reason)
                 continue
@@ -365,6 +385,8 @@ class MarketDataManager:
             if not is_valid:
                 rejection_stats['total_rejected'] += 1
                 logger.debug("Call option failed data validation",
+                            event_category="filtering",
+                            event_type="call_validation_failed",
                             symbol=call.get('symbol', 'unknown'),
                             reason=validation_reason)
                 continue

@@ -42,12 +42,18 @@ class CallSeller:
             
             # Only sell calls if we own shares in round lots (100 shares per contract)
             if shares_owned < 100:
-                logger.info("Insufficient shares for covered calls", 
-                           symbol=symbol, shares=shares_owned)
+                logger.info("Insufficient shares for covered calls",
+                           event_category="trade",
+                           event_type="insufficient_shares_for_calls",
+                           symbol=symbol,
+                           shares=shares_owned)
                 return None
-            
-            logger.info("Evaluating covered call opportunity", 
-                       symbol=symbol, shares=shares_owned)
+
+            logger.info("Evaluating covered call opportunity",
+                       event_category="trade",
+                       event_type="call_opportunity_evaluation",
+                       symbol=symbol,
+                       shares=shares_owned)
             
             # Get cost basis per share for filtering
             stock_cost_basis = float(stock_position['cost_basis']) / shares_owned
@@ -56,7 +62,10 @@ class CallSeller:
             suitable_calls = self.market_data.find_suitable_calls(symbol, min_strike_price=stock_cost_basis)
             
             if not suitable_calls:
-                logger.info("No suitable calls found", symbol=symbol)
+                logger.info("No suitable calls found",
+                           event_category="trade",
+                           event_type="no_suitable_calls",
+                           symbol=symbol)
                 return None
             
             # Select the best call (first in sorted list)
@@ -66,7 +75,10 @@ class CallSeller:
             position_details = self._calculate_call_position(best_call, shares_owned, stock_position)
             
             if not position_details:
-                logger.info("Call position validation failed", symbol=symbol)
+                logger.info("Call position validation failed",
+                           event_category="trade",
+                           event_type="call_position_validation_failed",
+                           symbol=symbol)
                 return None
             
             # Create opportunity
@@ -90,7 +102,9 @@ class CallSeller:
                 'timestamp': datetime.now().isoformat()
             }
             
-            logger.info("Covered call opportunity identified", 
+            logger.info("Covered call opportunity identified",
+                       event_category="trade",
+                       event_type="call_opportunity_found",
                        symbol=symbol,
                        strike=best_call['strike_price'],
                        premium=best_call['mid_price'],
@@ -100,8 +114,11 @@ class CallSeller:
             return opportunity
             
         except Exception as e:
-            logger.error("Failed to evaluate covered call opportunity", 
-                        symbol=stock_position.get('symbol', 'unknown'), error=str(e))
+            logger.error("Failed to evaluate covered call opportunity",
+                        event_category="error",
+                        event_type="call_opportunity_error",
+                        symbol=stock_position.get('symbol', 'unknown'),
+                        error=str(e))
             return None
     
     def _calculate_call_position(self, call_option: Dict[str, Any], shares_owned: int, 
@@ -166,7 +183,10 @@ class CallSeller:
             }
             
         except Exception as e:
-            logger.error("Failed to calculate call position", error=str(e))
+            logger.error("Failed to calculate call position",
+                        event_category="error",
+                        event_type="call_position_calculation_error",
+                        error=str(e))
             return None
     
     def execute_call_sale(self, opportunity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -212,7 +232,9 @@ class CallSeller:
             # Calculate limit price (slightly below mid to improve fill probability)
             limit_price = round(premium * 0.95, 2)  # 5% below mid price
             
-            logger.info("Executing covered call sale", 
+            logger.info("Executing covered call sale",
+                       event_category="trade",
+                       event_type="call_sale_executing",
                        symbol=option_symbol,
                        contracts=contracts,
                        limit_price=limit_price)
@@ -349,7 +371,10 @@ class CallSeller:
             }
             
         except Exception as e:
-            logger.error("Failed to evaluate call assignment", error=str(e))
+            logger.error("Failed to evaluate call assignment",
+                        event_category="error",
+                        event_type="call_assignment_evaluation_error",
+                        error=str(e))
             return {'assignment_risk': 'unknown'}
     
     def _parse_dte_from_option_symbol(self, option_symbol: str) -> int:
@@ -373,6 +398,8 @@ class CallSeller:
             match = re.search(r'(\d{6})[PC]', option_symbol)
             if not match:
                 logger.warning("Could not parse expiration date from option symbol",
+                              event_category="data",
+                              event_type="option_symbol_parse_warning",
                               symbol=option_symbol)
                 return 7  # Default fallback
 
@@ -392,6 +419,8 @@ class CallSeller:
 
         except Exception as e:
             logger.error("Failed to parse DTE from option symbol",
+                        event_category="error",
+                        event_type="dte_parse_error",
                         symbol=option_symbol,
                         error=str(e))
             return 7  # Default fallback
@@ -416,6 +445,8 @@ class CallSeller:
                 target = band['profit_target']
 
                 logger.debug("Using DTE band profit target",
+                            event_category="trade",
+                            event_type="profit_target_dte_band",
                             dte=dte,
                             target=f"{target*100:.0f}%",
                             description=band.get('description', ''))
@@ -430,12 +461,16 @@ class CallSeller:
         if dte > 7:
             target = self.config.profit_taking_default_long_dte
             logger.debug("Using long DTE default profit target",
+                        event_category="trade",
+                        event_type="profit_target_long_dte",
                         dte=dte,
                         target=f"{target*100:.0f}%")
             return target
 
         # Fallback to static target
         logger.warning("No DTE band found, using static profit target",
+                      event_category="trade",
+                      event_type="profit_target_static_fallback",
                       dte=dte,
                       static_target=f"{self.config.profit_taking_static_target*100:.0f}%")
         return self.config.profit_taking_static_target
@@ -467,6 +502,8 @@ class CallSeller:
 
                 if profit_percentage >= profit_target:
                     logger.info("Call position reached dynamic profit target",
+                               event_category="trade",
+                               event_type="call_profit_target_reached",
                                symbol=option_symbol,
                                dte=dte,
                                profit_pct=round(profit_percentage * 100, 1),
@@ -480,7 +517,10 @@ class CallSeller:
             return False
 
         except Exception as e:
-            logger.error("Failed to evaluate early close", error=str(e))
+            logger.error("Failed to evaluate early close",
+                        event_category="error",
+                        event_type="early_close_evaluation_error",
+                        error=str(e))
             return False
 
     def _check_call_stop_loss(self, call_position: Dict[str, Any], current_option_data: Dict[str, Any] = None) -> bool:
@@ -505,10 +545,12 @@ class CallSeller:
                 stop_loss_threshold = self.config.call_stop_loss_percent * self.config.stop_loss_multiplier
                 
                 if loss_percentage >= stop_loss_threshold:
-                    logger.warning("Call position hit premium stop loss", 
-                                 symbol=call_position['symbol'],
-                                 loss_pct=loss_percentage,
-                                 threshold=stop_loss_threshold)
+                    logger.warning("Call position hit premium stop loss",
+                                  event_category="risk",
+                                  event_type="call_premium_stop_loss",
+                                  symbol=call_position['symbol'],
+                                  loss_pct=loss_percentage,
+                                  threshold=stop_loss_threshold)
                     return True
             
             # Method 2: Delta-based stop loss (if current option data available)
@@ -517,17 +559,22 @@ class CallSeller:
                 
                 # If delta > 0.5, the call is likely ITM and stock moved significantly up
                 if current_delta > 0.5:  # Delta > 0.5 means we're likely ITM
-                    logger.warning("Call position hit delta stop loss", 
-                                 symbol=call_position['symbol'],
-                                 current_delta=current_delta)
+                    logger.warning("Call position hit delta stop loss",
+                                  event_category="risk",
+                                  event_type="call_delta_stop_loss",
+                                  symbol=call_position['symbol'],
+                                  current_delta=current_delta)
                     return True
             
             return False
             
         except Exception as e:
-            logger.error("Failed to check call stop loss", error=str(e))
+            logger.error("Failed to check call stop loss",
+                        event_category="error",
+                        event_type="call_stop_loss_check_error",
+                        error=str(e))
             return False
-    
+
     def handle_call_assignment(self, assignment_info: Dict[str, Any], wheel_state_manager=None) -> Dict[str, Any]:
         """Handle when a short call gets assigned (shares called away).
 
@@ -545,6 +592,8 @@ class CallSeller:
             assignment_date = assignment_info.get('date', datetime.now())
 
             logger.info("Handling call assignment",
+                       event_category="trade",
+                       event_type="call_assignment_handling",
                        symbol=symbol,
                        shares=shares_assigned,
                        strike=strike_price)
@@ -586,6 +635,8 @@ class CallSeller:
                     result['completed_wheel_cycle'] = wheel_result['completed_cycle']
 
             logger.info("Call assignment handled with wheel state management",
+                       event_category="trade",
+                       event_type="call_assignment_complete",
                        symbol=symbol,
                        shares_assigned=shares_assigned,
                        wheel_cycle_completed=result['wheel_cycle_completed'],
@@ -609,5 +660,8 @@ class CallSeller:
             return result
 
         except Exception as e:
-            logger.error("Failed to handle call assignment", error=str(e))
+            logger.error("Failed to handle call assignment",
+                        event_category="error",
+                        event_type="call_assignment_error",
+                        error=str(e))
             return {'error': str(e)}
