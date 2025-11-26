@@ -27,7 +27,10 @@ class Config:
         
         # Substitute environment variables
         self._substitute_env_vars()
-        
+
+        # Validate configuration
+        self._validate_config()
+
         logger.info("Configuration loaded", config_path=config_path)
     
     def _load_config(self) -> Dict[str, Any]:
@@ -56,7 +59,130 @@ class Config:
                 return obj
         
         self._config = substitute_recursive(self._config)
-    
+
+    def _validate_config(self):
+        """Validate configuration values for correctness and safety."""
+        errors = []
+
+        # Required sections
+        required_sections = ['alpaca', 'strategy', 'risk', 'stocks', 'monitoring']
+        for section in required_sections:
+            if section not in self._config:
+                errors.append(f"Missing required section: '{section}'")
+
+        if errors:
+            # Can't proceed with validation if sections missing
+            raise ValueError(f"Configuration validation failed:\n" + "\n".join(errors))
+
+        # Alpaca validation
+        alpaca = self._config.get('alpaca', {})
+        if not alpaca.get('api_key_id') or alpaca.get('api_key_id', '').startswith('${'):
+            errors.append("Alpaca API key not configured (check ALPACA_API_KEY_ID env var)")
+        if not alpaca.get('secret_key') or alpaca.get('secret_key', '').startswith('${'):
+            errors.append("Alpaca secret key not configured (check ALPACA_SECRET_KEY env var)")
+
+        # Strategy validation
+        strategy = self._config.get('strategy', {})
+
+        # DTE must be positive
+        put_dte = strategy.get('put_target_dte', 0)
+        call_dte = strategy.get('call_target_dte', 0)
+        if put_dte <= 0:
+            errors.append(f"put_target_dte must be positive (got {put_dte})")
+        if call_dte <= 0:
+            errors.append(f"call_target_dte must be positive (got {call_dte})")
+
+        # Delta ranges must be valid
+        put_delta = strategy.get('put_delta_range', [])
+        call_delta = strategy.get('call_delta_range', [])
+        if len(put_delta) != 2 or not (0 <= put_delta[0] <= put_delta[1] <= 1):
+            errors.append(f"put_delta_range must be [min, max] with 0 <= min <= max <= 1 (got {put_delta})")
+        if len(call_delta) != 2 or not (0 <= call_delta[0] <= call_delta[1] <= 1):
+            errors.append(f"call_delta_range must be [min, max] with 0 <= min <= max <= 1 (got {call_delta})")
+
+        # Price ranges
+        min_price = strategy.get('min_stock_price', 0)
+        max_price = strategy.get('max_stock_price', 0)
+        if min_price < 0:
+            errors.append(f"min_stock_price must be non-negative (got {min_price})")
+        if max_price <= 0:
+            errors.append(f"max_stock_price must be positive (got {max_price})")
+        if min_price >= max_price:
+            errors.append(f"min_stock_price ({min_price}) must be less than max_stock_price ({max_price})")
+
+        # Position limits
+        max_positions = strategy.get('max_total_positions', 0)
+        if max_positions <= 0:
+            errors.append(f"max_total_positions must be positive (got {max_positions})")
+
+        max_per_stock = strategy.get('max_positions_per_stock', 0)
+        if max_per_stock <= 0:
+            errors.append(f"max_positions_per_stock must be positive (got {max_per_stock})")
+
+        max_exposure = strategy.get('max_exposure_per_ticker', 0)
+        if max_exposure <= 0:
+            errors.append(f"max_exposure_per_ticker must be positive (got {max_exposure})")
+
+        # Risk management validation
+        risk = self._config.get('risk', {})
+
+        # Percentages should be in valid ranges
+        max_alloc = risk.get('max_portfolio_allocation', 0)
+        if not (0 < max_alloc <= 1):
+            errors.append(f"max_portfolio_allocation must be between 0 and 1 (got {max_alloc})")
+
+        max_pos_size = risk.get('max_position_size', 0)
+        if not (0 < max_pos_size <= 1):
+            errors.append(f"max_position_size must be between 0 and 1 (got {max_pos_size})")
+
+        min_cash = risk.get('min_cash_reserve', -1)
+        if not (0 <= min_cash < 1):
+            errors.append(f"min_cash_reserve must be between 0 and 1 (got {min_cash})")
+
+        # Stop loss percentages
+        if risk.get('use_put_stop_loss'):
+            put_sl = risk.get('put_stop_loss_percent', 0)
+            if not (0 < put_sl <= 10):  # Max 1000% loss seems reasonable
+                errors.append(f"put_stop_loss_percent should be between 0 and 10 (got {put_sl})")
+
+        if risk.get('use_call_stop_loss'):
+            call_sl = risk.get('call_stop_loss_percent', 0)
+            if not (0 < call_sl <= 10):
+                errors.append(f"call_stop_loss_percent should be between 0 and 10 (got {call_sl})")
+
+        # Profit taking validation
+        profit_taking = risk.get('profit_taking', {})
+        if profit_taking:
+            min_target = profit_taking.get('min_profit_target', 0)
+            max_target = profit_taking.get('max_profit_target', 1)
+            if not (0 < min_target <= max_target <= 1):
+                errors.append(f"profit_taking targets invalid: min={min_target}, max={max_target} (need 0 < min <= max <= 1)")
+
+        # Stock universe validation
+        stocks = self._config.get('stocks', {})
+        symbols = stocks.get('symbols', [])
+        if not symbols:
+            errors.append("No stock symbols configured in stocks.symbols")
+
+        # Monitoring validation
+        monitoring = self._config.get('monitoring', {})
+        check_interval = monitoring.get('check_interval_minutes', 0)
+        if check_interval <= 0:
+            errors.append(f"check_interval_minutes must be positive (got {check_interval})")
+
+        # Report errors
+        if errors:
+            error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+            logger.error("Configuration validation failed",
+                        event_category="error",
+                        event_type="config_validation_error",
+                        errors=errors)
+            raise ValueError(error_msg)
+
+        logger.debug("Configuration validation passed",
+                    event_category="system",
+                    event_type="config_validated")
+
     # Alpaca API Settings
     @property
     def alpaca_api_key(self) -> str:

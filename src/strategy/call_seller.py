@@ -431,7 +431,7 @@ class CallSeller:
         Parse option symbol to extract underlying, strike, and DTE.
 
         Option symbol format: AMD251031C00350000
-        - Underlying: AMD (letters before date)
+        - Underlying: AMD (1-6 letters before date)
         - Date: 251031 (YYMMDD)
         - Type: P (Put) or C (Call)
         - Strike: 00350000 (last 8 digits / 1000 = $350.00)
@@ -446,12 +446,42 @@ class CallSeller:
         from datetime import datetime, timezone
 
         try:
+            # Use fully anchored regex pattern to parse entire symbol at once
+            # OCC standard: 1-6 letter underlying + 6-digit date + P/C + 8-digit strike
+            pattern = r'^([A-Z]{1,6})(\d{6})([PC])(\d{8})$'
+            match = re.match(pattern, option_symbol.strip().upper())
+
+            if match:
+                underlying = match.group(1)
+                date_str = match.group(2)
+                # option_type = match.group(3)  # P or C - not used currently
+                strike_str = match.group(4)
+
+                # Parse date
+                year = 2000 + int(date_str[0:2])
+                month = int(date_str[2:4])
+                day = int(date_str[4:6])
+                exp_date = datetime(year, month, day, tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                dte = max(0, (exp_date.date() - now.date()).days)
+
+                # Parse strike price
+                strike_price = float(strike_str) / 1000.0
+
+                return underlying, strike_price, dte
+
+            # Fallback to legacy parsing for non-standard formats
+            logger.debug("Option symbol did not match standard OCC format, using fallback parsing",
+                        event_category="data",
+                        event_type="option_symbol_fallback_parse",
+                        symbol=option_symbol)
+
             # Extract underlying symbol (letters at start)
-            underlying_match = re.match(r'^([A-Z]+)', option_symbol)
+            underlying_match = re.match(r'^([A-Z]+)', option_symbol.upper())
             underlying = underlying_match.group(1) if underlying_match else option_symbol[:3]
 
-            # Extract date portion (6 digits after ticker, before P/C)
-            date_match = re.search(r'(\d{6})[PC]', option_symbol)
+            # Extract date portion (6 digits immediately before P/C)
+            date_match = re.search(r'(\d{6})[PC]', option_symbol.upper())
             if date_match:
                 date_str = date_match.group(1)
                 year = 2000 + int(date_str[0:2])
@@ -464,7 +494,7 @@ class CallSeller:
                 dte = 7  # Default fallback
 
             # Extract strike price (last 8 digits / 1000)
-            strike_match = re.search(r'[PC](\d{8})$', option_symbol)
+            strike_match = re.search(r'[PC](\d{8})$', option_symbol.upper())
             if strike_match:
                 strike_price = float(strike_match.group(1)) / 1000.0
             else:

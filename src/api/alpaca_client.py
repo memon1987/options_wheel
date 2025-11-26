@@ -439,10 +439,18 @@ class AlpacaClient:
             submitted_at = order.submitted_at.isoformat() if order and order.submitted_at else None
 
             if not order_id:
-                logger.warning("Order submitted but no order ID returned",
-                              event_category="trade",
-                              event_type="order_missing_id",
-                              symbol=symbol, qty=qty, side=side)
+                logger.error("Order submitted but no order ID returned - treating as failure",
+                            event_category="error",
+                            event_type="order_missing_id",
+                            symbol=symbol, qty=qty, side=side)
+                return {
+                    'success': False,
+                    'error_type': 'missing_order_id',
+                    'error': 'Order submitted but no order ID returned',
+                    'symbol': symbol,
+                    'qty': qty,
+                    'side': side
+                }
 
             logger.info("Option order placed",
                        event_category="trade",
