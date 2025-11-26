@@ -323,6 +323,13 @@ class MarketDataManager:
                    delta_range=self.config.call_delta_range,
                    min_strike_price=min_strike_price)
 
+        # Warn if cost basis protection is not being used
+        if min_strike_price == 0.0:
+            logger.warning("find_suitable_calls called without cost basis protection",
+                          event_category="warning",
+                          event_type="missing_cost_basis_filter",
+                          symbol=symbol)
+
         suitable_calls = []
 
         # Track rejection reasons for detailed logging

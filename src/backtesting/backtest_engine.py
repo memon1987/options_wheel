@@ -1086,9 +1086,33 @@ class BacktestEngine:
     def _find_suitable_call(self, symbol: str, current_price: float, date: datetime) -> Optional[Dict]:
         """Find suitable call option to sell."""
         try:
+            # Get cost basis from portfolio position for protection
+            position = self.portfolio.positions.get(symbol)
+            cost_basis = position.entry_price if position else current_price
+
             # Target strike range (OTM calls)
-            min_strike = current_price * 1.05  # 5% OTM
+            # CRITICAL: Strike must be BOTH OTM AND above cost basis to avoid guaranteed loss
+            min_strike_otm = current_price * 1.05  # 5% OTM
+            min_strike = max(min_strike_otm, cost_basis)  # Must be above cost basis
             max_strike = current_price * 1.15  # 15% OTM
+
+            # Log if cost basis is limiting strike selection
+            if cost_basis > min_strike_otm:
+                logger.info("Cost basis limiting call strike selection",
+                           symbol=symbol,
+                           current_price=current_price,
+                           cost_basis=cost_basis,
+                           min_strike_otm=min_strike_otm,
+                           min_strike_used=min_strike)
+
+            # If min strike exceeds max strike, no valid calls available
+            if min_strike >= max_strike:
+                logger.debug("No valid call strikes - cost basis too high",
+                            symbol=symbol,
+                            cost_basis=cost_basis,
+                            min_strike=min_strike,
+                            max_strike=max_strike)
+                return None
             
             # Target DTE
             target_dte = self.config.call_target_dte

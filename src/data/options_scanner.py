@@ -117,13 +117,25 @@ class OptionsScanner:
             for position in stock_positions:
                 symbol = position['symbol']
                 shares = int(float(position['qty']))
-                
+
                 # Only consider positions with at least 100 shares
                 if shares < 100:
                     continue
-                
-                # Get call opportunities for this position
-                calls = self.market_data.find_suitable_calls(symbol)
+
+                # CRITICAL: Calculate cost basis per share for protection
+                # This ensures we never sell calls below cost basis (guaranteed loss)
+                cost_basis_per_share = float(position['cost_basis']) / shares
+
+                # Get call opportunities filtered by cost basis
+                calls = self.market_data.find_suitable_calls(
+                    symbol,
+                    min_strike_price=cost_basis_per_share
+                )
+
+                logger.debug("Filtering calls for cost basis protection",
+                            symbol=symbol,
+                            cost_basis_per_share=cost_basis_per_share,
+                            calls_found=len(calls))
                 
                 for call in calls[:3]:  # Top 3 calls per position
                     opportunity = self._create_call_opportunity(call, position)

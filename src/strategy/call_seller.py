@@ -171,14 +171,40 @@ class CallSeller:
     
     def execute_call_sale(self, opportunity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Execute a covered call trade.
-        
+
         Args:
             opportunity: Call opportunity details
-            
+
         Returns:
             Trade execution result
         """
         try:
+            # DEFENSIVE: Final validation before execution - prevent guaranteed losses
+            strike_price = opportunity.get('strike_price', 0)
+            stock_cost_basis = opportunity.get('stock_cost_basis', 0)
+            shares_covered = opportunity.get('shares_covered', 100)
+
+            if stock_cost_basis > 0 and strike_price > 0:
+                cost_basis_per_share = stock_cost_basis / shares_covered
+                if strike_price < cost_basis_per_share:
+                    log_error_event(
+                        logger,
+                        error_type="call_below_cost_basis_blocked",
+                        error_message=f"Strike ${strike_price} below cost basis ${cost_basis_per_share:.2f}/share - guaranteed loss prevented",
+                        component="call_seller",
+                        recoverable=True,
+                        symbol=opportunity.get('symbol', ''),
+                        option_symbol=opportunity.get('option_symbol', ''),
+                        strike_price=strike_price,
+                        cost_basis_per_share=cost_basis_per_share,
+                        loss_per_share=cost_basis_per_share - strike_price
+                    )
+                    return {
+                        'success': False,
+                        'error': 'strike_below_cost_basis',
+                        'message': f'Strike ${strike_price} below cost basis ${cost_basis_per_share:.2f}/share'
+                    }
+
             option_symbol = opportunity['option_symbol']
             contracts = opportunity['contracts']
             premium = opportunity['premium']
