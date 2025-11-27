@@ -3,18 +3,6 @@ import { useExpirations } from '../hooks/useApi'
 import LoadingSpinner from '../components/LoadingSpinner'
 import ErrorMessage from '../components/ErrorMessage'
 
-interface ExpirationPosition {
-  symbol: string
-  strike: number
-  option_type: string
-  quantity: number
-}
-
-interface Expiration {
-  expiration_date: string
-  positions: ExpirationPosition[]
-}
-
 export default function Calendar() {
   const [daysAhead, setDaysAhead] = useState(30)
   const { data: expirations, loading, error } = useExpirations(daysAhead)
