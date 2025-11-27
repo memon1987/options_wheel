@@ -9,7 +9,7 @@ steps:
       - '-c'
       - |
         pip install --no-cache-dir pytest pytest-mock pytest-asyncio
-        pip install --no-cache-dir alpaca-py pandas numpy structlog pyyaml python-dotenv
+        pip install --no-cache-dir alpaca-py pandas numpy structlog pyyaml python-dotenv tenacity
         python -m pytest tests/ -v --tb=short || exit 1
     id: 'run-tests'
 
