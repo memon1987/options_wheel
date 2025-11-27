@@ -1,0 +1,13 @@
+# FastAPI and server
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+httpx==0.26.0
+
+# Google Cloud
+google-cloud-bigquery==3.14.1
+
+# Data validation
+pydantic==2.5.3
+
+# Utils
+python-dotenv==1.0.0

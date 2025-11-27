@@ -13,7 +13,7 @@ steps:
         python -m pytest tests/ -v --tb=short || exit 1
     id: 'run-tests'
 
-  # Step 2: Build the container image
+  # Step 2: Build the trading bot container image
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
@@ -24,19 +24,41 @@ steps:
       - '-t'
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:latest'
       - '.'
-    id: 'build-image'
+    id: 'build-bot-image'
     waitFor: ['run-tests']
 
-  # Step 3: Push the container image
+  # Step 3: Build the dashboard container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:$COMMIT_SHA'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:latest'
+      - '.'
+    dir: 'dashboard'
+    id: 'build-dashboard-image'
+    waitFor: ['run-tests']
+
+  # Step 4: Push the trading bot container image
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
       - '--all-tags'
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy'
-    id: 'push-image'
-    waitFor: ['build-image']
+    id: 'push-bot-image'
+    waitFor: ['build-bot-image']
 
-  # Step 4: Deploy to Cloud Run
+  # Step 5: Push the dashboard container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard'
+    id: 'push-dashboard-image'
+    waitFor: ['build-dashboard-image']
+
+  # Step 6: Deploy trading bot to Cloud Run
   - name: 'gcr.io/cloud-builders/gcloud'
     args:
       - 'run'
@@ -50,10 +72,26 @@ steps:
       - '--min-instances=0'
       - '--timeout=300'
       - '--set-env-vars=ALPACA_PAPER_TRADING=true'
-    id: 'deploy-to-cloud-run'
-    waitFor: ['push-image']
+    id: 'deploy-bot-to-cloud-run'
+    waitFor: ['push-bot-image']
 
-  # Health check removed for faster builds - manual verification recommended
+  # Step 7: Deploy dashboard to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'options-wheel-dashboard'
+      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--memory=512Mi'
+      - '--cpu=1'
+      - '--max-instances=2'
+      - '--min-instances=0'
+      - '--timeout=300'
+      - '--set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID'
+      - '--allow-unauthenticated'
+    id: 'deploy-dashboard-to-cloud-run'
+    waitFor: ['push-dashboard-image']
 
 # Build configuration
 options:
@@ -65,7 +103,7 @@ options:
 serviceAccount: 'projects/gen-lang-client-0607444019/serviceAccounts/799970961417@cloudbuild.gserviceaccount.com'
 
 # Timeout for the entire build
-timeout: '600s'  # 10 minutes
+timeout: '900s'  # 15 minutes (increased for dashboard build)
 
 # Substitutions for build variables
 substitutions:
@@ -76,3 +114,5 @@ substitutions:
 images:
   - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA'
   - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:latest'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:$COMMIT_SHA'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-dashboard:latest'
