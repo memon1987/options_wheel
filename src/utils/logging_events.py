@@ -393,8 +393,8 @@ def log_filtering_event(
             total_analyzed=14,
             passed=12,
             rejected=2,
-            passed_symbols=["AAPL", "MSFT"],
-            rejected_symbols=["XYZ"]
+            passed_symbols="AAPL,MSFT",  # Use comma-separated string, NOT array
+            rejected_symbols="XYZ"
         )
 
         # Individual stock pass

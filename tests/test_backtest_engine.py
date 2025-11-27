@@ -31,6 +31,13 @@ class TestBacktestEngine:
         self.mock_config.use_call_stop_loss = True
         self.mock_config.call_stop_loss_percent = 0.50
         self.mock_config.stop_loss_multiplier = 1.5
+        # New profit taking settings (dynamic DTE-based)
+        self.mock_config.use_dynamic_profit_target = False  # Use static for test predictability
+        self.mock_config.profit_taking_static_target = 0.50
+        self.mock_config.profit_taking_min_target = 0.30
+        self.mock_config.profit_taking_max_target = 0.80
+        self.mock_config.profit_taking_default_long_dte = 0.50
+        self.mock_config.profit_taking_dte_bands = []
         self.mock_config._config = {
             'strategy': {
                 'put_target_dte': 7,
@@ -172,8 +179,8 @@ class TestBacktestEngine:
         }
         
         test_date = datetime(2023, 1, 15)
-        estimated_value = engine._estimate_option_value(option_position, test_date)
-        
+        estimated_value = engine._get_historical_option_value(option_position, test_date)
+
         assert isinstance(estimated_value, float)
         assert estimated_value >= 0  # Option value should be non-negative
     

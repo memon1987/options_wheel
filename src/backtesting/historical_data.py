@@ -214,7 +214,7 @@ class HistoricalDataManager:
                                         calls.append(option_data)
                 
                 except Exception as e:
-                    logger.debug("Batch request failed", symbols=symbols, error=str(e))
+                    logger.debug("Batch request failed", symbols=",".join(symbols) if symbols else "", error=str(e))
                     continue
             
             logger.info("Historical option chain with bars completed", 

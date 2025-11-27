@@ -108,19 +108,28 @@ class TestWheelEngine:
             'market_value': 15000.0,
             'unrealized_pl': 500.0
         }
-        
+
+        # Set up wheel state to have AAPL in holding_stock phase
+        # This is required for covered call selling to be allowed
+        self.wheel_engine.wheel_state.handle_put_assignment(
+            symbol='AAPL',
+            shares=100,
+            cost_basis=150.0,
+            assignment_date=datetime.now()
+        )
+
         # Mock call seller to return an action
         self.mock_call_seller.evaluate_covered_call_opportunity.return_value = {
             'action_type': 'new_position',
             'strategy': 'sell_call',
             'symbol': 'AAPL'
         }
-        
+
         actions = self.wheel_engine._manage_existing_positions([stock_position])
-        
+
         assert len(actions) == 1
         assert actions[0]['strategy'] == 'sell_call'
-        
+
         # Verify call seller was called with the stock position
         self.mock_call_seller.evaluate_covered_call_opportunity.assert_called_once_with(stock_position)
     
