@@ -47,17 +47,41 @@ async def health_check():
 
 
 # Serve static files in production
-static_dir = os.path.join(os.path.dirname(__file__), "../frontend/dist")
-if os.path.exists(static_dir):
-    app.mount("/assets", StaticFiles(directory=os.path.join(static_dir, "assets")), name="assets")
+# In Docker: frontend is at /app/static
+# In development: frontend is at ../frontend/dist
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if not os.path.exists(static_dir):
+    static_dir = os.path.join(os.path.dirname(__file__), "../frontend/dist")
 
-    @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        """Serve the SPA for all non-API routes."""
+if os.path.exists(static_dir):
+    # Mount assets directory
+    assets_dir = os.path.join(static_dir, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/")
+    async def serve_root():
+        """Serve the SPA root."""
         index_path = os.path.join(static_dir, "index.html")
         if os.path.exists(index_path):
             return FileResponse(index_path)
         return {"error": "Frontend not built"}
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """Serve the SPA for all non-API routes."""
+        # Don't serve index.html for API routes
+        if full_path.startswith("api/"):
+            return {"detail": "Not found"}
+        index_path = os.path.join(static_dir, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        return {"error": "Frontend not built"}
+else:
+    @app.get("/")
+    async def no_frontend():
+        """Fallback when frontend is not built."""
+        return {"error": "Frontend not built", "static_dir_checked": static_dir}
 
 
 if __name__ == "__main__":
