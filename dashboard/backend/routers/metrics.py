@@ -8,6 +8,8 @@ from fastapi import APIRouter, Query
 from typing import Dict, Any, List
 import httpx
 import os
+import google.auth.transport.requests
+import google.oauth2.id_token
 
 from services.bigquery import get_bigquery_service
 
@@ -17,6 +19,12 @@ TRADING_BOT_URL = os.getenv(
     "TRADING_BOT_URL",
     "https://options-wheel-strategy-799970961417.us-central1.run.app"
 )
+
+
+def get_identity_token(audience: str) -> str:
+    """Get an identity token for service-to-service authentication."""
+    auth_req = google.auth.transport.requests.Request()
+    return google.oauth2.id_token.fetch_id_token(auth_req, audience)
 
 
 @router.get("/summary")
@@ -37,8 +45,10 @@ async def get_metrics_summary(
 
     # Try to get current account value
     try:
+        token = get_identity_token(TRADING_BOT_URL)
+        headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{TRADING_BOT_URL}/account")
+            response = await client.get(f"{TRADING_BOT_URL}/account", headers=headers)
             if response.status_code == 200:
                 account = response.json()
                 metrics['portfolio_value'] = account.get('portfolio_value', 0)
@@ -94,8 +104,10 @@ async def get_upcoming_expirations() -> List[Dict[str, Any]]:
         List of positions with expiration dates for calendar view.
     """
     try:
+        token = get_identity_token(TRADING_BOT_URL)
+        headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{TRADING_BOT_URL}/positions")
+            response = await client.get(f"{TRADING_BOT_URL}/positions", headers=headers)
             if response.status_code == 200:
                 positions = response.json()
                 # Filter to options only and extract expiration info

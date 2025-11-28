@@ -8,6 +8,8 @@ from fastapi import APIRouter, HTTPException
 from typing import Dict, Any, List
 import httpx
 import os
+import google.auth.transport.requests
+import google.oauth2.id_token
 
 router = APIRouter()
 
@@ -21,10 +23,19 @@ TRADING_BOT_URL = os.getenv(
 client = httpx.AsyncClient(timeout=30.0)
 
 
+def get_identity_token(audience: str) -> str:
+    """Get an identity token for service-to-service authentication."""
+    auth_req = google.auth.transport.requests.Request()
+    return google.oauth2.id_token.fetch_id_token(auth_req, audience)
+
+
 async def proxy_request(endpoint: str) -> Dict[str, Any]:
-    """Proxy a request to the trading bot."""
+    """Proxy a request to the trading bot with authentication."""
     try:
-        response = await client.get(f"{TRADING_BOT_URL}{endpoint}")
+        # Get identity token for Cloud Run service-to-service auth
+        token = get_identity_token(TRADING_BOT_URL)
+        headers = {"Authorization": f"Bearer {token}"}
+        response = await client.get(f"{TRADING_BOT_URL}{endpoint}", headers=headers)
         response.raise_for_status()
         return response.json()
     except httpx.HTTPStatusError as e:
@@ -36,6 +47,11 @@ async def proxy_request(endpoint: str) -> Dict[str, Any]:
         raise HTTPException(
             status_code=503,
             detail=f"Cannot reach trading bot: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Authentication error: {str(e)}"
         )
 
 
