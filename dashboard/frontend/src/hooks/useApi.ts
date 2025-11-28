@@ -78,7 +78,7 @@ export function useBotStatus() {
   }>('/live/status', 15000) // Refresh every 15 seconds
 }
 
-export function useTrades(limit = 50) {
+export function useTrades(days = 7) {
   return useFetch<Array<{
     timestamp: string
     symbol: string
@@ -90,7 +90,7 @@ export function useTrades(limit = 50) {
     premium: number
     dte: number
     status: string
-  }>>(`/history/trades?limit=${limit}`)
+  }>>(`/history/trades?days=${days}`)
 }
 
 export function useDailySummary(days = 30) {
@@ -148,16 +148,16 @@ export function useExpirations(days = 30) {
   }>>(`/metrics/expirations?days=${days}`)
 }
 
-export function useErrors(limit = 20) {
+export function useErrors(days = 7) {
   return useFetch<Array<{
     timestamp: string
     severity: string
     component: string
     message: string
-  }>>(`/history/errors?limit=${limit}`)
+  }>>(`/history/errors?days=${days}`)
 }
 
-export function useFilteringStats(limit = 100) {
+export function useFilteringStats(days = 7) {
   return useFetch<Array<{
     timestamp: string
     symbol: string
@@ -166,7 +166,7 @@ export function useFilteringStats(limit = 100) {
     reason: string
     value: number
     threshold: number
-  }>>(`/history/filtering?limit=${limit}`)
+  }>>(`/history/filtering?days=${days}`)
 }
 
 export function useConfig() {

@@ -14,7 +14,7 @@ router = APIRouter()
 # Trading bot Cloud Run URL
 TRADING_BOT_URL = os.getenv(
     "TRADING_BOT_URL",
-    "https://options-wheel-bot-650263886572.us-central1.run.app"
+    "https://options-wheel-strategy-799970961417.us-central1.run.app"
 )
 
 # HTTP client with timeout

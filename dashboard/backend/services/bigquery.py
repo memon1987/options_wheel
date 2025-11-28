@@ -5,12 +5,17 @@ Provides access to trading logs stored in BigQuery via the log sink.
 """
 
 from google.cloud import bigquery
+from google.cloud.exceptions import GoogleCloudError
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Project and dataset configuration
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "options-wheel-bot")
+# GCP_PROJECT is set in Cloud Run environment, fallback to GOOGLE_CLOUD_PROJECT
+PROJECT_ID = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT", "gen-lang-client-0607444019")
 DATASET_ID = "options_wheel_logs"
 
 
@@ -23,9 +28,16 @@ class BigQueryService:
 
     def _run_query(self, query: str) -> List[Dict[str, Any]]:
         """Execute a query and return results as list of dicts."""
-        job = self.client.query(query)
-        results = job.result()
-        return [dict(row.items()) for row in results]
+        try:
+            job = self.client.query(query)
+            results = job.result(timeout=60)  # 60 second timeout
+            return [dict(row.items()) for row in results]
+        except GoogleCloudError as e:
+            logger.error(f"BigQuery error: {e}")
+            raise Exception(f"Database query failed: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error in BigQuery query: {e}")
+            raise Exception(f"Database query failed: {str(e)}")
 
     def get_recent_trades(self, days: int = 7, limit: int = 50) -> List[Dict[str, Any]]:
         """
