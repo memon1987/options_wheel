@@ -123,27 +123,14 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
 
   const formatDate = (dateStr: string) => {
     if (!dateStr) return 'N/A'
-    try {
-      return new Date(dateStr).toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: '2-digit',
-      })
-    } catch {
-      return dateStr
-    }
+    // Return YYYY-MM-DD format
+    return dateStr.split('T')[0]
   }
 
   const formatExpiration = (dateStr: string) => {
     if (!dateStr) return 'N/A'
-    try {
-      return new Date(dateStr).toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-      })
-    } catch {
-      return dateStr
-    }
+    // Already in YYYY-MM-DD format from parseOptionSymbol
+    return dateStr
   }
 
   const getStrategyLabel = (strategy: string) => {

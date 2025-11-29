@@ -54,11 +54,12 @@ export default function PositionsTable({ positions, compact = false }: Positions
         const day = expDate.slice(4, 6)
         const strike = parseInt(strikeRaw) / 1000
         const optionType = type === 'P' ? 'Put' : 'Call'
+        const expirationDate = `${year}-${month}-${day}`
         return {
-          display: `${underlying} ${month}/${day} $${strike} ${optionType}`,
+          display: `${underlying} ${expirationDate} $${strike} ${optionType}`,
           underlying,
           strike,
-          expiration: `${year}-${month}-${day}`,
+          expiration: expirationDate,
           type: optionType,
         }
       }
