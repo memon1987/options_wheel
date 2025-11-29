@@ -63,9 +63,7 @@ export function usePositions() {
     side: string
     market_value: string
     unrealized_pl: string
-    unrealized_plpc: string
-    current_price: string
-    avg_entry_price: string
+    cost_basis: string
   }>>('/live/positions', 30000)
 }
 
@@ -80,16 +78,11 @@ export function useBotStatus() {
 
 export function useTrades(days = 7) {
   return useFetch<Array<{
-    timestamp: string
+    timestamp_et?: string
+    date_et?: string
     symbol: string
-    underlying: string
-    strategy: string
-    quantity: number
-    strike_price: number
-    expiration: string
-    premium: number
-    dte: number
-    status: string
+    event_type?: string
+    event?: string
   }>>(`/history/trades?days=${days}`)
 }
 

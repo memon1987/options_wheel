@@ -5,9 +5,7 @@ interface Position {
   side: string
   market_value: string
   unrealized_pl: string
-  unrealized_plpc: string
-  current_price: string
-  avg_entry_price: string
+  cost_basis: string
 }
 
 interface PositionsTableProps {
@@ -15,18 +13,34 @@ interface PositionsTableProps {
   compact?: boolean
 }
 
+// Calculate derived fields from available data
+function calculateDerivedFields(pos: Position) {
+  const qty = parseFloat(pos.qty)
+  const costBasis = parseFloat(pos.cost_basis)
+  const marketValue = parseFloat(pos.market_value)
+  const unrealizedPl = parseFloat(pos.unrealized_pl)
+
+  // Handle edge cases to avoid NaN/Infinity
+  const avgEntryPrice = qty !== 0 ? costBasis / Math.abs(qty) : 0
+  const currentPrice = qty !== 0 ? marketValue / Math.abs(qty) : 0
+  const unrealizedPlpc = costBasis !== 0 ? unrealizedPl / Math.abs(costBasis) : 0
+
+  return { avgEntryPrice, currentPrice, unrealizedPlpc }
+}
+
 export default function PositionsTable({ positions, compact = false }: PositionsTableProps) {
   const formatCurrency = (value: string | number) => {
     const num = typeof value === 'string' ? parseFloat(value) : value
+    if (isNaN(num)) return '$0.00'
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency: 'USD',
     }).format(num)
   }
 
-  const formatPercent = (value: string | number) => {
-    const num = typeof value === 'string' ? parseFloat(value) : value
-    return `${(num * 100).toFixed(2)}%`
+  const formatPercent = (value: number) => {
+    if (isNaN(value)) return '0.00%'
+    return `${(value * 100).toFixed(2)}%`
   }
 
   const parseSymbol = (symbol: string, assetClass: string) => {
@@ -58,6 +72,7 @@ export default function PositionsTable({ positions, compact = false }: Positions
         {positions.map((pos, index) => {
           const parsed = parseSymbol(pos.symbol, pos.asset_class)
           const pl = parseFloat(pos.unrealized_pl)
+          const { avgEntryPrice, unrealizedPlpc } = calculateDerivedFields(pos)
           return (
             <div
               key={index}
@@ -66,13 +81,13 @@ export default function PositionsTable({ positions, compact = false }: Positions
               <div>
                 <p className="font-medium text-white">{parsed.display}</p>
                 <p className="text-xs text-gray-400">
-                  {pos.qty} @ {formatCurrency(pos.avg_entry_price)}
+                  {pos.qty} @ {formatCurrency(avgEntryPrice)}
                 </p>
               </div>
               <div className="text-right">
                 <p className={pl >= 0 ? 'profit' : 'loss'}>{formatCurrency(pl)}</p>
                 <p className={`text-xs ${pl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {formatPercent(pos.unrealized_plpc)}
+                  {formatPercent(unrealizedPlpc)}
                 </p>
               </div>
             </div>
@@ -99,6 +114,7 @@ export default function PositionsTable({ positions, compact = false }: Positions
           {positions.map((pos, index) => {
             const parsed = parseSymbol(pos.symbol, pos.asset_class)
             const pl = parseFloat(pos.unrealized_pl)
+            const { avgEntryPrice, currentPrice, unrealizedPlpc } = calculateDerivedFields(pos)
             return (
               <tr key={index} className="hover:bg-gray-750">
                 <td className="table-cell">
@@ -113,16 +129,16 @@ export default function PositionsTable({ positions, compact = false }: Positions
                 </td>
                 <td className="table-cell text-right text-gray-300">{pos.qty}</td>
                 <td className="table-cell text-right text-gray-300">
-                  {formatCurrency(pos.avg_entry_price)}
+                  {formatCurrency(avgEntryPrice)}
                 </td>
                 <td className="table-cell text-right text-gray-300">
-                  {formatCurrency(pos.current_price)}
+                  {formatCurrency(currentPrice)}
                 </td>
                 <td className={`table-cell text-right ${pl >= 0 ? 'profit' : 'loss'}`}>
                   {formatCurrency(pl)}
                 </td>
                 <td className={`table-cell text-right ${pl >= 0 ? 'profit' : 'loss'}`}>
-                  {formatPercent(pos.unrealized_plpc)}
+                  {formatPercent(unrealizedPlpc)}
                 </td>
               </tr>
             )
