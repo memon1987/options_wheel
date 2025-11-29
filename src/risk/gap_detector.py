@@ -430,8 +430,8 @@ class GapDetector:
                    input_symbols=len(symbols),
                    passed=len(suitable_symbols),
                    rejected=len(rejected_symbols),
-                   passed_symbols=", ".join(suitable_symbols),
-                   rejected_symbols=", ".join(rejected_symbols))
+                   passed_symbols=suitable_symbols,
+                   rejected_symbols=rejected_symbols)
 
         return suitable_symbols
 

@@ -287,13 +287,13 @@ class WheelEngine:
                            max_stocks=max_stocks,
                            total_available=len(gap_filtered_stocks),
                            evaluating=len(stocks_to_evaluate),
-                           symbols_to_evaluate=",".join([s['symbol'] for s in stocks_to_evaluate]))
+                           symbols_to_evaluate=[s['symbol'] for s in stocks_to_evaluate])
             else:
                 logger.info("STAGE 3: No stock evaluation limit (evaluating all gap-filtered stocks)",
                            event_category="filtering",
                            event_type="stage_3_no_limit",
                            stocks_to_evaluate=len(stocks_to_evaluate),
-                           symbols_to_evaluate=",".join([s['symbol'] for s in stocks_to_evaluate]))
+                           symbols_to_evaluate=[s['symbol'] for s in stocks_to_evaluate])
 
             # Process each stock according to wheel strategy phases
             for stock in stocks_to_evaluate:

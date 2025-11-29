@@ -117,7 +117,7 @@ class MarketDataManager:
                            event_category="filtering",
                            event_type="stock_rejected_filter",
                            symbol=symbol,
-                           reasons=", ".join(rejection_reasons),
+                           reasons=rejection_reasons,
                            price=metrics['current_price'],
                            avg_volume=int(metrics['avg_volume']))
                 rejected_stocks.append(symbol)
@@ -131,8 +131,8 @@ class MarketDataManager:
                    total_analyzed=len(symbols),
                    passed=len(suitable_stocks),
                    rejected=len(rejected_stocks),
-                   passed_symbols=", ".join([s['symbol'] for s in suitable_stocks]),
-                   rejected_symbols=", ".join(rejected_stocks))
+                   passed_symbols=[s['symbol'] for s in suitable_stocks],
+                   rejected_symbols=rejected_stocks)
 
         return suitable_stocks
     
