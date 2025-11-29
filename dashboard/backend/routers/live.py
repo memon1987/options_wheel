@@ -99,7 +99,12 @@ async def get_positions() -> List[Dict[str, Any]]:
         - unrealized_pl: Unrealized P&L
         - asset_class: us_equity or us_option
     """
-    return await proxy_request("/positions")
+    response = await proxy_request("/positions")
+    # Trading bot returns {count, positions, timestamp} wrapper
+    if isinstance(response, dict) and "positions" in response:
+        return response["positions"]
+    # Fallback: if response is already a list, return as-is
+    return response if isinstance(response, list) else []
 
 
 @router.get("/config")
