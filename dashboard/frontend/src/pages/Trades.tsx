@@ -11,7 +11,10 @@ interface ParsedOption {
 }
 
 // Parse OCC option symbol: GOOGL251205P00307500
-function parseOptionSymbol(symbol: string): ParsedOption {
+function parseOptionSymbol(symbol: string | null | undefined): ParsedOption {
+  if (!symbol) {
+    return { underlying: 'Unknown', expiration: '', type: '', strike: 0 }
+  }
   const match = symbol.match(/^([A-Z]+)(\d{6})([PC])(\d{8})$/)
   if (match) {
     const [, underlying, expDate, type, strikeRaw] = match
