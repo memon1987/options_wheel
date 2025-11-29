@@ -178,18 +178,36 @@ class BigQueryService:
         """
         results = self._run_query(query)
         if results:
-            metrics = results[0]
+            raw_metrics = results[0]
             # Convert None to 0 for all numeric fields
-            for key in metrics:
-                if metrics[key] is None:
-                    metrics[key] = 0
-            return metrics
+            for key in raw_metrics:
+                if raw_metrics[key] is None:
+                    raw_metrics[key] = 0
+
+            # Map to frontend expected field names
+            return {
+                'total_trades_30d': raw_metrics.get('total_trades', 0),
+                'total_opportunities': raw_metrics.get('total_opportunities', 0),
+                'total_scans': raw_metrics.get('total_scans', 0),
+                'total_errors': raw_metrics.get('total_errors', 0),
+                'trading_days': raw_metrics.get('trading_days', 0),
+                # Premium/win rate not available in BigQuery logs
+                # These would need to come from trade execution details
+                'total_premium_30d': None,
+                'win_rate': None,
+                'avg_premium': None,
+                'return_30d': None,
+            }
         return {
-            'total_trades': 0,
+            'total_trades_30d': 0,
             'total_opportunities': 0,
             'total_scans': 0,
             'total_errors': 0,
-            'trading_days': 0
+            'trading_days': 0,
+            'total_premium_30d': None,
+            'win_rate': None,
+            'avg_premium': None,
+            'return_30d': None,
         }
 
     def get_pnl_by_symbol(self, days: int = 30) -> List[Dict[str, Any]]:

@@ -19,16 +19,16 @@ export default function Dashboard() {
     return <ErrorMessage message={metricsError} />
   }
 
-  const formatCurrency = (value: number | undefined) => {
-    if (value === undefined) return '$0.00'
+  const formatCurrency = (value: number | undefined | null) => {
+    if (value === undefined || value === null) return 'N/A'
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency: 'USD',
     }).format(value)
   }
 
-  const formatPercent = (value: number | undefined) => {
-    if (value === undefined) return '0.0%'
+  const formatPercent = (value: number | undefined | null) => {
+    if (value === undefined || value === null) return 'N/A'
     return `${(value * 100).toFixed(1)}%`
   }
 
