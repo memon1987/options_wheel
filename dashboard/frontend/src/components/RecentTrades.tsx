@@ -182,11 +182,6 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
     return <span className="text-cyan-400">{sortDirection === 'asc' ? '↑' : '↓'}</span>
   }
 
-  // Get unique tickers for filter dropdown
-  const uniqueTickers = useMemo(() => {
-    const tickers = new Set(parsedTrades.map((t) => t.underlying))
-    return Array.from(tickers).sort()
-  }, [parsedTrades])
 
   return (
     <div className="space-y-3">

@@ -1,12 +1,120 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useTrades, useDailySummary } from '../hooks/useApi'
 import LoadingSpinner from '../components/LoadingSpinner'
 import ErrorMessage from '../components/ErrorMessage'
 
+interface ParsedOption {
+  underlying: string
+  expiration: string
+  type: string
+  strike: number
+}
+
+// Parse OCC option symbol: GOOGL251205P00307500
+function parseOptionSymbol(symbol: string): ParsedOption {
+  const match = symbol.match(/^([A-Z]+)(\d{6})([PC])(\d{8})$/)
+  if (match) {
+    const [, underlying, expDate, type, strikeRaw] = match
+    return {
+      underlying,
+      expiration: `20${expDate.slice(0, 2)}-${expDate.slice(2, 4)}-${expDate.slice(4, 6)}`,
+      type: type === 'P' ? 'Put' : 'Call',
+      strike: parseInt(strikeRaw) / 1000,
+    }
+  }
+  return { underlying: symbol, expiration: '', type: '', strike: 0 }
+}
+
+// Map event_type to strategy
+function mapEventToStrategy(eventType: string): string {
+  if (eventType.includes('put_sale') || eventType.includes('sell_put')) return 'sell_put'
+  if (eventType.includes('call_sale') || eventType.includes('sell_call')) return 'sell_call'
+  if (eventType.includes('close') || eventType.includes('buy_to_close')) return 'buy_to_close'
+  if (eventType.includes('assignment')) return 'assignment'
+  if (eventType.includes('expiration')) return 'expiration'
+  return eventType
+}
+
+type SortField = 'date' | 'underlying' | 'strike' | 'expiration' | 'type' | 'strategy'
+type SortDirection = 'asc' | 'desc'
+
 export default function Trades() {
-  const [limit, setLimit] = useState(50)
-  const { data: trades, loading: tradesLoading, error: tradesError } = useTrades(limit)
+  const [days, setDays] = useState(30)
+  const [sortField, setSortField] = useState<SortField>('date')
+  const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
+  const [filterTicker, setFilterTicker] = useState('')
+  const [filterType, setFilterType] = useState<string>('')
+
+  const { data: trades, loading: tradesLoading, error: tradesError } = useTrades(days)
   const { data: dailySummary } = useDailySummary(7)
+
+  // Parse and transform trades
+  const parsedTrades = useMemo(() => {
+    if (!trades) return []
+    return trades.map((trade) => {
+      const parsed = parseOptionSymbol(trade.symbol)
+      const strategy = mapEventToStrategy(trade.event_type || trade.event || '')
+      const timestamp = trade.timestamp_et || trade.date_et || ''
+
+      return {
+        ...parsed,
+        symbol: trade.symbol,
+        strategy,
+        timestamp,
+        date: timestamp.split('T')[0],
+      }
+    })
+  }, [trades])
+
+  // Filter trades
+  const filteredTrades = useMemo(() => {
+    return parsedTrades.filter((trade) => {
+      if (filterTicker && !trade.underlying.toLowerCase().includes(filterTicker.toLowerCase())) {
+        return false
+      }
+      if (filterType && trade.type !== filterType) {
+        return false
+      }
+      return true
+    })
+  }, [parsedTrades, filterTicker, filterType])
+
+  // Sort trades
+  const sortedTrades = useMemo(() => {
+    return [...filteredTrades].sort((a, b) => {
+      let comparison = 0
+      switch (sortField) {
+        case 'date':
+          comparison = a.timestamp.localeCompare(b.timestamp)
+          break
+        case 'underlying':
+          comparison = a.underlying.localeCompare(b.underlying)
+          break
+        case 'strike':
+          comparison = a.strike - b.strike
+          break
+        case 'expiration':
+          comparison = a.expiration.localeCompare(b.expiration)
+          break
+        case 'type':
+          comparison = a.type.localeCompare(b.type)
+          break
+        case 'strategy':
+          comparison = a.strategy.localeCompare(b.strategy)
+          break
+      }
+      return sortDirection === 'desc' ? -comparison : comparison
+    })
+  }, [filteredTrades, sortField, sortDirection])
+
+  const handleSort = (field: SortField) => {
+    if (sortField === field) {
+      setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortField(field)
+      setSortDirection('desc')
+    }
+  }
 
   if (tradesLoading) {
     return <LoadingSpinner />
@@ -24,12 +132,29 @@ export default function Trades() {
   }
 
   const formatDate = (dateStr: string) => {
-    return new Date(dateStr).toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    })
+    if (!dateStr) return 'N/A'
+    try {
+      return new Date(dateStr).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      })
+    } catch {
+      return dateStr
+    }
+  }
+
+  const formatExpiration = (dateStr: string) => {
+    if (!dateStr) return 'N/A'
+    try {
+      return new Date(dateStr).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+      })
+    } catch {
+      return dateStr
+    }
   }
 
   const getStrategyBadge = (strategy: string) => {
@@ -39,10 +164,36 @@ export default function Trades() {
       case 'sell_call':
         return 'bg-blue-900 text-blue-300'
       case 'buy_to_close':
+        return 'bg-yellow-900 text-yellow-300'
+      case 'assignment':
+        return 'bg-red-900 text-red-300'
+      case 'expiration':
         return 'bg-green-900 text-green-300'
       default:
         return 'bg-gray-700 text-gray-300'
     }
+  }
+
+  const getStrategyLabel = (strategy: string) => {
+    switch (strategy) {
+      case 'sell_put':
+        return 'Sell Put'
+      case 'sell_call':
+        return 'Sell Call'
+      case 'buy_to_close':
+        return 'Close'
+      case 'assignment':
+        return 'Assigned'
+      case 'expiration':
+        return 'Expired'
+      default:
+        return strategy
+    }
+  }
+
+  const SortIcon = ({ field }: { field: SortField }) => {
+    if (sortField !== field) return <span className="text-gray-600 ml-1">↕</span>
+    return <span className="text-cyan-400 ml-1">{sortDirection === 'asc' ? '↑' : '↓'}</span>
   }
 
   const totalPremium7d = dailySummary?.reduce((sum, d) => sum + d.total_premium, 0) || 0
@@ -54,13 +205,13 @@ export default function Trades() {
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between">
         <h1 className="text-2xl font-bold text-white">Trade History</h1>
         <select
-          value={limit}
-          onChange={(e) => setLimit(Number(e.target.value))}
+          value={days}
+          onChange={(e) => setDays(Number(e.target.value))}
           className="mt-2 sm:mt-0 bg-gray-700 text-white rounded-lg px-4 py-2 border border-gray-600"
         >
-          <option value={25}>Last 25 trades</option>
-          <option value={50}>Last 50 trades</option>
-          <option value={100}>Last 100 trades</option>
+          <option value={7}>Last 7 days</option>
+          <option value={30}>Last 30 days</option>
+          <option value={90}>Last 90 days</option>
         </select>
       </div>
 
@@ -82,7 +233,32 @@ export default function Trades() {
         </div>
         <div className="card">
           <p className="card-header">Showing</p>
-          <p className="card-value text-white">{trades?.length || 0}</p>
+          <p className="card-value text-white">{sortedTrades.length}</p>
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div className="card">
+        <div className="flex gap-3 flex-wrap items-center">
+          <input
+            type="text"
+            placeholder="Filter by ticker..."
+            value={filterTicker}
+            onChange={(e) => setFilterTicker(e.target.value)}
+            className="px-3 py-2 bg-gray-700 border border-gray-600 rounded text-sm text-white placeholder-gray-400 focus:outline-none focus:border-cyan-500"
+          />
+          <select
+            value={filterType}
+            onChange={(e) => setFilterType(e.target.value)}
+            className="px-3 py-2 bg-gray-700 border border-gray-600 rounded text-sm text-white focus:outline-none focus:border-cyan-500"
+          >
+            <option value="">All Types</option>
+            <option value="Put">Puts</option>
+            <option value="Call">Calls</option>
+          </select>
+          <span className="text-gray-400 text-sm">
+            {sortedTrades.length} of {parsedTrades.length} trades
+          </span>
         </div>
       </div>
 
@@ -92,66 +268,94 @@ export default function Trades() {
           <table className="w-full">
             <thead className="bg-gray-700">
               <tr>
-                <th className="table-cell table-header">Date</th>
-                <th className="table-cell table-header">Symbol</th>
-                <th className="table-cell table-header">Strategy</th>
-                <th className="table-cell table-header text-right">Strike</th>
-                <th className="table-cell table-header text-right">Premium</th>
-                <th className="table-cell table-header text-right">DTE</th>
-                <th className="table-cell table-header">Status</th>
+                <th
+                  className="table-cell table-header cursor-pointer hover:bg-gray-600"
+                  onClick={() => handleSort('date')}
+                >
+                  Date<SortIcon field="date" />
+                </th>
+                <th
+                  className="table-cell table-header cursor-pointer hover:bg-gray-600"
+                  onClick={() => handleSort('underlying')}
+                >
+                  Ticker<SortIcon field="underlying" />
+                </th>
+                <th
+                  className="table-cell table-header cursor-pointer hover:bg-gray-600"
+                  onClick={() => handleSort('type')}
+                >
+                  Type<SortIcon field="type" />
+                </th>
+                <th
+                  className="table-cell table-header text-right cursor-pointer hover:bg-gray-600"
+                  onClick={() => handleSort('strike')}
+                >
+                  Strike<SortIcon field="strike" />
+                </th>
+                <th
+                  className="table-cell table-header cursor-pointer hover:bg-gray-600"
+                  onClick={() => handleSort('expiration')}
+                >
+                  Expiration<SortIcon field="expiration" />
+                </th>
+                <th
+                  className="table-cell table-header cursor-pointer hover:bg-gray-600"
+                  onClick={() => handleSort('strategy')}
+                >
+                  Action<SortIcon field="strategy" />
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-700">
-              {trades?.map((trade, index) => (
-                <tr key={index} className="hover:bg-gray-750">
-                  <td className="table-cell text-gray-300 whitespace-nowrap">
-                    {formatDate(trade.timestamp)}
-                  </td>
-                  <td className="table-cell font-medium text-white">
-                    {trade.underlying || trade.symbol}
-                  </td>
-                  <td className="table-cell">
-                    <span
-                      className={`inline-flex px-2 py-1 rounded text-xs font-medium ${getStrategyBadge(
-                        trade.strategy
-                      )}`}
-                    >
-                      {trade.strategy.replace('_', ' ')}
-                    </span>
-                  </td>
-                  <td className="table-cell text-right text-gray-300">
-                    ${trade.strike_price?.toFixed(0)}
-                  </td>
-                  <td className="table-cell text-right profit">
-                    {formatCurrency(trade.premium * 100)}
-                  </td>
-                  <td className="table-cell text-right text-gray-300">
-                    {trade.dte}
-                  </td>
-                  <td className="table-cell">
-                    <span
-                      className={`inline-flex px-2 py-1 rounded text-xs font-medium ${
-                        trade.status === 'filled'
-                          ? 'bg-green-900 text-green-300'
-                          : trade.status === 'pending'
-                          ? 'bg-yellow-900 text-yellow-300'
-                          : 'bg-gray-700 text-gray-300'
-                      }`}
-                    >
-                      {trade.status}
-                    </span>
+              {sortedTrades.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="table-cell text-center text-gray-400 py-8">
+                    No trades found
                   </td>
                 </tr>
-              ))}
+              ) : (
+                sortedTrades.map((trade, index) => (
+                  <tr key={index} className="hover:bg-gray-750">
+                    <td className="table-cell text-gray-300 whitespace-nowrap">
+                      {formatDate(trade.timestamp)}
+                    </td>
+                    <td className="table-cell font-medium text-white">
+                      {trade.underlying}
+                    </td>
+                    <td className="table-cell">
+                      <span
+                        className={`px-2 py-0.5 rounded text-xs ${
+                          trade.type === 'Put'
+                            ? 'bg-purple-900/50 text-purple-300'
+                            : trade.type === 'Call'
+                            ? 'bg-blue-900/50 text-blue-300'
+                            : 'bg-gray-700 text-gray-300'
+                        }`}
+                      >
+                        {trade.type || 'N/A'}
+                      </span>
+                    </td>
+                    <td className="table-cell text-right text-gray-300">
+                      {trade.strike > 0 ? `$${trade.strike.toFixed(2)}` : 'N/A'}
+                    </td>
+                    <td className="table-cell text-gray-300">
+                      {formatExpiration(trade.expiration)}
+                    </td>
+                    <td className="table-cell">
+                      <span
+                        className={`inline-flex px-2 py-1 rounded text-xs font-medium ${getStrategyBadge(
+                          trade.strategy
+                        )}`}
+                      >
+                        {getStrategyLabel(trade.strategy)}
+                      </span>
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>
-
-        {(!trades || trades.length === 0) && (
-          <div className="text-center py-12">
-            <p className="text-gray-400">No trades found</p>
-          </div>
-        )}
       </div>
     </div>
   )
