@@ -56,6 +56,7 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
   const [filterTicker, setFilterTicker] = useState('')
   const [filterType, setFilterType] = useState<string>('')
+  const [filterAction, setFilterAction] = useState<string>('')
 
   // Parse and transform trades
   const parsedTrades = useMemo(() => {
@@ -83,9 +84,12 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
       if (filterType && trade.type !== filterType) {
         return false
       }
+      if (filterAction && trade.strategy !== filterAction) {
+        return false
+      }
       return true
     })
-  }, [parsedTrades, filterTicker, filterType])
+  }, [parsedTrades, filterTicker, filterType, filterAction])
 
   // Sort trades
   const sortedTrades = useMemo(() => {
@@ -192,6 +196,18 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
           <option value="">All Types</option>
           <option value="Put">Puts</option>
           <option value="Call">Calls</option>
+        </select>
+        <select
+          value={filterAction}
+          onChange={(e) => setFilterAction(e.target.value)}
+          className="px-3 py-1.5 bg-gray-700 border border-gray-600 rounded text-sm text-white focus:outline-none focus:border-cyan-500"
+        >
+          <option value="">All Actions</option>
+          <option value="sell_put">Sell Put</option>
+          <option value="sell_call">Sell Call</option>
+          <option value="buy_to_close">Close</option>
+          <option value="assignment">Assigned</option>
+          <option value="expiration">Expired</option>
         </select>
         <span className="text-gray-400 text-sm self-center">
           {sortedTrades.length} trades
