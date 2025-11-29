@@ -50,6 +50,7 @@ class BigQueryService:
         Returns:
             List of trade records
         """
+        # Filter to only actual trade executions, not validation events
         query = f"""
         SELECT
             timestamp_et,
@@ -59,6 +60,15 @@ class BigQueryService:
             event
         FROM `{self.dataset}.trades_executed`
         WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            AND symbol IS NOT NULL
+            AND symbol != ''
+            AND (
+                event_type LIKE '%executed%'
+                OR event_type LIKE '%sale%'
+                OR event_type LIKE '%assignment%'
+                OR event_type LIKE '%expir%'
+                OR event_type LIKE '%close%'
+            )
         ORDER BY timestamp_et DESC
         LIMIT {limit}
         """
