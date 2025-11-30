@@ -138,3 +138,54 @@ async def get_upcoming_expirations() -> List[Dict[str, Any]]:
     except Exception:
         pass
     return []
+
+
+@router.get("/premium-by-symbol")
+async def get_premium_by_symbol(
+    days: int = Query(default=30, ge=1, le=365, description="Days to analyze")
+) -> List[Dict[str, Any]]:
+    """
+    Get premium collection breakdown by symbol.
+
+    Args:
+        days: Number of days to analyze (1-365)
+
+    Returns:
+        List of per-symbol premium data: put_premium, call_premium, total_premium, trade_count.
+    """
+    bq = get_bigquery_service()
+    return bq.get_premium_by_symbol(days=days)
+
+
+@router.get("/premium-by-day")
+async def get_premium_by_day(
+    days: int = Query(default=30, ge=1, le=365, description="Days of history")
+) -> List[Dict[str, Any]]:
+    """
+    Get daily premium totals for charting.
+
+    Args:
+        days: Number of days of history (1-365)
+
+    Returns:
+        List of {date, put_premium, call_premium, total_premium, trade_count}.
+    """
+    bq = get_bigquery_service()
+    return bq.get_premium_by_day(days=days)
+
+
+@router.get("/stock-snapshots")
+async def get_stock_snapshots(
+    days: int = Query(default=30, ge=1, le=365, description="Days of history")
+) -> List[Dict[str, Any]]:
+    """
+    Get daily unrealized P&L snapshots for stock holdings.
+
+    Args:
+        days: Number of days of history (1-365)
+
+    Returns:
+        List of daily stock snapshot data with unrealized P&L.
+    """
+    bq = get_bigquery_service()
+    return bq.get_daily_stock_snapshots(days=days)

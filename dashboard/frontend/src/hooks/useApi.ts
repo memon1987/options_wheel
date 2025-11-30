@@ -101,6 +101,8 @@ export function useMetricsSummary() {
   return useFetch<{
     portfolio_value: number
     total_premium_30d: number
+    put_premium_30d: number
+    call_premium_30d: number
     total_trades_30d: number
     win_rate: number
     avg_premium: number
@@ -168,4 +170,54 @@ export function useConfig() {
     risk: Record<string, unknown>
     stocks: { symbols: string[] }
   }>('/live/config')
+}
+
+// Premium tracking hooks
+export function usePremiumBySymbol(days = 30) {
+  return useFetch<Array<{
+    symbol: string
+    total_premium: number
+    put_premium: number
+    call_premium: number
+    trade_count: number
+  }>>(`/metrics/premium-by-symbol?days=${days}`)
+}
+
+export function usePremiumByDay(days = 30) {
+  return useFetch<Array<{
+    date: string
+    total_premium: number
+    put_premium: number
+    call_premium: number
+    trade_count: number
+  }>>(`/metrics/premium-by-day?days=${days}`)
+}
+
+export function useStockSnapshots(days = 30) {
+  return useFetch<Array<{
+    date_et: string
+    symbol: string
+    shares: number
+    cost_basis: number
+    current_price: number
+    unrealized_pl: number
+    unrealized_pl_pct: number
+    days_held: number
+  }>>(`/metrics/stock-snapshots?days=${days}`)
+}
+
+export function useWheelCycles() {
+  return useFetch<Array<{
+    symbol: string
+    cycle_start: string
+    cycle_end: string | null
+    duration_days: number
+    put_premium_collected: number
+    call_premium_collected: number
+    total_premium: number
+    capital_gain: number
+    total_return: number
+    cost_basis: number
+    exit_price: number | null
+  }>>('/history/wheel-cycles')
 }

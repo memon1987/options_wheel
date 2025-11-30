@@ -1,11 +1,13 @@
-import { usePositions, useAccount } from '../hooks/useApi'
+import { usePositions, useAccount, useStockSnapshots } from '../hooks/useApi'
 import PositionsTable from '../components/PositionsTable'
+import StockPositionCard from '../components/StockPositionCard'
 import LoadingSpinner from '../components/LoadingSpinner'
 import ErrorMessage from '../components/ErrorMessage'
 
 export default function Positions() {
   const { data: positions, loading: positionsLoading, error: positionsError, refetch } = usePositions()
   const { data: account } = useAccount()
+  const { data: stockSnapshots } = useStockSnapshots(30)
 
   if (positionsLoading) {
     return <LoadingSpinner />
@@ -29,6 +31,25 @@ export default function Positions() {
       style: 'currency',
       currency: 'USD',
     }).format(num)
+  }
+
+  // Get the most recent snapshot for each symbol and historical data for sparklines
+  const getStockSnapshotData = (symbol: string) => {
+    if (!stockSnapshots) return null
+    const symbolSnapshots = stockSnapshots
+      .filter(s => s.symbol === symbol)
+      .sort((a, b) => new Date(a.date_et).getTime() - new Date(b.date_et).getTime())
+
+    if (symbolSnapshots.length === 0) return null
+
+    const latest = symbolSnapshots[symbolSnapshots.length - 1]
+    return {
+      ...latest,
+      historicalData: symbolSnapshots.map(s => ({
+        date: s.date_et,
+        unrealized_pl: s.unrealized_pl
+      }))
+    }
   }
 
   return (
@@ -76,11 +97,38 @@ export default function Positions() {
         </div>
       )}
 
-      {/* Stock Positions */}
+      {/* Stock Positions - Table View */}
       {stockPositions.length > 0 && (
         <div className="card">
           <h2 className="text-lg font-semibold text-white mb-4">Stock Positions</h2>
           <PositionsTable positions={stockPositions} />
+        </div>
+      )}
+
+      {/* Stock Position P&L with Sparklines */}
+      {stockSnapshots && stockSnapshots.length > 0 && (
+        <div>
+          <h2 className="text-lg font-semibold text-white mb-4">Stock Position P&L History</h2>
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+            {/* Get unique symbols from snapshots */}
+            {Array.from(new Set(stockSnapshots.map(s => s.symbol))).map(symbol => {
+              const data = getStockSnapshotData(symbol)
+              if (!data) return null
+              return (
+                <StockPositionCard
+                  key={symbol}
+                  symbol={symbol}
+                  shares={data.shares}
+                  costBasis={data.cost_basis}
+                  currentPrice={data.current_price}
+                  unrealizedPL={data.unrealized_pl}
+                  unrealizedPLPct={data.unrealized_pl_pct}
+                  daysHeld={data.days_held}
+                  historicalData={data.historicalData}
+                />
+              )
+            })}
+          </div>
         </div>
       )}
 
