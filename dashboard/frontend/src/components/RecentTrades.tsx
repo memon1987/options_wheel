@@ -5,8 +5,13 @@ interface RawTrade {
   timestamp_et?: string
   date_et?: string
   symbol: string
+  underlying?: string
   event_type?: string
   event?: string
+  strategy?: string
+  premium?: number
+  contracts?: number
+  limit_price?: number
 }
 
 interface RecentTradesProps {
@@ -48,7 +53,18 @@ function mapEventToStrategy(eventType: string): string {
   return eventType
 }
 
-type SortField = 'date' | 'underlying' | 'strike' | 'expiration' | 'type'
+// Map event_type to display status
+function mapEventToStatus(eventType: string): string {
+  if (eventType.includes('executed') || eventType.includes('sale')) return 'Filled'
+  if (eventType.includes('assignment')) return 'Assigned'
+  if (eventType.includes('expir')) return 'Expired'
+  if (eventType.includes('close')) return 'Closed'
+  if (eventType.includes('accepted')) return 'Accepted'
+  if (eventType.includes('pending')) return 'Pending'
+  return 'Unknown'
+}
+
+type SortField = 'date' | 'underlying' | 'strike' | 'expiration' | 'type' | 'premium'
 type SortDirection = 'asc' | 'desc'
 
 export default function RecentTrades({ trades }: RecentTradesProps) {
@@ -63,14 +79,25 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
     return trades.map((trade) => {
       const parsed = parseOptionSymbol(trade.symbol)
       const strategy = mapEventToStrategy(trade.event_type || trade.event || '')
+      const status = mapEventToStatus(trade.event_type || trade.event || '')
       const timestamp = trade.timestamp_et || trade.date_et || ''
+
+      // Calculate premium collected (premium * contracts * 100)
+      const contracts = trade.contracts || 1
+      const premium = trade.premium || 0
+      const premiumCollected = premium > 0 ? premium * contracts * 100 : null
 
       return {
         ...parsed,
         symbol: trade.symbol,
         strategy,
+        status,
         timestamp,
         date: timestamp.split('T')[0],
+        qty: contracts,
+        limitPrice: trade.limit_price || null,
+        premium: premium,
+        premiumCollected,
       }
     })
   }, [trades])
@@ -111,6 +138,9 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
         case 'type':
           comparison = a.type.localeCompare(b.type)
           break
+        case 'premium':
+          comparison = (a.premiumCollected || 0) - (b.premiumCollected || 0)
+          break
       }
       return sortDirection === 'desc' ? -comparison : comparison
     })
@@ -125,16 +155,29 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
     }
   }
 
-  const formatDate = (dateStr: string) => {
+  const formatDateTime = (dateStr: string) => {
     if (!dateStr) return 'N/A'
-    // Return YYYY-MM-DD format
-    return dateStr.split('T')[0]
+    const date = new Date(dateStr)
+    return date.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true
+    })
   }
 
   const formatExpiration = (dateStr: string) => {
     if (!dateStr) return 'N/A'
     // Already in YYYY-MM-DD format from parseOptionSymbol
     return dateStr
+  }
+
+  const formatCurrency = (value: number) => {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+    }).format(value)
   }
 
   const getStrategyLabel = (strategy: string) => {
@@ -223,7 +266,7 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
                 className="table-cell table-header cursor-pointer hover:bg-gray-600"
                 onClick={() => handleSort('date')}
               >
-                Date <SortIcon field="date" />
+                Date/Time <SortIcon field="date" />
               </th>
               <th
                 className="table-cell table-header cursor-pointer hover:bg-gray-600"
@@ -250,19 +293,25 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
                 Exp <SortIcon field="expiration" />
               </th>
               <th className="table-cell table-header">Action</th>
+              <th
+                className="table-cell table-header text-right cursor-pointer hover:bg-gray-600"
+                onClick={() => handleSort('premium')}
+              >
+                Premium <SortIcon field="premium" />
+              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-700">
             {sortedTrades.length === 0 ? (
               <tr>
-                <td colSpan={6} className="table-cell text-center text-gray-400 py-8">
+                <td colSpan={7} className="table-cell text-center text-gray-400 py-8">
                   No trades found
                 </td>
               </tr>
             ) : (
               sortedTrades.map((trade, index) => (
                 <tr key={index} className="hover:bg-gray-750">
-                  <td className="table-cell text-gray-300">{formatDate(trade.timestamp)}</td>
+                  <td className="table-cell text-gray-300">{formatDateTime(trade.timestamp)}</td>
                   <td className="table-cell font-medium text-white">{trade.underlying}</td>
                   <td className="table-cell">
                     <span
@@ -283,6 +332,9 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
                     <span className={`text-xs ${getStrategyColor(trade.strategy)}`}>
                       {getStrategyLabel(trade.strategy)}
                     </span>
+                  </td>
+                  <td className="table-cell text-right profit">
+                    {trade.premiumCollected ? formatCurrency(trade.premiumCollected) : 'N/A'}
                   </td>
                 </tr>
               ))

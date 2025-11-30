@@ -81,8 +81,13 @@ export function useTrades(days = 7) {
     timestamp_et?: string
     date_et?: string
     symbol: string
+    underlying?: string
     event_type?: string
     event?: string
+    strategy?: string
+    premium?: number
+    contracts?: number
+    limit_price?: number
   }>>(`/history/trades?days=${days}`)
 }
 

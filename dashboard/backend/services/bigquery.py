@@ -56,8 +56,13 @@ class BigQueryService:
             timestamp_et,
             date_et,
             symbol,
+            underlying,
             event_type,
-            event
+            event,
+            strategy,
+            premium,
+            contracts,
+            limit_price
         FROM `{self.dataset}.trades_executed`
         WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
             AND symbol IS NOT NULL

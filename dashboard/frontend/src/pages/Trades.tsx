@@ -38,7 +38,18 @@ function mapEventToStrategy(eventType: string): string {
   return eventType
 }
 
-type SortField = 'date' | 'underlying' | 'strike' | 'expiration' | 'type' | 'strategy'
+// Map event_type to display status
+function mapEventToStatus(eventType: string): string {
+  if (eventType.includes('executed') || eventType.includes('sale')) return 'Filled'
+  if (eventType.includes('assignment')) return 'Assigned'
+  if (eventType.includes('expir')) return 'Expired'
+  if (eventType.includes('close')) return 'Closed'
+  if (eventType.includes('accepted')) return 'Accepted'
+  if (eventType.includes('pending')) return 'Pending'
+  return 'Unknown'
+}
+
+type SortField = 'date' | 'underlying' | 'strike' | 'expiration' | 'type' | 'strategy' | 'status' | 'qty' | 'premium'
 type SortDirection = 'asc' | 'desc'
 
 export default function Trades() {
@@ -57,14 +68,25 @@ export default function Trades() {
     return trades.map((trade) => {
       const parsed = parseOptionSymbol(trade.symbol)
       const strategy = mapEventToStrategy(trade.event_type || trade.event || '')
+      const status = mapEventToStatus(trade.event_type || trade.event || '')
       const timestamp = trade.timestamp_et || trade.date_et || ''
+
+      // Calculate premium collected (premium * contracts * 100)
+      const contracts = trade.contracts || 1
+      const premium = trade.premium || 0
+      const premiumCollected = premium > 0 ? premium * contracts * 100 : null
 
       return {
         ...parsed,
         symbol: trade.symbol,
         strategy,
+        status,
         timestamp,
         date: timestamp.split('T')[0],
+        qty: contracts,
+        limitPrice: trade.limit_price || null,
+        premium: premium,
+        premiumCollected,
       }
     })
   }, [trades])
@@ -105,6 +127,15 @@ export default function Trades() {
         case 'strategy':
           comparison = a.strategy.localeCompare(b.strategy)
           break
+        case 'status':
+          comparison = a.status.localeCompare(b.status)
+          break
+        case 'qty':
+          comparison = a.qty - b.qty
+          break
+        case 'premium':
+          comparison = (a.premiumCollected || 0) - (b.premiumCollected || 0)
+          break
       }
       return sortDirection === 'desc' ? -comparison : comparison
     })
@@ -134,10 +165,16 @@ export default function Trades() {
     }).format(value)
   }
 
-  const formatDate = (dateStr: string) => {
+  const formatDateTime = (dateStr: string) => {
     if (!dateStr) return 'N/A'
-    // Return YYYY-MM-DD format
-    return dateStr.split('T')[0]
+    const date = new Date(dateStr)
+    return date.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true
+    })
   }
 
   const formatExpiration = (dateStr: string) => {
@@ -177,6 +214,25 @@ export default function Trades() {
         return 'Expired'
       default:
         return strategy
+    }
+  }
+
+  const getStatusBadge = (status: string) => {
+    switch (status) {
+      case 'Filled':
+        return 'bg-green-900 text-green-300'
+      case 'Assigned':
+        return 'bg-red-900 text-red-300'
+      case 'Expired':
+        return 'bg-gray-700 text-gray-300'
+      case 'Closed':
+        return 'bg-yellow-900 text-yellow-300'
+      case 'Accepted':
+        return 'bg-blue-900 text-blue-300'
+      case 'Pending':
+        return 'bg-orange-900 text-orange-300'
+      default:
+        return 'bg-gray-700 text-gray-300'
     }
   }
 
@@ -261,7 +317,7 @@ export default function Trades() {
                   className="table-cell table-header cursor-pointer hover:bg-gray-600"
                   onClick={() => handleSort('date')}
                 >
-                  Date<SortIcon field="date" />
+                  Date/Time<SortIcon field="date" />
                 </th>
                 <th
                   className="table-cell table-header cursor-pointer hover:bg-gray-600"
@@ -285,7 +341,7 @@ export default function Trades() {
                   className="table-cell table-header cursor-pointer hover:bg-gray-600"
                   onClick={() => handleSort('expiration')}
                 >
-                  Expiration<SortIcon field="expiration" />
+                  Exp<SortIcon field="expiration" />
                 </th>
                 <th
                   className="table-cell table-header cursor-pointer hover:bg-gray-600"
@@ -293,12 +349,33 @@ export default function Trades() {
                 >
                   Action<SortIcon field="strategy" />
                 </th>
+                <th
+                  className="table-cell table-header cursor-pointer hover:bg-gray-600"
+                  onClick={() => handleSort('status')}
+                >
+                  Status<SortIcon field="status" />
+                </th>
+                <th
+                  className="table-cell table-header text-center cursor-pointer hover:bg-gray-600"
+                  onClick={() => handleSort('qty')}
+                >
+                  Qty<SortIcon field="qty" />
+                </th>
+                <th className="table-cell table-header">
+                  Order Type
+                </th>
+                <th
+                  className="table-cell table-header text-right cursor-pointer hover:bg-gray-600"
+                  onClick={() => handleSort('premium')}
+                >
+                  Premium<SortIcon field="premium" />
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-700">
               {sortedTrades.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="table-cell text-center text-gray-400 py-8">
+                  <td colSpan={10} className="table-cell text-center text-gray-400 py-8">
                     No trades found
                   </td>
                 </tr>
@@ -306,7 +383,7 @@ export default function Trades() {
                 sortedTrades.map((trade, index) => (
                   <tr key={index} className="hover:bg-gray-750">
                     <td className="table-cell text-gray-300 whitespace-nowrap">
-                      {formatDate(trade.timestamp)}
+                      {formatDateTime(trade.timestamp)}
                     </td>
                     <td className="table-cell font-medium text-white">
                       {trade.underlying}
@@ -338,6 +415,20 @@ export default function Trades() {
                       >
                         {getStrategyLabel(trade.strategy)}
                       </span>
+                    </td>
+                    <td className="table-cell">
+                      <span className={`px-2 py-0.5 rounded text-xs ${getStatusBadge(trade.status)}`}>
+                        {trade.status}
+                      </span>
+                    </td>
+                    <td className="table-cell text-center text-gray-300">
+                      {trade.qty}
+                    </td>
+                    <td className="table-cell text-gray-300">
+                      {trade.limitPrice ? `Limit @ $${trade.limitPrice.toFixed(2)}` : 'N/A'}
+                    </td>
+                    <td className="table-cell text-right profit">
+                      {trade.premiumCollected ? formatCurrency(trade.premiumCollected) : 'N/A'}
                     </td>
                   </tr>
                 ))
