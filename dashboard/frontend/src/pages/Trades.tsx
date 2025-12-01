@@ -39,14 +39,11 @@ function mapEventToStrategy(eventType: string): string {
 }
 
 // Map event_type to display status
-// Use exact matching to distinguish between executing (pending) and executed (filled)
+// Note: *_executed means "Alpaca API accepted the order" NOT "filled in market"
 function mapEventToStatus(eventType: string): string {
-  // Exact matches for executed trades
-  if (eventType === 'put_sale_executed' || eventType === 'call_sale_executed') return 'Filled'
+  // Order accepted by Alpaca (may or may not have filled in market)
+  if (eventType === 'put_sale_executed' || eventType === 'call_sale_executed') return 'Accepted'
   if (eventType === 'buy_to_close_executed') return 'Closed'
-
-  // Pending orders (placed but not yet filled)
-  if (eventType === 'put_sale_executing' || eventType === 'call_sale_executing') return 'Pending'
 
   // Other statuses
   if (eventType.includes('assignment')) return 'Assigned'

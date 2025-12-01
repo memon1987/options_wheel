@@ -50,8 +50,10 @@ class BigQueryService:
         Returns:
             List of trade records
         """
-        # Filter to only actual trade events, not validation/evaluation events
-        # Using explicit event_type list to avoid duplicates from similar event names
+        # Only query final-state events, not interim logging events
+        # The *_executing events are logged when order is submitted to API
+        # The *_executed events are logged when API accepts the order
+        # We only want to show one entry per order (the final state)
         query = f"""
         SELECT
             timestamp_et,
@@ -71,8 +73,6 @@ class BigQueryService:
             AND event_type IN (
                 'put_sale_executed',
                 'call_sale_executed',
-                'put_sale_executing',
-                'call_sale_executing',
                 'put_assignment',
                 'call_assignment',
                 'option_expired',
