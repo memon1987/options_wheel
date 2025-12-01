@@ -39,13 +39,19 @@ function mapEventToStrategy(eventType: string): string {
 }
 
 // Map event_type to display status
+// Use exact matching to distinguish between executing (pending) and executed (filled)
 function mapEventToStatus(eventType: string): string {
-  if (eventType.includes('executed') || eventType.includes('sale')) return 'Filled'
+  // Exact matches for executed trades
+  if (eventType === 'put_sale_executed' || eventType === 'call_sale_executed') return 'Filled'
+  if (eventType === 'buy_to_close_executed') return 'Closed'
+
+  // Pending orders (placed but not yet filled)
+  if (eventType === 'put_sale_executing' || eventType === 'call_sale_executing') return 'Pending'
+
+  // Other statuses
   if (eventType.includes('assignment')) return 'Assigned'
   if (eventType.includes('expir')) return 'Expired'
-  if (eventType.includes('close')) return 'Closed'
-  if (eventType.includes('accepted')) return 'Accepted'
-  if (eventType.includes('pending')) return 'Pending'
+
   return 'Unknown'
 }
 
@@ -317,7 +323,7 @@ export default function Trades() {
                   className="table-cell table-header cursor-pointer hover:bg-gray-600"
                   onClick={() => handleSort('date')}
                 >
-                  Date/Time<SortIcon field="date" />
+                  Date/Time (ET)<SortIcon field="date" />
                 </th>
                 <th
                   className="table-cell table-header cursor-pointer hover:bg-gray-600"
