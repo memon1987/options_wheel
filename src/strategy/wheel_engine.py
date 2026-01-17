@@ -8,7 +8,7 @@ from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..risk.gap_detector import GapDetector
 from ..utils.config import Config
-from ..utils.logging_events import log_system_event, log_performance_metric, log_error_event
+from ..utils.logging_events import log_system_event, log_performance_metric, log_error_event, log_position_update, log_order_status_update
 from .put_seller import PutSeller
 from .call_seller import CallSeller
 from .wheel_state_manager import WheelStateManager, WheelPhase
@@ -109,6 +109,9 @@ class WheelEngine:
                 metric_unit="seconds",
                 actions_taken=len(cycle_summary['actions'])
             )
+
+            # Log daily unrealized P&L snapshot for each stock position
+            self._log_daily_stock_snapshots()
 
         except Exception as e:
             error_msg = f"Strategy cycle failed: {str(e)}"
@@ -646,3 +649,181 @@ class WheelEngine:
         except Exception as e:
             logger.error("Failed to get stock position", symbol=symbol, error=str(e))
             return None
+
+    def _log_daily_stock_snapshots(self):
+        """Log unrealized P&L snapshot for each stock position.
+
+        This logs daily snapshots to track stock ownership gains/losses
+        while holding positions from put assignments.
+        """
+        for symbol, state in self.wheel_state.symbol_states.items():
+            if state.get('stock_shares', 0) > 0:
+                try:
+                    # Get current price from market data
+                    stock_metrics = self.market_data.get_stock_metrics(symbol)
+                    if not stock_metrics:
+                        logger.warning("Could not get stock metrics for snapshot",
+                                      symbol=symbol)
+                        continue
+
+                    current_price = stock_metrics.get('current_price', 0)
+                    cost_basis = state.get('stock_cost_basis', 0)
+                    shares = state['stock_shares']
+                    acquisition_date = state.get('acquisition_date')
+
+                    if cost_basis > 0 and current_price > 0:
+                        unrealized_pl = (current_price - cost_basis) * shares
+                        unrealized_pl_pct = (current_price - cost_basis) / cost_basis
+
+                        # Calculate days held
+                        days_held = 0
+                        if acquisition_date:
+                            days_held = (datetime.now() - acquisition_date).days
+
+                        log_position_update(
+                            logger,
+                            event_type="daily_stock_snapshot",
+                            symbol=symbol,
+                            shares=shares,
+                            cost_basis=cost_basis,
+                            current_price=current_price,
+                            unrealized_pl=unrealized_pl,
+                            unrealized_pl_pct=unrealized_pl_pct,
+                            days_held=days_held,
+                        )
+
+                        logger.info("Daily stock snapshot logged",
+                                   symbol=symbol,
+                                   shares=shares,
+                                   cost_basis=cost_basis,
+                                   current_price=current_price,
+                                   unrealized_pl=unrealized_pl,
+                                   unrealized_pl_pct=f"{unrealized_pl_pct:.2%}",
+                                   days_held=days_held)
+
+                except Exception as e:
+                    logger.error("Failed to log daily stock snapshot",
+                                symbol=symbol,
+                                error=str(e))
+
+    def poll_order_statuses(self) -> Dict[str, Any]:
+        """Poll recent orders and log status updates for filled/expired orders.
+
+        This method checks all orders from the last 7 days and logs status
+        updates for orders that have transitioned to final states (filled,
+        expired, canceled). This enables the dashboard to show accurate
+        order statuses instead of just "Accepted".
+
+        Returns:
+            Summary of orders polled and status updates logged
+        """
+        try:
+            logger.info("Starting order status polling job",
+                       event_category="system",
+                       event_type="order_poll_started")
+
+            # Get all orders (Alpaca returns recent orders by default)
+            all_orders = self.alpaca.get_orders()
+
+            # Also check closed/filled orders
+            try:
+                # Use the trading client directly to get closed orders
+                from alpaca.trading.enums import QueryOrderStatus
+                closed_orders = self.alpaca.trading_client.get_orders(
+                    filter=alpaca.trading.requests.GetOrdersRequest(
+                        status=QueryOrderStatus.CLOSED,
+                        limit=100
+                    )
+                )
+            except Exception as e:
+                logger.debug("Could not fetch closed orders directly, using all_orders",
+                           error=str(e))
+                closed_orders = []
+
+            # Track statistics
+            stats = {
+                'orders_checked': 0,
+                'filled_logged': 0,
+                'expired_logged': 0,
+                'canceled_logged': 0,
+                'errors': 0
+            }
+
+            # Process orders from get_orders
+            for order in all_orders:
+                try:
+                    stats['orders_checked'] += 1
+                    order_id = str(order.get('order_id', ''))
+                    status = order.get('status', '').lower()
+                    symbol = order.get('symbol', '')
+
+                    # Only log final states
+                    if status == 'filled':
+                        # Extract underlying from option symbol
+                        underlying = self._extract_underlying_from_option_symbol(symbol)
+                        # Determine strategy from option type
+                        strategy = 'sell_put' if 'P' in symbol else 'sell_call' if 'C' in symbol else 'unknown'
+
+                        log_order_status_update(
+                            logger,
+                            event_type="order_filled",
+                            order_id=order_id,
+                            symbol=symbol,
+                            status=status,
+                            underlying=underlying or symbol,
+                            strategy=strategy,
+                            filled_qty=order.get('filled_qty', 0),
+                            filled_avg_price=order.get('filled_avg_price'),
+                            filled_at=str(order.get('filled_at', ''))
+                        )
+                        stats['filled_logged'] += 1
+
+                    elif status == 'expired':
+                        underlying = self._extract_underlying_from_option_symbol(symbol)
+                        strategy = 'sell_put' if 'P' in symbol else 'sell_call' if 'C' in symbol else 'unknown'
+
+                        log_order_status_update(
+                            logger,
+                            event_type="order_expired",
+                            order_id=order_id,
+                            symbol=symbol,
+                            status=status,
+                            underlying=underlying or symbol,
+                            strategy=strategy
+                        )
+                        stats['expired_logged'] += 1
+
+                    elif status in ('canceled', 'cancelled'):
+                        underlying = self._extract_underlying_from_option_symbol(symbol)
+                        strategy = 'sell_put' if 'P' in symbol else 'sell_call' if 'C' in symbol else 'unknown'
+
+                        log_order_status_update(
+                            logger,
+                            event_type="order_canceled",
+                            order_id=order_id,
+                            symbol=symbol,
+                            status=status,
+                            underlying=underlying or symbol,
+                            strategy=strategy
+                        )
+                        stats['canceled_logged'] += 1
+
+                except Exception as order_error:
+                    logger.warning("Failed to process order status",
+                                  order=order,
+                                  error=str(order_error))
+                    stats['errors'] += 1
+
+            logger.info("Order status polling completed",
+                       event_category="system",
+                       event_type="order_poll_completed",
+                       **stats)
+
+            return stats
+
+        except Exception as e:
+            logger.error("Order status polling failed",
+                        event_category="error",
+                        event_type="order_poll_error",
+                        error=str(e))
+            return {'error': str(e)}

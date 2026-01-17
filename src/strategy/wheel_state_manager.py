@@ -120,7 +120,9 @@ class WheelStateManager:
                 'active_puts': 0,
                 'active_calls': 0,
                 'wheel_cycle_start': None,
-                'total_premium_collected': 0.0
+                'total_premium_collected': 0.0,
+                'put_premium_collected': 0.0,
+                'call_premium_collected': 0.0
             }
 
         state = self.symbol_states[symbol]
@@ -227,6 +229,9 @@ class WheelStateManager:
         if remaining_shares == 0:
             wheel_cycle_completed = True
             cycle_start = state.get('wheel_cycle_start')
+            put_premium = state.get('put_premium_collected', 0)
+            call_premium = state.get('call_premium_collected', 0)
+            total_premium = state.get('total_premium_collected', 0)
 
             if cycle_start:
                 cycle_data = {
@@ -237,15 +242,35 @@ class WheelStateManager:
                     'initial_cost_basis': cost_basis,
                     'final_sale_price': strike_price,
                     'capital_gain': capital_gain,
-                    'total_premium': state.get('total_premium_collected', 0),
-                    'total_return': capital_gain + state.get('total_premium_collected', 0)
+                    'put_premium_collected': put_premium,
+                    'call_premium_collected': call_premium,
+                    'total_premium': total_premium,
+                    'total_return': capital_gain + total_premium
                 }
 
                 self.wheel_cycles.append(cycle_data)
 
+                # Log wheel cycle completion with premium breakdown
+                log_position_update(
+                    logger,
+                    event_type="wheel_cycle_complete",
+                    symbol=symbol,
+                    position_status="cycle_complete",
+                    put_premium_collected=put_premium,
+                    call_premium_collected=call_premium,
+                    total_premium=total_premium,
+                    capital_gain=capital_gain,
+                    total_return=capital_gain + total_premium,
+                    cycle_duration_days=(assignment_date - cycle_start).days,
+                    cost_basis=cost_basis,
+                    exit_price=strike_price,
+                )
+
             # Reset for new cycle
             state['wheel_cycle_start'] = None
             state['total_premium_collected'] = 0.0
+            state['put_premium_collected'] = 0.0
+            state['call_premium_collected'] = 0.0
 
         new_phase = self.get_wheel_phase(symbol)
 
@@ -320,12 +345,16 @@ class WheelStateManager:
                 'active_puts': 0,
                 'active_calls': 0,
                 'wheel_cycle_start': None,
-                'total_premium_collected': 0.0
+                'total_premium_collected': 0.0,
+                'put_premium_collected': 0.0,
+                'call_premium_collected': 0.0
             }
 
         state = self.symbol_states[symbol]
         state['active_puts'] += contracts
-        state['total_premium_collected'] += premium * contracts
+        premium_amount = premium * contracts
+        state['total_premium_collected'] += premium_amount
+        state['put_premium_collected'] = state.get('put_premium_collected', 0.0) + premium_amount
 
         logger.info("Put position added",
                    symbol=symbol,
@@ -353,7 +382,9 @@ class WheelStateManager:
 
         state = self.symbol_states[symbol]
         state['active_calls'] += contracts
-        state['total_premium_collected'] += premium * contracts
+        premium_amount = premium * contracts
+        state['total_premium_collected'] += premium_amount
+        state['call_premium_collected'] = state.get('call_premium_collected', 0.0) + premium_amount
 
         logger.info("Call position added",
                    symbol=symbol,
@@ -426,6 +457,8 @@ class WheelStateManager:
             'active_puts': state['active_puts'],
             'active_calls': state['active_calls'],
             'total_premium_collected': state.get('total_premium_collected', 0),
+            'put_premium_collected': state.get('put_premium_collected', 0),
+            'call_premium_collected': state.get('call_premium_collected', 0),
             'wheel_cycle_start': state.get('wheel_cycle_start'),
             'can_sell_puts': self.can_sell_puts(symbol),
             'can_sell_calls': self.can_sell_calls(symbol)

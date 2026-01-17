@@ -12,6 +12,10 @@ interface RawTrade {
   premium?: number
   contracts?: number
   limit_price?: number
+  order_id?: string
+  order_status?: string  // 'pending' | 'filled' | 'expired' | 'canceled'
+  final_fill_price?: number
+  filled_at?: string
 }
 
 interface RecentTradesProps {
@@ -53,16 +57,32 @@ function mapEventToStrategy(eventType: string): string {
   return eventType
 }
 
-// Map event_type to display status
-// Note: *_executed means "Alpaca API accepted the order" NOT "filled in market"
-function mapEventToStatus(eventType: string): string {
-  // Order accepted by Alpaca (may or may not have filled in market)
-  if (eventType === 'put_sale_executed' || eventType === 'call_sale_executed') return 'Accepted'
-  if (eventType === 'buy_to_close_executed') return 'Closed'
+// Map order_status from BigQuery to display status
+// order_status is from the polling job: 'pending', 'filled', 'expired', 'canceled'
+// Falls back to event_type for assignment/expiration events
+function mapToDisplayStatus(orderStatus: string | undefined, eventType: string): string {
+  // First check order_status from polling job (most accurate)
+  if (orderStatus) {
+    switch (orderStatus.toLowerCase()) {
+      case 'filled':
+        return 'Filled'
+      case 'expired':
+        return 'Expired'
+      case 'canceled':
+      case 'cancelled':
+        return 'Canceled'
+      case 'pending':
+        return 'Pending'
+    }
+  }
 
-  // Other statuses
+  // Fall back to event_type for special cases
   if (eventType.includes('assignment')) return 'Assigned'
   if (eventType.includes('expir')) return 'Expired'
+  if (eventType === 'buy_to_close_executed') return 'Closed'
+
+  // Order was submitted but no status update yet
+  if (eventType === 'put_sale_executed' || eventType === 'call_sale_executed') return 'Pending'
 
   return 'Unknown'
 }
@@ -81,8 +101,10 @@ export default function RecentTrades({ trades }: RecentTradesProps) {
   const parsedTrades = useMemo(() => {
     return trades.map((trade) => {
       const parsed = parseOptionSymbol(trade.symbol)
-      const strategy = mapEventToStrategy(trade.event_type || trade.event || '')
-      const status = mapEventToStatus(trade.event_type || trade.event || '')
+      const eventType = trade.event_type || trade.event || ''
+      const strategy = mapEventToStrategy(eventType)
+      // Use order_status from BigQuery join with fallback to event_type
+      const status = mapToDisplayStatus(trade.order_status, eventType)
       const timestamp = trade.timestamp_et || trade.date_et || ''
 
       // Calculate premium collected (premium * contracts * 100)

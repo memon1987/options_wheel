@@ -41,44 +41,74 @@ class BigQueryService:
 
     def get_recent_trades(self, days: int = 7, limit: int = 50) -> List[Dict[str, Any]]:
         """
-        Get recent trades from the trades_executed table.
+        Get recent trades from the trades_executed table with order status.
 
         Args:
             days: Number of days to look back
             limit: Maximum number of trades to return
 
         Returns:
-            List of trade records
+            List of trade records with order_status from polling job
         """
-        # Only query final-state events, not interim logging events
-        # The *_executing events are logged when order is submitted to API
-        # The *_executed events are logged when API accepts the order
-        # We only want to show one entry per order (the final state)
+        # Join trades with order status updates to get final fill status
+        # The order_filled/order_expired events are logged by the polling job
+        # and joined by order_id to show actual fill status
         query = f"""
+        WITH trades AS (
+            SELECT
+                timestamp_et,
+                date_et,
+                symbol,
+                underlying,
+                event_type,
+                event,
+                strategy,
+                premium,
+                contracts,
+                limit_price,
+                order_id
+            FROM `{self.dataset}.trades_executed`
+            WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+                AND symbol IS NOT NULL
+                AND symbol != ''
+                AND event_type IN (
+                    'put_sale_executed',
+                    'call_sale_executed',
+                    'put_assignment',
+                    'call_assignment',
+                    'option_expired',
+                    'buy_to_close_executed'
+                )
+        ),
+        order_statuses AS (
+            SELECT
+                order_id,
+                order_status,
+                event_type as status_event_type,
+                filled_avg_price as final_fill_price,
+                filled_at
+            FROM `{self.dataset}.trades_executed`
+            WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+                AND event_type IN ('order_filled', 'order_expired', 'order_canceled')
+        )
         SELECT
-            timestamp_et,
-            date_et,
-            symbol,
-            underlying,
-            event_type,
-            event,
-            strategy,
-            premium,
-            contracts,
-            limit_price
-        FROM `{self.dataset}.trades_executed`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-            AND symbol IS NOT NULL
-            AND symbol != ''
-            AND event_type IN (
-                'put_sale_executed',
-                'call_sale_executed',
-                'put_assignment',
-                'call_assignment',
-                'option_expired',
-                'buy_to_close_executed'
-            )
-        ORDER BY timestamp_et DESC
+            t.timestamp_et,
+            t.date_et,
+            t.symbol,
+            t.underlying,
+            t.event_type,
+            t.event,
+            t.strategy,
+            t.premium,
+            t.contracts,
+            t.limit_price,
+            t.order_id,
+            COALESCE(s.order_status, 'pending') as order_status,
+            s.final_fill_price,
+            s.filled_at
+        FROM trades t
+        LEFT JOIN order_statuses s ON t.order_id = s.order_id
+        ORDER BY t.timestamp_et DESC
         LIMIT {limit}
         """
         return self._run_query(query)

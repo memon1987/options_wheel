@@ -538,14 +538,46 @@ class AlpacaClient:
                     })
             
             return order_list
-            
+
         except Exception as e:
             logger.error("Failed to get orders",
                         event_category="error",
                         event_type="orders_error",
                         error=str(e))
             raise
-    
+
+    @api_retry
+    def get_order_by_id(self, order_id: str) -> Dict[str, Any]:
+        """Get order details by order ID.
+
+        Args:
+            order_id: The Alpaca order ID
+
+        Returns:
+            Dict with order details including status, fill info
+        """
+        try:
+            order = self.trading_client.get_order_by_id(order_id)
+            return {
+                'order_id': str(order.id),
+                'symbol': order.symbol,
+                'status': order.status.value,
+                'qty': int(order.qty),
+                'filled_qty': int(order.filled_qty) if order.filled_qty else 0,
+                'filled_avg_price': float(order.filled_avg_price) if order.filled_avg_price else None,
+                'filled_at': order.filled_at.isoformat() if order.filled_at else None,
+                'expired_at': order.expired_at.isoformat() if hasattr(order, 'expired_at') and order.expired_at else None,
+                'canceled_at': order.canceled_at.isoformat() if hasattr(order, 'canceled_at') and order.canceled_at else None,
+                'submitted_at': order.submitted_at.isoformat() if order.submitted_at else None
+            }
+        except Exception as e:
+            logger.error("Failed to get order by ID",
+                        event_category="error",
+                        event_type="order_lookup_error",
+                        order_id=order_id,
+                        error=str(e))
+            raise
+
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order.
         

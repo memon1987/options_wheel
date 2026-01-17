@@ -132,6 +132,71 @@ mypy src/                        # Type checking
 - If cloud data is not available, request user to trigger cloud-based backtesting first
 - This ensures analysis reflects production-ready, persistent, and centralized data
 
+## Dashboard & Backend Cascading Impact Analysis
+
+**CRITICAL: Before making changes to the dashboard or backend, ALWAYS perform a cascading impact analysis.**
+
+The dashboard architecture has multiple interconnected layers. Changes to one layer can break functionality in others. Always trace data flow end-to-end:
+
+### Data Flow Architecture
+```
+Trading Bot (Cloud Run) → Cloud Logging → BigQuery Views → Dashboard Backend → Dashboard Frontend
+```
+
+### Pre-Change Checklist
+
+Before modifying ANY dashboard or backend component, analyze:
+
+1. **Data Source Changes (BigQuery Views/Tables)**
+   - Which backend queries use this data?
+   - What fields does the frontend expect?
+   - Are there aggregations that depend on specific field values?
+
+2. **Backend API Changes (FastAPI endpoints)**
+   - Which frontend hooks consume this endpoint?
+   - What TypeScript types need updating?
+   - Are there caching considerations?
+
+3. **Frontend Component Changes**
+   - What API data does this component expect?
+   - Are there shared components (e.g., RecentTrades used in multiple places)?
+   - Does the status/display logic match backend data format?
+
+4. **Logging Event Changes (logging_events.py)**
+   - Which BigQuery views depend on this event_type?
+   - Will existing queries still work?
+   - Do frontend status mappings need updating?
+
+### Key Files by Layer
+
+| Layer | Key Files | Impact When Changed |
+|-------|-----------|---------------------|
+| Bot Logging | `src/utils/logging_events.py` | BigQuery views, dashboard status displays |
+| BigQuery | `dashboard/backend/services/bigquery.py` | All dashboard endpoints |
+| Backend API | `dashboard/backend/routers/*.py` | Frontend hooks, data types |
+| Frontend Hooks | `dashboard/frontend/src/hooks/useApi.ts` | All consuming components |
+| Frontend Components | `dashboard/frontend/src/components/*.tsx` | UI display, user experience |
+| Frontend Pages | `dashboard/frontend/src/pages/*.tsx` | Feature functionality |
+
+### Example: Order Status Fix
+
+When fixing order status display from "Accepted" to "Filled/Expired":
+
+1. **Bot Layer**: Add `poll_order_statuses()` to log `order_filled`/`order_expired` events
+2. **BigQuery Layer**: Update `get_recent_trades()` query to join order status events
+3. **Backend Layer**: Ensure new fields (`order_status`, `order_id`) are returned
+4. **Frontend Hooks**: Add `order_status` to TypeScript interface
+5. **Frontend Components**: Update `mapEventToStatus()` to use new `order_status` field
+6. **Verify**: Premium calculations and other metrics remain unaffected
+
+### Verification Steps
+
+After any change:
+1. Check that existing features still work (premium tracking, trade history, etc.)
+2. Verify TypeScript compiles without errors
+3. Test the full data flow from bot to dashboard display
+4. Confirm metrics and aggregations are unaffected by display-only changes
+
 ## Development Notes
 
 **Alpaca Setup**: Requires options trading approval and paper trading endpoint

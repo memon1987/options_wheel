@@ -365,6 +365,59 @@ def log_position_update(
     )
 
 
+def log_order_status_update(
+    logger: Any,
+    event_type: str,
+    order_id: str,
+    symbol: str,
+    status: str,
+    **kwargs
+) -> None:
+    """Log an order status update event (filled, expired, canceled).
+
+    This function is used by the order polling job to log status changes
+    for orders that were previously submitted (e.g., put_sale_executed).
+
+    Args:
+        logger: structlog logger instance
+        event_type: Type of event (e.g., 'order_filled', 'order_expired', 'order_canceled')
+        order_id: Alpaca order ID
+        symbol: Option symbol
+        status: Alpaca order status (e.g., 'filled', 'expired', 'canceled')
+        **kwargs: Additional context (filled_qty, filled_avg_price, filled_at, etc.)
+
+    Example:
+        log_order_status_update(
+            logger,
+            event_type="order_filled",
+            order_id="abc123",
+            symbol="AMD251003P00155000",
+            status="filled",
+            underlying="AMD",
+            strategy="sell_put",
+            filled_qty=1,
+            filled_avg_price=0.74,
+            filled_at="2025-11-28T10:30:00"
+        )
+
+    BigQuery Result:
+        SELECT order_id, symbol, status, filled_avg_price
+        FROM logs
+        WHERE event_category = 'trade' AND event_type LIKE 'order_%'
+    """
+    logger.info(
+        event_type,
+        event_category="trade",
+        event_type=event_type,
+        order_id=order_id,
+        symbol=symbol,
+        order_status=status,
+        timestamp_ms=int(time.time() * 1000),
+        timestamp_iso=datetime.now().isoformat(),
+        **kwargs
+    )
+
+
 def log_filtering_event(
     logger: Any,
     stage_number: int,

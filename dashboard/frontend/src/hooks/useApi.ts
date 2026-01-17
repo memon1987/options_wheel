@@ -88,6 +88,10 @@ export function useTrades(days = 7) {
     premium?: number
     contracts?: number
     limit_price?: number
+    order_id?: string
+    order_status?: string  // 'pending' | 'filled' | 'expired' | 'canceled'
+    final_fill_price?: number
+    filled_at?: string
   }>>(`/history/trades?days=${days}`)
 }
 

@@ -88,6 +88,24 @@ class StrategyScheduler:
         except Exception as e:
             logger.error("Position management job failed", error=str(e))
 
+    def order_status_poll_job(self):
+        """Poll order statuses and log fills/expirations."""
+        try:
+            logger.info("Starting order status poll job")
+
+            if not self.is_trading_day():
+                return
+
+            # Poll order statuses and log updates
+            result = self.wheel_engine.poll_order_statuses()
+            logger.info("Order status poll completed",
+                       orders_checked=result.get('orders_checked', 0),
+                       filled_logged=result.get('filled_logged', 0),
+                       expired_logged=result.get('expired_logged', 0))
+
+        except Exception as e:
+            logger.error("Order status poll job failed", error=str(e))
+
     def end_of_day_report(self):
         """Generate end-of-day performance report."""
         try:
@@ -145,6 +163,13 @@ class StrategyScheduler:
         schedule.every().day.at("11:00").do(self.position_management_job)
         schedule.every().day.at("13:00").do(self.position_management_job)
         schedule.every().day.at("15:00").do(self.position_management_job)
+
+        # Order status polling (10:00 AM, 12:00 PM, 14:00 PM, 16:00 PM ET)
+        # Polls Alpaca for order fills/expirations and logs to BigQuery
+        schedule.every().day.at("10:00").do(self.order_status_poll_job)
+        schedule.every().day.at("12:00").do(self.order_status_poll_job)
+        schedule.every().day.at("14:00").do(self.order_status_poll_job)
+        schedule.every().day.at("16:00").do(self.order_status_poll_job)
 
         # End-of-day report (4:30 PM ET)
         schedule.every().day.at("16:30").do(self.end_of_day_report)
