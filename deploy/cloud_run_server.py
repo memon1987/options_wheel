@@ -1665,11 +1665,12 @@ def run_regression_tests():
 
         from tools.testing.regression_monitor import RegressionMonitor
 
-        # Run in internal mode -- the monitor calls our own endpoints
-        # via the service URL (or localhost when running inside Cloud Run).
+        # Run in internal mode -- call our own endpoints via localhost
+        # to avoid Cloud Run IAM auth requirements on self-calls.
+        port = os.environ.get("PORT", "8080")
         service_url = os.environ.get(
             "REGRESSION_SERVICE_URL",
-            request.url_root.rstrip("/"),
+            f"http://localhost:{port}",
         )
         api_key = os.environ.get("STRATEGY_API_KEY", "")
 
