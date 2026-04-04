@@ -1,6 +1,7 @@
 # Core Trading and API
 alpaca-py>=0.21.0,<1.0.0
 requests>=2.31.0,<3.0.0
+pytz>=2023.3,<2026.0
 
 # Google Cloud services
 google-cloud-bigquery>=3.0.0,<4.0.0
