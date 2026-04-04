@@ -16,7 +16,6 @@ This directory contains all development, testing, deployment, and monitoring too
 - `setup_backtesting_schedule.sh` - Configure automated backtesting jobs
 - `setup_github_deployment.sh` - Configure GitHub Actions CI/CD
 - `setup_scheduled_backtesting.sh` - Legacy scheduler setup (use setup_backtesting_schedule.sh)
-- `scheduler.py` - Cloud Scheduler job management utilities
 
 ### 🛠️ `/development/`
 **Development and debugging tools**

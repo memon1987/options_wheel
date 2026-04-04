@@ -212,19 +212,20 @@ az container create \
 
 ## 📊 Scheduling & Automation
 
-### Using the Built-in Scheduler
+### Cloud Scheduler (Production)
 
-The application includes a built-in scheduler that handles market hours and trading cycles:
+In production, scheduling is handled by Google Cloud Scheduler which triggers HTTP endpoints on Cloud Run:
+
+- **Scan jobs** (`/scan`) - Run at :00 of each hour (10 AM - 3 PM ET)
+- **Execute jobs** (`/run`) - Run at :15 of each hour (10 AM - 3 PM ET)
+- **Monitor jobs** (`/monitor`) - Run at :55 of each hour (9 AM - 2 PM ET)
 
 ```bash
-# Run with scheduler (default mode)
-python scripts/scheduler.py
+# List all scheduled jobs
+gcloud scheduler jobs list --location=us-central1
 
-# Test mode (single cycle)
-python scripts/scheduler.py test
-
-# Report only
-python scripts/scheduler.py report
+# Manually trigger a job
+gcloud scheduler jobs run scan-10am --location=us-central1
 ```
 
 ### Cron-based Scheduling
@@ -378,8 +379,8 @@ python scripts/check_api_connection.py
 
 2. **Market Data Issues:**
 ```bash
-# Verify market hours
-python -c "from scripts.scheduler import StrategyScheduler; print(StrategyScheduler().is_market_open())"
+# Check market status via Cloud Run endpoint
+curl https://your-cloud-run-url/status
 ```
 
 3. **Permission Errors:**
