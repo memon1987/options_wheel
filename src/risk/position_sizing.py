@@ -129,7 +129,7 @@ class PositionSizer:
             }
             
         except Exception as e:
-            logger.error("Failed to calculate put position size", error=str(e))
+            logger.error("Failed to calculate put position size", event_category="error", event_type="put_position_size_failed", error=str(e))
             return {'recommended_contracts': 0, 'error': str(e)}
     
     def calculate_call_position_size(self, 
@@ -219,7 +219,7 @@ class PositionSizer:
             }
             
         except Exception as e:
-            logger.error("Failed to calculate call position size", error=str(e))
+            logger.error("Failed to calculate call position size", event_category="error", event_type="call_position_size_failed", error=str(e))
             return {'recommended_contracts': 0, 'error': str(e)}
     
     def _get_volatility_adjustment(self, volatility: float) -> float:
@@ -400,5 +400,5 @@ class PositionSizer:
             return True, "Position size validated"
             
         except Exception as e:
-            logger.error("Position size validation failed", error=str(e))
+            logger.error("Position size validation failed", event_category="error", event_type="position_size_validation_failed", error=str(e))
             return False, f"Validation error: {str(e)}"

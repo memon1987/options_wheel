@@ -27,15 +27,17 @@ def main():
     args = parser.parse_args()
     
     try:
+        # Setup logging first so Config init messages are captured
+        setup_logging(args.log_level)
+        logger = get_logger(__name__)
+
         # Load configuration
         config = Config(args.config)
         
-        # Setup logging
-        setup_logging(args.log_level)
-        logger = get_logger(__name__)
-        
-        logger.info("Starting Options Wheel Strategy", 
-                   command=args.command, 
+        logger.info("Starting Options Wheel Strategy",
+                   event_category="system",
+                   event_type="application_started",
+                   command=args.command,
                    config_file=args.config,
                    dry_run=args.dry_run)
         
@@ -55,22 +57,22 @@ def main():
         elif args.command == 'report':
             generate_report(portfolio_tracker, logger)
         
-        logger.info("Command completed successfully")
+        logger.info("Command completed successfully", event_category="system", event_type="command_completed")
         
     except KeyboardInterrupt:
-        logger.info("Application interrupted by user")
+        logger.info("Application interrupted by user", event_category="system", event_type="application_interrupted")
         sys.exit(1)
     except Exception as e:
-        logger.error("Application failed", error=str(e))
+        logger.error("Application failed", event_category="error", event_type="application_failed", error=str(e))
         sys.exit(1)
 
 
 def run_strategy(config: Config, dry_run: bool, logger):
     """Run the wheel strategy."""
-    logger.info("Initializing wheel strategy engine", dry_run=dry_run)
+    logger.info("Initializing wheel strategy engine", event_category="system", event_type="engine_initializing", dry_run=dry_run)
     
     if dry_run:
-        logger.warning("DRY RUN MODE - No trades will be executed")
+        logger.warning("DRY RUN MODE - No trades will be executed", event_category="system", event_type="dry_run_mode")
     
     wheel_engine = WheelEngine(config)
     
@@ -79,6 +81,8 @@ def run_strategy(config: Config, dry_run: bool, logger):
         cycle_result = wheel_engine.run_strategy_cycle()
         
         logger.info("Strategy cycle completed",
+                   event_category="system",
+                   event_type="strategy_cycle_completed",
                    actions_taken=len(cycle_result['actions']),
                    new_positions=cycle_result.get('new_positions', 0),
                    closed_positions=cycle_result.get('closed_positions', 0))
@@ -112,13 +116,13 @@ def run_strategy(config: Config, dry_run: bool, logger):
             print(f"  Buying Power: ${account.get('buying_power', 0):,.2f}")
         
     except Exception as e:
-        logger.error("Strategy execution failed", error=str(e))
+        logger.error("Strategy execution failed", event_category="error", event_type="strategy_execution_failed", error=str(e))
         print(f"\nStrategy execution failed: {str(e)}")
 
 
 def scan_opportunities(scanner: OptionsScanner, logger):
     """Scan for trading opportunities."""
-    logger.info("Scanning for trading opportunities")
+    logger.info("Scanning for trading opportunities", event_category="system", event_type="scan_started")
     
     try:
         # Get market overview
@@ -166,13 +170,13 @@ def scan_opportunities(scanner: OptionsScanner, logger):
             print("\nNo suitable opportunities found at this time.")
         
     except Exception as e:
-        logger.error("Opportunity scan failed", error=str(e))
+        logger.error("Opportunity scan failed", event_category="error", event_type="scan_failed", error=str(e))
         print(f"\nOpportunity scan failed: {str(e)}")
 
 
 def show_status(tracker: PortfolioTracker, logger):
     """Show current portfolio status."""
-    logger.info("Getting portfolio status")
+    logger.info("Getting portfolio status", event_category="system", event_type="status_requested")
     
     try:
         snapshot = tracker.get_current_portfolio_snapshot()
@@ -224,13 +228,13 @@ def show_status(tracker: PortfolioTracker, logger):
                 print(f"  {symbol}: {stage} (${value:,.0f}, P&L: ${pl:+,.0f})")
         
     except Exception as e:
-        logger.error("Status retrieval failed", error=str(e))
+        logger.error("Status retrieval failed", event_category="error", event_type="status_failed", error=str(e))
         print(f"\nStatus retrieval failed: {str(e)}")
 
 
 def generate_report(tracker: PortfolioTracker, logger):
     """Generate comprehensive performance report."""
-    logger.info("Generating performance report")
+    logger.info("Generating performance report", event_category="system", event_type="report_generating")
     
     try:
         report = tracker.generate_performance_report()
@@ -286,7 +290,7 @@ def generate_report(tracker: PortfolioTracker, logger):
             print(f"Data exported to: {filename}")
         
     except Exception as e:
-        logger.error("Report generation failed", error=str(e))
+        logger.error("Report generation failed", event_category="error", event_type="report_failed", error=str(e))
         print(f"\nReport generation failed: {str(e)}")
 
 

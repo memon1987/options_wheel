@@ -1,7 +1,9 @@
 """Alpaca API client wrapper for options wheel strategy."""
 
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
+import hashlib
+import time
 import pandas as pd
 import structlog
 from functools import wraps
@@ -25,8 +27,74 @@ from tenacity import (
 import requests.exceptions
 
 from ..utils.config import Config
+from ..utils.option_symbols import parse_option_symbol
 
 logger = structlog.get_logger(__name__)
+
+
+class CircuitBreaker:
+    """Simple circuit breaker for API calls.
+
+    States:
+        closed  - Normal operation, requests flow through.
+        open    - Too many failures; requests are blocked.
+        half_open - After reset_timeout, one test request is allowed through.
+    """
+
+    def __init__(self, failure_threshold: int = 5, reset_timeout: int = 60):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.failure_count = 0
+        self.last_failure_time: Optional[float] = None
+        self.state = 'closed'  # closed=normal, open=failing, half_open=testing
+
+    def record_failure(self) -> None:
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.failure_threshold:
+            if self.state != 'open':
+                logger.warning(
+                    "Circuit breaker opened — API failures exceeded threshold",
+                    event_category="system",
+                    event_type="circuit_breaker_opened",
+                    failure_count=self.failure_count,
+                    threshold=self.failure_threshold,
+                )
+            self.state = 'open'
+
+    def record_success(self) -> None:
+        if self.state != 'closed':
+            logger.info(
+                "Circuit breaker closed — API recovered",
+                event_category="system",
+                event_type="circuit_breaker_closed",
+                previous_state=self.state,
+            )
+        self.failure_count = 0
+        self.state = 'closed'
+
+    def can_execute(self) -> bool:
+        if self.state == 'closed':
+            return True
+        if self.state == 'open' and self.last_failure_time is not None and \
+                time.time() - self.last_failure_time > self.reset_timeout:
+            logger.info(
+                "Circuit breaker half-open — allowing test request",
+                event_category="system",
+                event_type="circuit_breaker_half_open",
+            )
+            self.state = 'half_open'
+            return True
+        return self.state != 'open'
+
+
+class CircuitBreakerOpen(Exception):
+    """Raised when the circuit breaker is open and blocking requests."""
+    pass
+
+
+# Module-level circuit breaker shared across all Alpaca API calls
+_circuit_breaker = CircuitBreaker(failure_threshold=5, reset_timeout=60)
 
 
 def is_rate_limit_error(exception: Exception) -> bool:
@@ -45,8 +113,23 @@ def is_retryable_error(exception: Exception) -> bool:
     return any(pattern in error_str for pattern in retryable_patterns)
 
 
+def _generate_client_order_id(symbol: str, qty: int, side: str, limit_price: float) -> str:
+    """Generate deterministic client_order_id for idempotent order submission.
+
+    Uses a hash of order parameters plus today's date so the same logical order
+    on the same day always produces the same ID, preventing duplicate orders
+    when HTTP requests are retried.
+    """
+    raw = f"{symbol}:{date.today().isoformat()}:{side}:{qty}:{limit_price}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
 def api_retry(func):
     """Decorator to add retry logic with exponential backoff for API calls.
+
+    Includes circuit breaker protection: if the API has failed repeatedly,
+    new requests are blocked until a reset timeout elapses to avoid
+    overwhelming a degraded service.
 
     Retries on:
     - Network timeouts and connection errors
@@ -60,6 +143,16 @@ def api_retry(func):
     """
     @wraps(func)
     def wrapper(*args, **kwargs):
+        # Check circuit breaker before attempting the call
+        if not _circuit_breaker.can_execute():
+            logger.error("API call blocked by circuit breaker",
+                        event_category="error",
+                        event_type="circuit_breaker_blocked",
+                        function=func.__name__)
+            raise CircuitBreakerOpen(
+                f"Circuit breaker is open — API call to {func.__name__} blocked"
+            )
+
         @retry(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=1, max=30),
@@ -76,8 +169,11 @@ def api_retry(func):
             return func(*args, **kwargs)
 
         try:
-            return inner()
+            result = inner()
+            _circuit_breaker.record_success()
+            return result
         except RetryError as e:
+            _circuit_breaker.record_failure()
             # Log final failure after all retries exhausted
             logger.error("API call failed after all retries",
                         event_category="error",
@@ -309,40 +405,11 @@ class AlpacaClient:
             options = []
             # Chain is a dictionary with option symbols as keys and OptionsSnapshot data as values
             for option_symbol, contract in chain.items():
-                # Parse option symbol to extract details
-                # Format: UNH251024C00185000 -> UNH 25/10/24 Call $185
-                try:
-                    # Extract option type and strike from symbol
-                    if 'C' in option_symbol:
-                        option_type = 'call'
-                        parts = option_symbol.split('C')
-                    elif 'P' in option_symbol:
-                        option_type = 'put'
-                        parts = option_symbol.split('P')
-                    else:
-                        option_type = 'unknown'
-                        parts = [option_symbol, '00000000']
-
-                    # Extract strike price (last 8 digits, divide by 1000)
-                    strike_str = parts[1] if len(parts) > 1 else '00000000'
-                    strike_price = float(strike_str) / 1000.0
-
-                    # Extract expiration date from symbol (6 digits after underlying)
-                    underlying_len = len(underlying_symbol)
-                    exp_str = option_symbol[underlying_len:underlying_len+6]
-                    if len(exp_str) == 6:
-                        # Format: YYMMDD
-                        year = 2000 + int(exp_str[:2])
-                        month = int(exp_str[2:4])
-                        day = int(exp_str[4:6])
-                        exp_date = f"{year:04d}-{month:02d}-{day:02d}"
-                    else:
-                        exp_date = None
-
-                except:
-                    option_type = 'unknown'
-                    strike_price = 0.0
-                    exp_date = None
+                # Parse option symbol to extract details using shared parser
+                parsed = parse_option_symbol(option_symbol, underlying_hint=underlying_symbol)
+                option_type = parsed['option_type']
+                strike_price = parsed['strike_price']
+                exp_date = parsed['expiration_date']
 
                 # Extract quote data
                 quote = getattr(contract, 'latest_quote', None)
@@ -412,26 +479,33 @@ class AlpacaClient:
         """
         try:
             order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
-            
+
+            # Generate a deterministic client_order_id so retried HTTP requests
+            # don't create duplicate orders on Alpaca's side.
+            effective_price = limit_price if limit_price is not None else 0.0
+            client_order_id = _generate_client_order_id(symbol, qty, side.lower(), effective_price)
+
             if order_type.lower() == 'market':
                 order_data = MarketOrderRequest(
                     symbol=symbol,
                     qty=qty,
                     side=order_side,
-                    time_in_force=TimeInForce.DAY
+                    time_in_force=TimeInForce.DAY,
+                    client_order_id=client_order_id
                 )
             else:  # limit order
                 if limit_price is None:
                     raise ValueError("Limit price required for limit orders")
-                
+
                 order_data = LimitOrderRequest(
                     symbol=symbol,
                     qty=qty,
                     side=order_side,
                     time_in_force=TimeInForce.DAY,
-                    limit_price=limit_price
+                    limit_price=limit_price,
+                    client_order_id=client_order_id
                 )
-            
+
             order = self.trading_client.submit_order(order_data)
 
             # Validate order response - handle potential None values
@@ -457,11 +531,13 @@ class AlpacaClient:
                        event_category="trade",
                        event_type="order_placed",
                        symbol=symbol, qty=qty, side=side,
-                       order_type=order_type, order_id=order_id)
+                       order_type=order_type, order_id=order_id,
+                       client_order_id=client_order_id)
 
             return {
                 'success': True,
                 'order_id': order_id,
+                'client_order_id': client_order_id,
                 'symbol': symbol,
                 'qty': qty,
                 'side': side,
@@ -473,13 +549,23 @@ class AlpacaClient:
             error_msg = str(e)
 
             # Categorize error for better handling
-            error_type = "unknown"
+            error_type = "order_error"
+            non_retryable = False
             if "insufficient" in error_msg.lower() or "buying power" in error_msg.lower():
                 error_type = "insufficient_funds"
+                non_retryable = True
             elif "not found" in error_msg.lower() or "invalid symbol" in error_msg.lower():
                 error_type = "invalid_symbol"
+                non_retryable = True
+            elif "not eligible" in error_msg.lower() or "40310000" in error_msg:
+                error_type = "account_not_eligible"
+                non_retryable = True
+            elif "market hours" in error_msg.lower() or "42210000" in error_msg:
+                error_type = "outside_market_hours"
+                non_retryable = True
             elif "rejected" in error_msg.lower():
                 error_type = "order_rejected"
+                non_retryable = True
             elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
                 error_type = "connection_error"
 
@@ -497,6 +583,7 @@ class AlpacaClient:
                 'success': False,
                 'error_type': error_type,
                 'error_message': error_msg,
+                'non_retryable': non_retryable,
                 'symbol': symbol,
                 'qty': qty,
                 'side': side

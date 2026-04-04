@@ -29,7 +29,7 @@ class OpportunityStore:
         # Ensure bucket exists
         self._ensure_bucket_exists()
 
-        logger.info("OpportunityStore initialized", bucket=bucket_name)
+        logger.info("OpportunityStore initialized", event_category="system", event_type="opportunity_store_initialized", bucket=bucket_name)
 
     def _ensure_bucket_exists(self):
         """Create bucket if it doesn't exist."""
@@ -40,7 +40,7 @@ class OpportunityStore:
                     self.bucket_name,
                     location="us-central1"
                 )
-                logger.info("Created opportunities bucket", bucket=self.bucket_name)
+                logger.info("Created opportunities bucket", event_category="system", event_type="opportunities_bucket_created", bucket=self.bucket_name)
         except Exception as e:
             logger.warning("Could not create bucket (may already exist)",
                           bucket=self.bucket_name, error=str(e))
@@ -235,7 +235,7 @@ class OpportunityStore:
                 )
 
                 if not blobs:
-                    logger.warning("Cannot mark executed - no scans found", date=date_str)
+                    logger.warning("Cannot mark executed - no scans found", event_category="error", event_type="mark_executed_no_scans", date=date_str)
                     return False
 
                 # Find the most recent non-executed scan
@@ -252,21 +252,21 @@ class OpportunityStore:
                             break
                     except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
                         logger.warning("Failed to process scan file, skipping",
-                                      event_category="error",
+                                      event_category="data",
                                       event_type="scan_file_parse_error",
                                       path=blob.name,
                                       error=str(e))
                         continue
 
             if not scan_blob_path:
-                logger.warning("Cannot mark executed - no valid scan found")
+                logger.warning("Cannot mark executed - no valid scan found", event_category="error", event_type="mark_executed_no_valid_scan")
                 return False
 
             bucket = self.storage_client.bucket(self.bucket_name)
             blob = bucket.blob(scan_blob_path)
 
             if not blob.exists():
-                logger.warning("Cannot mark executed - blob not found", path=scan_blob_path)
+                logger.warning("Cannot mark executed - blob not found", event_category="error", event_type="mark_executed_blob_not_found", path=scan_blob_path)
                 return False
 
             # Update status

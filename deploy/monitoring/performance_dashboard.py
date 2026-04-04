@@ -77,9 +77,9 @@ class PerformanceMonitor:
             try:
                 self.monitoring_client = monitoring_v3.MetricServiceClient()
                 self.logging_client = cloud_logging.Client(project=project_id)
-                logger.info("Google Cloud monitoring initialized")
+                logger.info("Google Cloud monitoring initialized", event_category="system", event_type="cloud_monitoring_initialized")
             except Exception as e:
-                logger.warning("Failed to initialize Google Cloud monitoring", error=str(e))
+                logger.warning("Failed to initialize Google Cloud monitoring", event_category="error", event_type="cloud_monitoring_init_failed", error=str(e))
 
         # Local metrics storage
         self.metrics_history: List[PerformanceMetrics] = []
@@ -130,11 +130,11 @@ class PerformanceMonitor:
             if len(self.metrics_history) > 1000:
                 self.metrics_history = self.metrics_history[-1000:]
 
-            logger.debug("Metrics collected", portfolio_value=metrics.portfolio_value)
+            logger.debug("Metrics collected", event_category="system", event_type="metrics_collected", portfolio_value=metrics.portfolio_value)
             return metrics
 
         except Exception as e:
-            logger.error("Failed to collect metrics", error=str(e))
+            logger.error("Failed to collect metrics", event_category="error", event_type="metrics_collection_failed", error=str(e))
             # Return default metrics on error
             return PerformanceMetrics(
                 timestamp=datetime.now().isoformat(),
@@ -246,7 +246,7 @@ class PerformanceMonitor:
         # Store alerts
         for alert in alerts:
             self.alerts_history.append(alert)
-            logger.warning("Alert triggered", **alert)
+            logger.warning("Alert triggered", event_category="risk", event_type="alert_triggered", **alert)
 
         return alerts
 

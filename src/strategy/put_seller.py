@@ -8,6 +8,7 @@ from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_trade_event, log_error_event, log_risk_event
+from ..utils.option_symbols import parse_option_symbol
 
 logger = structlog.get_logger(__name__)
 
@@ -359,8 +360,9 @@ class PutSeller:
 
             else:
                 # Order failed - return structured error
-                error_type = order_result.get('error_type', 'unknown') if order_result else 'unknown'
+                error_type = order_result.get('error_type', 'order_error') if order_result else 'order_error'
                 error_msg = order_result.get('error_message', 'Unknown error') if order_result else 'No result returned'
+                non_retryable = order_result.get('non_retryable', False) if order_result else False
 
                 # Enhanced error logging for BigQuery analytics
                 log_error_event(
@@ -368,7 +370,7 @@ class PutSeller:
                     error_type=error_type,
                     error_message=error_msg,
                     component="put_seller",
-                    recoverable=True,
+                    recoverable=not non_retryable,
                     symbol=option_symbol,
                     underlying=opportunity.get('symbol', ''),
                     strike_price=strike_price,
@@ -380,6 +382,7 @@ class PutSeller:
                     'success': False,
                     'error': error_type,
                     'message': error_msg,
+                    'non_retryable': non_retryable,
                     'symbol': option_symbol,
                     'strategy': 'sell_put',
                     'timestamp': datetime.now().isoformat()
@@ -454,8 +457,7 @@ class PutSeller:
         """
         Extract DTE (Days to Expiration) from option symbol.
 
-        Option symbol format: AMD251031P00330000
-                              ^^^YYMMDD = 251031 = 2025-10-31
+        Delegates to the shared parse_option_symbol() utility.
 
         Args:
             option_symbol: Option symbol string
@@ -463,50 +465,18 @@ class PutSeller:
         Returns:
             Days to expiration (0-N), or 7 as fallback if parse fails
         """
-        try:
-            import re
-            from datetime import datetime, timezone
-
-            # Extract date portion (6 digits after ticker, before P/C)
-            match = re.search(r'(\d{6})[PC]', option_symbol)
-            if not match:
-                logger.warning("Could not parse expiration date from option symbol",
-                              event_category="data",
-                              event_type="option_symbol_parse_warning",
-                              symbol=option_symbol)
-                return 7  # Default fallback
-
-            date_str = match.group(1)
-
-            # Parse YYMMDD format
-            year = 2000 + int(date_str[0:2])
-            month = int(date_str[2:4])
-            day = int(date_str[4:6])
-
-            exp_date = datetime(year, month, day, tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
-
-            dte = (exp_date.date() - now.date()).days
-
-            return max(0, dte)  # Never negative
-
-        except Exception as e:
-            logger.error("Failed to parse DTE from option symbol",
-                        event_category="error",
-                        event_type="dte_parse_error",
-                        symbol=option_symbol,
-                        error=str(e))
-            return 7  # Default fallback
+        parsed = parse_option_symbol(option_symbol)
+        dte = parsed.get('dte', 0)
+        # If parsing failed entirely (no expiration found), use fallback
+        if parsed.get('expiration_date') is None:
+            return 7
+        return dte
 
     def _parse_option_symbol(self, option_symbol: str) -> tuple:
         """
         Parse option symbol to extract underlying, strike, and DTE.
 
-        Option symbol format: AMD251031P00330000
-        - Underlying: AMD (1-6 letters before date)
-        - Date: 251031 (YYMMDD)
-        - Type: P (Put) or C (Call)
-        - Strike: 00330000 (last 8 digits / 1000 = $330.00)
+        Delegates to the shared parse_option_symbol() utility.
 
         Args:
             option_symbol: Full option symbol
@@ -514,74 +484,14 @@ class PutSeller:
         Returns:
             Tuple of (underlying_symbol, strike_price, dte)
         """
-        import re
-        from datetime import datetime, timezone
-
-        try:
-            # Use fully anchored regex pattern to parse entire symbol at once
-            # OCC standard: 1-6 letter underlying + 6-digit date + P/C + 8-digit strike
-            pattern = r'^([A-Z]{1,6})(\d{6})([PC])(\d{8})$'
-            match = re.match(pattern, option_symbol.strip().upper())
-
-            if match:
-                underlying = match.group(1)
-                date_str = match.group(2)
-                # option_type = match.group(3)  # P or C - not used currently
-                strike_str = match.group(4)
-
-                # Parse date
-                year = 2000 + int(date_str[0:2])
-                month = int(date_str[2:4])
-                day = int(date_str[4:6])
-                exp_date = datetime(year, month, day, tzinfo=timezone.utc)
-                now = datetime.now(timezone.utc)
-                dte = max(0, (exp_date.date() - now.date()).days)
-
-                # Parse strike price
-                strike_price = float(strike_str) / 1000.0
-
-                return underlying, strike_price, dte
-
-            # Fallback to legacy parsing for non-standard formats
-            logger.debug("Option symbol did not match standard OCC format, using fallback parsing",
-                        event_category="data",
-                        event_type="option_symbol_fallback_parse",
-                        symbol=option_symbol)
-
-            # Extract underlying symbol (letters at start)
-            underlying_match = re.match(r'^([A-Z]+)', option_symbol.upper())
-            underlying = underlying_match.group(1) if underlying_match else option_symbol[:3]
-
-            # Extract date portion (6 digits immediately before P/C)
-            date_match = re.search(r'(\d{6})[PC]', option_symbol.upper())
-            if date_match:
-                date_str = date_match.group(1)
-                year = 2000 + int(date_str[0:2])
-                month = int(date_str[2:4])
-                day = int(date_str[4:6])
-                exp_date = datetime(year, month, day, tzinfo=timezone.utc)
-                now = datetime.now(timezone.utc)
-                dte = max(0, (exp_date.date() - now.date()).days)
-            else:
-                dte = 7  # Default fallback
-
-            # Extract strike price (last 8 digits / 1000)
-            strike_match = re.search(r'[PC](\d{8})$', option_symbol.upper())
-            if strike_match:
-                strike_price = float(strike_match.group(1)) / 1000.0
-            else:
-                strike_price = 0
-
-            return underlying, strike_price, dte
-
-        except Exception as e:
-            logger.debug("Failed to parse option symbol",
-                        event_category="data",
-                        event_type="option_symbol_parse_debug",
-                        symbol=option_symbol,
-                        error=str(e))
-            # Return safe defaults
-            return option_symbol[:3] if len(option_symbol) >= 3 else option_symbol, 0, 7
+        parsed = parse_option_symbol(option_symbol)
+        underlying = parsed['underlying']
+        strike_price = parsed['strike_price']
+        dte = parsed['dte']
+        # Use fallback DTE of 7 if parsing failed
+        if parsed.get('expiration_date') is None:
+            dte = 7
+        return underlying, strike_price, dte
 
     def _get_profit_target_for_dte(self, dte: int) -> float:
         """

@@ -58,9 +58,10 @@ steps:
     id: 'push-dashboard-image'
     waitFor: ['build-dashboard-image']
 
-  # Step 6: Deploy trading bot to Cloud Run
-  - name: 'gcr.io/cloud-builders/gcloud'
+  # Step 6: Deploy trading bot to Cloud Run (canary - no traffic)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     args:
+      - 'gcloud'
       - 'run'
       - 'deploy'
       - 'options-wheel-strategy'
@@ -72,12 +73,37 @@ steps:
       - '--min-instances=0'
       - '--timeout=300'
       - '--set-env-vars=ALPACA_PAPER_TRADING=true'
-    id: 'deploy-bot-to-cloud-run'
+      - '--no-traffic'
+      - '--tag=canary'
+    id: 'deploy-bot-canary'
     waitFor: ['push-bot-image']
 
-  # Step 7: Deploy dashboard to Cloud Run
-  - name: 'gcr.io/cloud-builders/gcloud'
+  # Step 7: Smoke test the trading bot canary revision
+  - name: 'gcr.io/cloud-builders/curl'
+    entrypoint: 'bash'
     args:
+      - '-c'
+      - 'curl -sf --retry 3 --retry-delay 5 https://canary---options-wheel-strategy-799970961417.us-central1.run.app/ || exit 1'
+    id: 'smoke-test-bot'
+    waitFor: ['deploy-bot-canary']
+
+  # Step 8: Shift traffic to new trading bot revision
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    args:
+      - 'gcloud'
+      - 'run'
+      - 'services'
+      - 'update-traffic'
+      - 'options-wheel-strategy'
+      - '--to-latest'
+      - '--region=us-central1'
+    id: 'promote-bot'
+    waitFor: ['smoke-test-bot']
+
+  # Step 9: Deploy dashboard to Cloud Run (canary - no traffic)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    args:
+      - 'gcloud'
       - 'run'
       - 'deploy'
       - 'options-wheel-dashboard'
@@ -89,15 +115,38 @@ steps:
       - '--min-instances=0'
       - '--timeout=300'
       - '--set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID'
-      - '--allow-unauthenticated'
-    id: 'deploy-dashboard-to-cloud-run'
+      - '--no-traffic'
+      - '--tag=canary'
+    id: 'deploy-dashboard-canary'
     waitFor: ['push-dashboard-image']
+
+  # Step 10: Smoke test the dashboard canary revision
+  - name: 'gcr.io/cloud-builders/curl'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - 'curl -sf --retry 3 --retry-delay 5 https://canary---options-wheel-dashboard-799970961417.us-central1.run.app/ || exit 1'
+    id: 'smoke-test-dashboard'
+    waitFor: ['deploy-dashboard-canary']
+
+  # Step 11: Shift traffic to new dashboard revision
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    args:
+      - 'gcloud'
+      - 'run'
+      - 'services'
+      - 'update-traffic'
+      - 'options-wheel-dashboard'
+      - '--to-latest'
+      - '--region=us-central1'
+    id: 'promote-dashboard'
+    waitFor: ['smoke-test-dashboard']
 
 # Build configuration
 options:
   logging: CLOUD_LOGGING_ONLY
-  machineType: 'E2_HIGHCPU_32'  # Fastest builds
-  diskSizeGb: 100
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 30
 
 # Service account for Cloud Build
 serviceAccount: 'projects/gen-lang-client-0607444019/serviceAccounts/799970961417@cloudbuild.gserviceaccount.com'

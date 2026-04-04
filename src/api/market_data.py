@@ -2,6 +2,7 @@
 
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
+import time
 import pandas as pd
 import numpy as np
 import structlog
@@ -11,30 +12,50 @@ from ..utils.config import Config
 
 logger = structlog.get_logger(__name__)
 
+# Default cache TTL in seconds (5 minutes)
+_DEFAULT_CACHE_TTL = 300
+
 
 class MarketDataManager:
     """Manager for market data operations and analysis."""
-    
+
     def __init__(self, alpaca_client: AlpacaClient, config: Config):
         """Initialize market data manager.
-        
+
         Args:
             alpaca_client: Alpaca client instance
             config: Configuration instance
         """
         self.alpaca = alpaca_client
         self.config = config
+        # Caches: dict of symbol -> (value, timestamp)
+        self._metrics_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        self._options_chain_cache: Dict[str, Tuple[Dict[str, List[Dict[str, Any]]], float]] = {}
+        self._cache_ttl = _DEFAULT_CACHE_TTL
         
     def get_stock_metrics(self, symbol: str) -> Dict[str, Any]:
         """Get comprehensive stock metrics for wheel strategy evaluation.
-        
+
+        Results are cached for up to 5 minutes to avoid repeated API calls
+        for the same symbol within a scan cycle.
+
         Args:
             symbol: Stock symbol
-            
+
         Returns:
             Dictionary with stock metrics
         """
         try:
+            # Check cache first
+            cached = self._metrics_cache.get(symbol)
+            if cached is not None:
+                value, ts = cached
+                if time.time() - ts < self._cache_ttl:
+                    logger.debug("Using cached stock metrics",
+                                event_category="data",
+                                event_type="stock_metrics_cache_hit",
+                                symbol=symbol)
+                    return value
             # Get current quote
             quote = self.alpaca.get_stock_quote(symbol)
             current_price = (quote['bid'] + quote['ask']) / 2
@@ -61,7 +82,7 @@ class MarketDataManager:
             # Volume criteria check
             meets_volume_criteria = avg_volume >= self.config.min_avg_volume
             
-            return {
+            result = {
                 'symbol': symbol,
                 'current_price': current_price,
                 'bid': quote['bid'],
@@ -73,7 +94,9 @@ class MarketDataManager:
                 'meets_volume_criteria': meets_volume_criteria,
                 'suitable_for_wheel': meets_price_criteria and meets_volume_criteria
             }
-            
+            self._metrics_cache[symbol] = (result, time.time())
+            return result
+
         except Exception as e:
             logger.error("Failed to get stock metrics",
                         event_category="error",
@@ -138,14 +161,29 @@ class MarketDataManager:
     
     def get_option_chain_with_analysis(self, symbol: str) -> Dict[str, List[Dict[str, Any]]]:
         """Get options chain with analysis for wheel strategy.
-        
+
+        Results are cached for up to 5 minutes to avoid repeated API calls
+        when both find_suitable_puts() and find_suitable_calls() need the
+        same chain.
+
         Args:
             symbol: Underlying stock symbol
-            
+
         Returns:
             Dictionary with 'puts' and 'calls' lists
         """
         try:
+            # Check cache first
+            cached = self._options_chain_cache.get(symbol)
+            if cached is not None:
+                value, ts = cached
+                if time.time() - ts < self._cache_ttl:
+                    logger.debug("Using cached options chain",
+                                event_category="data",
+                                event_type="options_chain_cache_hit",
+                                symbol=symbol)
+                    return value
+
             options_chain = self.alpaca.get_options_chain(symbol)
             
             if not options_chain:
@@ -198,8 +236,10 @@ class MarketDataManager:
                 else:
                     calls.append(option_data)
             
-            return {'puts': puts, 'calls': calls}
-            
+            result = {'puts': puts, 'calls': calls}
+            self._options_chain_cache[symbol] = (result, time.time())
+            return result
+
         except Exception as e:
             logger.error("Failed to get options chain",
                         event_category="error",

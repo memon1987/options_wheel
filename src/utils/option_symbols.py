@@ -13,12 +13,13 @@ Example: AAPL250117C00185000
 - 00185000: Strike price $185.00 * 1000 with padding
 """
 
-from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional, Tuple
 import calendar
+import re
 import structlog
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 
 class OptionSymbolGenerator:
@@ -219,6 +220,109 @@ class OptionSymbolGenerator:
             
         except Exception:
             return False
+
+
+def parse_option_symbol(option_symbol: str, underlying_hint: Optional[str] = None) -> Dict[str, Any]:
+    """Parse an OCC-format option symbol into its components.
+
+    OCC format: UNDERLYING + YYMMDD + C/P + STRIKE*1000 (8 digits)
+    Example: AAPL250117C00185000 -> AAPL, 2025-01-17, call, $185.00
+
+    Args:
+        option_symbol: Full OCC option symbol string
+        underlying_hint: Optional underlying symbol to assist parsing
+            (used when the underlying length is ambiguous)
+
+    Returns:
+        Dictionary with keys:
+            underlying: str - underlying stock symbol
+            expiration_date: str or None - "YYYY-MM-DD" format
+            option_type: str - "call", "put", or "unknown"
+            strike_price: float - strike price in dollars
+            dte: int - days to expiration (0 if expired)
+    """
+    if not option_symbol:
+        return {
+            'underlying': '', 'expiration_date': None,
+            'option_type': 'unknown', 'strike_price': 0.0, 'dte': 0,
+        }
+
+    result = {
+        'underlying': option_symbol[:3] if len(option_symbol) >= 3 else option_symbol,
+        'expiration_date': None,
+        'option_type': 'unknown',
+        'strike_price': 0.0,
+        'dte': 0,
+    }
+
+    try:
+        symbol = option_symbol.strip().upper()
+
+        # Primary: fully-anchored OCC regex
+        pattern = r'^([A-Z]{1,6})(\d{6})([PC])(\d{8})$'
+        match = re.match(pattern, symbol)
+
+        if match:
+            underlying = match.group(1)
+            date_str = match.group(2)
+            type_char = match.group(3)
+            strike_str = match.group(4)
+        else:
+            # Fallback: use underlying_hint or heuristic extraction
+            if underlying_hint:
+                underlying = underlying_hint.upper()
+                remainder = symbol[len(underlying):]
+            else:
+                # Letters at start are the underlying
+                ul_match = re.match(r'^([A-Z]+)', symbol)
+                underlying = ul_match.group(1) if ul_match else symbol[:3]
+                remainder = symbol[len(underlying):]
+
+            # Extract date (6 digits) + type (P/C) + strike (8 digits)
+            parts_match = re.match(r'^(\d{6})([PC])(\d{8})$', remainder)
+            if parts_match:
+                date_str = parts_match.group(1)
+                type_char = parts_match.group(2)
+                strike_str = parts_match.group(3)
+            else:
+                # Last-resort partial extraction
+                date_match = re.search(r'(\d{6})[PC]', symbol)
+                date_str = date_match.group(1) if date_match else None
+                type_char = 'C' if 'C' in symbol else ('P' if 'P' in symbol else None)
+                strike_match = re.search(r'[PC](\d{8})$', symbol)
+                strike_str = strike_match.group(1) if strike_match else None
+
+        result['underlying'] = underlying
+
+        # Parse option type
+        if type_char == 'C':
+            result['option_type'] = 'call'
+        elif type_char == 'P':
+            result['option_type'] = 'put'
+
+        # Parse strike price
+        if strike_str:
+            result['strike_price'] = float(strike_str) / 1000.0
+
+        # Parse expiration date and calculate DTE
+        if date_str and len(date_str) == 6:
+            year = 2000 + int(date_str[0:2])
+            month = int(date_str[2:4])
+            day = int(date_str[4:6])
+            result['expiration_date'] = f"{year:04d}-{month:02d}-{day:02d}"
+
+            exp_date = datetime(year, month, day, tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            result['dte'] = max(0, (exp_date.date() - now.date()).days)
+
+    except Exception as e:
+        logger.debug("Failed to parse option symbol",
+                    event_category="data",
+                    event_type="option_symbol_parse_error",
+                    symbol=option_symbol,
+                    error=str(e))
+
+    return result
 
 
 # Global instance for easy access

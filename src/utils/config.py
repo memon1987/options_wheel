@@ -9,6 +9,37 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+
+def _load_secret(secret_id: str, fallback_env_var: str) -> str:
+    """Load secret from env var, falling back to GCP Secret Manager.
+
+    Checks the environment variable first. If not set (or empty),
+    attempts to retrieve the secret from GCP Secret Manager using
+    the project ID from GOOGLE_CLOUD_PROJECT or GCP_PROJECT_ID env vars.
+
+    Args:
+        secret_id: The secret name in GCP Secret Manager.
+        fallback_env_var: The environment variable to check first.
+
+    Returns:
+        The secret value, or an empty string if unavailable.
+    """
+    value = os.getenv(fallback_env_var)
+    if value:
+        return value
+    try:
+        from google.cloud import secretmanager
+        client = secretmanager.SecretManagerServiceClient()
+        project_id = os.getenv('GOOGLE_CLOUD_PROJECT', os.getenv('GCP_PROJECT_ID'))
+        if project_id:
+            name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+            response = client.access_secret_version(request={"name": name})
+            return response.payload.data.decode("UTF-8")
+    except Exception:
+        pass
+    return ""
+
+
 class Config:
     """Configuration manager for the options wheel strategy."""
     
@@ -31,7 +62,7 @@ class Config:
         # Validate configuration
         self._validate_config()
 
-        logger.info("Configuration loaded", config_path=config_path)
+        logger.info("Configuration loaded", event_category="system", event_type="config_loaded", config_path=config_path)
     
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from YAML file."""
@@ -39,14 +70,26 @@ class Config:
             with open(self.config_path, 'r') as file:
                 return yaml.safe_load(file)
         except FileNotFoundError:
-            logger.error("Configuration file not found", path=self.config_path)
+            logger.error("Configuration file not found", event_category="error", event_type="config_file_not_found", path=self.config_path)
             raise
         except yaml.YAMLError as e:
-            logger.error("Error parsing YAML configuration", error=str(e))
+            logger.error("Error parsing YAML configuration", event_category="error", event_type="config_yaml_parse_error", error=str(e))
             raise
     
+    # Mapping of env var names to their GCP Secret Manager secret IDs.
+    # Used by _substitute_env_vars to fall back to Secret Manager when
+    # an env var is not set locally.
+    _SECRET_MANAGER_MAP = {
+        "ALPACA_API_KEY": "alpaca-api-key",
+        "ALPACA_SECRET_KEY": "alpaca-secret-key",
+    }
+
     def _substitute_env_vars(self):
-        """Substitute environment variables in configuration values."""
+        """Substitute environment variables in configuration values.
+
+        For variables listed in _SECRET_MANAGER_MAP, this will fall back
+        to GCP Secret Manager when the env var is not set locally.
+        """
         def substitute_recursive(obj):
             if isinstance(obj, dict):
                 return {k: substitute_recursive(v) for k, v in obj.items()}
@@ -54,10 +97,13 @@ class Config:
                 return [substitute_recursive(item) for item in obj]
             elif isinstance(obj, str) and obj.startswith("${") and obj.endswith("}"):
                 env_var = obj[2:-1]
+                if env_var in self._SECRET_MANAGER_MAP:
+                    value = _load_secret(self._SECRET_MANAGER_MAP[env_var], env_var)
+                    return value if value else obj
                 return os.getenv(env_var, obj)
             else:
                 return obj
-        
+
         self._config = substitute_recursive(self._config)
 
     def _validate_config(self):

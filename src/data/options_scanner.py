@@ -10,6 +10,7 @@ from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_performance_metric, log_error_event
+from ..utils.positions import get_stock_positions
 
 logger = structlog.get_logger(__name__)
 
@@ -39,7 +40,7 @@ class OptionsScanner:
             List of put opportunities sorted by attractiveness
         """
         try:
-            logger.info("Scanning for put opportunities", symbols=len(self.config.stock_symbols))
+            logger.info("Scanning for put opportunities", event_category="system", event_type="put_scan_started", symbols=len(self.config.stock_symbols))
             
             opportunities = []
             
@@ -112,7 +113,7 @@ class OptionsScanner:
             
             # Get current stock positions
             positions = self.alpaca.get_positions()
-            stock_positions = [p for p in positions if p['asset_class'] == 'us_equity' and float(p['qty']) > 0]
+            stock_positions = get_stock_positions(positions)
             
             for position in stock_positions:
                 symbol = position['symbol']
@@ -195,7 +196,7 @@ class OptionsScanner:
             }
             
         except Exception as e:
-            logger.error("Failed to scan all opportunities", error=str(e))
+            logger.error("Failed to scan all opportunities", event_category="error", event_type="scan_failed", error=str(e))
             return {'puts': [], 'calls': [], 'error': str(e)}
     
     def _create_put_opportunity(self, put_option: Dict[str, Any], stock_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -432,7 +433,7 @@ class OptionsScanner:
             return min(100, max(0, score))
             
         except Exception as e:
-            logger.error("Failed to calculate put attractiveness score", error=str(e))
+            logger.error("Failed to calculate put attractiveness score", event_category="error", event_type="put_score_calculation_failed", error=str(e))
             return 0
     
     def _calculate_call_attractiveness_score(self, annual_return: float, delta: float, 
@@ -496,7 +497,7 @@ class OptionsScanner:
             return min(100, max(0, score))
             
         except Exception as e:
-            logger.error("Failed to calculate call attractiveness score", error=str(e))
+            logger.error("Failed to calculate call attractiveness score", event_category="error", event_type="call_score_calculation_failed", error=str(e))
             return 0
     
     def _has_existing_position(self, symbol: str) -> bool:
@@ -523,7 +524,7 @@ class OptionsScanner:
             return False
             
         except Exception as e:
-            logger.error("Failed to check existing positions", symbol=symbol, error=str(e))
+            logger.error("Failed to check existing positions", event_category="error", event_type="position_check_failed", symbol=symbol, error=str(e))
             return True  # Conservative assumption
     
     def get_market_overview(self) -> Dict[str, Any]:
@@ -578,5 +579,5 @@ class OptionsScanner:
             return overview
             
         except Exception as e:
-            logger.error("Failed to get market overview", error=str(e))
+            logger.error("Failed to get market overview", event_category="error", event_type="market_overview_failed", error=str(e))
             return {'error': str(e)}

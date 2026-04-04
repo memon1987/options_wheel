@@ -107,14 +107,16 @@ class RiskManager:
             if not validation_result[0]:
                 return validation_result
             
-            logger.info("Position risk validation passed", 
+            logger.info("Position risk validation passed",
+                       event_category="risk",
+                       event_type="position_risk_validated",
                        symbol=opportunity['symbol'],
                        strategy=opportunity['strategy'])
             
             return True, "Position approved"
             
         except Exception as e:
-            logger.error("Risk validation failed", error=str(e))
+            logger.error("Risk validation failed", event_category="error", event_type="risk_validation_failed", error=str(e))
             return False, f"Risk validation error: {str(e)}"
     
     def _validate_option_specific_risks(self, opportunity: Dict[str, Any]) -> Tuple[bool, str]:
@@ -187,7 +189,7 @@ class RiskManager:
             return True, "Option parameters validated"
             
         except Exception as e:
-            logger.error("Option validation failed", error=str(e))
+            logger.error("Option validation failed", event_category="error", event_type="option_validation_failed", error=str(e))
             return False, f"Option validation error: {str(e)}"
     
     def calculate_portfolio_risk_metrics(self, account_info: Dict[str, Any], 
@@ -270,7 +272,7 @@ class RiskManager:
             }
             
         except Exception as e:
-            logger.error("Failed to calculate risk metrics", error=str(e))
+            logger.error("Failed to calculate risk metrics", event_category="error", event_type="risk_metrics_failed", error=str(e))
             return {'error': str(e)}
     
     def should_reduce_positions(self, risk_metrics: Dict[str, Any]) -> Tuple[bool, List[str]]:
@@ -303,7 +305,7 @@ class RiskManager:
         should_reduce = len(reasons) > 0
         
         if should_reduce:
-            logger.warning("Risk reduction recommended", reasons=reasons)
+            logger.warning("Risk reduction recommended", event_category="risk", event_type="risk_reduction_recommended", reasons=reasons)
         
         return should_reduce, reasons
     
@@ -346,6 +348,6 @@ class RiskManager:
         emergency_stop = len(reasons) > 0
         
         if emergency_stop:
-            logger.critical("Emergency stop conditions met", reasons=reasons)
+            logger.critical("Emergency stop conditions met", event_category="risk", event_type="emergency_stop_triggered", reasons=reasons)
         
         return emergency_stop, reasons

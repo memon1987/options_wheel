@@ -3,11 +3,15 @@
 from typing import Dict, List, Any, Optional, Literal
 from datetime import datetime
 from enum import Enum
+import json
 import structlog
 
 from ..utils.logging_events import log_position_update
 
 logger = structlog.get_logger(__name__)
+
+# GCS blob path for persisted state
+_STATE_BLOB_PATH = "wheel_state/current_state.json"
 
 
 class WheelPhase(Enum):
@@ -20,10 +24,117 @@ class WheelPhase(Enum):
 class WheelStateManager:
     """Manages wheel strategy state and phase transitions for proper position handling."""
 
-    def __init__(self):
-        """Initialize wheel state manager."""
+    def __init__(self, storage_bucket: Optional[str] = None):
+        """Initialize wheel state manager.
+
+        Args:
+            storage_bucket: Optional GCS bucket name for state persistence.
+                           If provided, state is loaded from / saved to GCS so
+                           it survives Cloud Run cold starts.  If GCS is
+                           unavailable the manager falls back to in-memory only.
+        """
         self.symbol_states: Dict[str, Dict[str, Any]] = {}
         self.wheel_cycles: List[Dict[str, Any]] = []
+
+        # GCS persistence setup
+        self._bucket_name = storage_bucket
+        self._storage_client = None
+        if storage_bucket:
+            try:
+                from google.cloud import storage as gcs
+                self._storage_client = gcs.Client()
+                logger.info("WheelStateManager GCS persistence enabled",
+                           event_category="system", bucket=storage_bucket)
+            except Exception as e:
+                logger.warning("GCS unavailable — running in-memory only",
+                              event_category="system", error=str(e))
+
+        # Restore state from GCS (no-op when GCS is not configured)
+        self._load_state()
+
+    # ------------------------------------------------------------------
+    # GCS persistence helpers
+    # ------------------------------------------------------------------
+
+    def _save_state(self) -> None:
+        """Persist current state to GCS.  No-op when GCS is not configured."""
+        if not self._storage_client or not self._bucket_name:
+            return
+        try:
+            # datetime objects are not JSON-serialisable by default, so we
+            # convert them to ISO-8601 strings on the way out.
+            payload = {
+                "symbol_states": self._serialise_state(self.symbol_states),
+                "wheel_cycles": self._serialise_state(self.wheel_cycles),
+            }
+            bucket = self._storage_client.bucket(self._bucket_name)
+            blob = bucket.blob(_STATE_BLOB_PATH)
+            blob.upload_from_string(
+                json.dumps(payload, indent=2),
+                content_type="application/json",
+            )
+            logger.debug("Wheel state saved to GCS",
+                       event_category="system", path=_STATE_BLOB_PATH)
+        except Exception as e:
+            logger.warning("Failed to save wheel state to GCS — "
+                          "state lives in memory only until next successful save",
+                          event_category="error", error=str(e))
+
+    def _load_state(self) -> None:
+        """Load state from GCS if available.  No-op when GCS is not configured."""
+        if not self._storage_client or not self._bucket_name:
+            return
+        try:
+            bucket = self._storage_client.bucket(self._bucket_name)
+            blob = bucket.blob(_STATE_BLOB_PATH)
+            if not blob.exists():
+                logger.info("No persisted wheel state found in GCS — starting fresh",
+                           event_category="system", path=_STATE_BLOB_PATH)
+                return
+
+            content = blob.download_as_string()
+            data = json.loads(content)
+
+            self.symbol_states = self._deserialise_state(
+                data.get("symbol_states", {})
+            )
+            self.wheel_cycles = self._deserialise_state(
+                data.get("wheel_cycles", [])
+            )
+            logger.info("Wheel state restored from GCS",
+                       event_category="system",
+                       symbols=list(self.symbol_states.keys()),
+                       completed_cycles=len(self.wheel_cycles))
+        except Exception as e:
+            logger.warning("Failed to load wheel state from GCS — "
+                          "starting with empty state",
+                          event_category="error", error=str(e))
+
+    # ------------------------------------------------------------------
+    # Serialisation helpers (datetime <-> ISO-8601 strings)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _serialise_state(obj: Any) -> Any:
+        """Recursively convert datetime objects to ISO-8601 strings."""
+        if isinstance(obj, datetime):
+            return {"__datetime__": obj.isoformat()}
+        if isinstance(obj, dict):
+            return {k: WheelStateManager._serialise_state(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [WheelStateManager._serialise_state(v) for v in obj]
+        return obj
+
+    @staticmethod
+    def _deserialise_state(obj: Any) -> Any:
+        """Recursively restore datetime objects from ISO-8601 strings."""
+        if isinstance(obj, dict):
+            if "__datetime__" in obj:
+                return datetime.fromisoformat(obj["__datetime__"])
+            return {k: WheelStateManager._deserialise_state(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [WheelStateManager._deserialise_state(v) for v in obj]
+        return obj
 
     def get_wheel_phase(self, symbol: str) -> WheelPhase:
         """Get current wheel phase for a symbol.
@@ -66,6 +177,7 @@ class WheelStateManager:
 
         if not can_sell:
             logger.info("Put selling blocked by wheel state",
+                       event_category="trade",
                        symbol=symbol,
                        phase=phase.value,
                        reason="holding_stock_position")
@@ -92,6 +204,7 @@ class WheelStateManager:
 
         if not can_sell and stock_shares > 0:
             logger.info("Covered call selling blocked - insufficient shares",
+                       event_category="trade",
                        symbol=symbol,
                        shares=stock_shares,
                        required=100)
@@ -148,6 +261,7 @@ class WheelStateManager:
         new_phase = self.get_wheel_phase(symbol)
 
         logger.info("Put assignment processed",
+                   event_category="trade",
                    symbol=symbol,
                    shares_assigned=shares,
                    cost_basis=cost_basis,
@@ -172,7 +286,7 @@ class WheelStateManager:
             wheel_cycle_started=(current_shares == 0)
         )
 
-        return {
+        result = {
             'symbol': symbol,
             'action': 'put_assignment',
             'shares_assigned': shares,
@@ -182,6 +296,9 @@ class WheelStateManager:
             'phase_after': new_phase,
             'timestamp': assignment_date
         }
+
+        self._save_state()
+        return result
 
     def handle_call_assignment(self, symbol: str, shares: int, strike_price: float,
                              assignment_date: datetime, trade_info: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -275,6 +392,7 @@ class WheelStateManager:
         new_phase = self.get_wheel_phase(symbol)
 
         logger.info("Call assignment processed",
+                   event_category="trade",
                    symbol=symbol,
                    shares_called_away=shares,
                    strike_price=strike_price,
@@ -319,6 +437,7 @@ class WheelStateManager:
         if cycle_data:
             result['completed_cycle'] = cycle_data
 
+        self._save_state()
         return result
 
     def add_put_position(self, symbol: str, contracts: int, premium: float,
@@ -357,11 +476,13 @@ class WheelStateManager:
         state['put_premium_collected'] = state.get('put_premium_collected', 0.0) + premium_amount
 
         logger.info("Put position added",
+                   event_category="trade",
                    symbol=symbol,
                    contracts=contracts,
                    premium_per_contract=premium,
                    total_active_puts=state['active_puts'])
 
+        self._save_state()
         return True
 
     def add_call_position(self, symbol: str, contracts: int, premium: float,
@@ -387,11 +508,13 @@ class WheelStateManager:
         state['call_premium_collected'] = state.get('call_premium_collected', 0.0) + premium_amount
 
         logger.info("Call position added",
+                   event_category="trade",
                    symbol=symbol,
                    contracts=contracts,
                    premium_per_contract=premium,
                    total_active_calls=state['active_calls'])
 
+        self._save_state()
         return True
 
     def remove_position(self, symbol: str, position_type: Literal['put', 'call'],
@@ -418,11 +541,13 @@ class WheelStateManager:
             state['active_calls'] = max(0, state['active_calls'] - contracts)
 
         logger.info("Position removed",
+                   event_category="trade",
                    symbol=symbol,
                    type=position_type,
                    contracts=contracts,
                    reason=close_reason)
 
+        self._save_state()
         return True
 
     def get_position_summary(self, symbol: str) -> Dict[str, Any]:
@@ -495,4 +620,5 @@ class WheelStateManager:
         """
         if symbol in self.symbol_states:
             del self.symbol_states[symbol]
-            logger.info("Symbol state reset", symbol=symbol)
+            logger.info("Symbol state reset", event_category="system", symbol=symbol)
+            self._save_state()

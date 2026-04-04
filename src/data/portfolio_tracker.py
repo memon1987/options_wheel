@@ -8,6 +8,7 @@ import json
 
 from ..api.alpaca_client import AlpacaClient
 from ..utils.config import Config
+from ..utils.positions import get_stock_positions
 
 logger = structlog.get_logger(__name__)
 
@@ -38,7 +39,7 @@ class PortfolioTracker:
             positions = self.alpaca.get_positions()
             
             # Separate positions by type
-            stock_positions = [p for p in positions if p['asset_class'] == 'us_equity']
+            stock_positions = get_stock_positions(positions)
             option_positions = [p for p in positions if p['asset_class'] == 'us_option']
             
             # Calculate position values
@@ -89,7 +90,7 @@ class PortfolioTracker:
             return snapshot
             
         except Exception as e:
-            logger.error("Failed to get portfolio snapshot", error=str(e))
+            logger.error("Failed to get portfolio snapshot", event_category="error", event_type="portfolio_snapshot_failed", error=str(e))
             return {'error': str(e)}
     
     def _group_positions_by_underlying(self, positions: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -297,7 +298,7 @@ class PortfolioTracker:
             }
             
         except Exception as e:
-            logger.error("Failed to calculate performance metrics", error=str(e))
+            logger.error("Failed to calculate performance metrics", event_category="error", event_type="performance_metrics_failed", error=str(e))
             return {'error': str(e)}
     
     def generate_performance_report(self) -> Dict[str, Any]:
@@ -328,7 +329,7 @@ class PortfolioTracker:
             return report
             
         except Exception as e:
-            logger.error("Failed to generate performance report", error=str(e))
+            logger.error("Failed to generate performance report", event_category="error", event_type="performance_report_failed", error=str(e))
             return {'error': str(e)}
     
     def _calculate_risk_summary(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -366,7 +367,7 @@ class PortfolioTracker:
             }
             
         except Exception as e:
-            logger.error("Failed to calculate risk summary", error=str(e))
+            logger.error("Failed to calculate risk summary", event_category="error", event_type="risk_summary_failed", error=str(e))
             return {'error': str(e)}
     
     def _generate_recommendations(self, snapshot: Dict[str, Any], performance: Dict[str, Any]) -> List[str]:
@@ -411,7 +412,7 @@ class PortfolioTracker:
                 recommendations.append(f"Review {assigned_stocks} assigned stock position(s) for covered call opportunities")
             
         except Exception as e:
-            logger.error("Failed to generate recommendations", error=str(e))
+            logger.error("Failed to generate recommendations", event_category="error", event_type="recommendations_failed", error=str(e))
             recommendations.append("Unable to generate recommendations due to data error")
         
         return recommendations
@@ -443,9 +444,9 @@ class PortfolioTracker:
             with open(filename, 'w') as f:
                 json.dump(export_data, f, indent=2, default=str)
             
-            logger.info("Performance data exported", filename=filename)
+            logger.info("Performance data exported", event_category="system", event_type="performance_data_exported", filename=filename)
             return filename
             
         except Exception as e:
-            logger.error("Failed to export performance data", error=str(e))
+            logger.error("Failed to export performance data", event_category="error", event_type="performance_export_failed", error=str(e))
             return ""

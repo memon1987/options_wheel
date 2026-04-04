@@ -9,9 +9,13 @@ import threading
 import time
 import json
 import traceback
+import hmac
+import uuid
+from functools import wraps
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 import structlog
+import structlog.contextvars
 
 # Add src to path
 import sys
@@ -24,6 +28,27 @@ logger = structlog.get_logger(__name__)
 
 app = Flask(__name__)
 
+
+@app.after_request
+def _clear_request_context(response):
+    structlog.contextvars.clear_contextvars()
+    return response
+
+
+@app.before_request
+def _bind_request_id():
+    """Generate a unique request ID and bind it to the structlog context.
+
+    The ID is propagated automatically to every log entry emitted during the
+    request thanks to the ``merge_contextvars`` processor in the structlog
+    pipeline.  If the caller supplies an ``X-Request-ID`` header we reuse it
+    so that correlation works across services.
+    """
+    request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+
+
 # Global state
 strategy_status = {
     'status': 'idle',
@@ -35,6 +60,58 @@ strategy_status = {
 }
 
 strategy_lock = threading.Lock()
+
+
+def require_api_key(f):
+    """Decorator that enforces API key authentication as defense-in-depth.
+
+    Checks for a valid key in either the X-API-Key header or the
+    Authorization: Bearer <token> header.  The expected key is read from
+    the STRATEGY_API_KEY environment variable.
+
+    If STRATEGY_API_KEY is not set, authentication is skipped so that
+    existing deployments without the key configured are not broken.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        expected_key = os.environ.get('STRATEGY_API_KEY')
+
+        # If no key is configured, skip auth (don't break existing deployments)
+        if not expected_key:
+            return f(*args, **kwargs)
+
+        # Try X-API-Key header first, then Authorization: Bearer <token>
+        provided_key = request.headers.get('X-API-Key')
+        if not provided_key:
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                provided_key = auth_header[7:]
+
+        if not provided_key:
+            logger.warning("API request rejected: missing authentication",
+                          event_category="security",
+                          event_type="auth_missing",
+                          endpoint=request.path,
+                          remote_addr=request.remote_addr)
+            return jsonify({
+                'error': 'Authentication required',
+                'message': 'Provide API key via X-API-Key header or Authorization: Bearer <token>'
+            }), 401
+
+        if not hmac.compare_digest(provided_key, expected_key):
+            logger.warning("API request rejected: invalid API key",
+                          event_category="security",
+                          event_type="auth_invalid",
+                          endpoint=request.path,
+                          remote_addr=request.remote_addr)
+            return jsonify({
+                'error': 'Invalid API key',
+                'message': 'The provided API key is not valid'
+            }), 401
+
+        return f(*args, **kwargs)
+    return decorated
+
 
 @app.route('/')
 def health_check():
@@ -51,6 +128,7 @@ def get_status():
     return jsonify(strategy_status)
 
 @app.route('/scan', methods=['POST'])
+@require_api_key
 def trigger_scan():
     """Trigger a market scan for opportunities."""
     with strategy_lock:
@@ -162,6 +240,7 @@ def trigger_scan():
             return jsonify({'error': error_msg}), 500
 
 @app.route('/run', methods=['POST'])
+@require_api_key
 def trigger_strategy():
     """Trigger strategy execution."""
     with strategy_lock:
@@ -183,10 +262,45 @@ def trigger_strategy():
             from src.api.market_data import MarketDataManager
             from src.data.opportunity_store import OpportunityStore
             from src.strategy.put_seller import PutSeller
+            from src.strategy.wheel_engine import WheelEngine
+            from src.strategy.execution_engine import ExecutionEngine
 
             alpaca_client = AlpacaClient(config)
-            market_data = MarketDataManager(alpaca_client, config)
             opportunity_store = OpportunityStore(config)
+
+            # --- Pre-trade housekeeping ---
+            # Poll previous order statuses so we have accurate state before new trades,
+            # then reconcile positions to ensure wheel state matches Alpaca reality.
+            try:
+                engine = WheelEngine(config)
+
+                poll_stats = engine.poll_order_statuses()
+                log_system_event(
+                    logger,
+                    event_type="pre_trade_order_poll_completed",
+                    status="completed",
+                    orders_checked=poll_stats.get('orders_checked', 0),
+                    filled_logged=poll_stats.get('filled_logged', 0),
+                    expired_logged=poll_stats.get('expired_logged', 0),
+                )
+
+                reconcile_stats = engine.reconcile_positions()
+                log_system_event(
+                    logger,
+                    event_type="pre_trade_reconciliation_completed",
+                    status="completed",
+                    discrepancies_found=reconcile_stats.get('discrepancies_found', 0),
+                    state_updates=reconcile_stats.get('state_updates', 0),
+                )
+            except Exception as e:
+                # Housekeeping failures should not block trade execution
+                log_error_event(
+                    logger,
+                    error_type="pre_trade_housekeeping_failed",
+                    error_message=str(e),
+                    component="cloud_run_server",
+                    recoverable=True
+                )
 
             # Retrieve pending opportunities from Cloud Storage
             opportunities = opportunity_store.get_pending_opportunities(start_time)
@@ -220,48 +334,59 @@ def trigger_strategy():
                        count=len(opportunities),
                        execution_time=start_time.isoformat())
 
+            # Initialize execution engine, put seller, and call seller
+            exec_engine = ExecutionEngine(alpaca_client, config, logger)
+            market_data = MarketDataManager(alpaca_client, config)
+            put_seller = PutSeller(alpaca_client, market_data, config)
+            from src.strategy.call_seller import CallSeller
+            call_seller = CallSeller(alpaca_client, market_data, config)
+
+            # NON-RETRYABLE FILTER: Skip opportunities that previously failed with
+            # non-retryable errors (e.g., "account not eligible", "invalid symbol")
+            opportunities, non_retryable_filtered = exec_engine.filter_failed_opportunities(
+                opportunities
+            )
+            if non_retryable_filtered > 0 and not opportunities:
+                logger.info("All opportunities previously failed with non-retryable errors",
+                           event_category="system",
+                           event_type="all_opportunities_non_retryable")
+                return jsonify({
+                    'message': 'All opportunities previously failed (non-retryable)',
+                    'timestamp': datetime.now().isoformat(),
+                    'results': {
+                        'opportunities_found': non_retryable_filtered,
+                        'non_retryable_filtered': non_retryable_filtered,
+                        'trades_executed': 0
+                    }
+                })
+
             # IDEMPOTENCY CHECK: Filter out opportunities where positions already exist
             # This prevents duplicate trades if execution runs twice (e.g., mark_executed failed)
             try:
                 existing_positions = alpaca_client.get_option_positions()
-                existing_symbols = {pos.get('symbol') for pos in existing_positions if pos.get('symbol')}
-
                 original_count = len(opportunities)
-                opportunities = [
-                    opp for opp in opportunities
-                    if opp.get('option_symbol') not in existing_symbols
-                ]
+                opportunities, filtered_count = exec_engine.filter_duplicate_opportunities(
+                    opportunities, existing_positions
+                )
 
-                if len(opportunities) < original_count:
-                    filtered_count = original_count - len(opportunities)
-                    logger.warning("Idempotency check: filtered out opportunities with existing positions",
-                                  event_category="system",
-                                  event_type="idempotency_filter_applied",
-                                  original_count=original_count,
-                                  filtered_count=filtered_count,
-                                  remaining_count=len(opportunities))
-
-                    if not opportunities:
-                        logger.info("All opportunities already have positions - likely duplicate execution",
-                                   event_category="system",
-                                   event_type="duplicate_execution_prevented")
-                        return jsonify({
-                            'message': 'All opportunities already executed (idempotency check)',
-                            'timestamp': datetime.now().isoformat(),
-                            'results': {
-                                'opportunities_found': original_count,
-                                'already_executed': filtered_count,
-                                'trades_executed': 0
-                            }
-                        })
+                if filtered_count > 0 and not opportunities:
+                    logger.info("All opportunities already have positions - likely duplicate execution",
+                               event_category="system",
+                               event_type="duplicate_execution_prevented")
+                    return jsonify({
+                        'message': 'All opportunities already executed (idempotency check)',
+                        'timestamp': datetime.now().isoformat(),
+                        'results': {
+                            'opportunities_found': original_count,
+                            'already_executed': filtered_count,
+                            'trades_executed': 0
+                        }
+                    })
             except Exception as e:
                 logger.warning("Idempotency check failed, proceeding with caution",
                               event_category="warning",
                               event_type="idempotency_check_failed",
                               error=str(e))
-
-            # Initialize put seller for execution
-            put_seller = PutSeller(alpaca_client, market_data, config)
 
             # Get initial buying power and track locally during execution
             # (Alpaca's API returns stale/incorrect data immediately after trades)
@@ -277,149 +402,16 @@ def trigger_strategy():
                        portfolio_value=account_info.get('portfolio_value'),
                        equity=account_info.get('equity'))
 
-            # BATCH ORDER STRATEGY: Select all opportunities that fit within buying power
-            # Sort by premium/exposure ratio (ROI) to maximize returns
-            # Submit all orders concurrently to avoid Alpaca's sequential execution bug
+            # Rank opportunities by ROI with position sizing
+            ranked = exec_engine.rank_opportunities(opportunities, put_seller, available_buying_power)
 
-            # Calculate ROI for each opportunity and add position sizing
-            opportunities_with_metrics = []
-            for opp in opportunities:
-                # Transform scanner format to position sizing format
-                if 'premium' in opp and 'mid_price' not in opp:
-                    opp['mid_price'] = opp['premium']
+            # Select opportunities that fit within buying power
+            selected_opportunities, remaining_bp = exec_engine.select_batch(ranked, available_buying_power)
 
-                # Calculate position size
-                position_size = put_seller._calculate_position_size(opp, override_buying_power=available_buying_power)
-                if not position_size:
-                    continue
-
-                opp['contracts'] = position_size['contracts']
-                collateral = opp['strike_price'] * 100 * opp['contracts']
-                premium_collected = opp['premium'] * 100 * opp['contracts']
-                roi = premium_collected / collateral if collateral > 0 else 0
-
-                opportunities_with_metrics.append({
-                    'opportunity': opp,
-                    'collateral': collateral,
-                    'premium': premium_collected,
-                    'roi': roi
-                })
-
-            # Sort by ROI (highest first)
-            opportunities_with_metrics.sort(key=lambda x: x['roi'], reverse=True)
-
-            # Select opportunities that fit within buying power (greedy algorithm)
-            # IMPORTANT: Only one position per underlying stock (risk management rule)
-            selected_opportunities = []
-            selected_underlyings = set()  # Track which stocks we've already selected
-            remaining_bp = available_buying_power
-
-            for item in opportunities_with_metrics:
-                underlying = item['opportunity'].get('symbol')
-
-                # Skip if we already have a position for this underlying
-                if underlying in selected_underlyings:
-                    logger.info("Skipping duplicate underlying in batch selection",
-                               event_category="filtering",
-                               event_type="duplicate_underlying_skipped",
-                               symbol=underlying,
-                               collateral=item['collateral'],
-                               premium=item['premium'],
-                               roi=f"{item['roi']:.4f}",
-                               reason="already_selected_for_execution")
-                    continue
-
-                if item['collateral'] <= remaining_bp:
-                    selected_opportunities.append(item['opportunity'])
-                    selected_underlyings.add(underlying)
-                    remaining_bp -= item['collateral']
-                    logger.info("Selected opportunity for batch execution",
-                               event_category="system",
-                               event_type="opportunity_selected_for_execution",
-                               symbol=underlying,
-                               collateral=item['collateral'],
-                               premium=item['premium'],
-                               roi=f"{item['roi']:.4f}",
-                               remaining_bp=remaining_bp)
-
-            logger.info("Batch order selection complete",
-                       event_category="system",
-                       event_type="batch_selection_completed",
-                       total_opportunities=len(opportunities),
-                       selected_count=len(selected_opportunities),
-                       initial_bp=available_buying_power,
-                       bp_to_use=available_buying_power - remaining_bp)
-
-            # Execute orders SEQUENTIALLY (not concurrently) to prevent race conditions
-            # BUG FIX (Oct 2025): Concurrent execution was causing buying power race conditions.
-            # When the first trade consumed BP, subsequent concurrent trades didn't know about it
-            # and would fail with "insufficient buying power" errors (84.5% failure rate).
-            # Sequential execution with real-time BP checks prevents this race condition.
-
-            logger.info("Executing batch orders sequentially",
-                       event_category="system",
-                       event_type="batch_orders_executing",
-                       order_count=len(selected_opportunities))
-
-            execution_results = []
-            trades_executed = 0
-
-            # Execute each order sequentially with real-time buying power validation
-            for opp in selected_opportunities:
-                try:
-                    # Execute with buying power check (DO NOT skip - prevents race conditions)
-                    # Each order will check current buying power before executing
-                    result = put_seller.execute_put_sale(opp, skip_buying_power_check=False)
-
-                    execution_data = {
-                        'opportunity': opp,
-                        'result': result,
-                        'success': result and result.get('success', False)
-                    }
-                    execution_results.append(execution_data)
-
-                    if execution_data['success']:
-                        trades_executed += 1
-
-                        # Log successful trade
-                        # Convert UUID to string if present
-                        order_id = result.get('order_id')
-                        if order_id is not None:
-                            order_id = str(order_id)
-
-                        log_system_event(
-                            logger,
-                            event_type="trade_executed",
-                            status="success",
-                            symbol=opp.get('symbol'),
-                            option_symbol=opp.get('option_symbol'),
-                            contracts=opp.get('contracts'),
-                            premium=opp.get('premium'),
-                            strike_price=opp.get('strike_price'),
-                            order_id=order_id
-                        )
-                    else:
-                        # Log failed trade
-                        log_error_event(
-                            logger,
-                            error_type="trade_execution_failed",
-                            error_message=result.get('message', 'Unknown error'),
-                            component="execution_engine",
-                            recoverable=True,
-                            symbol=opp.get('symbol'),
-                            option_symbol=opp.get('option_symbol')
-                        )
-                except Exception as e:
-                    logger.error("Exception during order execution",
-                                event_category="error",
-                                event_type="order_execution_exception",
-                                symbol=opp.get('symbol'),
-                                error=str(e))
-                    execution_results.append({
-                        'opportunity': opp,
-                        'result': {'success': False, 'message': str(e)},
-                        'success': False
-                    })
+            # Execute orders sequentially with real-time buying power validation
+            execution_results, trades_executed = exec_engine.execute_batch(
+                selected_opportunities, put_seller, call_seller=call_seller
+            )
 
             # Mark opportunities as executed in Cloud Storage
             # CRITICAL: If this fails, opportunities remain pending and could re-execute
@@ -486,23 +478,55 @@ def trigger_strategy():
             })
 
         except Exception as e:
-            error_msg = f"Strategy execution failed: {str(e)}"
-            logger.error(error_msg,
+            logger.error("Strategy execution failed",
                         event_category="error",
                         event_type="strategy_execution_exception",
                         error=str(e),
                         traceback=traceback.format_exc())
             strategy_status['errors'].append({
                 'timestamp': datetime.now().isoformat(),
-                'error': error_msg
+                'error': f"Strategy execution failed: {str(e)}"
             })
-            return jsonify({'error': error_msg}), 500
+            return jsonify({'error': f"Strategy execution failed: {str(e)}"}), 500
+
+def _is_market_open() -> bool:
+    """Check if the US stock market is currently open.
+
+    Uses a simple time check: market is open 9:30 AM - 4:00 PM ET, Mon-Fri.
+    This covers regular sessions and is conservative on half-days (the
+    scheduler should not trigger outside these bounds anyway).
+
+    Returns:
+        True if market is currently open.
+    """
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    # Weekday: Monday=0 ... Friday=4
+    if now_et.weekday() > 4:
+        return False
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now_et <= market_close
+
 
 @app.route('/monitor', methods=['POST'])
+@require_api_key
 def monitor_positions():
     """Monitor existing positions and close profitable ones."""
     with strategy_lock:
         start_time = datetime.now()
+
+        # Gate: skip monitoring entirely when market is closed to avoid
+        # "options market orders are only allowed during market hours" errors.
+        if not _is_market_open():
+            logger.info("Market closed - skipping monitor",
+                       event_category="system",
+                       event_type="monitor_skipped_market_closed")
+            return jsonify({
+                'message': 'Market closed - skipping monitor',
+                'timestamp': datetime.now().isoformat()
+            })
+
         try:
             log_system_event(
                 logger,
@@ -556,7 +580,7 @@ def monitor_positions():
                         should_close = call_seller.should_close_call_early(position)
                         position_type = 'CALL'
                     else:
-                        logger.warning("Unknown option type", symbol=symbol)
+                        logger.warning("Unknown option type", event_category="error", event_type="unknown_option_type", symbol=symbol)
                         continue
 
                     if should_close:
@@ -682,8 +706,10 @@ def monitor_positions():
             return jsonify({'error': error_msg}), 500
 
 @app.route('/account', methods=['GET'])
+@require_api_key
 def get_account():
     """Get Alpaca account information."""
+    logger.debug("Endpoint called", event_category="system", event_type="get_account", endpoint="/account")
     try:
         config = Config()
         from src.api.alpaca_client import AlpacaClient
@@ -698,17 +724,18 @@ def get_account():
         return jsonify(account_info)
 
     except Exception as e:
-        error_msg = f"Failed to get account info: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Failed to get account info",
                     event_category="error",
                     event_type="account_info_failed",
                     error=str(e),
                     traceback=traceback.format_exc())
-        return jsonify({'error': error_msg}), 500
+        return jsonify({'error': f"Failed to get account info: {str(e)}"}), 500
 
 @app.route('/positions', methods=['GET'])
+@require_api_key
 def get_positions():
     """Get current positions."""
+    logger.debug("Endpoint called", event_category="system", event_type="get_positions", endpoint="/positions")
     try:
         config = Config()
         from src.api.alpaca_client import AlpacaClient
@@ -723,17 +750,18 @@ def get_positions():
         })
 
     except Exception as e:
-        error_msg = f"Failed to get positions: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Failed to get positions",
                     event_category="error",
                     event_type="positions_fetch_failed",
                     error=str(e),
                     traceback=traceback.format_exc())
-        return jsonify({'error': error_msg}), 500
+        return jsonify({'error': f"Failed to get positions: {str(e)}"}), 500
 
 @app.route('/config', methods=['GET'])
+@require_api_key
 def get_config():
     """Get current configuration (sanitized)."""
+    logger.debug("Endpoint called", event_category="system", event_type="get_config", endpoint="/config")
     try:
         config = Config()
 
@@ -751,11 +779,11 @@ def get_config():
         return jsonify(config_data)
 
     except Exception as e:
-        error_msg = f"Config retrieval failed: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Config retrieval failed",
                     event_category="error",
-                    event_type="config_retrieval_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="config_retrieval_failed",
+                    error=str(e))
+        return jsonify({'error': f"Config retrieval failed: {str(e)}"}), 500
 
 @app.route('/health')
 def detailed_health():
@@ -794,6 +822,7 @@ def detailed_health():
 # ============================================================================
 
 @app.route('/backtest', methods=['POST'])
+@require_api_key
 def run_backtest():
     """Run a backtesting analysis."""
     try:
@@ -897,15 +926,14 @@ def run_backtest():
         })
 
     except Exception as e:
-        error_msg = f"Backtest failed: {str(e)}"
         logger.error("Backtest execution failed",
                     event_category="error",
                     event_type="backtest_execution_failed",
-                    error=error_msg,
+                    error=str(e),
                     traceback=traceback.format_exc())
 
         return jsonify({
-            'error': error_msg,
+            'error': f"Backtest failed: {str(e)}",
             'timestamp': datetime.now().isoformat()
         }), 500
 
@@ -1091,6 +1119,7 @@ def generate_monthly_returns(start_date, end_date):
 @app.route('/backtest/results/<backtest_id>')
 def get_backtest_results(backtest_id):
     """Retrieve stored backtest results."""
+    logger.debug("Endpoint called", event_category="system", event_type="get_backtest_results", endpoint="/backtest/results/<id>")
     try:
         # In a real implementation, this would fetch from cloud storage
         # For now, return a mock response
@@ -1106,15 +1135,16 @@ def get_backtest_results(backtest_id):
         })
 
     except Exception as e:
-        error_msg = f"Failed to retrieve backtest results: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Failed to retrieve backtest results",
                     event_category="error",
-                    event_type="backtest_results_retrieval_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="backtest_results_retrieval_failed",
+                    error=str(e))
+        return jsonify({'error': f"Failed to retrieve backtest results: {str(e)}"}), 500
 
 @app.route('/backtest/history')
 def get_backtest_history():
     """Get list of recent backtest runs."""
+    logger.debug("Endpoint called", event_category="system", event_type="get_backtest_history", endpoint="/backtest/history")
     try:
         # Mock recent backtest history
         history = []
@@ -1138,15 +1168,17 @@ def get_backtest_history():
         })
 
     except Exception as e:
-        error_msg = f"Failed to retrieve backtest history: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Failed to retrieve backtest history",
                     event_category="error",
-                    event_type="backtest_history_retrieval_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="backtest_history_retrieval_failed",
+                    error=str(e))
+        return jsonify({'error': f"Failed to retrieve backtest history: {str(e)}"}), 500
 
 @app.route('/backtest/performance-comparison', methods=['POST'])
+@require_api_key
 def performance_comparison():
     """Compare live trading performance vs backtested expectations."""
+    logger.debug("Endpoint called", event_category="system", event_type="performance_comparison", endpoint="/backtest/performance-comparison")
     try:
         data = request.get_json() or {}
         comparison_period = data.get('period_days', 30)
@@ -1185,15 +1217,16 @@ def performance_comparison():
         })
 
     except Exception as e:
-        error_msg = f"Performance comparison failed: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Performance comparison failed",
                     event_category="error",
-                    event_type="performance_comparison_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="performance_comparison_failed",
+                    error=str(e))
+        return jsonify({'error': f"Performance comparison failed: {str(e)}"}), 500
 
 @app.route('/cache/stats')
 def get_cache_stats():
     """Get cache usage statistics."""
+    logger.debug("Endpoint called", event_category="system", event_type="get_cache_stats", endpoint="/cache/stats")
     try:
         # Try to get actual cache stats
         try:
@@ -1215,15 +1248,17 @@ def get_cache_stats():
         })
 
     except Exception as e:
-        error_msg = f"Failed to get cache stats: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Failed to get cache stats",
                     event_category="error",
-                    event_type="cache_stats_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="cache_stats_failed",
+                    error=str(e))
+        return jsonify({'error': f"Failed to get cache stats: {str(e)}"}), 500
 
 @app.route('/cache/cleanup', methods=['POST'])
+@require_api_key
 def cleanup_cache():
     """Clean up old cache files."""
+    logger.debug("Endpoint called", event_category="system", event_type="cleanup_cache", endpoint="/cache/cleanup")
     try:
         data = request.get_json() or {}
         days_old = data.get('days_old', 30)
@@ -1248,11 +1283,11 @@ def cleanup_cache():
         })
 
     except Exception as e:
-        error_msg = f"Cache cleanup failed: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Cache cleanup failed",
                     event_category="error",
-                    event_type="cache_cleanup_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="cache_cleanup_failed",
+                    error=str(e))
+        return jsonify({'error': f"Cache cleanup failed: {str(e)}"}), 500
 
 # ============================================================================
 # PERFORMANCE MONITORING DASHBOARD ENDPOINTS
@@ -1286,11 +1321,11 @@ def performance_dashboard():
         })
 
     except Exception as e:
-        error_msg = f"Dashboard generation failed: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Dashboard generation failed",
                     event_category="error",
-                    event_type="dashboard_generation_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="dashboard_generation_failed",
+                    error=str(e))
+        return jsonify({'error': f"Dashboard generation failed: {str(e)}"}), 500
 
 @app.route('/dashboard/alerts')
 def get_active_alerts():
@@ -1321,11 +1356,11 @@ def get_active_alerts():
         })
 
     except Exception as e:
-        error_msg = f"Alert check failed: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Alert check failed",
                     event_category="error",
-                    event_type="alert_check_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="alert_check_failed",
+                    error=str(e))
+        return jsonify({'error': f"Alert check failed: {str(e)}"}), 500
 
 @app.route('/dashboard/metrics/export')
 def export_metrics():
@@ -1352,11 +1387,11 @@ def export_metrics():
         }), 503
 
     except Exception as e:
-        error_msg = f"Metrics export failed: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Metrics export failed",
                     event_category="error",
-                    event_type="metrics_export_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="metrics_export_failed",
+                    error=str(e))
+        return jsonify({'error': f"Metrics export failed: {str(e)}"}), 500
 
 @app.route('/dashboard/health')
 def system_health_check():
@@ -1390,11 +1425,11 @@ def system_health_check():
         })
 
     except Exception as e:
-        error_msg = f"Health check failed: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Health check failed",
                     event_category="error",
-                    event_type="health_check_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="health_check_failed",
+                    error=str(e))
+        return jsonify({'error': f"Health check failed: {str(e)}"}), 500
 
 @app.route('/dashboard/trends')
 def get_performance_trends():
@@ -1422,11 +1457,11 @@ def get_performance_trends():
         })
 
     except Exception as e:
-        error_msg = f"Trend analysis failed: {str(e)}"
-        logger.error(error_msg,
+        logger.error("Trend analysis failed",
                     event_category="error",
-                    event_type="trend_analysis_failed")
-        return jsonify({'error': error_msg}), 500
+                    event_type="trend_analysis_failed",
+                    error=str(e))
+        return jsonify({'error': f"Trend analysis failed: {str(e)}"}), 500
 
 @app.route('/backtest/trades/<backtest_id>')
 def get_detailed_trades(backtest_id):
@@ -1512,9 +1547,10 @@ def get_detailed_trades(backtest_id):
         return jsonify(trade_analysis)
 
     except Exception as e:
-        logger.error(f"Failed to get detailed trades: {str(e)}",
+        logger.error("Failed to get detailed trades",
                     event_category="error",
-                    event_type="detailed_trades_fetch_failed")
+                    event_type="detailed_trades_fetch_failed",
+                    error=str(e))
         return jsonify({'error': f'Failed to get trades: {str(e)}'}), 500
 
 @app.route('/backtest/analytics/<backtest_id>')
@@ -1601,9 +1637,10 @@ def get_backtest_analytics(backtest_id):
         return jsonify(analytics)
 
     except Exception as e:
-        logger.error(f"Failed to get backtest analytics: {str(e)}",
+        logger.error("Failed to get backtest analytics",
                     event_category="error",
-                    event_type="backtest_analytics_fetch_failed")
+                    event_type="backtest_analytics_fetch_failed",
+                    error=str(e))
         return jsonify({'error': f'Failed to get analytics: {str(e)}'}), 500
 
 def setup_logging():
@@ -1621,6 +1658,7 @@ def setup_logging():
     # Configure structlog to use Python logging
     structlog.configure(
         processors=[
+            structlog.contextvars.merge_contextvars,
             structlog.stdlib.filter_by_level,
             structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,
