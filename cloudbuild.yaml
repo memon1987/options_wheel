@@ -79,11 +79,15 @@ steps:
     waitFor: ['push-bot-image']
 
   # Step 7: Smoke test the trading bot canary revision
-  - name: 'gcr.io/cloud-builders/curl'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     args:
       - '-c'
-      - 'curl -sf --retry 3 --retry-delay 5 https://canary---options-wheel-strategy-799970961417.us-central1.run.app/ || exit 1'
+      - |
+        TOKEN=$(gcloud auth print-identity-token --audiences=https://canary---options-wheel-strategy-799970961417.us-central1.run.app)
+        curl -sf --retry 3 --retry-delay 5 \
+          -H "Authorization: Bearer $${TOKEN}" \
+          https://canary---options-wheel-strategy-799970961417.us-central1.run.app/ || exit 1
     id: 'smoke-test-bot'
     waitFor: ['deploy-bot-canary']
 
@@ -121,11 +125,15 @@ steps:
     waitFor: ['push-dashboard-image']
 
   # Step 10: Smoke test the dashboard canary revision
-  - name: 'gcr.io/cloud-builders/curl'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     args:
       - '-c'
-      - 'curl -sf --retry 3 --retry-delay 5 https://canary---options-wheel-dashboard-799970961417.us-central1.run.app/ || exit 1'
+      - |
+        TOKEN=$(gcloud auth print-identity-token --audiences=https://canary---options-wheel-dashboard-799970961417.us-central1.run.app)
+        curl -sf --retry 3 --retry-delay 5 \
+          -H "Authorization: Bearer $${TOKEN}" \
+          https://canary---options-wheel-dashboard-799970961417.us-central1.run.app/ || exit 1
     id: 'smoke-test-dashboard'
     waitFor: ['deploy-dashboard-canary']
 
