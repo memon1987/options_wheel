@@ -1643,6 +1643,75 @@ def get_backtest_analytics(backtest_id):
                     error=str(e))
         return jsonify({'error': f'Failed to get analytics: {str(e)}'}), 500
 
+# ============================================================================
+# REGRESSION TESTING ENDPOINT
+# ============================================================================
+
+@app.route('/regression', methods=['POST'])
+@require_api_key
+def run_regression_tests():
+    """Run production regression tests and return a report.
+
+    Invoked by Cloud Scheduler during market hours to validate system health.
+    Returns 200 if all checks pass, 500 if critical failures are detected.
+    """
+    start_time = datetime.now()
+    try:
+        log_system_event(
+            logger,
+            event_type="regression_test_triggered",
+            status="starting"
+        )
+
+        from tools.testing.regression_monitor import RegressionMonitor
+
+        # Run in internal mode -- the monitor calls our own endpoints
+        # via the service URL (or localhost when running inside Cloud Run).
+        service_url = os.environ.get(
+            "REGRESSION_SERVICE_URL",
+            request.url_root.rstrip("/"),
+        )
+        api_key = os.environ.get("STRATEGY_API_KEY", "")
+
+        monitor = RegressionMonitor(
+            service_url=service_url,
+            api_key=api_key,
+            internal=True,
+        )
+        report = monitor.run_all_checks()
+
+        duration_seconds = (datetime.now() - start_time).total_seconds()
+
+        log_performance_metric(
+            logger,
+            metric_name="regression_endpoint_duration",
+            metric_value=duration_seconds,
+            metric_unit="seconds",
+            overall_status=report.get("overall_status", "unknown"),
+        )
+
+        status_code = 200 if report.get("overall_status") != "fail" else 500
+        return jsonify(report), status_code
+
+    except Exception as e:
+        log_error_event(
+            logger,
+            error_type="regression_test_exception",
+            error_message=str(e),
+            component="cloud_run_server",
+            recoverable=True,
+        )
+        logger.error("Regression test failed",
+                    event_category="error",
+                    event_type="regression_test_exception",
+                    error=str(e),
+                    traceback=traceback.format_exc())
+        return jsonify({
+            'error': f"Regression test failed: {str(e)}",
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
 def setup_logging():
     """Configure structured logging."""
     import logging

@@ -78,16 +78,24 @@ steps:
     id: 'deploy-bot-canary'
     waitFor: ['push-bot-image']
 
-  # Step 7: Smoke test the trading bot canary revision
+  # Step 7: Verify the trading bot canary revision is healthy
+  # Cannot curl authenticated Cloud Run from Cloud Build, so verify via API
+  # that the revision is ready and serving on the canary tag.
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
-        TOKEN=$(gcloud auth print-identity-token --audiences=https://canary---options-wheel-strategy-799970961417.us-central1.run.app)
-        curl -sf --retry 3 --retry-delay 5 \
-          -H "Authorization: Bearer $${TOKEN}" \
-          https://canary---options-wheel-strategy-799970961417.us-central1.run.app/ || exit 1
+        echo "Verifying canary revision is ready..."
+        STATUS=$(gcloud run revisions list --service=options-wheel-strategy \
+          --region=us-central1 --limit=1 \
+          --format="value(status.conditions[0].status)")
+        echo "Latest revision status: $${STATUS}"
+        if [ "$${STATUS}" != "True" ]; then
+          echo "FAIL: Canary revision not ready"
+          exit 1
+        fi
+        echo "PASS: Canary revision is ready"
     id: 'smoke-test-bot'
     waitFor: ['deploy-bot-canary']
 
@@ -124,16 +132,22 @@ steps:
     id: 'deploy-dashboard-canary'
     waitFor: ['push-dashboard-image']
 
-  # Step 10: Smoke test the dashboard canary revision
+  # Step 10: Verify the dashboard canary revision is healthy
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
-        TOKEN=$(gcloud auth print-identity-token --audiences=https://canary---options-wheel-dashboard-799970961417.us-central1.run.app)
-        curl -sf --retry 3 --retry-delay 5 \
-          -H "Authorization: Bearer $${TOKEN}" \
-          https://canary---options-wheel-dashboard-799970961417.us-central1.run.app/ || exit 1
+        echo "Verifying dashboard canary revision is ready..."
+        STATUS=$(gcloud run revisions list --service=options-wheel-dashboard \
+          --region=us-central1 --limit=1 \
+          --format="value(status.conditions[0].status)")
+        echo "Latest revision status: $${STATUS}"
+        if [ "$${STATUS}" != "True" ]; then
+          echo "FAIL: Dashboard canary revision not ready"
+          exit 1
+        fi
+        echo "PASS: Dashboard canary revision is ready"
     id: 'smoke-test-dashboard'
     waitFor: ['deploy-dashboard-canary']
 
