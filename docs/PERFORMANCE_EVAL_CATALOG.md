@@ -320,6 +320,47 @@ ORDER BY date DESC
 
 ---
 
+## EVAL-010: Symbol Universe Optimization
+
+**Hypothesis:** The current 14-symbol universe is inefficient — 8 symbols never trade, wasting ~6,000 API calls per month and slowing scans.
+
+**Data (collected Apr 2026):**
+
+| Symbol | Status | Reason |
+|---|---|---|
+| AMD | ACTIVE (51 trades) | Top earner, but gap-filtered 47% of the time |
+| NVDA | ACTIVE (75 trades) | Most active |
+| AMZN | ACTIVE (30 trades) | Best ROI (1.50%) — stopped trading Feb 5, investigate |
+| UNH | ACTIVE (45 trades) | Steady performer |
+| GOOGL | ACTIVE (27 trades) | Solid |
+| IWM | ACTIVE (32 trades) | Worst ROI (0.58%) — consider removing |
+| AAPL | NEVER TRADED | Passes filters but `no_puts_met_criteria` 738 times — premiums too thin at our delta range |
+| MSFT | NEVER TRADED | Price $400-490, above $400 max_stock_price |
+| QQQ | NEVER TRADED | Price $480-520, above $400 max |
+| SPY | NEVER TRADED | Price $550-600, above $400 max |
+| F | NEVER TRADED | At $6, puts pay $0.05-0.15, below $0.50 min premium |
+| PFE | NEVER TRADED | At $25, premiums $0.10-0.30, below min |
+| KMI | NEVER TRADED | At $28, insufficient premium |
+| VZ | NEVER TRADED | At $43, premiums $0.20-0.40, borderline |
+
+**Recommended changes (pending validation):**
+- Remove: AAPL, MSFT, QQQ, SPY, F, PFE, KMI, VZ (all dead weight)
+- Keep: AMD, NVDA, AMZN, UNH, GOOGL
+- Evaluate IWM: lowest ROI but provides ETF diversification
+- Investigate: Why AMZN stopped trading after Feb 5 (gap risk? position limit?)
+- Consider adding: META, TSLA, COIN, PLTR (all in $100-350 range with high IV)
+- If adding MSFT: requires raising max_stock_price from $400 to $500+ ($48k collateral)
+
+**Investigate AMD gap filtering:** AMD is gap-filtered 47% of the time (262 of 553 scans). The gap risk thresholds may be too conservative for a stock that's your top premium generator. Compare AMD's actual overnight gaps vs the filter threshold.
+
+**Action threshold:** Remove symbols with 0 trades over 3+ months. Add symbols only after backtesting confirms they'd pass all filters and generate premium above minimum.
+
+**Status:** READY — data collected, changes cataloged for future session
+
+**Config parameters:** `stocks.symbols`, `strategy.max_stock_price`, `strategy.min_put_premium`, `risk.gap_risk_controls.*`
+
+---
+
 ## Future Automation Architecture
 
 Once 3+ evals have sufficient data and stable thresholds, build:
