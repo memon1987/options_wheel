@@ -61,6 +61,10 @@ strategy_status = {
 
 strategy_lock = threading.Lock()
 
+# Track symbols that have been closed today to prevent repeated close attempts.
+# Cleared on Cloud Run cold start (naturally daily for scale-to-zero services).
+_closed_today: set = set()
+
 
 def require_api_key(f):
     """Decorator that enforces API key authentication as defense-in-depth.
@@ -584,6 +588,14 @@ def monitor_positions():
                         continue
 
                     if should_close:
+                        # --- Dedup: skip if already closed today ---
+                        if symbol in _closed_today:
+                            logger.debug("Skipping already-closed position",
+                                        event_category="filtering",
+                                        event_type="close_dedup_skipped",
+                                        symbol=symbol)
+                            continue
+
                         logger.info("Position reached profit target - closing",
                                    event_category="execution",
                                    event_type="early_close_triggered",
@@ -593,19 +605,68 @@ def monitor_positions():
                                    market_value=position.get('market_value'))
 
                         # Extract underlying symbol from option symbol
-                        # Option symbols format: AMD251017P00330000
-                        # Extract underlying by removing date and option details
                         import re
                         underlying_match = re.match(r'^([A-Z]+)', symbol)
                         underlying = underlying_match.group(1) if underlying_match else symbol[:symbol.find('2') if '2' in symbol else len(symbol)]
 
-                        # Place buy-to-close order
-                        close_result = alpaca_client.place_option_order(
-                            symbol=symbol,
-                            qty=abs(qty),
-                            side='buy',
-                            order_type='market'
-                        )
+                        # --- Get option quote for smart limit order pricing ---
+                        # Strategy: Use the option's current bid/ask to set an
+                        # intelligent limit. We're buying back a short position, so
+                        # we want to pay as little as possible while still filling.
+                        #
+                        # - Bid: lowest price (best for us, may not fill)
+                        # - Ask: highest price (guaranteed fill, worst for us = market order)
+                        # - Our limit: ask * 0.95 (5% below ask) — captures most of
+                        #   the spread savings while maintaining high fill probability.
+                        #   If the spread is $0.50-$0.80, we'd pay ~$0.76 vs $0.80 ask.
+                        #   For wider spreads the savings are larger.
+                        #
+                        # If the limit doesn't fill by EOD (DAY order), the position
+                        # stays open and will be re-evaluated next cycle.
+                        close_limit_price = None
+                        option_bid = None
+                        option_ask = None
+                        try:
+                            option_quote = alpaca_client.get_option_quote(symbol)
+                            option_bid = option_quote.get('bid', 0)
+                            option_ask = option_quote.get('ask', 0)
+                            if option_ask > 0 and option_bid > 0:
+                                # Set limit at 95% of ask (saves ~5% of spread)
+                                close_limit_price = round(option_ask * 0.95, 2)
+                                # Floor: never below the bid (would never fill)
+                                close_limit_price = max(close_limit_price, option_bid)
+                        except Exception:
+                            pass  # Fall back to market order
+
+                        # Place buy-to-close order (limit if quote available, market as fallback)
+                        if close_limit_price and close_limit_price > 0:
+                            close_result = alpaca_client.place_option_order(
+                                symbol=symbol,
+                                qty=abs(qty),
+                                side='buy',
+                                order_type='limit',
+                                limit_price=close_limit_price
+                            )
+                        else:
+                            close_result = alpaca_client.place_option_order(
+                                symbol=symbol,
+                                qty=abs(qty),
+                                side='buy',
+                                order_type='market'
+                            )
+
+                        # --- Capture fill price from Alpaca ---
+                        fill_price = None
+                        order_id = close_result.get('order_id')
+                        if close_result.get('success') and order_id:
+                            _closed_today.add(symbol)
+                            try:
+                                import time as _time
+                                _time.sleep(1)  # Brief wait for fill
+                                order_detail = alpaca_client.get_order_by_id(order_id)
+                                fill_price = order_detail.get('filled_avg_price')
+                            except Exception:
+                                pass  # Fill price captured later by poll_order_statuses
 
                         # Calculate profit/loss percentage
                         unrealized_pl = float(position.get('unrealized_pl', 0))
@@ -618,7 +679,9 @@ def monitor_positions():
                             'qty': abs(qty),
                             'unrealized_pl': unrealized_pl,
                             'profit_pct': profit_pct,
-                            'close_result': close_result
+                            'close_result': close_result,
+                            'limit_price': close_limit_price,
+                            'fill_price': fill_price
                         })
 
                         # Log trade event for BigQuery analytics
@@ -633,11 +696,15 @@ def monitor_positions():
                             contracts=abs(qty),
                             unrealized_pl=unrealized_pl,
                             profit_pct=round(profit_pct, 2),
-                            order_id=close_result.get('order_id'),
+                            order_id=order_id,
                             reason="profit_target_reached",
                             market_value=market_value,
                             entry_price=float(position.get('avg_entry_price', 0)),
-                            exit_price=float(position.get('current_price', 0))
+                            exit_price=fill_price or float(position.get('current_price', 0)),
+                            limit_price=close_limit_price,
+                            fill_price=fill_price,
+                            bid=option_bid,
+                            ask=option_ask
                         )
 
                         logger.info("Position closed successfully",
@@ -647,7 +714,11 @@ def monitor_positions():
                                    type=position_type,
                                    unrealized_pl=unrealized_pl,
                                    profit_pct=round(profit_pct, 2),
-                                   order_id=close_result.get('order_id'))
+                                   order_id=order_id,
+                                   limit_price=close_limit_price,
+                                   fill_price=fill_price,
+                                   bid=option_bid,
+                                   ask=option_ask)
 
                 except Exception as pos_error:
                     error_msg = f"Failed to evaluate position {position.get('symbol')}: {str(pos_error)}"

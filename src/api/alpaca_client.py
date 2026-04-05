@@ -12,7 +12,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.data import OptionHistoricalDataClient, StockHistoricalDataClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
-from alpaca.data.requests import StockLatestQuoteRequest, OptionChainRequest, StockBarsRequest
+from alpaca.data.requests import StockLatestQuoteRequest, OptionLatestQuoteRequest, OptionChainRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 from tenacity import (
@@ -328,7 +328,43 @@ class AlpacaClient:
                         symbol=symbol,
                         error=str(e))
             raise
-    
+
+    def get_option_quote(self, option_symbol: str) -> Dict[str, Any]:
+        """Get latest bid/ask quote for a specific option contract.
+
+        Args:
+            option_symbol: Full OCC option symbol (e.g., AAPL250117C00185000)
+
+        Returns:
+            Dict with bid, ask, mid_price, or empty dict on failure.
+        """
+        try:
+            request = OptionLatestQuoteRequest(symbol_or_symbols=[option_symbol])
+            quotes = self.option_data_client.get_option_latest_quote(request)
+            quote = quotes.get(option_symbol)
+            if not quote:
+                return {}
+
+            bid = float(quote.bid_price) if quote.bid_price else 0.0
+            ask = float(quote.ask_price) if quote.ask_price else 0.0
+            mid = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else 0.0
+
+            return {
+                'symbol': option_symbol,
+                'bid': bid,
+                'ask': ask,
+                'mid_price': mid,
+                'bid_size': int(quote.bid_size) if quote.bid_size else 0,
+                'ask_size': int(quote.ask_size) if quote.ask_size else 0,
+            }
+        except Exception as e:
+            logger.debug("Could not get option quote",
+                        event_category="data",
+                        event_type="option_quote_failed",
+                        symbol=option_symbol,
+                        error=str(e))
+            return {}
+
     @api_retry
     def get_stock_bars(self, symbol: str, days: int = 30) -> pd.DataFrame:
         """Get historical stock bars using SIP feed with 15-min delay buffer.
@@ -532,7 +568,8 @@ class AlpacaClient:
                        event_type="order_placed",
                        symbol=symbol, qty=qty, side=side,
                        order_type=order_type, order_id=order_id,
-                       client_order_id=client_order_id)
+                       client_order_id=client_order_id,
+                       limit_price=limit_price)
 
             return {
                 'success': True,
@@ -541,6 +578,7 @@ class AlpacaClient:
                 'symbol': symbol,
                 'qty': qty,
                 'side': side,
+                'limit_price': limit_price,
                 'status': order_status,
                 'submitted_at': submitted_at
             }
