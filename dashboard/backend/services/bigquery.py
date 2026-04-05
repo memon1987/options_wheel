@@ -50,65 +50,40 @@ class BigQueryService:
         Returns:
             List of trade records with order_status from polling job
         """
-        # Join trades with order status updates to get final fill status
-        # The order_filled/order_expired events are logged by the polling job
-        # and joined by order_id to show actual fill status
+        # Query trades from the trades_executed view.
+        # Order status join removed — order_status/filled_avg_price fields
+        # don't exist in the current schema. poll_order_statuses() will
+        # populate these going forward; the join can be re-added once data exists.
         query = f"""
-        WITH trades AS (
-            SELECT
-                timestamp_et,
-                date_et,
-                symbol,
-                underlying,
-                event_type,
-                event,
-                strategy,
-                premium,
-                contracts,
-                limit_price,
-                order_id
-            FROM `{self.dataset}.trades_executed`
-            WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-                AND symbol IS NOT NULL
-                AND symbol != ''
-                AND event_type IN (
-                    'put_sale_executed',
-                    'call_sale_executed',
-                    'put_assignment',
-                    'call_assignment',
-                    'option_expired',
-                    'buy_to_close_executed'
-                )
-        ),
-        order_statuses AS (
-            SELECT
-                order_id,
-                order_status,
-                event_type as status_event_type,
-                filled_avg_price as final_fill_price,
-                filled_at
-            FROM `{self.dataset}.trades_executed`
-            WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-                AND event_type IN ('order_filled', 'order_expired', 'order_canceled')
-        )
         SELECT
-            t.timestamp_et,
-            t.date_et,
-            t.symbol,
-            t.underlying,
-            t.event_type,
-            t.event,
-            t.strategy,
-            t.premium,
-            t.contracts,
-            t.limit_price,
-            t.order_id,
-            COALESCE(s.order_status, 'pending') as order_status,
-            s.final_fill_price,
-            s.filled_at
-        FROM trades t
-        LEFT JOIN order_statuses s ON t.order_id = s.order_id
-        ORDER BY t.timestamp_et DESC
+            timestamp_et,
+            date_et,
+            symbol,
+            underlying,
+            event_type,
+            event,
+            strategy,
+            premium,
+            contracts,
+            limit_price,
+            order_id,
+            strike_price,
+            collateral_required,
+            dte
+        FROM `{self.dataset}.trades_executed`
+        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            AND symbol IS NOT NULL
+            AND symbol != ''
+            AND event_type IN (
+                'put_sale_executed',
+                'call_sale_executed',
+                'early_close_executed',
+                'put_assignment',
+                'call_assignment',
+                'option_expired',
+                'buy_to_close_executed'
+            )
+        ORDER BY timestamp_et DESC
         LIMIT {limit}
         """
         return self._run_query(query)
@@ -391,6 +366,10 @@ class BigQueryService:
         Returns:
             List of daily stock snapshot data
         """
+        # daily_stock_snapshot events are not yet emitted by the trading bot.
+        # Return empty results gracefully until this logging is implemented.
+        # The event will be logged by wheel_engine._log_daily_stock_snapshot()
+        # once that method populates the required fields (shares, cost_basis, etc.)
         query = f"""
         SELECT
             DATE(timestamp, 'America/New_York') as date_et,
@@ -404,7 +383,9 @@ class BigQueryService:
         FROM `{PROJECT_ID}.options_wheel_logs.run_googleapis_com_stderr_*`
         WHERE jsonPayload.event_type = 'daily_stock_snapshot'
             AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY))
+            AND jsonPayload.symbol IS NOT NULL
         ORDER BY timestamp DESC
+        LIMIT 0
         """
         return self._run_query(query)
 
@@ -417,23 +398,20 @@ class BigQueryService:
         Returns:
             List of wheel cycle data with premium breakdown
         """
+        # wheel_cycle_complete events are not yet emitted by the trading bot.
+        # The WheelStateManager.complete_cycle() method exists but these events
+        # haven't been generated in production yet. Return empty results gracefully.
         query = f"""
         SELECT
             jsonPayload.symbol as symbol,
-            SAFE_CAST(jsonPayload.put_premium_collected AS FLOAT64) as put_premium_collected,
-            SAFE_CAST(jsonPayload.call_premium_collected AS FLOAT64) as call_premium_collected,
-            SAFE_CAST(jsonPayload.total_premium AS FLOAT64) as total_premium,
-            SAFE_CAST(jsonPayload.capital_gain AS FLOAT64) as capital_gain,
-            SAFE_CAST(jsonPayload.total_return AS FLOAT64) as total_return,
-            SAFE_CAST(jsonPayload.cycle_duration_days AS INT64) as duration_days,
-            SAFE_CAST(jsonPayload.cost_basis AS FLOAT64) as cost_basis,
-            SAFE_CAST(jsonPayload.exit_price AS FLOAT64) as exit_price,
+            SAFE_CAST(jsonPayload.premium_collected AS FLOAT64) as total_premium,
             DATETIME(timestamp, 'America/New_York') as cycle_end,
             DATE(timestamp, 'America/New_York') as date_et
         FROM `{PROJECT_ID}.options_wheel_logs.run_googleapis_com_stderr_*`
         WHERE jsonPayload.event_type = 'wheel_cycle_complete'
             AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY))
         ORDER BY timestamp DESC
+        LIMIT 0
         """
         return self._run_query(query)
 
