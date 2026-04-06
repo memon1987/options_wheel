@@ -24,6 +24,7 @@ from tenacity import (
     before_sleep_log,
     RetryError
 )
+import requests
 import requests.exceptions
 
 from ..utils.config import Config
@@ -700,6 +701,71 @@ class AlpacaClient:
                         event_category="error",
                         event_type="order_lookup_error",
                         order_id=order_id,
+                        error=str(e))
+            raise
+
+    def get_account_activities(self, activity_types: str = 'OPASN,OPEXP',
+                               after: str = None, page_size: int = 100) -> List[Dict[str, Any]]:
+        """Fetch account activities from Alpaca REST API.
+
+        The Alpaca TradingClient SDK does not expose the activities endpoint,
+        so this method calls the REST API directly using requests.
+
+        Args:
+            activity_types: Comma-separated activity types (OPASN, OPEXP, FILL, etc.)
+            after: ISO date string to fetch activities after
+            page_size: Number of results per page (max 100)
+
+        Returns:
+            List of activity dicts with: activity_type, date, symbol, qty,
+            net_amount, description, status, id, price (for FILL), order_id (for FILL)
+        """
+        try:
+            # Determine base URL based on paper vs live trading
+            if self.config.paper_trading:
+                base_url = 'https://paper-api.alpaca.markets'
+            else:
+                base_url = 'https://api.alpaca.markets'
+
+            url = f'{base_url}/v2/account/activities'
+
+            headers = {
+                'APCA-API-KEY-ID': self.config.alpaca_api_key,
+                'APCA-API-SECRET-KEY': self.config.alpaca_secret_key,
+                'Accept': 'application/json',
+            }
+
+            params = {
+                'activity_types': activity_types,
+                'page_size': min(page_size, 100),
+            }
+            if after:
+                params['after'] = after
+
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response.raise_for_status()
+
+            activities = response.json()
+
+            logger.debug("Fetched account activities",
+                        event_category="data",
+                        event_type="activities_fetched",
+                        activity_types=activity_types,
+                        count=len(activities))
+
+            return activities
+
+        except requests.exceptions.HTTPError as e:
+            logger.error("Failed to fetch account activities (HTTP error)",
+                        event_category="error",
+                        event_type="activities_http_error",
+                        status_code=e.response.status_code if e.response is not None else None,
+                        error=str(e))
+            raise
+        except Exception as e:
+            logger.error("Failed to fetch account activities",
+                        event_category="error",
+                        event_type="activities_error",
                         error=str(e))
             raise
 

@@ -409,50 +409,6 @@ class PutSeller:
                 'timestamp': datetime.now().isoformat()
             }
     
-    def evaluate_put_assignment(self, put_position: Dict[str, Any]) -> Dict[str, Any]:
-        """Evaluate if a short put position might get assigned.
-
-        Args:
-            put_position: Short put position details
-
-        Returns:
-            Assignment evaluation
-        """
-        try:
-            option_symbol = put_position['symbol']
-
-            # Parse option symbol: format AMD251031P00330000
-            # Extract underlying (letters before date), strike (last 8 digits / 1000)
-            underlying_symbol, strike_price, dte = self._parse_option_symbol(option_symbol)
-
-            # Get current stock price
-            stock_metrics = self.market_data.get_stock_metrics(underlying_symbol)
-            current_price = stock_metrics.get('current_price', 0)
-
-            # Calculate assignment risk based on moneyness
-            assignment_risk = "low"
-            if strike_price > 0 and current_price > 0:
-                if current_price <= strike_price * 1.02:  # Within 2% of strike (ITM or near)
-                    assignment_risk = "high"
-                elif current_price <= strike_price * 1.05:  # Within 5% of strike
-                    assignment_risk = "medium"
-
-            return {
-                'symbol': underlying_symbol,
-                'current_price': current_price,
-                'strike_price': strike_price,
-                'assignment_risk': assignment_risk,
-                'days_to_expiration': dte,
-                'position_value': float(put_position['market_value'])
-            }
-            
-        except Exception as e:
-            logger.error("Failed to evaluate put assignment",
-                        event_category="error",
-                        event_type="put_assignment_evaluation_error",
-                        error=str(e))
-            return {'assignment_risk': 'unknown'}
-    
     def _parse_dte_from_option_symbol(self, option_symbol: str) -> int:
         """
         Extract DTE (Days to Expiration) from option symbol.

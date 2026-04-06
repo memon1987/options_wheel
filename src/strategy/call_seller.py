@@ -330,54 +330,6 @@ class CallSeller:
                 'timestamp': datetime.now().isoformat()
             }
     
-    def evaluate_call_assignment_risk(self, call_position: Dict[str, Any]) -> Dict[str, Any]:
-        """Evaluate if a short call position might get assigned.
-
-        Args:
-            call_position: Short call position details
-
-        Returns:
-            Assignment evaluation
-        """
-        try:
-            option_symbol = call_position['symbol']
-
-            # Parse option symbol: format AMD251031C00350000
-            # Extract underlying (letters before date), strike (last 8 digits / 1000)
-            underlying_symbol, strike_price, dte = self._parse_option_symbol(option_symbol)
-
-            # Get current stock price
-            stock_metrics = self.market_data.get_stock_metrics(underlying_symbol)
-            current_price = stock_metrics.get('current_price', 0)
-
-            # Calculate assignment risk based on moneyness
-            assignment_risk = "low"
-            if strike_price > 0 and current_price > 0:
-                if current_price >= strike_price * 0.98:  # Within 2% of strike (above)
-                    assignment_risk = "high"
-                elif current_price >= strike_price * 0.95:  # Within 5% of strike
-                    assignment_risk = "medium"
-
-            # Calculate potential profit/loss if assigned
-            intrinsic_value = max(0, current_price - strike_price) if strike_price > 0 else 0
-
-            return {
-                'symbol': underlying_symbol,
-                'current_price': current_price,
-                'strike_price': strike_price,
-                'assignment_risk': assignment_risk,
-                'intrinsic_value': intrinsic_value,
-                'days_to_expiration': dte,
-                'position_value': float(call_position['market_value'])
-            }
-            
-        except Exception as e:
-            logger.error("Failed to evaluate call assignment",
-                        event_category="error",
-                        event_type="call_assignment_evaluation_error",
-                        error=str(e))
-            return {'assignment_risk': 'unknown'}
-    
     def _parse_dte_from_option_symbol(self, option_symbol: str) -> int:
         """
         Extract DTE (Days to Expiration) from option symbol.

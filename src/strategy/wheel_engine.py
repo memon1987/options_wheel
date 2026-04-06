@@ -1,7 +1,7 @@
 """Core options wheel strategy engine."""
 
 from typing import Dict, List, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import structlog
 
@@ -74,9 +74,6 @@ class WheelEngine:
             # Get current positions
             positions = self.alpaca.get_positions()
             cycle_summary['positions_analyzed'] = len(positions)
-
-            # Sync wheel state with current positions
-            self._sync_wheel_state_with_positions(positions)
 
             # Analyze current positions and manage them
             position_actions = self._manage_existing_positions(positions)
@@ -571,68 +568,6 @@ class WheelEngine:
                         error=str(e))
             return {'error': str(e)}
 
-    def _sync_wheel_state_with_positions(self, positions: List[Dict[str, Any]]):
-        """Synchronize wheel state manager with current account positions.
-
-        Args:
-            positions: Current positions from account
-        """
-        try:
-            # Track symbols we've seen to identify removed positions
-            current_symbols = set()
-
-            # Process stock positions
-            stock_positions = get_stock_positions(positions)
-            for stock_pos in stock_positions:
-                symbol = stock_pos['symbol']
-                shares = int(float(stock_pos['qty']))
-                cost_basis = float(stock_pos['avg_cost'])
-
-                if shares > 0:  # Long position
-                    current_symbols.add(symbol)
-                    # Update wheel state if not already tracked
-                    state_summary = self.wheel_state.get_position_summary(symbol)
-                    if state_summary['stock_shares'] != shares:
-                        logger.info("Syncing stock position with wheel state",
-                                   event_category="system", event_type="position_sync_started",
-                                   symbol=symbol, shares=shares, cost_basis=cost_basis)
-                        # This is a simplified sync - in practice might need more sophisticated handling
-                        self.wheel_state.handle_put_assignment(
-                            symbol, shares - state_summary['stock_shares'], cost_basis, datetime.now()
-                        )
-
-            # Process option positions to track active contracts
-            option_positions = [p for p in positions if p['asset_class'] == 'us_option']
-            for option_pos in option_positions:
-                option_symbol = option_pos['symbol']
-                qty = float(option_pos['qty'])
-
-                if qty < 0:  # Short position (sold option)
-                    # Extract underlying symbol from option symbol
-                    # This is simplified - you might need more robust option symbol parsing
-                    underlying = self._extract_underlying_from_option_symbol(option_symbol)
-                    if underlying:
-                        current_symbols.add(underlying)
-                        contracts = abs(int(qty))
-
-                        # Determine option type and update state accordingly
-                        if 'P' in option_symbol:  # Put option
-                            # Note: We don't automatically add puts here as they might violate wheel logic
-                            # This sync is primarily for existing positions
-                            pass
-                        elif 'C' in option_symbol:  # Call option
-                            # Update call position tracking
-                            pass
-
-            logger.debug("Wheel state synchronized with account positions",
-                        event_category="system", event_type="position_sync_completed",
-                        symbols_tracked=len(current_symbols))
-
-        except Exception as e:
-            logger.error("Failed to sync wheel state with positions",
-                        event_category="error", event_type="position_sync_failed",
-                        error=str(e))
-
     def _extract_underlying_from_option_symbol(self, option_symbol: str) -> Optional[str]:
         """Extract underlying stock symbol from option symbol.
 
@@ -880,6 +815,146 @@ class WheelEngine:
                 'orphaned_state_entries_cleared': 0,
             }
 
+            # --- Primary: Check Alpaca Activities API for assignments/expirations ---
+            try:
+                cutoff_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+                activities = self.alpaca.get_account_activities(
+                    'OPASN,OPEXP', after=cutoff_date
+                )
+
+                # Track which activities we've already processed (by id) to avoid
+                # double-counting on repeated reconciliation runs.
+                if not hasattr(self, '_processed_activity_ids'):
+                    self._processed_activity_ids = set()
+
+                for activity in activities:
+                    activity_id = activity.get('id', '')
+                    if activity_id in self._processed_activity_ids:
+                        continue
+
+                    activity_type = activity.get('activity_type', '')
+                    act_symbol = activity.get('symbol', '')
+                    act_qty = abs(int(float(activity.get('qty', 0))))
+                    act_date_str = activity.get('date', '') or activity.get('transaction_time', '')
+                    net_amount = float(activity.get('net_amount', 0))
+
+                    # Parse the option symbol to extract underlying and type
+                    try:
+                        parsed = parse_option_symbol(act_symbol)
+                        underlying = parsed.get('underlying', '')
+                        option_type = parsed.get('option_type', 'unknown')
+                        strike_price = parsed.get('strike_price', 0.0)
+                    except Exception:
+                        underlying = act_symbol
+                        option_type = 'unknown'
+                        strike_price = 0.0
+
+                    # Parse the activity date
+                    try:
+                        if act_date_str:
+                            # Handle both YYYY-MM-DD and ISO datetime formats
+                            act_date = datetime.fromisoformat(act_date_str.replace('Z', '+00:00'))
+                        else:
+                            act_date = datetime.now()
+                    except (ValueError, TypeError):
+                        act_date = datetime.now()
+
+                    if activity_type == 'OPASN' and underlying:
+                        # Option assignment: shares = contracts * 100
+                        assigned_shares = act_qty * 100 if act_qty < 100 else act_qty
+
+                        stats.setdefault('activities_assignments_detected', 0)
+                        stats['activities_assignments_detected'] += 1
+
+                        if option_type == 'put':
+                            # Put assignment: we get assigned shares at strike price
+                            per_share_cost = strike_price if strike_price > 0 else abs(net_amount) / max(assigned_shares, 1)
+                            try:
+                                self.wheel_state.handle_put_assignment(
+                                    symbol=underlying,
+                                    shares=assigned_shares,
+                                    cost_basis=per_share_cost,
+                                    assignment_date=act_date,
+                                )
+                                log_trade_event(
+                                    logger,
+                                    event_type="put_assignment_from_activity",
+                                    symbol=underlying,
+                                    strategy="put_assignment",
+                                    success=True,
+                                    underlying=underlying,
+                                    option_type="PUT",
+                                    shares=assigned_shares,
+                                    cost_basis=per_share_cost,
+                                    activity_id=activity_id,
+                                )
+                            except Exception as e:
+                                logger.warning("Failed to process put assignment activity",
+                                              event_category="error",
+                                              event_type="activity_put_assignment_failed",
+                                              symbol=underlying, activity_id=activity_id,
+                                              error=str(e))
+
+                        elif option_type == 'call':
+                            # Call assignment: shares are called away at strike price
+                            try:
+                                self.wheel_state.handle_call_assignment(
+                                    symbol=underlying,
+                                    shares=assigned_shares,
+                                    strike_price=strike_price,
+                                    assignment_date=act_date,
+                                )
+                                log_trade_event(
+                                    logger,
+                                    event_type="call_assignment_from_activity",
+                                    symbol=underlying,
+                                    strategy="call_assignment",
+                                    success=True,
+                                    underlying=underlying,
+                                    option_type="CALL",
+                                    shares=assigned_shares,
+                                    strike_price=strike_price,
+                                    activity_id=activity_id,
+                                )
+                            except Exception as e:
+                                logger.warning("Failed to process call assignment activity",
+                                              event_category="error",
+                                              event_type="activity_call_assignment_failed",
+                                              symbol=underlying, activity_id=activity_id,
+                                              error=str(e))
+
+                    elif activity_type == 'OPEXP' and underlying:
+                        # Option expiration (worthless or exercised)
+                        stats.setdefault('activities_expirations_detected', 0)
+                        stats['activities_expirations_detected'] += 1
+                        logger.info("Option expiration detected via Activities API",
+                                   event_category="trade",
+                                   event_type="option_expiration_from_activity",
+                                   symbol=act_symbol,
+                                   underlying=underlying,
+                                   option_type=option_type,
+                                   qty=act_qty,
+                                   activity_id=activity_id)
+
+                    # Mark activity as processed
+                    self._processed_activity_ids.add(activity_id)
+
+                if activities:
+                    logger.info("Activities API assignment detection completed",
+                               event_category="system",
+                               event_type="activities_detection_completed",
+                               total_activities=len(activities),
+                               new_processed=len(activities) - len([
+                                   a for a in activities
+                                   if a.get('id', '') in self._processed_activity_ids
+                               ]))
+
+            except Exception as e:
+                logger.warning("Activities API unavailable, falling back to position diff",
+                              event_category="system",
+                              event_type="activities_api_fallback",
+                              error=str(e))
+
             # --- Fetch actual positions from Alpaca ---
             all_positions = self.alpaca.get_positions()
             # Intentionally not using get_stock_positions() here — reconciliation
@@ -958,17 +1033,22 @@ class WheelEngine:
 
                     # Trigger wheel state transition: SELLING_PUTS -> HOLDING_STOCK
                     try:
-                        # Estimate cost basis from the put strike (assignment price)
-                        # This is approximate — the actual assignment price is the strike
-                        cost_basis = 0.0
+                        # Compute per-share cost basis from Alpaca's total cost_basis
+                        # Alpaca returns total cost_basis (price * qty), but
+                        # handle_put_assignment expects per-share cost.
+                        total_cost_basis = 0.0
+                        shares_in_position = 1
                         for pos in stock_positions:
                             if pos.get('symbol') == symbol:
-                                cost_basis = float(pos.get('cost_basis', 0))
+                                total_cost_basis = float(pos.get('cost_basis', 0))
+                                shares_in_position = int(float(pos.get('qty', 1)))
                                 break
+                        per_share_cost = total_cost_basis / max(shares_in_position, 1)
                         self.wheel_state.handle_put_assignment(
                             symbol=symbol,
                             shares=new_shares,
-                            cost_basis=cost_basis,
+                            cost_basis=per_share_cost,
+                            assignment_date=datetime.now(),
                         )
                     except Exception as e:
                         logger.warning("Failed to update wheel state for put assignment",
@@ -1025,6 +1105,7 @@ class WheelEngine:
                             symbol=symbol,
                             shares=shares_called,
                             strike_price=strike_price,
+                            assignment_date=datetime.now(),
                         )
                     except Exception as e:
                         logger.warning("Failed to update wheel state for call assignment",
