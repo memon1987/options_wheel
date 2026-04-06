@@ -302,7 +302,8 @@ class ExecutionEngine:
                         })
                         continue
 
-                    # Verify share ownership before executing covered call
+                    # Verify AVAILABLE shares before executing covered call.
+                    # Available = owned shares - shares already committed to existing short calls.
                     underlying = opp.get('symbol')
                     contracts = opp.get('contracts', 1)
                     required_shares = contracts * 100
@@ -316,25 +317,44 @@ class ExecutionEngine:
                             None,
                         )
                         owned_shares = int(float(stock_pos['qty'])) if stock_pos else 0
-                    except Exception:
-                        owned_shares = 0
 
-                    if owned_shares < required_shares:
+                        # Subtract shares already backing existing short calls
+                        committed_shares = 0
+                        for pos in positions:
+                            if (pos.get('asset_class') == 'us_option'
+                                    and float(pos.get('qty', 0)) < 0):  # short option
+                                opt_sym = pos.get('symbol', '')
+                                # Check if it's a call on the same underlying
+                                opt_underlying = ''
+                                for ch in opt_sym:
+                                    if ch.isdigit():
+                                        break
+                                    opt_underlying += ch
+                                if opt_underlying == underlying and 'C' in opt_sym:
+                                    committed_shares += abs(int(float(pos.get('qty', 0)))) * 100
+
+                        available_shares = owned_shares - committed_shares
+                    except Exception:
+                        available_shares = 0
+
+                    if available_shares < required_shares:
                         self.logger.warning(
-                            "Naked call prevented — insufficient shares",
+                            "Call blocked — insufficient available shares",
                             event_category="risk",
                             event_type="naked_call_blocked",
                             symbol=underlying,
                             option_symbol=opp.get('option_symbol'),
                             required_shares=required_shares,
                             owned_shares=owned_shares,
+                            committed_to_calls=committed_shares,
+                            available_shares=available_shares,
                         )
                         # Do NOT add to _failed_symbols — share ownership is transient.
                         # The account could acquire shares before the next /run cycle
                         # (e.g., put assignment), at which point this call becomes valid.
                         execution_results.append({
                             'opportunity': opp,
-                            'result': {'success': False, 'message': f'Naked call blocked: own {owned_shares} shares, need {required_shares}'},
+                            'result': {'success': False, 'message': f'Call blocked: {available_shares} available shares ({owned_shares} owned - {committed_shares} committed), need {required_shares}'},
                             'success': False,
                         })
                         continue
