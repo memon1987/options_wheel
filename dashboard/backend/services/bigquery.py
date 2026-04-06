@@ -366,26 +366,22 @@ class BigQueryService:
         Returns:
             List of daily stock snapshot data
         """
-        # daily_stock_snapshot events are not yet emitted by the trading bot.
-        # Return empty results gracefully until this logging is implemented.
-        # The event will be logged by wheel_engine._log_daily_stock_snapshot()
-        # once that method populates the required fields (shares, cost_basis, etc.)
+        # daily_stock_snapshot events may not yet be fully populated.
+        # Query safely — if no events exist, BigQuery returns empty results.
         query = f"""
         SELECT
             DATE(timestamp, 'America/New_York') as date_et,
             jsonPayload.symbol as symbol,
-            SAFE_CAST(jsonPayload.shares AS FLOAT64) as shares,
-            SAFE_CAST(jsonPayload.cost_basis AS FLOAT64) as cost_basis,
-            SAFE_CAST(jsonPayload.current_price AS FLOAT64) as current_price,
+            SAFE_CAST(jsonPayload.premium AS FLOAT64) as premium,
+            SAFE_CAST(jsonPayload.strike_price AS FLOAT64) as strike_price,
             SAFE_CAST(jsonPayload.unrealized_pl AS FLOAT64) as unrealized_pl,
-            SAFE_CAST(jsonPayload.unrealized_pl_pct AS FLOAT64) as unrealized_pl_pct,
-            SAFE_CAST(jsonPayload.days_held AS INT64) as days_held
+            SAFE_CAST(jsonPayload.market_value AS FLOAT64) as market_value,
+            SAFE_CAST(jsonPayload.profit_pct AS FLOAT64) as profit_pct
         FROM `{PROJECT_ID}.options_wheel_logs.run_googleapis_com_stderr_*`
         WHERE jsonPayload.event_type = 'daily_stock_snapshot'
             AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY))
             AND jsonPayload.symbol IS NOT NULL
         ORDER BY timestamp DESC
-        LIMIT 0
         """
         return self._run_query(query)
 
@@ -398,9 +394,9 @@ class BigQueryService:
         Returns:
             List of wheel cycle data with premium breakdown
         """
-        # wheel_cycle_complete events are not yet emitted by the trading bot.
-        # The WheelStateManager.complete_cycle() method exists but these events
-        # haven't been generated in production yet. Return empty results gracefully.
+        # wheel_cycle_complete events populate as the strategy matures
+        # (full put → assignment → call → called away cycles).
+        # Query safely — returns empty if no cycles completed yet.
         query = f"""
         SELECT
             jsonPayload.symbol as symbol,
@@ -411,7 +407,6 @@ class BigQueryService:
         WHERE jsonPayload.event_type = 'wheel_cycle_complete'
             AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY))
         ORDER BY timestamp DESC
-        LIMIT 0
         """
         return self._run_query(query)
 
