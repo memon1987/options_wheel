@@ -186,7 +186,7 @@ class BacktestEngine:
             start_date=self.backtest_config.start_date.isoformat(),
             end_date=self.backtest_config.end_date.isoformat(),
             initial_capital=self.backtest_config.initial_capital,
-            symbols=self.backtest_config.symbols,
+            symbols=", ".join(self.backtest_config.symbols) if self.backtest_config.symbols else "",
             symbol_count=len(self.backtest_config.symbols),
             put_target_dte=self.config.put_target_dte,
             call_target_dte=self.config.call_target_dte,
@@ -255,7 +255,7 @@ class BacktestEngine:
             premium_collected=result.premium_collected,
 
             # Configuration
-            symbols=self.backtest_config.symbols,
+            symbols=", ".join(self.backtest_config.symbols) if self.backtest_config.symbols else "",
             symbol_count=len(self.backtest_config.symbols),
             trading_days=trading_days,
 

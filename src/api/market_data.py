@@ -154,8 +154,8 @@ class MarketDataManager:
                    total_analyzed=len(symbols),
                    passed=len(suitable_stocks),
                    rejected=len(rejected_stocks),
-                   passed_symbols=[s['symbol'] for s in suitable_stocks],
-                   rejected_symbols=rejected_stocks)
+                   passed_symbols=", ".join(s['symbol'] for s in suitable_stocks),
+                   rejected_symbols=", ".join(str(r) for r in rejected_stocks) if rejected_stocks else "")
 
         return suitable_stocks
     

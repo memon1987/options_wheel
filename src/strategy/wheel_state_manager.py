@@ -103,7 +103,7 @@ class WheelStateManager:
             )
             logger.info("Wheel state restored from GCS",
                        event_category="system",
-                       symbols=list(self.symbol_states.keys()),
+                       symbols=", ".join(self.symbol_states.keys()),
                        completed_cycles=len(self.wheel_cycles))
         except Exception as e:
             logger.warning("Failed to load wheel state from GCS — "
