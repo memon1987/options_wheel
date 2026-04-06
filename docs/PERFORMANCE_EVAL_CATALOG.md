@@ -404,7 +404,7 @@ WHERE jsonPayload.event_type = 'naked_call_blocked'
 
 **Action threshold:** ANY occurrence of error 40310000 after Apr 6 2026 is a critical regression. Investigate and fix same day.
 
-**Status:** ACTIVE — can verify immediately after next /run cycle
+**Status:** READY — query can run now; not yet automated as a recurring check
 
 **Config parameter:** None — this is a safety invariant, not a tunable parameter
 
