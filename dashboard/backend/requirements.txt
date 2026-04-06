@@ -9,5 +9,8 @@ google-cloud-bigquery==3.14.1
 # Data validation
 pydantic==2.5.3
 
+# Logging
+structlog==23.3.0
+
 # Utils
 python-dotenv==1.0.0
