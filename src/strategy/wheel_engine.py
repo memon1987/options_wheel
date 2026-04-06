@@ -9,7 +9,7 @@ from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..risk.gap_detector import GapDetector
 from ..utils.config import Config
-from ..utils.logging_events import log_system_event, log_performance_metric, log_error_event, log_position_update, log_order_status_update
+from ..utils.logging_events import log_system_event, log_performance_metric, log_error_event, log_position_update, log_order_status_update, log_trade_event
 from ..utils.positions import get_stock_positions
 from ..utils.option_symbols import parse_option_symbol
 from .put_seller import PutSeller
@@ -930,6 +930,55 @@ class WheelEngine:
                 actual_opts = alpaca_option_counts.get(symbol, {'puts': 0, 'calls': 0})
                 actual_puts = actual_opts['puts']
                 actual_calls = actual_opts['calls']
+
+                # --- Assignment Detection ---
+                # Put assignment: puts decreased AND shares increased
+                # (broker exercised the put, assigned us stock)
+                if tracked_puts > actual_puts and actual_shares > tracked_shares:
+                    assigned_contracts = tracked_puts - actual_puts
+                    new_shares = actual_shares - tracked_shares
+                    stats.setdefault('assignments_detected', 0)
+                    stats['assignments_detected'] += assigned_contracts
+
+                    log_trade_event(
+                        logger,
+                        event_type="put_assignment_detected",
+                        symbol=symbol,
+                        strategy="put_assignment",
+                        success=True,
+                        underlying=symbol,
+                        option_type="PUT",
+                        contracts=assigned_contracts,
+                        new_shares=new_shares,
+                        previous_puts=tracked_puts,
+                        current_puts=actual_puts,
+                        previous_shares=tracked_shares,
+                        current_shares=actual_shares,
+                    )
+
+                # Call assignment: calls decreased AND shares decreased
+                # (broker exercised the call, shares called away)
+                if tracked_calls > actual_calls and actual_shares < tracked_shares:
+                    assigned_contracts = tracked_calls - actual_calls
+                    shares_called = tracked_shares - actual_shares
+                    stats.setdefault('call_assignments_detected', 0)
+                    stats['call_assignments_detected'] += assigned_contracts
+
+                    log_trade_event(
+                        logger,
+                        event_type="call_assignment_detected",
+                        symbol=symbol,
+                        strategy="call_assignment",
+                        success=True,
+                        underlying=symbol,
+                        option_type="CALL",
+                        contracts=assigned_contracts,
+                        shares_called=shares_called,
+                        previous_calls=tracked_calls,
+                        current_calls=actual_calls,
+                        previous_shares=tracked_shares,
+                        current_shares=actual_shares,
+                    )
 
                 # Check for stock share discrepancy
                 if tracked_shares != actual_shares:
