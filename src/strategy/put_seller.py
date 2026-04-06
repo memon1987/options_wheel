@@ -236,6 +236,23 @@ class PutSeller:
             premium = opportunity['premium']
             strike_price = opportunity.get('strike_price', 0)
 
+            # SAFETY: Reject call options that were incorrectly routed here.
+            # Put seller must ONLY handle puts. Calls require share verification
+            # and must go through call_seller.execute_call_sale().
+            parsed = parse_option_symbol(option_symbol)
+            if parsed.get('option_type') == 'call':
+                logger.warning("Call option incorrectly routed to put_seller — rejecting",
+                              event_category="risk",
+                              event_type="call_rejected_by_put_seller",
+                              symbol=option_symbol,
+                              underlying=parsed.get('underlying'))
+                return {
+                    'success': False,
+                    'error_type': 'wrong_seller',
+                    'message': f'Call option {option_symbol} cannot be executed by put_seller',
+                    'non_retryable': True
+                }
+
             # CRITICAL: Validate buying power before placing order
             collateral_required = strike_price * 100 * contracts  # Cash-secured put
 
