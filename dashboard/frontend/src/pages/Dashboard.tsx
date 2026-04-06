@@ -1,117 +1,191 @@
-import { useMetricsSummary, useBotStatus, usePositions, useTrades } from '../hooks/useApi'
-import StatusCard from '../components/StatusCard'
-import PositionsTable from '../components/PositionsTable'
-import RecentTrades from '../components/RecentTrades'
-import LoadingSpinner from '../components/LoadingSpinner'
-import ErrorMessage from '../components/ErrorMessage'
+import { useApi } from '../hooks/useApi';
+import LoadingState from '../components/LoadingState';
+import ErrorState from '../components/ErrorState';
+
+interface AccountData {
+  portfolio_value?: string | number;
+  cash?: string | number;
+  buying_power?: string | number;
+  equity?: string | number;
+}
+
+interface StatusData {
+  status?: string;
+  last_run?: string;
+  last_scan?: string;
+  positions?: number;
+  pnl?: number;
+  errors?: number;
+}
+
+interface Trade {
+  timestamp_et?: string;
+  date_et?: string;
+  symbol?: string;
+  underlying?: string;
+  event_type?: string;
+  strategy?: string;
+  premium?: number;
+  contracts?: number;
+}
+
+interface Position {
+  symbol: string;
+}
+
+function formatCurrency(value: string | number | undefined | null): string {
+  if (value === undefined || value === null) return '$0.00';
+  const num = typeof value === 'string' ? parseFloat(value) : value;
+  if (isNaN(num)) return '$0.00';
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(num);
+}
+
+function formatTime(dateStr: string | undefined | null): string {
+  if (!dateStr) return 'N/A';
+  try {
+    return new Date(dateStr).toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    });
+  } catch {
+    return dateStr;
+  }
+}
 
 export default function Dashboard() {
-  const { data: metrics, loading: metricsLoading, error: metricsError } = useMetricsSummary()
-  const { data: status, loading: statusLoading } = useBotStatus()
-  const { data: positions, loading: positionsLoading } = usePositions()
-  const { data: trades, loading: tradesLoading } = useTrades(5)
+  const { data: account, loading: accountLoading, error: accountError, refetch: refetchAccount } =
+    useApi<AccountData>('/api/live/account', { refreshInterval: 30_000 });
 
-  if (metricsLoading && statusLoading) {
-    return <LoadingSpinner />
-  }
+  const { data: status, loading: statusLoading, error: statusError, refetch: refetchStatus } =
+    useApi<StatusData>('/api/live/status', { refreshInterval: 15_000 });
 
-  if (metricsError) {
-    return <ErrorMessage message={metricsError} />
-  }
+  const { data: trades, loading: tradesLoading, error: tradesError, refetch: refetchTrades } =
+    useApi<Trade[]>('/api/history/trades', { refreshInterval: 60_000 });
 
-  const formatCurrency = (value: number | undefined | null) => {
-    if (value === undefined || value === null) return 'N/A'
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-    }).format(value)
-  }
+  const { data: positions, loading: positionsLoading } =
+    useApi<Position[]>('/api/live/positions', { refreshInterval: 30_000 });
 
-  const formatPercent = (value: number | undefined | null) => {
-    if (value === undefined || value === null) return 'N/A'
-    return `${(value * 100).toFixed(1)}%`
-  }
+  const recentTrades = trades?.slice(0, 10) ?? [];
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="text-2xl font-bold text-white">Dashboard</h1>
-        <div className="flex items-center mt-2 sm:mt-0">
-          <span
-            className={`inline-flex items-center px-3 py-1 rounded-full text-sm font-medium ${
-              status?.market_open
-                ? 'bg-green-900 text-green-300'
-                : 'bg-gray-700 text-gray-300'
-            }`}
-          >
-            <span
-              className={`w-2 h-2 mr-2 rounded-full ${
-                status?.market_open ? 'bg-green-400' : 'bg-gray-500'
-              }`}
-            />
-            {status?.market_open ? 'Market Open' : 'Market Closed'}
-          </span>
-        </div>
-      </div>
+      <h1 className="text-2xl font-bold text-white">Dashboard</h1>
 
-      {/* Status Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatusCard
-          title="Portfolio Value"
-          value={formatCurrency(metrics?.portfolio_value)}
-          trend={metrics?.return_30d}
-          trendLabel="30d return"
-        />
-        <StatusCard
-          title="Buying Power"
-          value={formatCurrency(metrics?.buying_power)}
-        />
-        <StatusCard
-          title="30d Premium"
-          value={formatCurrency(metrics?.total_premium_30d)}
-          subtitle={`${metrics?.total_trades_30d || 0} trades`}
-        />
-        <StatusCard
-          title="Win Rate"
-          value={formatPercent(metrics?.win_rate)}
-          subtitle={`Avg ${formatCurrency(metrics?.avg_premium)}`}
-        />
-      </div>
-
-      {/* Active Positions */}
-      <div className="card">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-white">Active Positions</h2>
-          <span className="text-sm text-gray-400">
-            {positions?.length || 0} position{positions?.length !== 1 ? 's' : ''}
-          </span>
-        </div>
-        {positionsLoading ? (
-          <LoadingSpinner />
-        ) : positions && positions.length > 0 ? (
-          <PositionsTable positions={positions} compact />
+      {/* Account Summary */}
+      <section>
+        <h2 className="text-sm font-medium text-gray-400 mb-3 uppercase tracking-wider">Account Summary</h2>
+        {accountLoading ? (
+          <LoadingState message="Loading account..." />
+        ) : accountError ? (
+          <ErrorState message={accountError} onRetry={refetchAccount} />
+        ) : account ? (
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="card">
+              <p className="card-header">Portfolio Value</p>
+              <p className="card-value text-white">{formatCurrency(account.portfolio_value)}</p>
+            </div>
+            <div className="card">
+              <p className="card-header">Cash</p>
+              <p className="card-value text-white">{formatCurrency(account.cash)}</p>
+            </div>
+            <div className="card">
+              <p className="card-header">Buying Power</p>
+              <p className="card-value text-white">{formatCurrency(account.buying_power)}</p>
+            </div>
+            <div className="card">
+              <p className="card-header">Equity</p>
+              <p className="card-value text-white">{formatCurrency(account.equity)}</p>
+            </div>
+          </div>
         ) : (
-          <p className="text-gray-400 text-center py-8">No active positions</p>
+          <p className="text-gray-400">No account data available</p>
         )}
-      </div>
+      </section>
+
+      {/* Status */}
+      <section>
+        <h2 className="text-sm font-medium text-gray-400 mb-3 uppercase tracking-wider">Strategy Status</h2>
+        {statusLoading ? (
+          <LoadingState message="Loading status..." />
+        ) : statusError ? (
+          <ErrorState message={statusError} onRetry={refetchStatus} />
+        ) : status ? (
+          <div className="card">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <div>
+                <p className="text-sm text-gray-400">Status</p>
+                <p className="text-white font-medium">{status.status ?? 'Unknown'}</p>
+              </div>
+              <div>
+                <p className="text-sm text-gray-400">Last Run</p>
+                <p className="text-white">{formatTime(status.last_run)}</p>
+              </div>
+              <div>
+                <p className="text-sm text-gray-400">Last Scan</p>
+                <p className="text-white">{formatTime(status.last_scan)}</p>
+              </div>
+              <div>
+                <p className="text-sm text-gray-400">Positions</p>
+                <p className="text-white font-medium">
+                  {positionsLoading ? '...' : (positions?.length ?? status.positions ?? 0)}
+                </p>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <p className="text-gray-400">No status data available</p>
+        )}
+      </section>
 
       {/* Recent Trades */}
-      <div className="card">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-white">Recent Trades</h2>
-          <a href="/trades" className="text-sm text-blue-400 hover:text-blue-300">
-            View all →
-          </a>
-        </div>
+      <section>
+        <h2 className="text-sm font-medium text-gray-400 mb-3 uppercase tracking-wider">Recent Trades</h2>
         {tradesLoading ? (
-          <LoadingSpinner />
-        ) : trades && trades.length > 0 ? (
-          <RecentTrades trades={trades} />
+          <LoadingState message="Loading trades..." />
+        ) : tradesError ? (
+          <ErrorState message={tradesError} onRetry={refetchTrades} />
+        ) : recentTrades.length > 0 ? (
+          <div className="card overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="bg-gray-700">
+                  <tr>
+                    <th className="table-cell table-header">Date</th>
+                    <th className="table-cell table-header">Symbol</th>
+                    <th className="table-cell table-header">Event</th>
+                    <th className="table-cell table-header">Strategy</th>
+                    <th className="table-cell table-header text-right">Premium</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-700">
+                  {recentTrades.map((trade, i) => (
+                    <tr key={i} className="hover:bg-gray-700/50">
+                      <td className="table-cell text-gray-300">
+                        {formatTime(trade.timestamp_et ?? trade.date_et)}
+                      </td>
+                      <td className="table-cell font-medium text-white">
+                        {trade.underlying ?? trade.symbol ?? '-'}
+                      </td>
+                      <td className="table-cell text-gray-300">{trade.event_type ?? '-'}</td>
+                      <td className="table-cell text-gray-300">{trade.strategy ?? '-'}</td>
+                      <td className="table-cell text-right profit">
+                        {trade.premium ? formatCurrency(trade.premium) : '-'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
         ) : (
-          <p className="text-gray-400 text-center py-8">No recent trades</p>
+          <div className="card text-center py-8">
+            <p className="text-gray-400">No recent trades</p>
+          </div>
         )}
-      </div>
+      </section>
     </div>
-  )
+  );
 }

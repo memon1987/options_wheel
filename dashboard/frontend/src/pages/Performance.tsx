@@ -1,192 +1,140 @@
-import { useState } from 'react'
-import { useMetricsSummary, usePortfolioChart, usePremiumBySymbol, usePremiumByDay } from '../hooks/useApi'
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Legend } from 'recharts'
-import LoadingSpinner from '../components/LoadingSpinner'
-import ErrorMessage from '../components/ErrorMessage'
+import { useApi } from '../hooks/useApi';
+import LoadingState from '../components/LoadingState';
+import ErrorState from '../components/ErrorState';
+
+interface MetricsSummary {
+  total_trades?: number;
+  total_premium?: number;
+  total_errors?: number;
+  avg_premium?: number;
+  [key: string]: unknown;
+}
+
+interface Trade {
+  timestamp_et?: string;
+  date_et?: string;
+  premium?: number;
+  strategy?: string;
+}
+
+function formatCurrency(value: number | undefined | null): string {
+  if (value === undefined || value === null) return '$0.00';
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(value);
+}
+
+/** Group trades by YYYY-MM and sum premium */
+function premiumByMonth(trades: Trade[]): Array<{ month: string; premium: number; count: number }> {
+  const map = new Map<string, { premium: number; count: number }>();
+
+  for (const t of trades) {
+    const dateStr = t.timestamp_et ?? t.date_et;
+    if (!dateStr) continue;
+    const month = dateStr.slice(0, 7); // "YYYY-MM"
+    const entry = map.get(month) ?? { premium: 0, count: 0 };
+    entry.premium += t.premium ?? 0;
+    entry.count += 1;
+    map.set(month, entry);
+  }
+
+  return Array.from(map.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, data]) => ({ month, ...data }));
+}
 
 export default function Performance() {
-  const [timeRange, setTimeRange] = useState(30)
-  const { data: metrics, loading: metricsLoading, error: metricsError } = useMetricsSummary()
-  const { data: premiumBySymbol } = usePremiumBySymbol(timeRange)
-  const { data: portfolioChart } = usePortfolioChart(timeRange)
-  const { data: premiumByDay } = usePremiumByDay(timeRange)
+  const { data: metrics, loading: metricsLoading, error: metricsError, refetch: refetchMetrics } =
+    useApi<MetricsSummary>('/api/metrics/summary', { refreshInterval: 60_000 });
 
-  if (metricsLoading) {
-    return <LoadingSpinner />
-  }
+  const { data: trades, loading: tradesLoading, error: tradesError, refetch: refetchTrades } =
+    useApi<Trade[]>('/api/history/trades?days=365');
 
-  if (metricsError) {
-    return <ErrorMessage message={metricsError} />
-  }
-
-  const formatCurrency = (value: number) => {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(value)
-  }
-
-  // Prepare chart data
-  const chartData = portfolioChart?.map(d => ({
-    date: new Date(d.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-    value: d.portfolio_value,
-    premium: d.cumulative_premium,
-  })) || []
-
-  const dailyPremiumData = premiumByDay?.map(d => ({
-    date: new Date(d.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-    put_premium: d.put_premium,
-    call_premium: d.call_premium,
-    total_premium: d.total_premium,
-    trades: d.trade_count,
-  })) || []
+  const monthlyData = trades ? premiumByMonth(trades) : [];
+  const loading = metricsLoading || tradesLoading;
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="text-2xl font-bold text-white">Performance</h1>
-        <select
-          value={timeRange}
-          onChange={(e) => setTimeRange(Number(e.target.value))}
-          className="mt-2 sm:mt-0 bg-gray-700 text-white rounded-lg px-4 py-2 border border-gray-600"
-        >
-          <option value={7}>Last 7 days</option>
-          <option value={30}>Last 30 days</option>
-          <option value={90}>Last 90 days</option>
-        </select>
-      </div>
+      <h1 className="text-2xl font-bold text-white">Performance</h1>
 
-      {/* Key Metrics */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="card">
-          <p className="card-header">Total Premium</p>
-          <p className="card-value profit">
-            {formatCurrency(metrics?.total_premium_30d || 0)}
-          </p>
-          <p className="text-xs text-gray-400 mt-1">{timeRange} days</p>
-        </div>
-        <div className="card">
-          <p className="card-header">Put Premium</p>
-          <p className="card-value text-purple-400">
-            {formatCurrency(metrics?.put_premium_30d || 0)}
-          </p>
-          <p className="text-xs text-gray-400 mt-1">from selling puts</p>
-        </div>
-        <div className="card">
-          <p className="card-header">Call Premium</p>
-          <p className="card-value text-blue-400">
-            {formatCurrency(metrics?.call_premium_30d || 0)}
-          </p>
-          <p className="text-xs text-gray-400 mt-1">from selling calls</p>
-        </div>
-        <div className="card">
-          <p className="card-header">Avg Premium</p>
-          <p className="card-value text-white">
-            {formatCurrency(metrics?.avg_premium || 0)}
-          </p>
-          <p className="text-xs text-gray-400 mt-1">per trade</p>
-        </div>
-      </div>
-
-      {/* Portfolio Value Chart */}
-      <div className="card">
-        <h2 className="text-lg font-semibold text-white mb-4">Portfolio Value</h2>
-        {chartData.length > 0 ? (
-          <div className="h-64 lg:h-80">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                <XAxis dataKey="date" stroke="#9CA3AF" fontSize={12} />
-                <YAxis stroke="#9CA3AF" fontSize={12} tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`} />
-                <Tooltip
-                  contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151' }}
-                  labelStyle={{ color: '#9CA3AF' }}
-                  formatter={(value: number) => [formatCurrency(value), 'Value']}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="value"
-                  stroke="#3B82F6"
-                  strokeWidth={2}
-                  dot={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
+      {/* Metrics Summary */}
+      <section>
+        <h2 className="text-sm font-medium text-gray-400 mb-3 uppercase tracking-wider">
+          Summary Metrics
+        </h2>
+        {metricsLoading ? (
+          <LoadingState message="Loading metrics..." />
+        ) : metricsError ? (
+          <ErrorState message={metricsError} onRetry={refetchMetrics} />
+        ) : metrics ? (
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="card">
+              <p className="card-header">Total Trades</p>
+              <p className="card-value text-white">{metrics.total_trades ?? 0}</p>
+            </div>
+            <div className="card">
+              <p className="card-header">Total Premium</p>
+              <p className="card-value profit">{formatCurrency(metrics.total_premium)}</p>
+            </div>
+            <div className="card">
+              <p className="card-header">Avg Premium</p>
+              <p className="card-value text-white">{formatCurrency(metrics.avg_premium)}</p>
+            </div>
+            <div className="card">
+              <p className="card-header">Errors</p>
+              <p className="card-value text-white">{metrics.total_errors ?? 0}</p>
+            </div>
           </div>
         ) : (
-          <p className="text-gray-400 text-center py-8">No data available</p>
+          <p className="text-gray-400">No metrics available</p>
         )}
-      </div>
+      </section>
 
-      {/* Daily Premium Chart */}
-      <div className="card">
-        <h2 className="text-lg font-semibold text-white mb-4">Daily Premium Collected</h2>
-        {dailyPremiumData.length > 0 ? (
-          <div className="h-64 lg:h-80">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={dailyPremiumData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                <XAxis dataKey="date" stroke="#9CA3AF" fontSize={12} />
-                <YAxis stroke="#9CA3AF" fontSize={12} tickFormatter={(v) => `$${v}`} />
-                <Tooltip
-                  contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151' }}
-                  labelStyle={{ color: '#9CA3AF' }}
-                  formatter={(value: number) => [formatCurrency(value)]}
-                />
-                <Legend />
-                <Bar dataKey="put_premium" name="Put Premium" stackId="premium" fill="#A78BFA" radius={[0, 0, 0, 0]} />
-                <Bar dataKey="call_premium" name="Call Premium" stackId="premium" fill="#60A5FA" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        ) : (
-          <p className="text-gray-400 text-center py-8">No data available</p>
-        )}
-      </div>
-
-      {/* P&L by Symbol */}
-      <div className="card">
-        <h2 className="text-lg font-semibold text-white mb-4">Premium by Symbol</h2>
-        {premiumBySymbol && premiumBySymbol.length > 0 ? (
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead className="bg-gray-700">
-                <tr>
-                  <th className="table-cell table-header">Symbol</th>
-                  <th className="table-cell table-header text-right">Total Premium</th>
-                  <th className="table-cell table-header text-right">Put Premium</th>
-                  <th className="table-cell table-header text-right">Call Premium</th>
-                  <th className="table-cell table-header text-right">Trades</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-700">
-                {premiumBySymbol.map((item) => (
-                  <tr key={item.symbol} className="hover:bg-gray-750">
-                    <td className="table-cell font-medium text-white">{item.symbol}</td>
-                    <td className="table-cell text-right profit">
-                      {formatCurrency(item.total_premium)}
-                    </td>
-                    <td className="table-cell text-right text-purple-400">
-                      {formatCurrency(item.put_premium)}
-                    </td>
-                    <td className="table-cell text-right text-blue-400">
-                      {formatCurrency(item.call_premium)}
-                    </td>
-                    <td className="table-cell text-right text-gray-300">
-                      {item.trade_count}
-                    </td>
+      {/* Premium by Month */}
+      <section>
+        <h2 className="text-sm font-medium text-gray-400 mb-3 uppercase tracking-wider">
+          Premium by Month
+        </h2>
+        {loading ? (
+          <LoadingState message="Loading monthly data..." />
+        ) : tradesError ? (
+          <ErrorState message={tradesError} onRetry={refetchTrades} />
+        ) : monthlyData.length > 0 ? (
+          <div className="card overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="bg-gray-700">
+                  <tr>
+                    <th className="table-cell table-header">Month</th>
+                    <th className="table-cell table-header text-right">Premium</th>
+                    <th className="table-cell table-header text-right">Trades</th>
+                    <th className="table-cell table-header text-right">Avg / Trade</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-gray-700">
+                  {monthlyData.map((row) => (
+                    <tr key={row.month} className="hover:bg-gray-700/50">
+                      <td className="table-cell font-medium text-white">{row.month}</td>
+                      <td className="table-cell text-right profit">{formatCurrency(row.premium)}</td>
+                      <td className="table-cell text-right text-gray-300">{row.count}</td>
+                      <td className="table-cell text-right text-gray-300">
+                        {row.count > 0 ? formatCurrency(row.premium / row.count) : '-'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         ) : (
-          <p className="text-gray-400 text-center py-8">No data available</p>
+          <div className="card text-center py-8">
+            <p className="text-gray-400">No trade data available for monthly breakdown</p>
+          </div>
         )}
-      </div>
+      </section>
     </div>
-  )
+  );
 }

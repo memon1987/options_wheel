@@ -1,232 +1,121 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react';
 
-const API_BASE = '/api'
-
-interface FetchState<T> {
-  data: T | null
-  loading: boolean
-  error: string | null
-  refetch: () => void
+interface UseApiOptions {
+  /** Auto-refresh interval in milliseconds. 0 = no auto-refresh. Default: 0 */
+  refreshInterval?: number;
+  /** Whether to fetch immediately on mount. Default: true */
+  immediate?: boolean;
 }
 
-export function useFetch<T>(endpoint: string, refreshInterval?: number): FetchState<T> {
-  const [data, setData] = useState<T | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+interface UseApiResult<T> {
+  data: T | null;
+  loading: boolean;
+  error: string | null;
+  refetch: () => void;
+}
+
+const TIMEOUT_MS = 15_000;
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 2_000;
+
+async function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry<T>(url: string): Promise<T> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, TIMEOUT_MS);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      const data = await response.json();
+      return data as T;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (lastError.name === 'AbortError') {
+        lastError = new Error(`Request timed out after ${TIMEOUT_MS / 1000}s`);
+      }
+
+      if (attempt < MAX_RETRIES) {
+        await sleep(RETRY_DELAY_MS);
+      }
+    }
+  }
+
+  throw lastError ?? new Error('Fetch failed after retries');
+}
+
+export function useApi<T>(url: string, options: UseApiOptions = {}): UseApiResult<T> {
+  const { refreshInterval = 0, immediate = true } = options;
+
+  const [data, setData] = useState<T | null>(null);
+  const [loading, setLoading] = useState<boolean>(immediate);
+  const [error, setError] = useState<string | null>(null);
+
+  const mountedRef = useRef(true);
+  const urlRef = useRef(url);
+  urlRef.current = url;
 
   const fetchData = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+
     try {
-      setLoading(true)
-      const response = await fetch(`${API_BASE}${endpoint}`)
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
+      const result = await fetchWithRetry<T>(url);
+      if (mountedRef.current && urlRef.current === url) {
+        setData(result);
+        setError(null);
       }
-      const result = await response.json()
-      setData(result)
-      setError(null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred')
+      if (mountedRef.current && urlRef.current === url) {
+        const message = err instanceof Error ? err.message : 'An unknown error occurred';
+        setError(message);
+      }
     } finally {
-      setLoading(false)
+      if (mountedRef.current) {
+        setLoading(false);
+      }
     }
-  }, [endpoint])
+  }, [url]);
 
   useEffect(() => {
-    fetchData()
+    mountedRef.current = true;
 
-    if (refreshInterval) {
-      const interval = setInterval(fetchData, refreshInterval)
-      return () => clearInterval(interval)
+    if (immediate) {
+      fetchData();
     }
-  }, [fetchData, refreshInterval])
 
-  return { data, loading, error, refetch: fetchData }
-}
+    return () => {
+      mountedRef.current = false;
+    };
+  }, [fetchData, immediate]);
 
-// Specific hooks for different data types
-export function useAccount() {
-  return useFetch<{
-    portfolio_value: string
-    cash: string
-    buying_power: string
-    equity: string
-    status: string
-    options_trading_level: number
-  }>('/live/account', 30000) // Refresh every 30 seconds
-}
+  useEffect(() => {
+    if (refreshInterval <= 0) return;
 
-export function usePositions() {
-  return useFetch<Array<{
-    symbol: string
-    asset_class: string
-    qty: string
-    side: string
-    market_value: string
-    unrealized_pl: string
-    cost_basis: string
-  }>>('/live/positions', 30000)
-}
+    const interval = setInterval(() => {
+      if (mountedRef.current) {
+        fetchData();
+      }
+    }, refreshInterval);
 
-export function useBotStatus() {
-  return useFetch<{
-    status: string
-    market_open: boolean
-    timestamp: string
-    account_status: string
-  }>('/live/status', 15000) // Refresh every 15 seconds
-}
+    return () => clearInterval(interval);
+  }, [fetchData, refreshInterval]);
 
-export function useTrades(days = 7) {
-  return useFetch<Array<{
-    timestamp_et?: string
-    date_et?: string
-    symbol: string
-    underlying?: string
-    event_type?: string
-    event?: string
-    strategy?: string
-    premium?: number
-    contracts?: number
-    limit_price?: number
-    order_id?: string
-    order_status?: string  // 'pending' | 'filled' | 'expired' | 'canceled'
-    final_fill_price?: number
-    filled_at?: string
-  }>>(`/history/trades?days=${days}`)
-}
-
-export function useDailySummary(days = 30) {
-  return useFetch<Array<{
-    date: string
-    total_premium: number
-    trades_count: number
-    puts_sold: number
-    calls_sold: number
-    win_rate: number
-  }>>(`/history/daily-summary?days=${days}`)
-}
-
-export function useMetricsSummary() {
-  return useFetch<{
-    portfolio_value: number
-    total_premium_30d: number
-    put_premium_30d: number
-    call_premium_30d: number
-    total_trades_30d: number
-    win_rate: number
-    avg_premium: number
-    active_positions: number
-    buying_power: number
-    return_30d: number
-  }>('/metrics/summary', 60000)
-}
-
-export function usePnLBySymbol() {
-  return useFetch<Array<{
-    symbol: string
-    total_premium: number
-    trades_count: number
-    win_rate: number
-    avg_premium: number
-  }>>('/metrics/pnl-by-symbol')
-}
-
-export function usePortfolioChart(days = 30) {
-  return useFetch<Array<{
-    date: string
-    portfolio_value: number
-    daily_pnl: number
-    cumulative_premium: number
-  }>>(`/metrics/portfolio-chart?days=${days}`)
-}
-
-export function useExpirations(days = 30) {
-  return useFetch<Array<{
-    expiration_date: string
-    positions: Array<{
-      symbol: string
-      strike: number
-      option_type: string
-      quantity: number
-    }>
-  }>>(`/metrics/expirations?days=${days}`)
-}
-
-export function useErrors(days = 7) {
-  return useFetch<Array<{
-    timestamp: string
-    severity: string
-    component: string
-    message: string
-  }>>(`/history/errors?days=${days}`)
-}
-
-export function useFilteringStats(days = 7) {
-  return useFetch<Array<{
-    timestamp: string
-    symbol: string
-    stage: string
-    passed: boolean
-    reason: string
-    value: number
-    threshold: number
-  }>>(`/history/filtering?days=${days}`)
-}
-
-export function useConfig() {
-  return useFetch<{
-    strategy: Record<string, unknown>
-    risk: Record<string, unknown>
-    stocks: { symbols: string[] }
-  }>('/live/config')
-}
-
-// Premium tracking hooks
-export function usePremiumBySymbol(days = 30) {
-  return useFetch<Array<{
-    symbol: string
-    total_premium: number
-    put_premium: number
-    call_premium: number
-    trade_count: number
-  }>>(`/metrics/premium-by-symbol?days=${days}`)
-}
-
-export function usePremiumByDay(days = 30) {
-  return useFetch<Array<{
-    date: string
-    total_premium: number
-    put_premium: number
-    call_premium: number
-    trade_count: number
-  }>>(`/metrics/premium-by-day?days=${days}`)
-}
-
-export function useStockSnapshots(days = 30) {
-  return useFetch<Array<{
-    date_et: string
-    symbol: string
-    shares: number
-    cost_basis: number
-    current_price: number
-    unrealized_pl: number
-    unrealized_pl_pct: number
-    days_held: number
-  }>>(`/metrics/stock-snapshots?days=${days}`)
-}
-
-export function useWheelCycles() {
-  return useFetch<Array<{
-    symbol: string
-    cycle_start: string
-    cycle_end: string | null
-    duration_days: number
-    put_premium_collected: number
-    call_premium_collected: number
-    total_premium: number
-    capital_gain: number
-    total_return: number
-    cost_basis: number
-    exit_price: number | null
-  }>>('/history/wheel-cycles')
+  return { data, loading, error, refetch: fetchData };
 }
