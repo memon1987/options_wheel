@@ -931,7 +931,7 @@ class WheelEngine:
                 actual_puts = actual_opts['puts']
                 actual_calls = actual_opts['calls']
 
-                # --- Assignment Detection ---
+                # --- Assignment Detection & Wheel State Transition ---
                 # Put assignment: puts decreased AND shares increased
                 # (broker exercised the put, assigned us stock)
                 if tracked_puts > actual_puts and actual_shares > tracked_shares:
@@ -956,6 +956,26 @@ class WheelEngine:
                         current_shares=actual_shares,
                     )
 
+                    # Trigger wheel state transition: SELLING_PUTS -> HOLDING_STOCK
+                    try:
+                        # Estimate cost basis from the put strike (assignment price)
+                        # This is approximate — the actual assignment price is the strike
+                        cost_basis = 0.0
+                        for pos in stock_positions:
+                            if pos.get('symbol') == symbol:
+                                cost_basis = float(pos.get('cost_basis', 0))
+                                break
+                        self.wheel_state.handle_put_assignment(
+                            symbol=symbol,
+                            shares=new_shares,
+                            cost_basis=cost_basis,
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to update wheel state for put assignment",
+                                      event_category="error",
+                                      event_type="put_assignment_state_update_failed",
+                                      symbol=symbol, error=str(e))
+
                 # Call assignment: calls decreased AND shares decreased
                 # (broker exercised the call, shares called away)
                 if tracked_calls > actual_calls and actual_shares < tracked_shares:
@@ -979,6 +999,38 @@ class WheelEngine:
                         previous_shares=tracked_shares,
                         current_shares=actual_shares,
                     )
+
+                    # Trigger wheel state transition: SELLING_CALLS -> cycle complete
+                    # This fires wheel_cycle_complete if all shares are called away
+                    try:
+                        # Estimate strike from option positions (approximate)
+                        strike_price = 0.0
+                        for pos in option_positions:
+                            opt_sym = pos.get('symbol', '')
+                            underlying_of_opt = self._extract_underlying_from_option_symbol(opt_sym)
+                            if underlying_of_opt == symbol and 'C' in opt_sym:
+                                try:
+                                    strike_price = float(opt_sym[-8:]) / 1000.0
+                                except (ValueError, IndexError):
+                                    pass
+                                break
+                        if strike_price == 0.0:
+                            # Fallback: use current stock price as estimate
+                            for pos in stock_positions:
+                                if pos.get('symbol') == symbol:
+                                    strike_price = float(pos.get('current_price', 0))
+                                    break
+
+                        self.wheel_state.handle_call_assignment(
+                            symbol=symbol,
+                            shares=shares_called,
+                            strike_price=strike_price,
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to update wheel state for call assignment",
+                                      event_category="error",
+                                      event_type="call_assignment_state_update_failed",
+                                      symbol=symbol, error=str(e))
 
                 # Check for stock share discrepancy
                 if tracked_shares != actual_shares:
