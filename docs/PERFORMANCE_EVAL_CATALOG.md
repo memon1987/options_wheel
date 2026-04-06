@@ -361,6 +361,83 @@ ORDER BY date DESC
 
 ---
 
+## EVAL-011: Covered Call Share Commitment Verification
+
+**Hypothesis:** The system never sells calls exceeding available shares (owned minus shares already committed to existing short calls).
+
+**Background:** On Apr 6 2026, IWM had 100 shares and 1 existing short call (100 shares committed). The system attempted to sell a second call, which Alpaca rejected as uncovered. Root cause: share verification counted total owned shares but didn't subtract committed shares. Fixed by computing `available_shares = owned - committed_to_existing_calls`.
+
+**Data required:** `naked_call_blocked` events + `order_placement_error` with code 40310000 (READY after fix deployed)
+
+**Query:**
+```sql
+-- Verify no uncovered call attempts reach Alpaca
+SELECT
+  DATE(timestamp, 'America/New_York') as date,
+  jsonPayload.event_type,
+  jsonPayload.symbol,
+  jsonPayload.error
+FROM `PROJECT.options_wheel_logs.run_googleapis_com_stderr_*`
+WHERE jsonPayload.event_type = 'order_placement_error'
+  AND jsonPayload.error LIKE '%40310000%'
+  AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+
+-- Should return ZERO rows after fix is deployed
+
+-- Verify blocks are working
+SELECT
+  DATE(timestamp, 'America/New_York') as date,
+  jsonPayload.symbol,
+  jsonPayload.owned_shares,
+  jsonPayload.committed_to_calls,
+  jsonPayload.available_shares,
+  jsonPayload.required_shares
+FROM `PROJECT.options_wheel_logs.run_googleapis_com_stderr_*`
+WHERE jsonPayload.event_type = 'naked_call_blocked'
+  AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+```
+
+**What to look for:**
+- Zero `order_placement_error` with code 40310000 after fix deployment (regression detection)
+- `naked_call_blocked` events should show `available_shares < required_shares` with `committed_to_calls > 0`
+- If any 40310000 errors appear, it means a new bypass path exists — investigate immediately
+
+**Action threshold:** ANY occurrence of error 40310000 after Apr 6 2026 is a critical regression. Investigate and fix same day.
+
+**Status:** ACTIVE — can verify immediately after next /run cycle
+
+**Config parameter:** None — this is a safety invariant, not a tunable parameter
+
+**Automation priority:** HIGH — this should be one of the first checks automated as a programmatic eval. A single uncovered call with real money could result in unlimited loss.
+
+---
+
+## EVAL-012: Covered Call Capacity Utilization
+
+**Hypothesis:** The system is leaving covered call premium on the table by not selling calls when shares are available.
+
+**Data required:** Position snapshots + call scan results + `naked_call_blocked` events
+
+**Query:**
+```sql
+-- Find times we had uncommitted shares but didn't sell calls
+-- (shares owned > shares committed to calls, but no call_sale_executed that day)
+-- Requires position snapshot data + trade execution data
+```
+
+**What to look for:**
+- Days where stock positions had available shares but no call was sold
+- Whether gap risk or premium thresholds blocked valid call opportunities
+- Revenue opportunity: `available_shares * potential_call_premium` on missed days
+
+**Action threshold:** If > 50% of stock-holding days have no call sold, investigate whether call scanning or filtering is too restrictive.
+
+**Status:** BLOCKED — needs position snapshot history and call scan rejection logs
+
+**Config parameter:** `strategy.call_delta_range`, `strategy.min_call_premium`
+
+---
+
 ## Future Automation Architecture
 
 Once 3+ evals have sufficient data and stable thresholds, build:
