@@ -61,7 +61,6 @@ class BigQueryService:
             symbol,
             underlying,
             event_type,
-            event,
             strategy,
             premium,
             contracts,
@@ -157,7 +156,7 @@ class BigQueryService:
         SELECT
             timestamp_et,
             date_et,
-            event_type,
+            error_type,
             event,
             symbol,
             severity,
@@ -179,59 +178,54 @@ class BigQueryService:
         Returns:
             Dict with performance metrics
         """
-        # Get summary from daily_operations_summary
-        query = f"""
+        # Get scan/error counts from daily_operations_summary (fields that exist)
+        ops_query = f"""
         SELECT
             SUM(total_executions) as total_trades,
-            SUM(puts_sold) as total_puts_sold,
-            SUM(early_closes) as total_early_closes,
             SUM(total_scans) as total_scans,
             SUM(total_errors) as total_errors,
-            SUM(premium_collected) as total_premium_from_ops,
             COUNT(DISTINCT date_et) as trading_days
         FROM `{self.dataset}.daily_operations_summary`
         WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
         """
-        results = self._run_query(query)
-        if results:
-            raw_metrics = results[0]
-            # Convert None to 0 for all numeric fields
-            for key in raw_metrics:
-                if raw_metrics[key] is None:
-                    raw_metrics[key] = 0
+        # Get puts_sold/early_closes from trades_executed (not in daily_operations_summary)
+        trade_counts_query = f"""
+        SELECT
+            COUNT(CASE WHEN event_type = 'put_sale_executed' THEN 1 END) as total_puts_sold,
+            COUNT(CASE WHEN event_type IN ('early_close_executed', 'buy_to_close_executed') THEN 1 END) as total_early_closes
+        FROM `{self.dataset}.trades_executed`
+        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+        """
+        ops_results = self._run_query(ops_query)
+        trade_counts = self._run_query(trade_counts_query)
 
-            # Get premium data from trades_executed
-            premium_data = self.get_premium_summary(days)
-            total_premium = premium_data.get('total_premium', 0)
-            trade_count = premium_data.get('trade_count', 0)
-            avg_premium = total_premium / trade_count if trade_count > 0 else 0
+        raw_metrics = ops_results[0] if ops_results else {}
+        trade_metrics = trade_counts[0] if trade_counts else {}
 
-            # Map to frontend expected field names
-            return {
-                'total_trades': raw_metrics.get('total_trades', 0),
-                'total_puts_sold': raw_metrics.get('total_puts_sold', 0),
-                'total_early_closes': raw_metrics.get('total_early_closes', 0),
-                'total_scans': raw_metrics.get('total_scans', 0),
-                'total_errors': raw_metrics.get('total_errors', 0),
-                'trading_days': raw_metrics.get('trading_days', 0),
-                'total_premium': total_premium,
-                'put_premium_30d': premium_data.get('put_premium', 0),
-                'call_premium_30d': premium_data.get('call_premium', 0),
-                'win_rate': None,  # TODO: Calculate from trade outcomes
-                'avg_premium': avg_premium,
-                'return_30d': None,  # TODO: Calculate from portfolio values
-            }
+        # Convert None to 0 for all numeric fields
+        for d in (raw_metrics, trade_metrics):
+            for key in d:
+                if d[key] is None:
+                    d[key] = 0
+
+        # Get premium data from trades_executed
+        premium_data = self.get_premium_summary(days)
+        total_premium = premium_data.get('total_premium', 0)
+        trade_count = premium_data.get('trade_count', 0)
+        avg_premium = total_premium / trade_count if trade_count > 0 else 0
+
         return {
-            'total_trades_30d': 0,
-            'total_opportunities': 0,
-            'total_scans': 0,
-            'total_errors': 0,
-            'trading_days': 0,
-            'total_premium_30d': 0,
-            'put_premium_30d': 0,
-            'call_premium_30d': 0,
+            'total_trades': raw_metrics.get('total_trades', 0),
+            'total_puts_sold': trade_metrics.get('total_puts_sold', 0),
+            'total_early_closes': trade_metrics.get('total_early_closes', 0),
+            'total_scans': raw_metrics.get('total_scans', 0),
+            'total_errors': raw_metrics.get('total_errors', 0),
+            'trading_days': raw_metrics.get('trading_days', 0),
+            'total_premium': total_premium,
+            'put_premium_30d': premium_data.get('put_premium', 0),
+            'call_premium_30d': premium_data.get('call_premium', 0),
             'win_rate': None,
-            'avg_premium': 0,
+            'avg_premium': avg_premium,
             'return_30d': None,
         }
 
@@ -369,24 +363,28 @@ class BigQueryService:
         Returns:
             List of daily stock snapshot data
         """
-        # daily_stock_snapshot events may not yet be fully populated.
-        # Query safely — if no events exist, BigQuery returns empty results.
-        query = f"""
-        SELECT
-            DATE(timestamp, 'America/New_York') as date_et,
-            jsonPayload.symbol as symbol,
-            SAFE_CAST(jsonPayload.premium AS FLOAT64) as premium,
-            SAFE_CAST(jsonPayload.strike_price AS FLOAT64) as strike_price,
-            SAFE_CAST(jsonPayload.unrealized_pl AS FLOAT64) as unrealized_pl,
-            SAFE_CAST(jsonPayload.market_value AS FLOAT64) as market_value,
-            SAFE_CAST(jsonPayload.profit_pct AS FLOAT64) as profit_pct
-        FROM `{PROJECT_ID}.options_wheel_logs.run_googleapis_com_stderr_*`
-        WHERE jsonPayload.event_type = 'daily_stock_snapshot'
-            AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY))
-            AND jsonPayload.symbol IS NOT NULL
-        ORDER BY timestamp DESC
-        """
-        return self._run_query(query)
+        # daily_stock_snapshot events are forward-only (not yet populated).
+        # Return empty list gracefully if no events exist.
+        try:
+            query = f"""
+            SELECT
+                DATE(timestamp, 'America/New_York') as date_et,
+                JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.symbol') as symbol,
+                SAFE_CAST(JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.premium') AS FLOAT64) as premium,
+                SAFE_CAST(JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.strike_price') AS FLOAT64) as strike_price,
+                SAFE_CAST(JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.unrealized_pl') AS FLOAT64) as unrealized_pl,
+                SAFE_CAST(JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.market_value') AS FLOAT64) as market_value,
+                SAFE_CAST(JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.profit_pct') AS FLOAT64) as profit_pct
+            FROM `{PROJECT_ID}.options_wheel_logs.run_googleapis_com_stderr_*`
+            WHERE JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.event_type') = 'daily_stock_snapshot'
+                AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY))
+                AND JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.symbol') IS NOT NULL
+            ORDER BY timestamp DESC
+            """
+            return self._run_query(query)
+        except Exception:
+            logger.info("No daily_stock_snapshot events found — returning empty list")
+            return []
 
     def get_position_updates(self, days: int = 30) -> List[Dict[str, Any]]:
         """Get wheel cycle completion events from position updates.
@@ -399,14 +397,18 @@ class BigQueryService:
         """
         # wheel_cycle_complete events are logged when a full wheel cycle
         # completes (put assigned → call assigned → shares called away).
-        # Includes both live events and backfilled historical cycles.
-        # Uses the wheel_cycles view (schema-tolerant via JSON_VALUE)
-        query = f"""
-        SELECT *
-        FROM `{self.dataset}.wheel_cycles`
-        ORDER BY logged_at DESC
-        """
-        return self._run_query(query)
+        # Note: backfilled events ran locally and didn't reach BQ.
+        # View will populate once live events flow from Cloud Run.
+        try:
+            query = f"""
+            SELECT *
+            FROM `{self.dataset}.wheel_cycles`
+            ORDER BY logged_at DESC
+            """
+            return self._run_query(query)
+        except Exception:
+            logger.info("wheel_cycles view query failed — returning empty list")
+            return []
 
 
 # Singleton instance
