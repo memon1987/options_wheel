@@ -12,6 +12,7 @@ from ..utils.config import Config
 from ..utils.logging_events import log_system_event, log_performance_metric, log_error_event, log_position_update, log_order_status_update, log_trade_event
 from ..utils.positions import get_stock_positions
 from ..utils.option_symbols import parse_option_symbol
+from ..data.analytics_writer import get_analytics_writer
 from .put_seller import PutSeller
 from .call_seller import CallSeller
 from .wheel_state_manager import WheelStateManager, WheelPhase
@@ -739,6 +740,22 @@ class WheelEngine:
                         )
                         stats['filled_logged'] += 1
 
+                        # Analytics: write order status for filled order
+                        try:
+                            analytics = get_analytics_writer()
+                            analytics.write_order_status(
+                                order_id=order.get('order_id'),
+                                symbol=order.get('symbol'),
+                                status=order.get('status'),
+                                side=order.get('side'),
+                                filled_price=float(order.get('filled_avg_price', 0)),
+                                filled_qty=int(order.get('filled_qty', 0)),
+                                filled_at=str(order.get('filled_at', '')),
+                            )
+                        except Exception:
+                            logger.debug("Analytics write_order_status failed (filled)",
+                                        order_id=order_id, exc_info=True)
+
                     elif status == 'expired':
                         underlying = self._extract_underlying_from_option_symbol(symbol)
                         strategy = 'sell_put' if 'P' in symbol else 'sell_call' if 'C' in symbol else 'unknown'
@@ -754,6 +771,22 @@ class WheelEngine:
                         )
                         stats['expired_logged'] += 1
 
+                        # Analytics: write order status for expired order
+                        try:
+                            analytics = get_analytics_writer()
+                            analytics.write_order_status(
+                                order_id=order.get('order_id'),
+                                symbol=order.get('symbol'),
+                                status=order.get('status'),
+                                side=order.get('side'),
+                                filled_price=float(order.get('filled_avg_price', 0)),
+                                filled_qty=int(order.get('filled_qty', 0)),
+                                filled_at=str(order.get('filled_at', '')),
+                            )
+                        except Exception:
+                            logger.debug("Analytics write_order_status failed (expired)",
+                                        order_id=order_id, exc_info=True)
+
                     elif status in ('canceled', 'cancelled'):
                         underlying = self._extract_underlying_from_option_symbol(symbol)
                         strategy = 'sell_put' if 'P' in symbol else 'sell_call' if 'C' in symbol else 'unknown'
@@ -768,6 +801,22 @@ class WheelEngine:
                             strategy=strategy
                         )
                         stats['canceled_logged'] += 1
+
+                        # Analytics: write order status for canceled order
+                        try:
+                            analytics = get_analytics_writer()
+                            analytics.write_order_status(
+                                order_id=order.get('order_id'),
+                                symbol=order.get('symbol'),
+                                status=order.get('status'),
+                                side=order.get('side'),
+                                filled_price=float(order.get('filled_avg_price', 0)),
+                                filled_qty=int(order.get('filled_qty', 0)),
+                                filled_at=str(order.get('filled_at', '')),
+                            )
+                        except Exception:
+                            logger.debug("Analytics write_order_status failed (canceled)",
+                                        order_id=order_id, exc_info=True)
 
                 except Exception as order_error:
                     logger.warning("Failed to process order status",
@@ -916,6 +965,23 @@ class WheelEngine:
                                     strike_price=strike_price,
                                     activity_id=activity_id,
                                 )
+
+                                # Analytics: record wheel cycle completion
+                                try:
+                                    analytics = get_analytics_writer()
+                                    cost_basis = state_summary.get('stock_cost_basis', 0) if (state_summary := self.wheel_state.symbol_states.get(underlying, {})) else 0
+                                    capital_gain = (strike_price - cost_basis) * assigned_shares if strike_price and cost_basis else 0
+                                    analytics.write_wheel_cycle(
+                                        symbol=underlying,
+                                        call_strike=strike_price,
+                                        assignment_date=act_date.strftime('%Y-%m-%d'),
+                                        capital_gain=capital_gain,
+                                        shares=assigned_shares,
+                                    )
+                                except Exception:
+                                    logger.debug("Analytics write_wheel_cycle failed (activity)",
+                                                symbol=underlying, exc_info=True)
+
                             except Exception as e:
                                 logger.warning("Failed to process call assignment activity",
                                               event_category="error",
@@ -1107,6 +1173,23 @@ class WheelEngine:
                             strike_price=strike_price,
                             assignment_date=datetime.now(),
                         )
+
+                        # Analytics: record wheel cycle completion
+                        try:
+                            analytics = get_analytics_writer()
+                            cost_basis = state_summary.get('stock_cost_basis', 0) if hasattr(state_summary, 'get') else 0
+                            capital_gain = (strike_price - cost_basis) * shares_called if strike_price and cost_basis else 0
+                            analytics.write_wheel_cycle(
+                                symbol=symbol,
+                                call_strike=strike_price,
+                                assignment_date=datetime.now().strftime('%Y-%m-%d'),
+                                capital_gain=capital_gain,
+                                shares=shares_called,
+                            )
+                        except Exception:
+                            logger.debug("Analytics write_wheel_cycle failed (position diff)",
+                                        symbol=symbol, exc_info=True)
+
                     except Exception as e:
                         logger.warning("Failed to update wheel state for call assignment",
                                       event_category="error",

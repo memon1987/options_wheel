@@ -1,13 +1,12 @@
 """
 BigQuery service for historical data queries.
 
-Provides access to trading logs stored in BigQuery via the log sink.
+Provides access to trading data stored in dedicated BigQuery tables.
 """
 
 from google.cloud import bigquery
 from google.cloud.exceptions import GoogleCloudError
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
 import os
 import logging
 
@@ -16,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Project and dataset configuration
 # GCP_PROJECT is set in Cloud Run environment, fallback to GOOGLE_CLOUD_PROJECT
 PROJECT_ID = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT", "gen-lang-client-0607444019")
-DATASET_ID = "options_wheel_logs"
+DATASET_ID = "options_wheel"
 
 
 class BigQueryService:
@@ -41,55 +40,53 @@ class BigQueryService:
 
     def get_recent_trades(self, days: int = 7, limit: int = 50) -> List[Dict[str, Any]]:
         """
-        Get recent trades from the trades_executed table with order status.
+        Get recent trades from the trades table.
 
         Args:
             days: Number of days to look back
             limit: Maximum number of trades to return
 
         Returns:
-            List of trade records with order_status from polling job
+            List of trade records
         """
-        # Query trades from the trades_executed view.
-        # Order status join removed — order_status/filled_avg_price fields
-        # don't exist in the current schema. poll_order_statuses() will
-        # populate these going forward; the join can be re-added once data exists.
         query = f"""
         SELECT
-            timestamp_et,
-            date_et,
+            timestamp,
+            DATE(timestamp, 'America/New_York') as date_et,
             symbol,
             underlying,
-            event_type,
+            option_type,
+            side,
             strategy,
+            status,
+            qty,
             premium,
-            contracts,
+            total_premium,
             limit_price,
+            fill_price,
             order_id,
+            client_order_id,
             strike_price,
-            collateral_required,
-            dte
-        FROM `{self.dataset}.trades_executed`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            collateral,
+            dte,
+            expiration,
+            roi,
+            outcome,
+            outcome_price,
+            realized_pnl,
+            filled_at
+        FROM `{self.dataset}.trades`
+        WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
             AND symbol IS NOT NULL
             AND symbol != ''
-            AND event_type IN (
-                'put_sale_executed',
-                'call_sale_executed',
-                'early_close_executed',
-                'put_assignment',
-                'call_assignment',
-                'option_expired',
-                'buy_to_close_executed'
-            )
-        ORDER BY timestamp_et DESC
+        ORDER BY timestamp DESC
         LIMIT {limit}
         """
         return self._run_query(query)
 
     def get_daily_summary(self, days: int = 30) -> List[Dict[str, Any]]:
         """
-        Get daily operations summary.
+        Get daily operations summary aggregated from executions table.
 
         Args:
             days: Number of days to look back
@@ -99,23 +96,23 @@ class BigQueryService:
         """
         query = f"""
         SELECT
-            date_et,
-            total_scans,
-            total_opportunities,
-            total_put_opportunities,
-            total_call_opportunities,
-            total_executions,
-            total_errors,
-            ROUND(avg_scan_duration_sec, 2) as avg_scan_duration_sec
-        FROM `{self.dataset}.daily_operations_summary`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            DATE(timestamp, 'America/New_York') as date_et,
+            SUM(scan_count) as total_scans,
+            SUM(opportunities_found) as total_opportunities,
+            SUM(trades_executed) as total_executions,
+            SUM(errors) as total_errors,
+            ROUND(AVG(duration_seconds), 2) as avg_scan_duration_sec,
+            SUM(trades_failed) as total_trades_failed
+        FROM `{self.dataset}.executions`
+        WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+        GROUP BY date_et
         ORDER BY date_et DESC
         """
         return self._run_query(query)
 
     def get_filtering_stats(self, days: int = 7) -> List[Dict[str, Any]]:
         """
-        Get filtering pipeline statistics.
+        Get filtering pipeline statistics from scans table.
 
         Args:
             days: Number of days to look back
@@ -125,25 +122,28 @@ class BigQueryService:
         """
         query = f"""
         SELECT
-            date_et,
-            stage_number,
-            stage_name,
-            total_events,
-            unique_symbols,
-            passed,
-            blocked,
-            found,
-            not_found
-        FROM `{self.dataset}.filtering_stage_summary`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-            AND stage_name IS NOT NULL
-        ORDER BY date_et DESC, stage_number
+            DATE(timestamp, 'America/New_York') as date_et,
+            stage,
+            result,
+            COUNT(*) as total_events,
+            COUNT(DISTINCT symbol) as unique_symbols,
+            COUNTIF(result = 'pass') as passed,
+            COUNTIF(result = 'fail') as blocked,
+            reason,
+            AVG(premium) as avg_premium,
+            AVG(delta) as avg_delta,
+            AVG(dte) as avg_dte
+        FROM `{self.dataset}.scans`
+        WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            AND stage IS NOT NULL
+        GROUP BY date_et, stage, result, reason
+        ORDER BY date_et DESC, stage
         """
         return self._run_query(query)
 
     def get_recent_errors(self, days: int = 7, limit: int = 50) -> List[Dict[str, Any]]:
         """
-        Get recent errors.
+        Get recent errors from the errors table.
 
         Args:
             days: Number of days to look back
@@ -154,23 +154,26 @@ class BigQueryService:
         """
         query = f"""
         SELECT
-            timestamp_et,
-            date_et,
+            timestamp,
+            DATE(timestamp, 'America/New_York') as date_et,
+            event_type,
             error_type,
-            event,
+            error_message,
             symbol,
-            severity,
-            logger_name
-        FROM `{self.dataset}.errors_all`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-        ORDER BY timestamp_et DESC
+            underlying,
+            component,
+            recoverable,
+            request_id
+        FROM `{self.dataset}.errors`
+        WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+        ORDER BY timestamp DESC
         LIMIT {limit}
         """
         return self._run_query(query)
 
     def get_performance_metrics(self, days: int = 30) -> Dict[str, Any]:
         """
-        Calculate performance metrics over a period.
+        Calculate performance metrics over a period from trades + executions.
 
         Args:
             days: Number of days to analyze
@@ -178,23 +181,23 @@ class BigQueryService:
         Returns:
             Dict with performance metrics
         """
-        # Get scan/error counts from daily_operations_summary (fields that exist)
+        # Aggregate from executions table
         ops_query = f"""
         SELECT
-            SUM(total_executions) as total_trades,
-            SUM(total_scans) as total_scans,
-            SUM(total_errors) as total_errors,
-            COUNT(DISTINCT date_et) as trading_days
-        FROM `{self.dataset}.daily_operations_summary`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            SUM(trades_executed) as total_trades,
+            SUM(scan_count) as total_scans,
+            SUM(errors) as total_errors,
+            COUNT(DISTINCT DATE(timestamp, 'America/New_York')) as trading_days
+        FROM `{self.dataset}.executions`
+        WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
         """
-        # Get puts_sold/early_closes from trades_executed (not in daily_operations_summary)
+        # Count by strategy from trades table
         trade_counts_query = f"""
         SELECT
-            COUNT(CASE WHEN event_type = 'put_sale_executed' THEN 1 END) as total_puts_sold,
-            COUNT(CASE WHEN event_type IN ('early_close_executed', 'buy_to_close_executed') THEN 1 END) as total_early_closes
-        FROM `{self.dataset}.trades_executed`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            COUNT(CASE WHEN option_type = 'put' AND side = 'sell' THEN 1 END) as total_puts_sold,
+            COUNT(CASE WHEN side = 'buy' THEN 1 END) as total_early_closes
+        FROM `{self.dataset}.trades`
+        WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
         """
         ops_results = self._run_query(ops_query)
         trade_counts = self._run_query(trade_counts_query)
@@ -204,11 +207,11 @@ class BigQueryService:
 
         # Convert None to 0 for all numeric fields
         for d in (raw_metrics, trade_metrics):
-            for key in d:
+            for key in list(d.keys()):
                 if d[key] is None:
                     d[key] = 0
 
-        # Get premium data from trades_executed
+        # Get premium data from trades table
         premium_data = self.get_premium_summary(days)
         total_premium = premium_data.get('total_premium', 0)
         trade_count = premium_data.get('trade_count', 0)
@@ -231,21 +234,23 @@ class BigQueryService:
 
     def get_pnl_by_symbol(self, days: int = 30) -> List[Dict[str, Any]]:
         """
-        Get trade count breakdown by symbol.
+        Get trade count and P&L breakdown by symbol.
 
         Args:
             days: Number of days to analyze
 
         Returns:
-            List of per-symbol trade counts
+            List of per-symbol trade counts and realized P&L
         """
         query = f"""
         SELECT
-            symbol,
-            COUNT(*) as trade_count
-        FROM `{self.dataset}.trades_executed`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-        GROUP BY symbol
+            underlying as symbol,
+            COUNT(*) as trade_count,
+            SUM(COALESCE(realized_pnl, 0)) as realized_pnl,
+            SUM(COALESCE(total_premium, 0)) as total_premium
+        FROM `{self.dataset}.trades`
+        WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+        GROUP BY underlying
         ORDER BY trade_count DESC
         LIMIT 20
         """
@@ -253,28 +258,29 @@ class BigQueryService:
 
     def get_portfolio_value_history(self, days: int = 30) -> List[Dict[str, Any]]:
         """
-        Get daily activity for charting.
+        Get portfolio value history from position_snapshots.
 
         Args:
             days: Number of days of history
 
         Returns:
-            List of daily activity stats
+            List of daily portfolio value records
         """
         query = f"""
         SELECT
-            date_et as date,
-            total_executions as trades,
-            total_opportunities as opportunities,
-            total_errors as errors
-        FROM `{self.dataset}.daily_operations_summary`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-        ORDER BY date_et ASC
+            date,
+            portfolio_value,
+            cash,
+            buying_power
+        FROM `{self.dataset}.position_snapshots`
+        WHERE symbol = 'PORTFOLIO'
+            AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+        ORDER BY date ASC
         """
         return self._run_query(query)
 
     def get_premium_summary(self, days: int = 30) -> Dict[str, Any]:
-        """Get premium collection summary.
+        """Get premium collection summary from trades table.
 
         Args:
             days: Number of days to analyze
@@ -284,13 +290,13 @@ class BigQueryService:
         """
         query = f"""
         SELECT
-            SUM(premium * contracts * 100) as total_premium,
-            SUM(CASE WHEN strategy = 'sell_put' THEN premium * contracts * 100 ELSE 0 END) as put_premium,
-            SUM(CASE WHEN strategy = 'sell_call' THEN premium * contracts * 100 ELSE 0 END) as call_premium,
+            SUM(COALESCE(total_premium, 0)) as total_premium,
+            SUM(CASE WHEN option_type = 'put' THEN COALESCE(total_premium, 0) ELSE 0 END) as put_premium,
+            SUM(CASE WHEN option_type = 'call' THEN COALESCE(total_premium, 0) ELSE 0 END) as call_premium,
             COUNT(*) as trade_count
-        FROM `{self.dataset}.trades_executed`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-            AND event_type LIKE '%executed%'
+        FROM `{self.dataset}.trades`
+        WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            AND side = 'sell'
             AND premium IS NOT NULL
         """
         results = self._run_query(query)
@@ -316,13 +322,13 @@ class BigQueryService:
         query = f"""
         SELECT
             underlying as symbol,
-            SUM(premium * contracts * 100) as total_premium,
-            SUM(CASE WHEN strategy = 'sell_put' THEN premium * contracts * 100 ELSE 0 END) as put_premium,
-            SUM(CASE WHEN strategy = 'sell_call' THEN premium * contracts * 100 ELSE 0 END) as call_premium,
+            SUM(COALESCE(total_premium, 0)) as total_premium,
+            SUM(CASE WHEN option_type = 'put' THEN COALESCE(total_premium, 0) ELSE 0 END) as put_premium,
+            SUM(CASE WHEN option_type = 'call' THEN COALESCE(total_premium, 0) ELSE 0 END) as call_premium,
             COUNT(*) as trade_count
-        FROM `{self.dataset}.trades_executed`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-            AND event_type LIKE '%executed%'
+        FROM `{self.dataset}.trades`
+        WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            AND side = 'sell'
             AND premium IS NOT NULL
         GROUP BY underlying
         ORDER BY total_premium DESC
@@ -340,22 +346,22 @@ class BigQueryService:
         """
         query = f"""
         SELECT
-            date_et as date,
-            SUM(premium * contracts * 100) as total_premium,
-            SUM(CASE WHEN strategy = 'sell_put' THEN premium * contracts * 100 ELSE 0 END) as put_premium,
-            SUM(CASE WHEN strategy = 'sell_call' THEN premium * contracts * 100 ELSE 0 END) as call_premium,
+            DATE(timestamp, 'America/New_York') as date,
+            SUM(COALESCE(total_premium, 0)) as total_premium,
+            SUM(CASE WHEN option_type = 'put' THEN COALESCE(total_premium, 0) ELSE 0 END) as put_premium,
+            SUM(CASE WHEN option_type = 'call' THEN COALESCE(total_premium, 0) ELSE 0 END) as call_premium,
             COUNT(*) as trade_count
-        FROM `{self.dataset}.trades_executed`
-        WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-            AND event_type LIKE '%executed%'
+        FROM `{self.dataset}.trades`
+        WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            AND side = 'sell'
             AND premium IS NOT NULL
-        GROUP BY date_et
-        ORDER BY date_et ASC
+        GROUP BY date
+        ORDER BY date ASC
         """
         return self._run_query(query)
 
     def get_daily_stock_snapshots(self, days: int = 30) -> List[Dict[str, Any]]:
-        """Get daily unrealized P&L snapshots for stock holdings.
+        """Get daily position snapshots for stock holdings.
 
         Args:
             days: Number of days of history
@@ -363,31 +369,30 @@ class BigQueryService:
         Returns:
             List of daily stock snapshot data
         """
-        # daily_stock_snapshot events are forward-only (not yet populated).
-        # Return empty list gracefully if no events exist.
         try:
             query = f"""
             SELECT
-                DATE(timestamp, 'America/New_York') as date_et,
-                JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.symbol') as symbol,
-                SAFE_CAST(JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.premium') AS FLOAT64) as premium,
-                SAFE_CAST(JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.strike_price') AS FLOAT64) as strike_price,
-                SAFE_CAST(JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.unrealized_pl') AS FLOAT64) as unrealized_pl,
-                SAFE_CAST(JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.market_value') AS FLOAT64) as market_value,
-                SAFE_CAST(JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.profit_pct') AS FLOAT64) as profit_pct
-            FROM `{PROJECT_ID}.options_wheel_logs.run_googleapis_com_stderr_*`
-            WHERE JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.event_type') = 'daily_stock_snapshot'
-                AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY))
-                AND JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.symbol') IS NOT NULL
-            ORDER BY timestamp DESC
+                date,
+                symbol,
+                shares,
+                contracts,
+                cost_basis,
+                market_value,
+                unrealized_pnl,
+                current_price
+            FROM `{self.dataset}.position_snapshots`
+            WHERE asset_class != 'account'
+                AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+                AND symbol IS NOT NULL
+            ORDER BY date DESC, symbol
             """
             return self._run_query(query)
         except Exception:
-            logger.info("No daily_stock_snapshot events found — returning empty list")
+            logger.info("No position_snapshots data found — returning empty list")
             return []
 
     def get_position_updates(self, days: int = 30) -> List[Dict[str, Any]]:
-        """Get wheel cycle completion events from position updates.
+        """Get completed wheel cycles.
 
         Args:
             days: Number of days to look back
@@ -395,19 +400,30 @@ class BigQueryService:
         Returns:
             List of wheel cycle data with premium breakdown
         """
-        # wheel_cycle_complete events are logged when a full wheel cycle
-        # completes (put assigned → call assigned → shares called away).
-        # Note: backfilled events ran locally and didn't reach BQ.
-        # View will populate once live events flow from Cloud Run.
         try:
             query = f"""
-            SELECT *
+            SELECT
+                timestamp,
+                symbol,
+                put_date,
+                put_strike,
+                put_premium,
+                assignment_date,
+                call_date,
+                call_strike,
+                call_premium,
+                capital_gain,
+                total_premium,
+                total_return,
+                duration_days,
+                shares
             FROM `{self.dataset}.wheel_cycles`
-            ORDER BY logged_at DESC
+            WHERE DATE(timestamp, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            ORDER BY timestamp DESC
             """
             return self._run_query(query)
         except Exception:
-            logger.info("wheel_cycles view query failed — returning empty list")
+            logger.info("wheel_cycles query failed — returning empty list")
             return []
 
 

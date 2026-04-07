@@ -219,6 +219,20 @@ def trigger_scan():
                 opportunities_found=scan_results['total_opportunities']
             )
 
+            # Write analytics execution record
+            try:
+                from src.data.analytics_writer import get_analytics_writer
+                analytics = get_analytics_writer()
+                analytics.write_execution(
+                    endpoint="/scan",
+                    status="completed",
+                    duration_seconds=duration_seconds,
+                    scan_count=1,
+                    opportunities_found=scan_results['total_opportunities'],
+                )
+            except Exception:
+                logger.debug("Analytics write failed for /scan", exc_info=True)
+
             return jsonify({
                 'message': 'Market scan completed successfully',
                 'timestamp': datetime.now().isoformat(),
@@ -236,6 +250,27 @@ def trigger_scan():
                 component="cloud_run_server",
                 recoverable=True
             )
+
+            # Write analytics error + failed execution
+            try:
+                from src.data.analytics_writer import get_analytics_writer
+                analytics = get_analytics_writer()
+                analytics.write_error(
+                    event_type="market_scan_exception",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    component="cloud_run_server",
+                    recoverable=True,
+                    stack_trace=traceback.format_exc(),
+                )
+                analytics.write_execution(
+                    endpoint="/scan",
+                    status="error",
+                    duration_seconds=(datetime.now() - start_time).total_seconds(),
+                    errors=1,
+                )
+            except Exception:
+                logger.debug("Analytics write failed for /scan error", exc_info=True)
 
             strategy_status['errors'].append({
                 'timestamp': datetime.now().isoformat(),
@@ -396,6 +431,37 @@ def trigger_strategy():
             # (Alpaca's API returns stale/incorrect data immediately after trades)
             account_info = alpaca_client.get_account()
             available_buying_power = float(account_info.get('options_buying_power') or account_info['buying_power'])
+
+            # Snapshot all positions for portfolio history (analytics)
+            try:
+                from src.data.analytics_writer import get_analytics_writer
+                analytics = get_analytics_writer()
+                all_positions = alpaca_client.get_positions()
+                date_str = datetime.now().strftime('%Y-%m-%d')
+
+                # Account-level snapshot
+                analytics.write_position_snapshot(
+                    date=date_str,
+                    symbol="PORTFOLIO",
+                    asset_class="account",
+                    portfolio_value=float(account_info.get('portfolio_value', 0)),
+                    cash=float(account_info.get('cash', 0)),
+                    buying_power=float(account_info.get('buying_power', 0)),
+                )
+
+                # Per-position snapshots
+                for pos in all_positions:
+                    analytics.write_position_snapshot(
+                        date=date_str,
+                        symbol=pos.get('symbol'),
+                        asset_class=pos.get('asset_class'),
+                        shares=int(float(pos.get('qty', 0))),
+                        cost_basis=float(pos.get('cost_basis', 0)),
+                        market_value=float(pos.get('market_value', 0)),
+                        unrealized_pnl=float(pos.get('unrealized_pl', 0)),
+                    )
+            except Exception:
+                logger.debug("Analytics position snapshot failed", exc_info=True)
             logger.info("Starting execution with buying power",
                        event_category="system",
                        event_type="execution_buying_power_check",
@@ -435,6 +501,29 @@ def trigger_strategy():
                     trades_executed=trades_executed,
                     execution_results_count=len(execution_results)
                 )
+
+                try:
+                    from src.data.analytics_writer import get_analytics_writer
+                    analytics = get_analytics_writer()
+                    analytics.write_error(
+                        event_type="mark_executed_failed",
+                        error_type="mark_executed_failed",
+                        error_message="Failed to mark opportunities as executed - risk of re-execution",
+                        component="cloud_run_server",
+                        recoverable=False,
+                    )
+                    analytics.write_execution(
+                        endpoint="/run",
+                        status="error",
+                        duration_seconds=(datetime.now() - start_time).total_seconds(),
+                        trades_executed=trades_executed,
+                        trades_failed=len(opportunities) - trades_executed,
+                        buying_power_before=available_buying_power,
+                        errors=1,
+                    )
+                except Exception:
+                    logger.debug("Analytics write failed for mark_executed_failed", exc_info=True)
+
                 return jsonify({
                     'error': 'mark_executed_failed',
                     'message': 'Trades executed but failed to mark complete - manual intervention required',
@@ -470,6 +559,33 @@ def trigger_strategy():
                 trades_executed=trades_executed
             )
 
+            # Write analytics execution record
+            try:
+                from src.data.analytics_writer import get_analytics_writer
+                analytics = get_analytics_writer()
+                # Fetch post-trade buying power for comparison
+                try:
+                    post_account = alpaca_client.get_account()
+                    buying_power_after = float(post_account.get('options_buying_power') or post_account.get('buying_power', 0))
+                    portfolio_value = float(post_account.get('portfolio_value', 0))
+                except Exception:
+                    buying_power_after = 0
+                    portfolio_value = 0
+
+                analytics.write_execution(
+                    endpoint="/run",
+                    status="completed",
+                    duration_seconds=duration_seconds,
+                    trades_executed=trades_executed,
+                    trades_failed=len(opportunities) - trades_executed,
+                    buying_power_before=available_buying_power,
+                    buying_power_after=buying_power_after,
+                    portfolio_value=portfolio_value,
+                    opportunities_found=len(opportunities),
+                )
+            except Exception:
+                logger.debug("Analytics write failed for /run", exc_info=True)
+
             return jsonify({
                 'message': 'Strategy execution completed successfully',
                 'timestamp': datetime.now().isoformat(),
@@ -487,6 +603,28 @@ def trigger_strategy():
                         event_type="strategy_execution_exception",
                         error=str(e),
                         traceback=traceback.format_exc())
+
+            # Write analytics error + failed execution
+            try:
+                from src.data.analytics_writer import get_analytics_writer
+                analytics = get_analytics_writer()
+                analytics.write_error(
+                    event_type="strategy_execution_exception",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    component="cloud_run_server",
+                    recoverable=True,
+                    stack_trace=traceback.format_exc(),
+                )
+                analytics.write_execution(
+                    endpoint="/run",
+                    status="error",
+                    duration_seconds=(datetime.now() - start_time).total_seconds(),
+                    errors=1,
+                )
+            except Exception:
+                logger.debug("Analytics write failed for /run error", exc_info=True)
+
             strategy_status['errors'].append({
                 'timestamp': datetime.now().isoformat(),
                 'error': f"Strategy execution failed: {str(e)}"
@@ -747,6 +885,20 @@ def monitor_positions():
             strategy_status['last_monitor'] = datetime.now().isoformat()
             strategy_status['status'] = 'monitor_completed'
 
+            # Write analytics execution record
+            try:
+                from src.data.analytics_writer import get_analytics_writer
+                analytics = get_analytics_writer()
+                analytics.write_execution(
+                    endpoint="/monitor",
+                    status="completed",
+                    duration_seconds=duration_seconds,
+                    trades_executed=len(closed_positions),
+                    errors=len(errors),
+                )
+            except Exception:
+                logger.debug("Analytics write failed for /monitor", exc_info=True)
+
             return jsonify({
                 'message': 'Position monitoring completed',
                 'timestamp': datetime.now().isoformat(),
@@ -773,6 +925,27 @@ def monitor_positions():
                 error=str(e),
                 duration_seconds=(datetime.now() - start_time).total_seconds()
             )
+
+            # Write analytics error + failed execution
+            try:
+                from src.data.analytics_writer import get_analytics_writer
+                analytics = get_analytics_writer()
+                analytics.write_error(
+                    event_type="position_monitoring_exception",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    component="cloud_run_server",
+                    recoverable=True,
+                    stack_trace=traceback.format_exc(),
+                )
+                analytics.write_execution(
+                    endpoint="/monitor",
+                    status="error",
+                    duration_seconds=(datetime.now() - start_time).total_seconds(),
+                    errors=1,
+                )
+            except Exception:
+                logger.debug("Analytics write failed for /monitor error", exc_info=True)
 
             return jsonify({'error': error_msg}), 500
 

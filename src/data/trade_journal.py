@@ -37,6 +37,9 @@ _TABLE_SCHEMA = [
     bigquery.SchemaField("premium", "FLOAT", description="Per-contract premium (mid price)"),
     bigquery.SchemaField("limit_price", "FLOAT", description="Limit price on the order"),
     bigquery.SchemaField("fill_price", "FLOAT", description="Actual fill price (if filled)"),
+    bigquery.SchemaField("bid", "FLOAT", description="Best bid at order time"),
+    bigquery.SchemaField("ask", "FLOAT", description="Best ask at order time"),
+    bigquery.SchemaField("mid_price", "FLOAT", description="Mid-price at order time"),
     bigquery.SchemaField("total_premium", "FLOAT", description="Total premium collected (premium * qty * 100)"),
     bigquery.SchemaField("collateral", "FLOAT", description="Collateral required (strike * qty * 100)"),
     bigquery.SchemaField("status", "STRING", description="Order status (submitted, filled, etc.)"),
@@ -44,6 +47,10 @@ _TABLE_SCHEMA = [
     bigquery.SchemaField("expiration", "STRING", description="Option expiration date"),
     bigquery.SchemaField("dte", "INTEGER", description="Days to expiration at entry"),
     bigquery.SchemaField("roi", "FLOAT", description="Return on investment at entry"),
+    bigquery.SchemaField("outcome", "STRING", description="Terminal outcome (expired, assigned, closed, active)"),
+    bigquery.SchemaField("outcome_price", "FLOAT", description="Price at outcome (assignment/close price)"),
+    bigquery.SchemaField("realized_pnl", "FLOAT", description="Realized P&L if position closed"),
+    bigquery.SchemaField("filled_at", "TIMESTAMP", description="Timestamp when order was actually filled"),
     bigquery.SchemaField("timestamp", "TIMESTAMP", description="UTC timestamp of the record"),
 ] if _HAS_BIGQUERY else []
 
@@ -145,6 +152,9 @@ class TradeJournal:
             "premium": trade_data.get("premium"),
             "limit_price": trade_data.get("limit_price"),
             "fill_price": trade_data.get("fill_price"),
+            "bid": trade_data.get("bid"),
+            "ask": trade_data.get("ask"),
+            "mid_price": trade_data.get("mid_price"),
             "total_premium": _calc_total_premium(trade_data),
             "collateral": _calc_collateral(trade_data),
             "status": trade_data.get("status", "submitted"),
@@ -152,6 +162,10 @@ class TradeJournal:
             "expiration": trade_data.get("expiration"),
             "dte": trade_data.get("dte"),
             "roi": trade_data.get("roi"),
+            "outcome": trade_data.get("outcome"),
+            "outcome_price": trade_data.get("outcome_price"),
+            "realized_pnl": trade_data.get("realized_pnl"),
+            "filled_at": trade_data.get("filled_at"),
             "timestamp": trade_data.get("timestamp") or now,
         }
 

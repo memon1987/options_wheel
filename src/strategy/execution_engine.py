@@ -132,7 +132,7 @@ class ExecutionEngine:
                 original_count=original_count,
                 filtered_count=filtered_count,
                 remaining_count=len(filtered),
-                failed_symbols=", ".join(_failed_symbols) if _failed_symbols else "",
+                failed_symbols=list(_failed_symbols),
             )
 
         return filtered, filtered_count

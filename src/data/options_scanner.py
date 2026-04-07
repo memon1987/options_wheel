@@ -40,7 +40,7 @@ class OptionsScanner:
             List of put opportunities sorted by attractiveness
         """
         try:
-            logger.info("Scanning for put opportunities", event_category="system", event_type="put_scan_started", symbols=len(self.config.stock_symbols))
+            logger.info("Scanning for put opportunities", event_category="system", event_type="put_scan_started", symbol_count=len(self.config.stock_symbols))
             
             opportunities = []
             

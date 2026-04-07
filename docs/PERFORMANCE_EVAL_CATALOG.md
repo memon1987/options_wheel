@@ -438,6 +438,20 @@ WHERE jsonPayload.event_type = 'naked_call_blocked'
 
 ---
 
+## Phase 2 Data Tables (build after 2 weeks of Phase 1 data)
+
+**`options_wheel.system_events`** — circuit breaker trips, naked call blocks, service incidents.
+- Unblocks: EVAL-009 (circuit breaker impact), EVAL-011 (share commitment verification)
+- Fields: event_type, timestamp, symbol, details, duration
+- Source: structured logging of system-level events
+
+**`options_wheel.eval_results`** — audit trail for autonomous parameter tuning.
+- Unblocks: Future automation framework
+- Fields: eval_id, run_date, metric_name, metric_value, recommendation, action_taken, changed_by
+- Source: scheduled eval runner output
+
+---
+
 ## Future Automation Architecture
 
 Once 3+ evals have sufficient data and stable thresholds, build:
