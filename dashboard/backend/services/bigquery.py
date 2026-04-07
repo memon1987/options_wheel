@@ -394,18 +394,25 @@ class BigQueryService:
         Returns:
             List of wheel cycle data with premium breakdown
         """
-        # wheel_cycle_complete events populate as the strategy matures
-        # (full put → assignment → call → called away cycles).
-        # Query safely — returns empty if no cycles completed yet.
+        # wheel_cycle_complete events are logged when a full wheel cycle
+        # completes (put assigned → call assigned → shares called away).
+        # Includes both live events and backfilled historical cycles.
         query = f"""
         SELECT
             jsonPayload.symbol as symbol,
+            SAFE_CAST(jsonPayload.capital_gain AS FLOAT64) as capital_gain,
+            SAFE_CAST(jsonPayload.put_strike AS FLOAT64) as put_strike,
+            SAFE_CAST(jsonPayload.call_strike AS FLOAT64) as call_strike,
+            SAFE_CAST(jsonPayload.cycle_duration_days AS INT64) as duration_days,
+            jsonPayload.put_assignment_date,
+            jsonPayload.call_assignment_date,
+            SAFE_CAST(jsonPayload.shares AS INT64) as shares,
             SAFE_CAST(jsonPayload.premium_collected AS FLOAT64) as total_premium,
             DATETIME(timestamp, 'America/New_York') as cycle_end,
             DATE(timestamp, 'America/New_York') as date_et
         FROM `{PROJECT_ID}.options_wheel_logs.run_googleapis_com_stderr_*`
         WHERE jsonPayload.event_type = 'wheel_cycle_complete'
-            AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY))
+            AND _TABLE_SUFFIX >= '20251001'
         ORDER BY timestamp DESC
         """
         return self._run_query(query)
