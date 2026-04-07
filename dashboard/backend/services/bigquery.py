@@ -183,9 +183,11 @@ class BigQueryService:
         query = f"""
         SELECT
             SUM(total_executions) as total_trades,
-            SUM(total_opportunities) as total_opportunities,
+            SUM(puts_sold) as total_puts_sold,
+            SUM(early_closes) as total_early_closes,
             SUM(total_scans) as total_scans,
             SUM(total_errors) as total_errors,
+            SUM(premium_collected) as total_premium_from_ops,
             COUNT(DISTINCT date_et) as trading_days
         FROM `{self.dataset}.daily_operations_summary`
         WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
@@ -206,12 +208,13 @@ class BigQueryService:
 
             # Map to frontend expected field names
             return {
-                'total_trades_30d': raw_metrics.get('total_trades', 0),
-                'total_opportunities': raw_metrics.get('total_opportunities', 0),
+                'total_trades': raw_metrics.get('total_trades', 0),
+                'total_puts_sold': raw_metrics.get('total_puts_sold', 0),
+                'total_early_closes': raw_metrics.get('total_early_closes', 0),
                 'total_scans': raw_metrics.get('total_scans', 0),
                 'total_errors': raw_metrics.get('total_errors', 0),
                 'trading_days': raw_metrics.get('trading_days', 0),
-                'total_premium_30d': total_premium,
+                'total_premium': total_premium,
                 'put_premium_30d': premium_data.get('put_premium', 0),
                 'call_premium_30d': premium_data.get('call_premium', 0),
                 'win_rate': None,  # TODO: Calculate from trade outcomes
