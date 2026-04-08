@@ -104,7 +104,7 @@ class TradeJournal:
 
         # Dataset
         dataset = bigquery.Dataset(dataset_ref)
-        dataset.location = "US"
+        dataset.location = "us-central1"
         self._client.create_dataset(dataset, exists_ok=True)
 
         # Table

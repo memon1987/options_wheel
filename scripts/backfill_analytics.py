@@ -23,6 +23,16 @@ ANALYTICS_DATASET = "options_wheel"
 
 
 def main():
+    # Create dataset and all tables first via AnalyticsWriter
+    print("Creating dataset and tables...")
+    from src.data.analytics_writer import AnalyticsWriter
+    writer = AnalyticsWriter(project_id=PROJECT_ID)
+    if writer.enabled:
+        print(f"  Dataset and tables created in {PROJECT_ID}.{ANALYTICS_DATASET}")
+    else:
+        print("  ERROR: AnalyticsWriter failed to initialize. Check GCP credentials.")
+        return
+
     client = bigquery.Client(project=PROJECT_ID)
     log_table = f"`{PROJECT_ID}.{LOG_DATASET}.run_googleapis_com_stderr_*`"
     suffix_filter = "_TABLE_SUFFIX BETWEEN '20251015' AND '20260406'"

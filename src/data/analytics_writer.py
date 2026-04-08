@@ -182,7 +182,7 @@ class AnalyticsWriter:
         """Create dataset and all tables if they don't exist."""
         dataset_ref = bigquery.DatasetReference(self._project_id, self._dataset_id)
         dataset = bigquery.Dataset(dataset_ref)
-        dataset.location = "US"
+        dataset.location = "us-central1"
         self._client.create_dataset(dataset, exists_ok=True)
 
         for table_name, schema in _SCHEMAS.items():
