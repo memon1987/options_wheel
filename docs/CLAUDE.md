@@ -6,6 +6,50 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is an algorithmic trading solution that executes an options wheel strategy. The options wheel is a systematic approach to generating income from stocks through selling cash-secured puts and covered calls. All trade execution is handled through the Alpaca.py APIs.
 
+## Plan-First Development
+
+**CRITICAL RULE:** Medium and large code changes must have a published execution plan in `docs/plans/` before any code is written. Ideas that have not yet graduated to a plan live in `docs/FUTURE_CONSIDERATIONS.md`.
+
+### Lifecycle
+```
+docs/FUTURE_CONSIDERATIONS.md  →  docs/plans/<slug>.md  →  code change
+        (FC entry)                  (published plan)        (commit/PR)
+```
+
+### What counts as "medium or large"
+Any change that meets **any** of the following requires a plan file:
+- Roughly 50+ lines changed
+- Touches more than one file in `src/`, `dashboard/`, or `deploy/`
+- Alters runtime behavior, trading logic, risk thresholds, or filtering
+- Adds or removes dependencies
+- Changes a public API, config schema, logged event shape, or BigQuery view
+- Modifies deployment, CI, or scheduling
+
+What is **exempt** (no plan needed):
+- Typos, comment/docstring edits, formatting
+- Single-file, isolated bug fixes under ~50 lines that don't change behavior contracts
+- Edits to `docs/FUTURE_CONSIDERATIONS.md`, `docs/plans/*`, and release notes themselves
+- Test-only additions that don't change production code
+
+### Enforcement for Claude Code sessions
+When the user requests a change that qualifies as medium/large:
+1. Check `docs/plans/` for a plan file matching the work.
+2. If no plan exists, **stop and surface it**: point at the relevant FC entry (or propose one) and ask the user to either (a) have a plan drafted first or (b) explicitly override.
+3. Do **not** start coding until one of those two paths is chosen.
+
+### Override
+The user may override the plan requirement by saying so explicitly in the request. Acceptable phrasings include: "skip plan", "no plan needed", "override plan requirement", or equivalent. When overridden, proceed but note the override in the commit message (e.g., `[no-plan: reason]`).
+
+### Referencing plans
+- Commit messages and PR descriptions for plan-driven work should include the plan file path: `Plan: docs/plans/<slug>.md`.
+- After merge, update the FC entry's status and move it to the "Completed" section with a link to the plan and the commit/PR.
+
+### Files
+- `docs/FUTURE_CONSIDERATIONS.md` — pre-plan ideas, FC-NNN format
+- `docs/plans/README.md` — plan workflow, index, naming
+- `docs/plans/_template.md` — template to copy for new plans
+- `docs/plans/<slug>.md` — individual published plans
+
 ## Development Setup
 
 Install dependencies:
