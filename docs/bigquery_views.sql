@@ -165,7 +165,7 @@ SELECT
   insertId,
   severity
 FROM `gen-lang-client-0607444019.options_wheel_logs.run_googleapis_com_stderr_*`
-WHERE jsonPayload.event_category = 'position_update'
+WHERE jsonPayload.event_category = 'position'
   AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY));
 
 -- ================================================================
@@ -218,4 +218,43 @@ SELECT
 FROM `gen-lang-client-0607444019.options_wheel_logs.run_googleapis_com_stderr_*`
 WHERE jsonPayload.event_category = 'backtest'
   AND jsonPayload.event_type = 'backtest_completed'
+  AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY));
+
+-- ================================================================
+-- 8. CALL ROLLS VIEW - Friday EOW call rolling (FC-006)
+-- ================================================================
+CREATE OR REPLACE VIEW `gen-lang-client-0607444019.options_wheel_logs.call_rolls` AS
+SELECT
+  timestamp as timestamp_utc,
+  DATETIME(timestamp, 'America/New_York') as timestamp_et,
+  DATE(timestamp) as date_utc,
+  DATE(timestamp, 'America/New_York') as date_et,
+  jsonPayload.event_type,
+  jsonPayload.symbol,
+  jsonPayload.underlying,
+  SAFE_CAST(jsonPayload.current_strike AS FLOAT64) as current_strike,
+  SAFE_CAST(jsonPayload.new_strike AS FLOAT64) as new_strike,
+  SAFE_CAST(jsonPayload.old_strike AS FLOAT64) as old_strike,
+  SAFE_CAST(jsonPayload.target_strike AS FLOAT64) as target_strike,
+  SAFE_CAST(jsonPayload.net_debit AS FLOAT64) as net_debit,
+  SAFE_CAST(jsonPayload.net_credit AS FLOAT64) as net_credit,
+  SAFE_CAST(jsonPayload.net_premium AS FLOAT64) as net_premium,
+  SAFE_CAST(jsonPayload.net_debit_pct AS FLOAT64) as net_debit_pct,
+  SAFE_CAST(jsonPayload.contracts AS INT64) as contracts,
+  SAFE_CAST(jsonPayload.filled_qty AS INT64) as filled_qty,
+  SAFE_CAST(jsonPayload.filled_price AS FLOAT64) as filled_price,
+  SAFE_CAST(jsonPayload.roll_count AS INT64) as roll_count,
+  jsonPayload.order_id,
+  jsonPayload.btc_order_id,
+  jsonPayload.stc_order_id,
+  jsonPayload.skip_reason,
+  jsonPayload.gate_failed,
+  SAFE_CAST(jsonPayload.success AS BOOL) as success,
+  jsonPayload.next_earnings_date,
+  SAFE_CAST(jsonPayload.days_to_earnings AS INT64) as days_to_earnings,
+  insertId,
+  severity
+FROM `gen-lang-client-0607444019.options_wheel_logs.run_googleapis_com_stderr_*`
+WHERE jsonPayload.event_category = 'trade'
+  AND jsonPayload.event_type LIKE 'call_roll_%'
   AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY));

@@ -517,6 +517,94 @@ class WheelStateManager:
         self._save_state()
         return True
 
+    def set_active_call_details(self, symbol: str, option_symbol: str,
+                                premium: float, strike: float,
+                                contracts: int, sell_date: str):
+        """Store per-position details for the active short call.
+
+        Called by CallSeller after successful execution to provide
+        the original premium for debit tolerance calculations during rolling.
+
+        Args:
+            symbol: Underlying stock symbol
+            option_symbol: OCC option symbol
+            premium: Premium collected per contract
+            strike: Strike price
+            contracts: Number of contracts
+            sell_date: ISO date string
+        """
+        if symbol not in self.symbol_states:
+            return
+
+        self.symbol_states[symbol]['active_call_details'] = {
+            'option_symbol': option_symbol,
+            'premium_per_contract': premium,
+            'strike': strike,
+            'contracts': contracts,
+            'sell_date': sell_date,
+        }
+        self._save_state()
+
+    def get_active_call_details(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get per-position details for the active short call.
+
+        Returns:
+            Dict with option_symbol, premium_per_contract, strike, contracts,
+            sell_date — or None if no active call details tracked.
+        """
+        if symbol not in self.symbol_states:
+            return None
+        return self.symbol_states[symbol].get('active_call_details')
+
+    def record_call_roll(self, symbol: str, old_symbol: str, new_symbol: str,
+                         contracts: int, net_premium: float, btc_cost: float,
+                         stc_credit: float, old_strike: float, new_strike: float,
+                         roll_date: str):
+        """Record a completed call roll in the symbol's roll history.
+
+        Args:
+            symbol: Underlying stock symbol
+            old_symbol: OCC symbol of the closed call
+            new_symbol: OCC symbol of the new call
+            contracts: Number of contracts rolled
+            net_premium: Net credit (positive) or debit (negative)
+            btc_cost: Cost to buy-to-close
+            stc_credit: Credit from sell-to-open
+            old_strike: Strike of closed call
+            new_strike: Strike of new call
+            roll_date: ISO date string
+        """
+        if symbol not in self.symbol_states:
+            return
+
+        state = self.symbol_states[symbol]
+        history = state.get('roll_history', [])
+        history.append({
+            'old_symbol': old_symbol,
+            'new_symbol': new_symbol,
+            'contracts': contracts,
+            'net_premium': net_premium,
+            'btc_cost': btc_cost,
+            'stc_credit': stc_credit,
+            'old_strike': old_strike,
+            'new_strike': new_strike,
+            'roll_date': roll_date,
+        })
+        state['roll_history'] = history
+        state['total_rolls'] = state.get('total_rolls', 0) + 1
+        state['cumulative_roll_premium'] = state.get('cumulative_roll_premium', 0.0) + net_premium
+        self._save_state()
+
+    def get_roll_count(self, symbol: str) -> int:
+        """Get total number of consecutive rolls for a symbol.
+
+        Returns:
+            Number of rolls, or 0 if none.
+        """
+        if symbol not in self.symbol_states:
+            return 0
+        return self.symbol_states[symbol].get('total_rolls', 0)
+
     def remove_position(self, symbol: str, position_type: Literal['put', 'call'],
                        contracts: int, close_reason: str = 'closed') -> bool:
         """Remove position from tracking (early close, expiration).

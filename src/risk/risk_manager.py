@@ -119,6 +119,58 @@ class RiskManager:
             logger.error("Risk validation failed", event_category="error", event_type="risk_validation_failed", error=str(e))
             return False, f"Risk validation error: {str(e)}"
     
+    def validate_roll(self, new_call: Dict[str, Any], current_strike: float,
+                      cost_basis_per_share: float) -> Tuple[bool, str]:
+        """Validate a call roll replacement leg.
+
+        Unlike validate_new_position, this skips portfolio-level checks
+        (position count, concentration, cash reserve) since a roll is a
+        replacement, not a new position.
+
+        Args:
+            new_call: Candidate replacement call from find_suitable_calls
+            current_strike: Strike of the call being closed
+            cost_basis_per_share: Stock cost basis per share
+
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        try:
+            new_strike = new_call.get('strike_price', 0)
+
+            # Roll-up only: new strike must exceed current strike
+            if new_strike <= current_strike:
+                return False, f"New strike {new_strike} not above current {current_strike} (roll-up only)"
+
+            # Cost basis protection
+            if new_strike < cost_basis_per_share:
+                return False, f"New strike {new_strike} below cost basis {cost_basis_per_share:.2f}"
+
+            # Delta within configured range
+            delta = abs(new_call.get('delta', 0))
+            delta_range = self.config.call_delta_range
+            if not (delta_range[0] <= delta <= delta_range[1]):
+                return False, f"Delta {delta:.3f} outside range {delta_range}"
+
+            # Premium meets minimum
+            premium = new_call.get('mid_price', 0)
+            if premium < self.config.min_call_premium:
+                return False, f"Premium {premium} below minimum {self.config.min_call_premium}"
+
+            # DTE within target
+            dte = new_call.get('dte', 0)
+            if dte > self.config.call_target_dte:
+                return False, f"DTE {dte} exceeds maximum {self.config.call_target_dte}"
+
+            return True, "Roll target validated"
+
+        except Exception as e:
+            logger.error("Roll validation failed",
+                        event_category="error",
+                        event_type="roll_validation_failed",
+                        error=str(e))
+            return False, f"Roll validation error: {str(e)}"
+
     def _validate_option_specific_risks(self, opportunity: Dict[str, Any]) -> Tuple[bool, str]:
         """Validate option-specific risk parameters.
         

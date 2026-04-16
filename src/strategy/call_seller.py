@@ -15,17 +15,20 @@ logger = structlog.get_logger(__name__)
 class CallSeller:
     """Handles covered call selling for the wheel strategy."""
     
-    def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager, config: Config):
+    def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager,
+                 config: Config, wheel_state_manager=None):
         """Initialize call seller.
-        
+
         Args:
             alpaca_client: Alpaca API client
             market_data: Market data manager
             config: Configuration instance
+            wheel_state_manager: Optional WheelStateManager for tracking active call details
         """
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
+        self.wheel_state = wheel_state_manager
         
     def evaluate_covered_call_opportunity(self, stock_position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Evaluate covered call opportunity for an assigned stock position.
@@ -278,6 +281,19 @@ class CallSeller:
                     total_return_if_called=opportunity.get('total_return_if_called', 0),
                     dte=opportunity.get('dte', 0)
                 )
+
+                # Track active call details for rolling engine (FC-006)
+                if self.wheel_state:
+                    underlying = opportunity.get('symbol', '')
+                    if underlying:
+                        self.wheel_state.set_active_call_details(
+                            symbol=underlying,
+                            option_symbol=option_symbol,
+                            premium=premium,
+                            strike=opportunity.get('strike_price', 0),
+                            contracts=contracts,
+                            sell_date=datetime.now().strftime('%Y-%m-%d'),
+                        )
 
                 return result
             else:

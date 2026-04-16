@@ -1,6 +1,7 @@
 # Plan: <Title>
 
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-NNN
+**Plan file:** `docs/plans/fc-NNN.md`
 **Status:** Draft | In review | Approved | Executing | Done
 **Size:** S | M | L
 **Author:** <name>
@@ -60,3 +61,12 @@ End-to-end test plan:
 ## Open questions
 
 - ...
+
+## Execution
+
+_Filled in after implementation is complete._
+
+- **PR:** https://github.com/owner/repo/pull/NNN
+- **Commit:** `abc1234`
+- **Date:** YYYY-MM-DD
+- **Notes:** Any deviations from plan, issues encountered, or follow-up items.

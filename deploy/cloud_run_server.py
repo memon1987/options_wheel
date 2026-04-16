@@ -949,6 +949,67 @@ def monitor_positions():
 
             return jsonify({'error': error_msg}), 500
 
+@app.route('/roll', methods=['POST'])
+@require_api_key
+def trigger_roll():
+    """Friday EOW call rolling cycle (FC-006).
+
+    Evaluates short call positions for rolling when the underlying has
+    rallied through the strike. Executes BTC -> STO with percentage-based
+    debit tolerance. Only runs on Fridays.
+    """
+    with strategy_lock:
+        start_time = datetime.now()
+
+        if not _is_market_open():
+            logger.info("Market closed - skipping roll",
+                       event_category="system",
+                       event_type="roll_skipped_market_closed")
+            return jsonify({
+                'message': 'Market closed - skipping roll',
+                'timestamp': datetime.now().isoformat()
+            })
+
+        # Friday-only guard
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        if now_et.weekday() != 4:
+            return jsonify({
+                'skipped': 'not_friday',
+                'day': now_et.strftime('%A'),
+                'timestamp': datetime.now().isoformat()
+            })
+
+        try:
+            config = Config()
+
+            from src.strategy.wheel_engine import WheelEngine
+            engine = WheelEngine(config)
+            results = engine.run_rolling_cycle()
+
+            return jsonify({
+                'status': 'completed',
+                'results': results,
+                'timestamp': datetime.now().isoformat(),
+                'duration_seconds': round((datetime.now() - start_time).total_seconds(), 2)
+            })
+
+        except Exception as e:
+            error_msg = f"Rolling cycle error: {str(e)}"
+            logger.error(error_msg,
+                        event_category="error",
+                        event_type="roll_cycle_error",
+                        error=str(e), exc_info=True)
+            log_error_event(
+                logger,
+                error_type="roll_cycle_exception",
+                error_message=str(e),
+                component="cloud_run_server",
+                recoverable=True,
+            )
+            return jsonify({'error': error_msg}), 500
+
+
 @app.route('/account', methods=['GET'])
 @require_api_key
 def get_account():

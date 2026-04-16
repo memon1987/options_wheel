@@ -67,6 +67,9 @@ yfinance>=0.2.18,<1.0.0
 # Memory profiling (development)
 memory-profiler>=0.61.0,<1.0.0
 
+# Earnings calendar (Finnhub)
+finnhub-python>=2.4.0,<3.0.0
+
 # API rate limiting and retry logic
 ratelimit>=2.2.1,<3.0.0
 tenacity>=8.2.0,<9.0.0

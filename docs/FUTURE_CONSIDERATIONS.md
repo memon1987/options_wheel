@@ -138,15 +138,33 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 **Status:** Plan published
 **Size estimate:** L
 **Owner:** Claude
-**Plan file:** `docs/plans/call-rolling-engine.md`
+**Plan file:** `docs/plans/fc-006.md`
 
 **Problem / opportunity:** When underlying stock rallies through covered call strikes (e.g., GOOGL, AMD after macro improvements + earnings run-up), shares get called away at a notable discount to current trading price. A rolling engine would buy-to-close expiring ITM calls and sell-to-open new calls at higher strikes for next week, moving the effective strike closer to market and preserving upside. Runs Friday-only to maximize theta decay on existing contracts. Uses percentage-based debit tolerance that scales with position economics.
 
 **Open questions:**
-- Should lifetime premium (original + all rolls) be used for display while immediate roll P&L gates the debit tolerance?
-- Multi-contract positions: all-or-nothing roll per symbol, or per-contract?
+- ~~Should lifetime premium (original + all rolls) be used for display while immediate roll P&L gates the debit tolerance?~~ Resolved: yes — lifetime for observability, immediate for gating.
+- ~~Multi-contract positions: all-or-nothing roll per symbol, or per-contract?~~ Resolved: all-or-nothing per symbol with partial fill tracking and alerting.
 
-**Links:** `docs/plans/call-rolling-engine.md`
+**Dependencies:** FC-007 (Earnings Calendar Service)
+
+**Links:** `docs/plans/fc-006.md`
+
+---
+
+### FC-007: Earnings Calendar Service (Finnhub)
+
+**Status:** Plan published
+**Size estimate:** M
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-007.md`
+
+**Problem / opportunity:** The codebase has `earnings_avoidance_days` config but no actual earnings date source. Gap detector checks overnight price gaps but cannot prevent trading into upcoming earnings. Alpaca's corporate actions API has no earnings calendar. Finnhub provides free-tier earnings dates (60 calls/min, SEC/exchange-sourced). A shared earnings calendar service benefits put selling, call selling, and call rolling (FC-006 dependency).
+
+**Open questions:**
+None — all resolved during review.
+
+**Links:** `docs/plans/fc-007.md`
 
 ---
 
