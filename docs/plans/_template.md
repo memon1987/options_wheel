@@ -61,3 +61,12 @@ End-to-end test plan:
 ## Open questions
 
 - ...
+
+## Execution
+
+_Filled in after implementation is complete._
+
+- **PR:** #NNN
+- **Commit:** `abc1234`
+- **Date:** YYYY-MM-DD
+- **Notes:** Any deviations from plan, issues encountered, or follow-up items.
