@@ -133,6 +133,23 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 
 ---
 
+### FC-006: Covered call rolling engine (Friday EOW)
+
+**Status:** Plan published
+**Size estimate:** L
+**Owner:** Claude
+**Plan file:** `docs/plans/call-rolling-engine.md`
+
+**Problem / opportunity:** When underlying stock rallies through covered call strikes (e.g., GOOGL, AMD after macro improvements + earnings run-up), shares get called away at a notable discount to current trading price. A rolling engine would buy-to-close expiring ITM calls and sell-to-open new calls at higher strikes for next week, moving the effective strike closer to market and preserving upside. Runs Friday-only to maximize theta decay on existing contracts. Uses percentage-based debit tolerance that scales with position economics.
+
+**Open questions:**
+- Should lifetime premium (original + all rolls) be used for display while immediate roll P&L gates the debit tolerance?
+- Multi-contract positions: all-or-nothing roll per symbol, or per-contract?
+
+**Links:** `docs/plans/call-rolling-engine.md`
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
