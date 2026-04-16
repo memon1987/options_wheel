@@ -188,7 +188,7 @@ monitoring:
   
 # Call Rolling (Friday EOW) — FC-006
 rolling:
-  enabled: false                        # Enable with true after paper testing
+  enabled: true
   trigger_time_et: "15:00"
   max_current_dte: 1
   itm_trigger_ratio: 0.98
