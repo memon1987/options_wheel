@@ -1,6 +1,7 @@
 # Plan: <Title>
 
 **FC entry:** `docs/FUTURE_CONSIDERATIONS.md` FC-NNN
+**Plan file:** `docs/plans/fc-NNN.md`
 **Status:** Draft | In review | Approved | Executing | Done
 **Size:** S | M | L
 **Author:** <name>

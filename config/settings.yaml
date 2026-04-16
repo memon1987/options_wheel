@@ -186,6 +186,13 @@ monitoring:
   max_execution_time_minutes: 5  # Cloud Run timeout consideration
   enable_performance_metrics: true
   
+# Earnings Calendar (Finnhub)
+earnings:
+  enabled: true
+  cache_ttl_hours: 24
+  blackout_days: 2
+  lookahead_days: 90
+
 # Logging Configuration
 logging:
   level: "INFO"

@@ -165,7 +165,7 @@ SELECT
   insertId,
   severity
 FROM `gen-lang-client-0607444019.options_wheel_logs.run_googleapis_com_stderr_*`
-WHERE jsonPayload.event_category = 'position_update'
+WHERE jsonPayload.event_category = 'position'
   AND _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY));
 
 -- ================================================================

@@ -13,8 +13,8 @@ Published plans for changes to this codebase. **No medium or large change should
 
 ## Naming
 
-- File name: `docs/plans/<kebab-case-slug>.md` (e.g., `symbol-universe-refactor.md`)
-- Slug should match the FC entry title when possible.
+- File name: `docs/plans/fc-NNN.md` matching the FC entry number (e.g., `fc-006.md` for FC-006)
+- This ensures direct traceability between FC entries and their published plans.
 
 ## Plan template
 
@@ -24,8 +24,5 @@ Copy `_template.md` in this directory to start a new plan.
 
 _List active plans here as they are added._
 
-<!--
-Example:
-- [symbol-universe-refactor.md](symbol-universe-refactor.md) — FC-001, status: drafted
-- [dte-target-optimization.md](dte-target-optimization.md) — FC-003, status: executing
--->
+- [fc-006.md](fc-006.md) — FC-006: Covered call rolling engine, status: plan published
+- [fc-007.md](fc-007.md) — FC-007: Earnings calendar service, status: plan published

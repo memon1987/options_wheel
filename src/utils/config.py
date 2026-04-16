@@ -82,6 +82,7 @@ class Config:
     _SECRET_MANAGER_MAP = {
         "ALPACA_API_KEY": "alpaca-api-key",
         "ALPACA_SECRET_KEY": "alpaca-secret-key",
+        "FINNHUB_API_KEY": "finnhub-api-key",
     }
 
     def _substitute_env_vars(self):
@@ -482,6 +483,32 @@ class Config:
     def significant_gap_threshold(self) -> float:
         """Threshold for counting significant gaps (legacy name)."""
         return self.quality_gap_threshold
+
+    # Finnhub / Earnings Calendar
+    @property
+    def finnhub_api_key(self) -> str:
+        """Get Finnhub API key for earnings calendar."""
+        return os.getenv("FINNHUB_API_KEY", "")
+
+    @property
+    def earnings_enabled(self) -> bool:
+        """Whether earnings calendar service is enabled."""
+        return self._config.get("earnings", {}).get("enabled", False)
+
+    @property
+    def earnings_cache_ttl_hours(self) -> int:
+        """Cache TTL in hours for earnings data."""
+        return self._config.get("earnings", {}).get("cache_ttl_hours", 24)
+
+    @property
+    def earnings_blackout_days(self) -> int:
+        """Days before earnings to block new positions/rolls."""
+        return self._config.get("earnings", {}).get("blackout_days", 2)
+
+    @property
+    def earnings_lookahead_days(self) -> int:
+        """Days to look ahead when querying earnings calendar."""
+        return self._config.get("earnings", {}).get("lookahead_days", 90)
 
     def get(self, key: str, default=None):
         """Get configuration value by key path (e.g., 'alpaca.paper_trading')."""
