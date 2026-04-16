@@ -116,3 +116,20 @@ async def get_portfolio_history(
     """
     bq = get_bigquery_service()
     return bq.get_portfolio_value_history(days=days)
+
+
+@router.get("/call-rolls")
+async def get_call_rolls(
+    days: int = Query(default=30, ge=1, le=90, description="Days to look back")
+) -> List[Dict[str, Any]]:
+    """
+    Get call roll history (FC-006).
+
+    Args:
+        days: Number of days to look back (1-90)
+
+    Returns:
+        List of call roll events with strikes, premiums, and outcomes.
+    """
+    bq = get_bigquery_service()
+    return bq.get_call_rolls(days=days)

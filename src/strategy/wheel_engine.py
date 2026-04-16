@@ -15,7 +15,10 @@ from ..utils.option_symbols import parse_option_symbol
 from ..data.analytics_writer import get_analytics_writer
 from .put_seller import PutSeller
 from .call_seller import CallSeller
+from .call_roller import CallRoller
 from .wheel_state_manager import WheelStateManager, WheelPhase
+from ..risk.risk_manager import RiskManager
+from ..api.earnings_calendar import EarningsCalendarService
 
 logger = structlog.get_logger(__name__)
 
@@ -34,9 +37,10 @@ class WheelEngine:
         self.market_data = MarketDataManager(self.alpaca, config)
         self.gap_detector = GapDetector(config, self.alpaca)
         self.put_seller = PutSeller(self.alpaca, self.market_data, config)
-        self.call_seller = CallSeller(self.alpaca, self.market_data, config)
         state_bucket = getattr(config, 'state_storage_bucket', None) or os.getenv('STATE_STORAGE_BUCKET')
         self.wheel_state = WheelStateManager(storage_bucket=state_bucket)
+        self.call_seller = CallSeller(self.alpaca, self.market_data, config,
+                                      wheel_state_manager=self.wheel_state)
 
         # Track pending orders within current execution cycle to prevent duplicates
         self._pending_underlyings = set()
@@ -1331,3 +1335,88 @@ class WheelEngine:
                         event_type="reconciliation_error",
                         error=str(e))
             return {'error': str(e)}
+
+    def run_rolling_cycle(self) -> Dict[str, Any]:
+        """Run Friday EOW call rolling cycle (FC-006).
+
+        Evaluates all short call positions for rolling eligibility,
+        then executes qualifying rolls via CallRoller.
+
+        Returns:
+            Summary dict with rolls_evaluated, rolls_executed, rolls_skipped.
+        """
+        start_time = datetime.now()
+
+        if not self.config.rolling_enabled:
+            return {'skipped': 'rolling_disabled'}
+
+        log_system_event(logger, event_type="roll_cycle_started", status="starting")
+
+        # Initialize rolling components
+        risk_manager = RiskManager(self.config)
+        earnings_calendar = None
+        if self.config.earnings_enabled:
+            earnings_calendar = EarningsCalendarService(self.config)
+
+        roller = CallRoller(
+            self.alpaca, self.market_data, self.config,
+            self.wheel_state, risk_manager, earnings_calendar)
+
+        # Get all positions
+        positions = self.alpaca.get_positions()
+        stock_positions = get_stock_positions(positions)
+        option_positions = [p for p in positions
+                           if p.get('asset_class') == 'us_option']
+
+        # Build stock lookup by symbol
+        stock_by_symbol = {}
+        for sp in stock_positions:
+            sym = sp.get('symbol', '')
+            stock_by_symbol[sym] = sp
+
+        # Filter to short call positions
+        short_calls = []
+        for op in option_positions:
+            qty = float(op.get('qty', 0))
+            if qty >= 0:
+                continue  # not short
+            parsed = parse_option_symbol(op.get('symbol', ''))
+            if parsed.get('option_type') != 'call':
+                continue
+            underlying = parsed.get('underlying', '')
+            if underlying in stock_by_symbol:
+                short_calls.append((op, stock_by_symbol[underlying]))
+
+        results = {
+            'rolls_evaluated': 0,
+            'rolls_executed': 0,
+            'rolls_skipped': 0,
+            'roll_details': [],
+        }
+
+        for call_pos, stock_pos in short_calls:
+            results['rolls_evaluated'] += 1
+
+            opportunity = roller.evaluate_roll_opportunity(call_pos, stock_pos)
+            if not opportunity:
+                results['rolls_skipped'] += 1
+                continue
+
+            roll_result = roller.execute_roll(opportunity)
+            results['roll_details'].append(roll_result)
+
+            if roll_result.get('success'):
+                results['rolls_executed'] += 1
+            else:
+                results['rolls_skipped'] += 1
+
+        duration = (datetime.now() - start_time).total_seconds()
+        log_system_event(
+            logger, event_type="roll_cycle_completed", status="completed",
+            rolls_evaluated=results['rolls_evaluated'],
+            rolls_executed=results['rolls_executed'],
+            rolls_skipped=results['rolls_skipped'],
+            duration_seconds=round(duration, 2),
+        )
+
+        return results

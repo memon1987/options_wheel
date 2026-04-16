@@ -426,6 +426,46 @@ class BigQueryService:
             logger.info("wheel_cycles query failed — returning empty list")
             return []
 
+    def get_call_rolls(self, days: int = 30) -> List[Dict[str, Any]]:
+        """Get call roll history (FC-006).
+
+        Args:
+            days: Number of days to look back
+
+        Returns:
+            List of call roll events
+        """
+        try:
+            query = f"""
+            SELECT
+                timestamp_et,
+                symbol,
+                underlying,
+                event_type,
+                current_strike,
+                new_strike,
+                old_strike,
+                net_debit,
+                net_credit,
+                net_premium,
+                contracts,
+                filled_qty,
+                roll_count,
+                skip_reason,
+                success,
+                next_earnings_date,
+                days_to_earnings,
+                btc_order_id,
+                stc_order_id
+            FROM `{self.dataset}.call_rolls`
+            WHERE date_et >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+            ORDER BY timestamp_et DESC
+            """
+            return self._run_query(query)
+        except Exception:
+            logger.info("call_rolls query failed — returning empty list")
+            return []
+
 
 # Singleton instance
 _bq_service: Optional[BigQueryService] = None

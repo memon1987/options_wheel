@@ -484,6 +484,67 @@ class Config:
         """Threshold for counting significant gaps (legacy name)."""
         return self.quality_gap_threshold
 
+    # Call Rolling (FC-006)
+    @property
+    def rolling_enabled(self) -> bool:
+        """Whether call rolling engine is enabled."""
+        return self._config.get("rolling", {}).get("enabled", False)
+
+    @property
+    def rolling_trigger_time_et(self) -> str:
+        """Earliest ET time to trigger rolling."""
+        return self._config.get("rolling", {}).get("trigger_time_et", "15:00")
+
+    @property
+    def rolling_max_current_dte(self) -> int:
+        """Max DTE on existing call to be eligible for roll."""
+        return self._config.get("rolling", {}).get("max_current_dte", 1)
+
+    @property
+    def rolling_itm_trigger_ratio(self) -> float:
+        """Stock price / strike ratio to trigger roll evaluation."""
+        return self._config.get("rolling", {}).get("itm_trigger_ratio", 0.98)
+
+    @property
+    def rolling_max_debit_pct_of_premium(self) -> float:
+        """Max net debit as % of original premium collected."""
+        return self._config.get("rolling", {}).get("max_debit_pct_of_premium", 0.25)
+
+    @property
+    def rolling_max_debit_pct_of_notional(self) -> float:
+        """Max net debit as % of notional exposure (backstop)."""
+        return self._config.get("rolling", {}).get("max_debit_pct_of_notional", 0.005)
+
+    @property
+    def rolling_max_rolls_per_position(self) -> int:
+        """Max consecutive rolls per symbol."""
+        return self._config.get("rolling", {}).get("max_rolls_per_position", 2)
+
+    @property
+    def rolling_earnings_blackout_days(self) -> int:
+        """Days before earnings to block rolling."""
+        return self._config.get("rolling", {}).get("earnings_blackout_days", 2)
+
+    @property
+    def rolling_btc_limit_over_ask_pct(self) -> float:
+        """BTC limit price premium over ask (aggression)."""
+        return self._config.get("rolling", {}).get("btc_limit_over_ask_pct", 0.05)
+
+    @property
+    def rolling_stc_limit_under_bid_pct(self) -> float:
+        """STC limit price discount under bid (aggression)."""
+        return self._config.get("rolling", {}).get("stc_limit_under_bid_pct", 0.05)
+
+    @property
+    def rolling_btc_fill_timeout_seconds(self) -> int:
+        """Seconds to wait for BTC/STC order fill."""
+        return self._config.get("rolling", {}).get("btc_fill_timeout_seconds", 120)
+
+    @property
+    def rolling_fallback_strike_attempts(self) -> int:
+        """Number of fallback strikes to try if first STO fails."""
+        return self._config.get("rolling", {}).get("fallback_strike_attempts", 2)
+
     # Finnhub / Earnings Calendar
     @property
     def finnhub_api_key(self) -> str:

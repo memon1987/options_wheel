@@ -186,6 +186,21 @@ monitoring:
   max_execution_time_minutes: 5  # Cloud Run timeout consideration
   enable_performance_metrics: true
   
+# Call Rolling (Friday EOW) — FC-006
+rolling:
+  enabled: false                        # Enable with true after paper testing
+  trigger_time_et: "15:00"
+  max_current_dte: 1
+  itm_trigger_ratio: 0.98
+  max_debit_pct_of_premium: 0.25        # 25% of original premium collected
+  max_debit_pct_of_notional: 0.005      # 0.5% of notional exposure
+  max_rolls_per_position: 2
+  earnings_blackout_days: 2
+  btc_limit_over_ask_pct: 0.05
+  stc_limit_under_bid_pct: 0.05         # symmetric with BTC aggression
+  btc_fill_timeout_seconds: 120
+  fallback_strike_attempts: 2
+
 # Earnings Calendar (Finnhub)
 earnings:
   enabled: true
