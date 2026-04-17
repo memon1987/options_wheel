@@ -395,6 +395,11 @@ class Config:
         return self._config["risk"]["profit_taking"]["max_profit_target"]
 
     @property
+    def profit_taking_min_hold_hours(self) -> int:
+        """Minimum hours to hold before profit-target evaluation."""
+        return self._config.get("risk", {}).get("profit_taking", {}).get("min_hold_hours", 4)
+
+    @property
     def profit_taking_default_long_dte(self) -> float:
         """Default profit target for DTE > 7."""
         return self._config["risk"]["profit_taking"]["default_long_dte_target"]
