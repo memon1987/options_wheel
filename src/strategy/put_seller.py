@@ -15,10 +15,10 @@ logger = structlog.get_logger(__name__)
 
 class PutSeller:
     """Handles cash-secured put selling for the wheel strategy."""
-    
+
     def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager, config: Config):
         """Initialize put seller.
-        
+
         Args:
             alpaca_client: Alpaca API client
             market_data: Market data manager
@@ -27,6 +27,7 @@ class PutSeller:
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
+        self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
         
     def find_put_opportunity(self, symbol: str, wheel_state_manager=None) -> Optional[Dict[str, Any]]:
         """Find the best put selling opportunity for a stock.
@@ -373,6 +374,9 @@ class PutSeller:
                     dte=opportunity.get('dte', 0)
                 )
 
+                # Track entry time for hold period (min_hold_hours)
+                self._entry_times[option_symbol] = datetime.now()
+
                 return result
 
             else:
@@ -532,12 +536,20 @@ class PutSeller:
             unrealized_pl = float(put_position['unrealized_pl'])
             position_value = abs(float(put_position['market_value']))
 
+            option_symbol = put_position['symbol']
+
             # Profit target: Dynamic based on DTE (theta-optimized)
             if unrealized_pl > 0 and position_value > 0:
+                # Hold period check: skip profit-target if position too new
+                entry_time = self._entry_times.get(option_symbol)
+                if entry_time:
+                    hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+                    if hours_held < self.config.profit_taking_min_hold_hours:
+                        return False
+
                 profit_percentage = unrealized_pl / position_value
 
                 # Get dynamic profit target based on DTE
-                option_symbol = put_position['symbol']
                 dte = self._parse_dte_from_option_symbol(option_symbol)
                 profit_target = self._get_profit_target_for_dte(dte)
 

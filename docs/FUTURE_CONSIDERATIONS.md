@@ -168,6 +168,46 @@ None — all resolved during review.
 
 ---
 
+### FC-008: Stop-loss events mislabeled as profit_target_reached
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** Multiple early close events in BQ show -75% to -81% P/L but are logged with `event_type=early_close_executed` and `reason=profit_target_reached`. These are clearly stop-loss triggers (config: 50% loss × 1.5 multiplier = 75% threshold) being logged under the wrong event type. This corrupts BQ analytics — any query filtering on `profit_target_reached` includes large losses.
+
+Affected positions (Apr 8-15): IWM call (-$927), GOOGL call (-$2,095), AMD call (-$970), AMZN call (-$904).
+
+**Open questions:**
+- Root cause: does `should_close_call_early()` return True for both profit targets and stop losses without distinguishing?
+- Should the return type change from `bool` to `Tuple[bool, str]` (close, reason)?
+- Does the monitor endpoint need to propagate the reason to logging?
+
+**Links:** BQ query: `SELECT * FROM trades WHERE event_type = 'early_close_executed' AND profit_pct < 0`
+
+---
+
+### FC-009: Duplicate early_close_executed logging
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** The bot logs `early_close_executed` multiple times (4-10 duplicates) for the same position when the close order doesn't fill. The `_closed_today` dedup set in `cloud_run_server.py` is in-memory and resets on Cloud Run cold starts. Each monitor invocation on a fresh instance retries the close and logs "executed" again.
+
+Affected positions: NVDA260410P00167500 (6 duplicates on Apr 3), NVDA260415P00165000 (~10 duplicates Apr 8-9), GOOGL260415C00312500 (~8 duplicates Apr 14).
+
+**Open questions:**
+- Should the dedup set be persisted to GCS (alongside wheel state)?
+- Or should the bot check Alpaca order history for pending close orders before placing a new one?
+- Does the duplicate logging cause duplicate orders, or just duplicate log entries?
+
+**Links:** BQ query: `SELECT symbol, DATE(timestamp), COUNT(*) FROM trades WHERE event_type = 'early_close_executed' GROUP BY 1, 2 HAVING COUNT(*) > 1`
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._

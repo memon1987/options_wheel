@@ -29,6 +29,7 @@ class CallSeller:
         self.market_data = market_data
         self.config = config
         self.wheel_state = wheel_state_manager
+        self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
         
     def evaluate_covered_call_opportunity(self, stock_position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Evaluate covered call opportunity for an assigned stock position.
@@ -295,6 +296,9 @@ class CallSeller:
                             sell_date=datetime.now().strftime('%Y-%m-%d'),
                         )
 
+                # Track entry time for hold period (min_hold_hours)
+                self._entry_times[option_symbol] = datetime.now()
+
                 return result
             else:
                 # Order failed - return structured error
@@ -545,12 +549,20 @@ class CallSeller:
             unrealized_pl = float(call_position['unrealized_pl'])
             position_value = abs(float(call_position['market_value']))
 
+            option_symbol = call_position['symbol']
+
             # Profit target: Dynamic based on DTE (theta-optimized)
             if unrealized_pl > 0 and position_value > 0:
+                # Hold period check: skip profit-target if position too new
+                entry_time = self._entry_times.get(option_symbol)
+                if entry_time:
+                    hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+                    if hours_held < self.config.profit_taking_min_hold_hours:
+                        return False
+
                 profit_percentage = unrealized_pl / position_value
 
                 # Get dynamic profit target based on DTE
-                option_symbol = call_position['symbol']
                 dte = self._parse_dte_from_option_symbol(option_symbol)
                 profit_target = self._get_profit_target_for_dte(dte)
 

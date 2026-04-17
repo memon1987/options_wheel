@@ -73,22 +73,26 @@ risk:
 
     # DTE-based profit target bands (optimized for 7 DTE options)
     # EASILY TUNABLE - just edit these percentages and redeploy
+    # Minimum hours to hold a position before profit-target evaluation kicks in.
+    # Prevents quick closes on lucky overnight moves. Stop-loss still fires immediately.
+    min_hold_hours: 4
+
     dte_bands:
       - dte: 7
-        profit_target: 0.20
-        description: "Day 0: Just opened, 3% daily theta (slow decay)"
+        profit_target: 0.35
+        description: "Day 0: Just opened — raised from 0.20 to reduce day-1 churn"
 
       - dte: 6
-        profit_target: 0.25
-        description: "Day 1: 5% daily theta (still slow, exit if profitable)"
+        profit_target: 0.40
+        description: "Day 1: Raised from 0.25 — overnight moves shouldn't trigger close"
 
       - dte: 5
-        profit_target: 0.30
-        description: "Day 2: 6% daily theta (moderate decay)"
+        profit_target: 0.35
+        description: "Day 2: Raised from 0.30 — moderate decay, let theta work"
 
       - dte: 4
-        profit_target: 0.40
-        description: "Day 3: 8% daily theta (acceleration begins)"
+        profit_target: 0.45
+        description: "Day 3: Raised from 0.40 — acceleration beginning"
 
       - dte: 3
         profit_target: 0.50
