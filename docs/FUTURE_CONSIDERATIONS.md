@@ -208,6 +208,25 @@ Affected positions: NVDA260410P00167500 (6 duplicates on Apr 3), NVDA260415P0016
 
 ---
 
+### FC-010: Disable call stop-losses (assignment is profitable by design)
+
+**Status:** Done
+**Size estimate:** S
+**Owner:** Claude
+**Plan file:** N/A (config-only, single-line change)
+
+**Problem / opportunity:** Call stop-losses cost $20,391 in the last 60 days while all profitable closes combined earned only $5,882 — a net loss of $14,509 from the stop-loss mechanism alone. When a covered call goes deep ITM, the stop-loss pays real cash ($900-$2,095 per event) to buy back the call. But assignment on a covered call is a profitable exit by construction (strike is always above cost basis due to the cost-basis protection filter). The "loss" from assignment is foregone upside — opportunity cost, not cash loss.
+
+With FC-006 (rolling engine) live, the "stock rallied through my strike" scenario is handled by economics-aware rolling on Fridays, making the panic-buyback stop-loss redundant and harmful.
+
+**Change:** `config/settings.yaml`: `use_call_stop_loss: true` → `use_call_stop_loss: false`
+
+**Data:** 65 profit closes (+$5,882 total, avg +$90.50) vs 13 stop-loss closes (-$20,391 total, avg -$1,568.54). GOOGL260415C00312500 alone triggered 10 duplicate stop-loss events losing $17,590 on a position that collected $493.50 premium.
+
+**Links:** PR #7
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
