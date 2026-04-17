@@ -58,7 +58,7 @@ risk:
   
   # Stop loss settings (separate controls for puts vs calls)
   use_put_stop_loss: false        # Take assignment instead of stopping out puts
-  use_call_stop_loss: true        # Still protect covered calls from adverse moves
+  use_call_stop_loss: false       # Disabled (FC-010): assignment is profitable by design, FC-006 handles rolling
   put_stop_loss_percent: 0.50     # Put stop loss threshold (ignored if disabled)
   call_stop_loss_percent: 0.50    # Call stop loss threshold
   stop_loss_multiplier: 1.5       # Multiplier for short-term options (accounts for time decay)
