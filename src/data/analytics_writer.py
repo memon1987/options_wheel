@@ -5,13 +5,18 @@ writes to purpose-built, time-partitioned tables.  Each table has a
 code-defined schema — no auto-detection, no wildcard query conflicts.
 
 Manages these tables in the ``options_wheel`` dataset:
-  - trades        (expanded from TradeJournal)
-  - errors        (replaces errors_all log-sink view)
-  - executions    (replaces execution_cycle_results + daily_operations_summary)
-  - scans         (replaces filtering_stage_summary)
-  - wheel_cycles  (replaces wheel_cycles log-sink view)
-  - position_snapshots (new — portfolio value history)
-  - order_statuses     (new — fill price tracking)
+  - errors        (error events)
+  - executions    (endpoint run summaries)
+  - wheel_cycles  (completed wheel cycles — dashboard now reads from
+                   wheel_cycles_from_activities view; this remains as
+                   a secondary audit)
+  - order_statuses (fill price tracking — dashboard reads from
+                    trades_with_outcomes; this remains as audit)
+
+Post-FC-012 (2026-04-24) removals:
+  - write_scan_result / write_scan_results_batch (never called)
+  - write_position_snapshot / write_position_snapshots_batch (migrated
+    to equity_history_from_alpaca; per-symbol snapshots dropped)
 
 Design principles:
   - Graceful no-op if BigQuery is unavailable
@@ -69,19 +74,8 @@ if _HAS_BIGQUERY:
             bigquery.SchemaField("portfolio_value", "FLOAT"),
             bigquery.SchemaField("request_id", "STRING"),
         ],
-        "scans": [
-            bigquery.SchemaField("timestamp", "TIMESTAMP"),
-            bigquery.SchemaField("symbol", "STRING"),
-            bigquery.SchemaField("stage", "STRING", description="stage_1, stage_2, ..., stage_8"),
-            bigquery.SchemaField("result", "STRING", description="passed, blocked, not_found"),
-            bigquery.SchemaField("reason", "STRING"),
-            bigquery.SchemaField("premium", "FLOAT"),
-            bigquery.SchemaField("delta", "FLOAT"),
-            bigquery.SchemaField("dte", "INTEGER"),
-            bigquery.SchemaField("strike_price", "FLOAT"),
-            bigquery.SchemaField("current_price", "FLOAT"),
-            bigquery.SchemaField("scan_id", "STRING"),
-        ],
+        # scans table: populated by the Cloud Logging sink (filtering events).
+        # AnalyticsWriter never wrote it — dead schema + methods removed in FC-012.
         "wheel_cycles": [
             bigquery.SchemaField("timestamp", "TIMESTAMP"),
             bigquery.SchemaField("symbol", "STRING"),
@@ -98,21 +92,9 @@ if _HAS_BIGQUERY:
             bigquery.SchemaField("duration_days", "INTEGER"),
             bigquery.SchemaField("shares", "INTEGER"),
         ],
-        "position_snapshots": [
-            bigquery.SchemaField("timestamp", "TIMESTAMP"),
-            bigquery.SchemaField("date", "DATE"),
-            bigquery.SchemaField("symbol", "STRING"),
-            bigquery.SchemaField("asset_class", "STRING", description="us_equity, us_option, account"),
-            bigquery.SchemaField("shares", "INTEGER"),
-            bigquery.SchemaField("contracts", "INTEGER"),
-            bigquery.SchemaField("cost_basis", "FLOAT"),
-            bigquery.SchemaField("market_value", "FLOAT"),
-            bigquery.SchemaField("unrealized_pnl", "FLOAT"),
-            bigquery.SchemaField("current_price", "FLOAT"),
-            bigquery.SchemaField("portfolio_value", "FLOAT"),
-            bigquery.SchemaField("cash", "FLOAT"),
-            bigquery.SchemaField("buying_power", "FLOAT"),
-        ],
+        # position_snapshots: removed in FC-012. PORTFOLIO rows migrated to
+        # equity_history_from_alpaca; non-PORTFOLIO rows dropped entirely
+        # (frontend never consumed /metrics/stock-snapshots).
         "order_statuses": [
             bigquery.SchemaField("timestamp", "TIMESTAMP"),
             bigquery.SchemaField("order_id", "STRING"),
@@ -280,29 +262,6 @@ class AnalyticsWriter:
             "request_id": request_id,
         })
 
-    def write_scan_result(self, *, symbol: str, stage: str,
-                          result: str, reason: str = "",
-                          premium: float = 0, delta: float = 0,
-                          dte: int = 0, strike_price: float = 0,
-                          current_price: float = 0,
-                          scan_id: str = "", **extra) -> None:
-        self._write("scans", {
-            "symbol": symbol,
-            "stage": stage,
-            "result": result,
-            "reason": reason,
-            "premium": premium,
-            "delta": delta,
-            "dte": dte,
-            "strike_price": strike_price,
-            "current_price": current_price,
-            "scan_id": scan_id,
-        })
-
-    def write_scan_results_batch(self, rows: List[dict]) -> None:
-        """Write a batch of scan results (e.g., all stages for one scan cycle)."""
-        self._write_batch("scans", rows)
-
     def write_wheel_cycle(self, *, symbol: str, put_date: str = "",
                           put_strike: float = 0, put_premium: float = 0,
                           assignment_date: str = "", call_date: str = "",
@@ -325,35 +284,6 @@ class AnalyticsWriter:
             "duration_days": duration_days,
             "shares": shares,
         })
-
-    def write_position_snapshot(self, *, date: str, symbol: str,
-                                 asset_class: str = "account",
-                                 shares: int = 0, contracts: int = 0,
-                                 cost_basis: float = 0,
-                                 market_value: float = 0,
-                                 unrealized_pnl: float = 0,
-                                 current_price: float = 0,
-                                 portfolio_value: float = 0,
-                                 cash: float = 0,
-                                 buying_power: float = 0, **extra) -> None:
-        self._write("position_snapshots", {
-            "date": date,
-            "symbol": symbol,
-            "asset_class": asset_class,
-            "shares": shares,
-            "contracts": contracts,
-            "cost_basis": cost_basis,
-            "market_value": market_value,
-            "unrealized_pnl": unrealized_pnl,
-            "current_price": current_price,
-            "portfolio_value": portfolio_value,
-            "cash": cash,
-            "buying_power": buying_power,
-        })
-
-    def write_position_snapshots_batch(self, rows: List[dict]) -> None:
-        """Write a batch of position snapshots (e.g., all positions at once)."""
-        self._write_batch("position_snapshots", rows)
 
     def write_order_status(self, *, order_id: str, symbol: str,
                            status: str, side: str = "",
