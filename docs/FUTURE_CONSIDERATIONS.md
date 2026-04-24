@@ -133,37 +133,47 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 
 ---
 
-### FC-009: Duplicate early_close_executed logging (narrowed 2026-04-24 post-FC-012)
+### FC-009: Duplicate early_close_executed (revised 2026-04-24 post-FC-012)
 
-**Status:** Consideration (scope narrowed)
-**Size estimate:** S
+**Status:** Consideration (scope clarified, not narrowed)
+**Size estimate:** M
 **Owner:** unassigned
 **Plan file:** not yet
 
-**Original problem:** The bot logs `early_close_executed` multiple times (4-10 duplicates) for the same position when the close order doesn't fill. The `_closed_today` dedup set in `cloud_run_server.py` is in-memory and resets on Cloud Run cold starts.
+**Original problem:** The bot logs `early_close_executed` multiple times (4-10 duplicates) for the same position when the close order doesn't fill quickly. The `_closed_today` dedup set in `cloud_run_server.py` is in-memory and resets on Cloud Run cold starts. Each monitor invocation on a fresh instance re-evaluates the position, finds it still meets the close criteria, and places another close order.
 
-**What FC-012 changed:** the dashboard no longer reads from `options_wheel.trades` (the structlog-populated table where the duplicate rows landed). It reads `trades_with_outcomes`, which projects over `trades_from_activities` — Alpaca-sourced, deduped on `activity_id`. Duplicate structlog events no longer corrupt dashboard numbers.
+**What FC-012 changed:** the dashboard no longer reads from the structlog-sourced `options_wheel.trades` table. Dashboard counts are from `trades_with_outcomes` (Alpaca FILLs, deduped on `activity_id`). So duplicate log entries no longer corrupt dashboard numbers. **But the bug is about duplicate *orders*, not logs — the dashboard migration doesn't fix the underlying mechanism.**
 
-**Remaining scope:** one open question from the original FC is still unanswered:
+**What FC-010 did NOT change:** FC-010 only disabled the call **stop-loss** branch. Call profit-target early-closes and put profit-target early-closes still flow through the same shared code path (`deploy/cloud_run_server.py:694-776`) with the same in-memory dedup. FC-010 reduced the *frequency* of vulnerable events but not the *mechanism*.
 
-> Does the duplicate logging cause duplicate *orders*, or just duplicate *log entries*?
+**Paths currently exposed to the bug:**
+- Put profit-target early-closes (never touched by prior fixes)
+- Call profit-target early-closes (stop-loss portion was silenced by FC-010, profit-target portion unchanged)
 
-If only log entries, this FC is fully superseded — close without work. If real duplicate orders, FC-010 already reduces the blast radius (call stop-loss early-closes disabled, so the main offender is gone), but put early-closes use the same path and could still double-fire.
+**Why duplicate orders can actually happen:**
+1. Monitor fires → `should_close_*_early()` returns True → check `_closed_today` (empty on cold start) → place buy-to-close order → add symbol to `_closed_today`.
+2. Before the order fills, Cloud Run scales to zero.
+3. Next monitor fires on a new instance → `_closed_today` is empty again → position still exists at Alpaca (short option) → `should_close_*_early()` still returns True (position still meets profit-target threshold based on mark) → second close order placed.
+4. Both orders sit in Alpaca's queue. Depending on timing, one or both may fill.
 
-**Action needed:** verification only — check Alpaca order history for the affected dates (e.g., NVDA260415P00165000 on Apr 8-9) and count distinct `buy_to_close` orders vs. the number of `early_close_executed` log entries for that symbol. Could be done via a single BQ query now that `trades_from_activities` has the real fill stream:
+**Remaining work:**
+1. **Verify** via BQ query against `trades_from_activities`:
+   ```sql
+   SELECT symbol, COUNT(*) AS close_fills, COUNT(DISTINCT order_id) AS close_orders
+   FROM `options_wheel.trades_from_activities`
+   WHERE side = 'buy_to_close'
+     AND transaction_time >= '2026-04-01'
+   GROUP BY symbol
+   HAVING COUNT(DISTINCT order_id) > 1
+   ```
+   If the query returns rows where `close_orders > 1` on the same symbol on the same day → real duplicate orders confirmed.
+2. **Fix** the dedup so it survives cold starts. Two viable options:
+   - Persist `_closed_today` to GCS alongside the existing wheel state.
+   - Before placing a close order, check Alpaca for open buy-to-close orders on the same option symbol. Skip if one is already pending.
 
-```sql
-SELECT symbol, COUNT(DISTINCT order_id) AS real_close_orders
-FROM `options_wheel.trades_from_activities`
-WHERE side = 'buy_to_close'
-  AND symbol = 'NVDA260415P00165000'
-  AND DATE(transaction_time, 'America/New_York') BETWEEN '2026-04-08' AND '2026-04-09'
-GROUP BY symbol
-```
+The second option is more robust — it handles the "Cloud Run instance crashed mid-cycle" case that even GCS persistence wouldn't catch cleanly. Small M-sized change.
 
-If `real_close_orders = 1`, the duplicates were log-only → close FC-009. Otherwise keep open with narrowed scope (fix the dedup, not the logging).
-
-**Links:** BQ query above; FC-010, FC-012.
+**Links:** FC-010, FC-012. Relevant code: `deploy/cloud_run_server.py:694-776`, `src/strategy/put_seller.py:523` (`should_close_put_early`), `src/strategy/call_seller.py:536` (`should_close_call_early`).
 
 ---
 
