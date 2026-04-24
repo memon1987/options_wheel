@@ -227,6 +227,31 @@ With FC-006 (rolling engine) live, the "stock rallied through my strike" scenari
 
 ---
 
+### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
+
+**Status:** Consideration
+**Size estimate:** L
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** Some high-volume symbols (e.g., GOOGL, AMZN, SPY, QQQ) now have options expiring every trading day, not just Fridays. The current system assumes Friday-only expirations in multiple places:
+
+1. **FC-006 rolling engine** — hardcoded Friday guard (`weekday()==4`) in both the `/roll` endpoint and Cloud Scheduler (`30 15 * * 5`). Positions expiring on a Wednesday won't be evaluated for rolling.
+2. **DTE bands** — the 7→0 bands assume a Monday-sell, Friday-expire cadence. A position sold Monday with a Wednesday expiry has DTE=2 at open, hitting different (later) bands than intended.
+3. **`call_target_dte: 7` / `put_target_dte: 7`** — assumes next-Friday expiry. With daily expirations available, shorter DTE targets (2-3 days) become viable, potentially improving theta capture per calendar day.
+4. **Strike selection** — `find_suitable_calls/puts` filters by `dte <= target_dte` which works, but may miss better opportunities at non-Friday expirations.
+
+**Open questions:**
+- Which symbols in our universe have daily expirations vs Friday-only? Need to audit Alpaca's option chain data.
+- Should the rolling engine run daily (not just Fridays) for symbols with daily expirations?
+- Do DTE bands need to be reparameterized for shorter-DTE strategies (see FC-003)?
+- Should we support mixed strategies — daily expirations for some symbols, weekly for others?
+- How does this interact with FC-003 (DTE target optimization from 7 to 2-3)?
+
+**Links:** FC-003 (DTE target optimization), FC-006 (rolling engine)
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
