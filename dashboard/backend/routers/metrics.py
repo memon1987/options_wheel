@@ -172,20 +172,3 @@ async def get_premium_by_day(
     """
     bq = get_bigquery_service()
     return bq.get_premium_by_day(days=days)
-
-
-@router.get("/stock-snapshots")
-async def get_stock_snapshots(
-    days: int = Query(default=30, ge=1, le=365, description="Days of history")
-) -> List[Dict[str, Any]]:
-    """
-    Get daily unrealized P&L snapshots for stock holdings.
-
-    Args:
-        days: Number of days of history (1-365)
-
-    Returns:
-        List of daily stock snapshot data with unrealized P&L.
-    """
-    bq = get_bigquery_service()
-    return bq.get_daily_stock_snapshots(days=days)

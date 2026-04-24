@@ -432,36 +432,12 @@ def trigger_strategy():
             account_info = alpaca_client.get_account()
             available_buying_power = float(account_info.get('options_buying_power') or account_info['buying_power'])
 
-            # Snapshot all positions for portfolio history (analytics)
-            try:
-                from src.data.analytics_writer import get_analytics_writer
-                analytics = get_analytics_writer()
-                all_positions = alpaca_client.get_positions()
-                date_str = datetime.now().strftime('%Y-%m-%d')
-
-                # Account-level snapshot
-                analytics.write_position_snapshot(
-                    date=date_str,
-                    symbol="PORTFOLIO",
-                    asset_class="account",
-                    portfolio_value=float(account_info.get('portfolio_value', 0)),
-                    cash=float(account_info.get('cash', 0)),
-                    buying_power=float(account_info.get('buying_power', 0)),
-                )
-
-                # Per-position snapshots
-                for pos in all_positions:
-                    analytics.write_position_snapshot(
-                        date=date_str,
-                        symbol=pos.get('symbol'),
-                        asset_class=pos.get('asset_class'),
-                        shares=int(float(pos.get('qty', 0))),
-                        cost_basis=float(pos.get('cost_basis', 0)),
-                        market_value=float(pos.get('market_value', 0)),
-                        unrealized_pnl=float(pos.get('unrealized_pl', 0)),
-                    )
-            except Exception:
-                logger.debug("Analytics position snapshot failed", exc_info=True)
+            # Portfolio equity history is now sourced from Alpaca's
+            # /v2/account/portfolio/history endpoint via the daily
+            # /ingest-portfolio-history scheduler (FC-012 Phase 2.5).
+            # Per-symbol snapshots were dropped entirely — frontend does
+            # not consume them and realized P&L is covered by the Alpaca
+            # activities view.
             logger.info("Starting execution with buying power",
                        event_category="system",
                        event_type="execution_buying_power_check",
@@ -1136,6 +1112,56 @@ def ingest_activities():
         logger.error("Activities ingest failed",
                     event_category="error",
                     event_type="ingest_activities_failed",
+                    error=str(e),
+                    exc_info=True)
+        return jsonify({
+            'status': 'failed',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat(),
+        }), 500
+
+@app.route('/ingest-portfolio-history', methods=['POST'])
+@require_api_key
+def ingest_portfolio_history():
+    """Pull Alpaca portfolio/history and append finalized days to BigQuery (FC-012 §2.5).
+
+    Idempotent, append-only. Designed to run once per day (EOD + 30 min).
+    """
+    logger.info("Endpoint called",
+                event_category="system",
+                event_type="ingest_portfolio_history_endpoint",
+                endpoint="/ingest-portfolio-history")
+
+    try:
+        from src.api.alpaca_client import AlpacaClient
+        from src.data.portfolio_history_ingestor import PortfolioHistoryIngestor
+
+        config = Config()
+        alpaca_client = AlpacaClient(config)
+        ingestor = PortfolioHistoryIngestor(alpaca_client)
+
+        if not ingestor.enabled:
+            return jsonify({
+                'status': 'disabled',
+                'reason': 'PortfolioHistoryIngestor not enabled',
+                'timestamp': datetime.now().isoformat(),
+            }), 503
+
+        period = request.args.get('period', '1M')
+        result = ingestor.run_once(period=period)
+        result['timestamp'] = datetime.now().isoformat()
+
+        status = result.get('status')
+        if status in ('ok', 'disabled', 'partial'):
+            http_status = 200
+        else:
+            http_status = 500
+        return jsonify(result), http_status
+
+    except Exception as e:
+        logger.error("Portfolio history ingest failed",
+                    event_category="error",
+                    event_type="ingest_portfolio_history_failed",
                     error=str(e),
                     exc_info=True)
         return jsonify({

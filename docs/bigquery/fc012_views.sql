@@ -107,3 +107,133 @@ SELECT
   END AS outcome_price
 FROM paired
 WHERE rn = 1 OR rn IS NULL;
+
+
+-- ================================================================
+-- wheel_cycles_from_activities (Phase 2.6)
+-- ================================================================
+--
+-- Reconstructs wheel cycles from the raw activities stream. A cycle is
+-- defined as: short put sold -> stock assigned via OPASN -> short call
+-- sold on the assigned stock -> call assigned (called_away) OR call
+-- expired worthless OR call bought to close.
+--
+-- We only emit rows for cycles where the PUT side has been assigned
+-- (i.e., stock was acquired). Cycles that expire without assignment do
+-- not appear here — those are visible in ``trades_with_outcomes`` as
+-- ``outcome='expiration'`` with no stock leg.
+
+CREATE OR REPLACE VIEW `options_wheel.wheel_cycles_from_activities` AS
+WITH
+-- All put FILLs that were assigned (via matching OPASN on same symbol).
+-- Upstream view exposes close_* columns; the close-side for an assignment
+-- is the OPASN activity itself.
+assigned_puts AS (
+  SELECT
+    activity_id             AS put_activity_id,
+    transaction_time        AS put_transaction_time,
+    activity_date           AS put_activity_date,
+    underlying,
+    strike_price            AS put_strike,
+    premium_total           AS put_premium,
+    qty                     AS put_qty,
+    close_transaction_time  AS put_assignment_time,
+    close_activity_id       AS opasn_activity_id
+  FROM `options_wheel.trades_with_outcomes`
+  WHERE option_type = 'put'
+    AND outcome = 'assignment'
+),
+-- All call FILLs on assigned underlyings, with their outcome.
+covered_calls AS (
+  SELECT
+    activity_id             AS call_activity_id,
+    transaction_time        AS call_transaction_time,
+    activity_date           AS call_activity_date,
+    underlying,
+    strike_price            AS call_strike,
+    premium_total           AS call_premium,
+    qty                     AS call_qty,
+    outcome                 AS call_outcome,
+    close_transaction_time  AS call_outcome_time,
+    outcome_price           AS call_outcome_price
+  FROM `options_wheel.trades_with_outcomes`
+  WHERE option_type = 'call'
+),
+-- Pair each assigned put to the NEXT covered call on same underlying.
+paired AS (
+  SELECT
+    p.*,
+    c.call_activity_id,
+    c.call_transaction_time,
+    c.call_activity_date,
+    c.call_strike,
+    c.call_premium,
+    c.call_qty,
+    c.call_outcome,
+    c.call_outcome_time,
+    c.call_outcome_price,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.put_activity_id
+      ORDER BY c.call_transaction_time ASC
+    ) AS rn
+  FROM assigned_puts p
+  LEFT JOIN covered_calls c
+    ON c.underlying = p.underlying
+    AND c.call_transaction_time > p.put_assignment_time
+)
+SELECT
+  -- Identity
+  put_activity_id,
+  opasn_activity_id,
+  call_activity_id,
+  underlying,
+  put_transaction_time,
+  put_assignment_time,
+  call_transaction_time,
+  call_outcome_time,
+  -- Put side
+  DATE(put_transaction_time, 'America/New_York')  AS put_date,
+  put_strike,
+  put_premium,
+  put_qty,
+  DATE(put_assignment_time, 'America/New_York')   AS assignment_date,
+  -- Call side
+  DATE(call_transaction_time, 'America/New_York') AS call_date,
+  call_strike,
+  call_premium,
+  call_qty,
+  call_outcome,
+  DATE(call_outcome_time, 'America/New_York')     AS call_outcome_date,
+  -- Matched quantity: the number of contracts the put/call pair covers.
+  -- If a call was sold for fewer contracts than the put provides collateral
+  -- for, capital_gain / total_return apply only to the matched subset.
+  LEAST(ABS(COALESCE(put_qty, 0)), ABS(COALESCE(call_qty, 0))) AS matched_contracts,
+  -- Computed metrics
+  COALESCE(put_premium, 0) + COALESCE(call_premium, 0) AS total_premium,
+  CASE
+    WHEN call_strike IS NOT NULL AND put_strike IS NOT NULL THEN
+      (call_strike - put_strike) * 100
+        * LEAST(ABS(COALESCE(put_qty, 0)), ABS(COALESCE(call_qty, 0)))
+  END AS capital_gain,
+  CASE
+    WHEN put_strike IS NOT NULL AND put_strike > 0 AND put_qty IS NOT NULL THEN
+      SAFE_DIVIDE(
+        COALESCE(put_premium, 0) + COALESCE(call_premium, 0)
+          + CASE
+              WHEN call_strike IS NOT NULL THEN
+                (call_strike - put_strike) * 100
+                  * LEAST(ABS(put_qty), ABS(COALESCE(call_qty, 0)))
+              ELSE 0
+            END,
+        put_strike * 100 * ABS(put_qty)
+      )
+  END AS total_return,
+  DATE_DIFF(
+    DATE(COALESCE(call_outcome_time, call_transaction_time, put_assignment_time),
+         'America/New_York'),
+    DATE(put_assignment_time, 'America/New_York'),
+    DAY
+  ) AS duration_days,
+  CAST(ABS(COALESCE(put_qty, 0)) * 100 AS INT64) AS shares
+FROM paired
+WHERE rn = 1 OR rn IS NULL;
