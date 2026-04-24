@@ -200,10 +200,10 @@ Affected positions: NVDA260410P00167500 (6 duplicates on Apr 3), NVDA260415P0016
 
 ### FC-012: Shift dashboard logging to Alpaca queries wherever authoritative (+ historical backfill)
 
-**Status:** Consideration
+**Status:** Plan published
 **Size estimate:** L
-**Owner:** unassigned
-**Plan file:** not yet
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-012.md`
 
 **Problem / opportunity:** Dashboard data today is produced at runtime by the bot via two paths: (1) structlog → Cloud Logging → BigQuery sink into `options_wheel.trades`, and (2) direct inserts through `AnalyticsWriter` (`src/data/analytics_writer.py`). Runtime-generated data ties dashboard correctness to bot uptime and to our own event schemas staying in sync. If the bot crashes after a fill but before the event emits, the dashboard is blind. Every new strategy change risks a log-schema change that has to propagate through the pipeline.
 
