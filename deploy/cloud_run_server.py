@@ -1090,6 +1090,60 @@ def get_config():
                     error=str(e))
         return jsonify({'error': f"Config retrieval failed: {str(e)}"}), 500
 
+@app.route('/ingest-activities', methods=['POST'])
+@require_api_key
+def ingest_activities():
+    """Pull Alpaca account activities and append to BigQuery (FC-012 §2.1).
+
+    Triggered by Cloud Scheduler (15 min market hours, hourly off-hours).
+    Append-only; idempotent by activity_id. Safe to call repeatedly.
+    """
+    logger.info("Endpoint called",
+                event_category="system",
+                event_type="ingest_activities_endpoint",
+                endpoint="/ingest-activities")
+
+    try:
+        from src.api.alpaca_client import AlpacaClient
+        from src.data.activities_ingestor import ActivitiesIngestor
+
+        config = Config()
+        alpaca_client = AlpacaClient(config)
+        ingestor = ActivitiesIngestor(alpaca_client)
+
+        if not ingestor.enabled:
+            return jsonify({
+                'status': 'disabled',
+                'reason': 'ActivitiesIngestor not enabled (check GCP_PROJECT env var and BQ access)',
+                'timestamp': datetime.now().isoformat(),
+            }), 503
+
+        result = ingestor.run_once()
+        result['timestamp'] = datetime.now().isoformat()
+
+        # Map ingest status to HTTP. 'ok' and 'partial' return 200 so the
+        # Cloud Scheduler does not storm-retry for per-row BQ insert errors
+        # that a retry would not fix. 'failed' (pull or full insert failure)
+        # returns 500 so the scheduler backs off and the failure is visible.
+        status = result.get('status')
+        if status in ('ok', 'disabled', 'partial'):
+            http_status = 200
+        else:
+            http_status = 500
+        return jsonify(result), http_status
+
+    except Exception as e:
+        logger.error("Activities ingest failed",
+                    event_category="error",
+                    event_type="ingest_activities_failed",
+                    error=str(e),
+                    exc_info=True)
+        return jsonify({
+            'status': 'failed',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat(),
+        }), 500
+
 @app.route('/health')
 def detailed_health():
     """Detailed health check including dependencies."""

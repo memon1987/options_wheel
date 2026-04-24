@@ -705,7 +705,9 @@ class AlpacaClient:
             raise
 
     def get_account_activities(self, activity_types: str = 'OPASN,OPEXP',
-                               after: str = None, page_size: int = 100) -> List[Dict[str, Any]]:
+                               after: str = None, page_size: int = 100,
+                               page_token: str = None,
+                               direction: str = 'desc') -> List[Dict[str, Any]]:
         """Fetch account activities from Alpaca REST API.
 
         The Alpaca TradingClient SDK does not expose the activities endpoint,
@@ -715,6 +717,8 @@ class AlpacaClient:
             activity_types: Comma-separated activity types (OPASN, OPEXP, FILL, etc.)
             after: ISO date string to fetch activities after
             page_size: Number of results per page (max 100)
+            page_token: Pagination cursor (last activity ID from prior page)
+            direction: 'asc' or 'desc' (default 'desc')
 
         Returns:
             List of activity dicts with: activity_type, date, symbol, qty,
@@ -738,9 +742,12 @@ class AlpacaClient:
             params = {
                 'activity_types': activity_types,
                 'page_size': min(page_size, 100),
+                'direction': direction,
             }
             if after:
                 params['after'] = after
+            if page_token:
+                params['page_token'] = page_token
 
             response = requests.get(url, headers=headers, params=params, timeout=30)
             response.raise_for_status()
