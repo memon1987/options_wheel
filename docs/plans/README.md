@@ -24,5 +24,6 @@ Copy `_template.md` in this directory to start a new plan.
 
 _List active plans here as they are added._
 
-- [fc-006.md](fc-006.md) — FC-006: Covered call rolling engine, status: plan published
-- [fc-007.md](fc-007.md) — FC-007: Earnings calendar service, status: plan published
+- [fc-006.md](fc-006.md) — FC-006: Covered call rolling engine, status: done
+- [fc-007.md](fc-007.md) — FC-007: Earnings calendar service, status: done
+- [fc-010.md](fc-010.md) — FC-010: Disable call stop-losses, status: done

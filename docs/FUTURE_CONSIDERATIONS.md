@@ -213,7 +213,7 @@ Affected positions: NVDA260410P00167500 (6 duplicates on Apr 3), NVDA260415P0016
 **Status:** Done
 **Size estimate:** S
 **Owner:** Claude
-**Plan file:** N/A (config-only, single-line change)
+**Plan file:** `docs/plans/fc-010.md`
 
 **Problem / opportunity:** Call stop-losses cost $20,391 in the last 60 days while all profitable closes combined earned only $5,882 — a net loss of $14,509 from the stop-loss mechanism alone. When a covered call goes deep ITM, the stop-loss pays real cash ($900-$2,095 per event) to buy back the call. But assignment on a covered call is a profitable exit by construction (strike is always above cost basis due to the cost-basis protection filter). The "loss" from assignment is foregone upside — opportunity cost, not cash loss.
 
