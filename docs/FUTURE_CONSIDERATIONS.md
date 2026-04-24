@@ -198,6 +198,47 @@ Affected positions: NVDA260410P00167500 (6 duplicates on Apr 3), NVDA260415P0016
 
 ---
 
+### FC-012: Shift dashboard logging to Alpaca queries wherever authoritative (+ historical backfill)
+
+**Status:** Consideration
+**Size estimate:** L
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** Dashboard data today is produced at runtime by the bot via two paths: (1) structlog → Cloud Logging → BigQuery sink into `options_wheel.trades`, and (2) direct inserts through `AnalyticsWriter` (`src/data/analytics_writer.py`). Runtime-generated data ties dashboard correctness to bot uptime and to our own event schemas staying in sync. If the bot crashes after a fill but before the event emits, the dashboard is blind. Every new strategy change risks a log-schema change that has to propagate through the pipeline.
+
+Alpaca maintains authoritative records for a meaningful subset of what we log — executions, assignments, expirations, exercises, order history, portfolio/equity history, account activity. We already use `/v2/account/activities` for reconciliation in `src/api/alpaca_client.py`. Where Alpaca is authoritative, **querying Alpaca is preferable to logging our own events** — simpler, idempotent, survives bot crashes, backfillable from inception (pending retention validation).
+
+**Guiding principle — anchor of the eventual plan:** for any piece of dashboard data, prefer an Alpaca-sourced pull over a runtime-emitted event *when* Alpaca can reproduce it faithfully. Things Alpaca genuinely cannot cover stay on the structlog pipeline:
+- Scan decisions, filtered symbols, risk-manager rejections, gap-detector triggers
+- Strategy-context fields (earnings proximity, gap status, DTE-at-close, fill vs bid/ask spread)
+- Errors, circuit-breaker trips, execution timing, dedup/attempt counts
+- Anything describing *why* the bot chose to act or not act
+
+Everything else is fair game to migrate — including `AnalyticsWriter` tables, but not limited to them. Fill events, assignment events, expiration events, order-status transitions, position snapshots, and equity history are all candidates if an Alpaca endpoint covers them.
+
+**Plan requirement:** When this graduates to `docs/plans/fc-012.md`, the plan **must** begin with an extensive **current vs future state** audit: inventory every table and field the dashboard reads today (both `AnalyticsWriter` outputs and structlog-sourced tables), and map each to one of:
+- **(a)** Fully replaceable by an Alpaca endpoint (`/v2/account/activities`, `/v2/orders`, `/v2/account/portfolio/history`, `/v2/positions`, etc.) — migrate.
+- **(b)** Derivable from Alpaca data + light computation — migrate.
+- **(c)** Partially covered — document the gap and decide per-field whether to migrate-with-enrichment or leave on structlog.
+- **(d)** Not covered by Alpaca — stays on structlog pipeline, untouched.
+
+Only (a) and (b) migrate without caveat. (c) items require explicit per-field decisions in the plan. No field moves off the structlog pipeline without a documented Alpaca equivalent.
+
+**Open questions:**
+- Does Alpaca actually retain activity history from account inception? Docs don't specify — needs empirical test (`after=2020-01-01` against a long-running paper account) *before* the plan commits to "backfill to beginning of time."
+- Which endpoints beyond `/v2/account/activities` are worth auditing? `/v2/orders` (order history + status), `/v2/account/portfolio/history` (equity curves), `/v2/positions` (current holdings). Are there others?
+- Backfill strategy: drop-and-reload from Alpaca vs. incremental dedup against existing rows by `order_id` / activity ID? Risk of double-counting if keys don't align cleanly across the two sources.
+- Schema: new Alpaca-sourced tables alongside existing, or in-place rebuild? In-place is cleaner for dashboard queries but higher-risk during transition.
+- Polling cadence and rate-limit budget (200 req/min) once backfill pagination + ongoing pulls are both active.
+- Enrichment fields (earnings_proximity, gap status, DTE-at-close) currently attached at write-time — join at read-time from a separate enrichment table keyed by `order_id`, or drop them from the Alpaca-sourced rows?
+- Interaction with FC-008 (mislabeled stop-loss events) and FC-009 (duplicate close logging) — does sourcing executions from Alpaca sidestep these bugs, or do they remain on whatever structlog events still fire?
+- Migration order: start with the easiest Alpaca-covered slice (e.g., fills) to prove the pattern, then expand? Or all-at-once rebuild?
+
+**Links:** `src/api/alpaca_client.py` `get_account_activities()`, `src/utils/logging_events.py`, `src/data/analytics_writer.py`, `dashboard/backend/services/bigquery.py`. Alpaca docs: https://docs.alpaca.markets/reference/getaccountactivities
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
