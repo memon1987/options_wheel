@@ -37,7 +37,7 @@ For direct logger.info() calls (not using these functions):
     ❌ WRONG: logger.info("Some event", metric=123)
     ✅ CORRECT: logger.info("Some event", event_category="filtering", metric=123)
 
-See docs/LOGGING_GUIDELINES.md for complete guide.
+See docs/logging/GUIDELINES.md for complete guide.
 """
 
 import time

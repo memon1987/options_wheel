@@ -13,7 +13,7 @@ recreate_view() {
     echo "Creating view: $view_name..."
 
     # Extract the view definition from the SQL file and execute it
-    awk "/CREATE OR REPLACE VIEW.*${view_name}/,/;/" docs/bigquery_views.sql | \
+    awk "/CREATE OR REPLACE VIEW.*${view_name}/,/;/" docs/bigquery/views.sql | \
     sed 's/;$//' | \
     bq query --use_legacy_sql=false
 

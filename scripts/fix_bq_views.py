@@ -27,14 +27,14 @@ def fix_json_field_references(sql_content):
     return sql_content
 
 # Read the SQL file
-with open('/Users/zmemon/options_wheel-1/docs/bigquery_views.sql', 'r') as f:
+with open('/Users/zmemon/options_wheel-1/docs/bigquery/views.sql', 'r') as f:
     sql_content = f.read()
 
 # Fix the references
 fixed_sql = fix_json_field_references(sql_content)
 
 # Write back
-with open('/Users/zmemon/options_wheel-1/docs/bigquery_views.sql', 'w') as f:
+with open('/Users/zmemon/options_wheel-1/docs/bigquery/views.sql', 'w') as f:
     f.write(fixed_sql)
 
 print("Fixed all jsonPayload references to use JSON_VALUE()")

@@ -84,15 +84,17 @@ def roller(mock_alpaca, mock_market_data, rolling_config, mock_wheel_state,
 class TestShouldRoll:
 
     def test_eligible_when_all_gates_pass(self, roller):
-        call_pos = {'symbol': 'AMD260417C00100000', 'qty': '-1'}
+        # Use today's date to ensure DTE=0 (always eligible)
+        today = datetime.now().strftime('%y%m%d')
+        call_pos = {'symbol': f'AMD{today}C00100000', 'qty': '-1'}
         stock_pos = {'symbol': 'AMD', 'qty': '100', 'cost_basis': '9500'}
         should, reason = roller.should_roll(call_pos, stock_pos, 105.0)
         assert should is True
         assert reason == 'eligible'
 
     def test_blocked_dte_too_high(self, roller):
-        # DTE > 1 should fail
-        call_pos = {'symbol': 'AMD260424C00100000', 'qty': '-1'}
+        # DTE > 1 should fail — use far-future expiry to avoid date sensitivity
+        call_pos = {'symbol': 'AMD261231C00100000', 'qty': '-1'}
         stock_pos = {'symbol': 'AMD', 'qty': '100'}
         should, reason = roller.should_roll(call_pos, stock_pos, 105.0)
         assert should is False
@@ -100,7 +102,8 @@ class TestShouldRoll:
 
     def test_blocked_not_itm_enough(self, roller):
         # Stock at 95, strike at 100 => ratio 0.95 < 0.98
-        call_pos = {'symbol': 'AMD260417C00100000', 'qty': '-1'}
+        today = datetime.now().strftime('%y%m%d')
+        call_pos = {'symbol': f'AMD{today}C00100000', 'qty': '-1'}
         stock_pos = {'symbol': 'AMD', 'qty': '100'}
         should, reason = roller.should_roll(call_pos, stock_pos, 95.0)
         assert should is False
@@ -108,7 +111,8 @@ class TestShouldRoll:
 
     def test_blocked_max_rolls_reached(self, roller, mock_wheel_state):
         mock_wheel_state.get_roll_count.return_value = 2
-        call_pos = {'symbol': 'AMD260417C00100000', 'qty': '-1'}
+        today = datetime.now().strftime('%y%m%d')
+        call_pos = {'symbol': f'AMD{today}C00100000', 'qty': '-1'}
         stock_pos = {'symbol': 'AMD', 'qty': '100'}
         should, reason = roller.should_roll(call_pos, stock_pos, 105.0)
         assert should is False
@@ -116,7 +120,8 @@ class TestShouldRoll:
 
     def test_blocked_earnings_blackout(self, roller, mock_earnings):
         mock_earnings.is_earnings_within_n_days.return_value = True
-        call_pos = {'symbol': 'AMD260417C00100000', 'qty': '-1'}
+        today = datetime.now().strftime('%y%m%d')
+        call_pos = {'symbol': f'AMD{today}C00100000', 'qty': '-1'}
         stock_pos = {'symbol': 'AMD', 'qty': '100'}
         should, reason = roller.should_roll(call_pos, stock_pos, 105.0)
         assert should is False

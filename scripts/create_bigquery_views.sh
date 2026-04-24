@@ -8,7 +8,7 @@ set -e
 
 PROJECT_ID="gen-lang-client-0607444019"
 DATASET="options_wheel_logs"
-VIEWS_SQL="docs/bigquery_views.sql"
+VIEWS_SQL="docs/bigquery/views.sql"
 
 echo "===================================="
 echo "BigQuery Views Creation Script"
