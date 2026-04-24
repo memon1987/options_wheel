@@ -133,43 +133,37 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 
 ---
 
-### FC-008: Stop-loss events mislabeled as profit_target_reached
+### FC-009: Duplicate early_close_executed logging (narrowed 2026-04-24 post-FC-012)
 
-**Status:** Consideration
-**Size estimate:** M
+**Status:** Consideration (scope narrowed)
+**Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
 
-**Problem / opportunity:** Multiple early close events in BQ show -75% to -81% P/L but are logged with `event_type=early_close_executed` and `reason=profit_target_reached`. These are clearly stop-loss triggers (config: 50% loss × 1.5 multiplier = 75% threshold) being logged under the wrong event type. This corrupts BQ analytics — any query filtering on `profit_target_reached` includes large losses.
+**Original problem:** The bot logs `early_close_executed` multiple times (4-10 duplicates) for the same position when the close order doesn't fill. The `_closed_today` dedup set in `cloud_run_server.py` is in-memory and resets on Cloud Run cold starts.
 
-Affected positions (Apr 8-15): IWM call (-$927), GOOGL call (-$2,095), AMD call (-$970), AMZN call (-$904).
+**What FC-012 changed:** the dashboard no longer reads from `options_wheel.trades` (the structlog-populated table where the duplicate rows landed). It reads `trades_with_outcomes`, which projects over `trades_from_activities` — Alpaca-sourced, deduped on `activity_id`. Duplicate structlog events no longer corrupt dashboard numbers.
 
-**Open questions:**
-- Root cause: does `should_close_call_early()` return True for both profit targets and stop losses without distinguishing?
-- Should the return type change from `bool` to `Tuple[bool, str]` (close, reason)?
-- Does the monitor endpoint need to propagate the reason to logging?
+**Remaining scope:** one open question from the original FC is still unanswered:
 
-**Links:** BQ query: `SELECT * FROM trades WHERE event_type = 'early_close_executed' AND profit_pct < 0`
+> Does the duplicate logging cause duplicate *orders*, or just duplicate *log entries*?
 
----
+If only log entries, this FC is fully superseded — close without work. If real duplicate orders, FC-010 already reduces the blast radius (call stop-loss early-closes disabled, so the main offender is gone), but put early-closes use the same path and could still double-fire.
 
-### FC-009: Duplicate early_close_executed logging
+**Action needed:** verification only — check Alpaca order history for the affected dates (e.g., NVDA260415P00165000 on Apr 8-9) and count distinct `buy_to_close` orders vs. the number of `early_close_executed` log entries for that symbol. Could be done via a single BQ query now that `trades_from_activities` has the real fill stream:
 
-**Status:** Consideration
-**Size estimate:** M
-**Owner:** unassigned
-**Plan file:** not yet
+```sql
+SELECT symbol, COUNT(DISTINCT order_id) AS real_close_orders
+FROM `options_wheel.trades_from_activities`
+WHERE side = 'buy_to_close'
+  AND symbol = 'NVDA260415P00165000'
+  AND DATE(transaction_time, 'America/New_York') BETWEEN '2026-04-08' AND '2026-04-09'
+GROUP BY symbol
+```
 
-**Problem / opportunity:** The bot logs `early_close_executed` multiple times (4-10 duplicates) for the same position when the close order doesn't fill. The `_closed_today` dedup set in `cloud_run_server.py` is in-memory and resets on Cloud Run cold starts. Each monitor invocation on a fresh instance retries the close and logs "executed" again.
+If `real_close_orders = 1`, the duplicates were log-only → close FC-009. Otherwise keep open with narrowed scope (fix the dedup, not the logging).
 
-Affected positions: NVDA260410P00167500 (6 duplicates on Apr 3), NVDA260415P00165000 (~10 duplicates Apr 8-9), GOOGL260415C00312500 (~8 duplicates Apr 14).
-
-**Open questions:**
-- Should the dedup set be persisted to GCS (alongside wheel state)?
-- Or should the bot check Alpaca order history for pending close orders before placing a new one?
-- Does the duplicate logging cause duplicate orders, or just duplicate log entries?
-
-**Links:** BQ query: `SELECT symbol, DATE(timestamp), COUNT(*) FROM trades WHERE event_type = 'early_close_executed' GROUP BY 1, 2 HAVING COUNT(*) > 1`
+**Links:** BQ query above; FC-010, FC-012.
 
 ---
 
@@ -225,3 +219,8 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - PR: https://github.com/memon1987/options_wheel/pull/8 (merged 2026-04-24)
 - Commit: `8b31a1b`
 - Notes: All phases (2.1-2.7) shipped in one PR after user dropped the parity gate. New tables: `trades_from_activities` (465 rows backfilled) and `equity_history_from_alpaca` (124 rows). New views: `trades_with_outcomes`, `wheel_cycles_from_activities`. Three Cloud Scheduler jobs ingest on a split schedule. V1 tables (trades, wheel_cycles, position_snapshots, order_statuses) left inert pending manual `bq rm` — a follow-up remote routine on 2026-05-01 opens a cleanup PR. Follow-up fix PR #9 preserves `GCP_PROJECT` env var across bot deploys.
+
+### FC-008: Stop-loss events mislabeled as profit_target_reached (superseded)
+- No dedicated PR — superseded by FC-010 + FC-012.
+- Closed: 2026-04-24
+- Notes: Two independent mechanisms neutralized this. (1) FC-010 disabled call stop-losses, so `should_close_call_early` no longer returns True for losses — the mislabeling trigger is gone. (2) FC-012 cut dashboard reads over to `trades_with_outcomes` (Alpaca-sourced), so the corrupted `event_type=early_close_executed` + `reason=profit_target_reached` rows in the v1 `trades` table no longer affect analytics. Historical rows remain dirty but unread; the v1 table itself is scheduled for drop on 2026-05-01 via the FC-012 cleanup routine. If put early-closes ever start showing the same mislabel in structlog events, re-file as a new FC focused on the put-side path only.
