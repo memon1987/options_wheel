@@ -177,6 +177,74 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 
 ---
 
+### FC-013: Gate health audit & earnings blackout symmetry
+
+**Status:** Plan published
+**Size estimate:** M
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-013.md`
+
+**Problem / opportunity:** A GOOG put executed 2026-04-28 the day before Google's 2026-04-29 earnings. The FC-007 `EarningsCalendarService` exists and works, but is only wired into `CallRoller.should_roll()` — never into `PutSeller.find_put_opportunity()` or `CallSeller.evaluate_covered_call_opportunity()`. The FC-007 execution note acknowledged this deferral. A holistic gate audit also surfaced that `config.earnings_blackout_days`, `config.earnings_avoidance_days`, and `RiskManager.validate_new_position()` are all defined but never read/invoked. FC-013 wires earnings into both sellers, flips fail-open → fail-closed, removes the dead `earnings_avoidance_days` knob, and publishes `docs/gates.md` as a single source of truth for all gates.
+
+**Open questions:** see plan file.
+
+**Links:** FC-006, FC-007, `docs/CLAUDE.md` Wheel Strategy Symmetry Principle. Sibling FCs spun off from the audit: FC-014, FC-015, FC-016.
+
+---
+
+### FC-014: Wire RiskManager.validate_new_position() into sellers (or retire it)
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** `RiskManager.validate_new_position()` (risk_manager.py:23) is defined but **never invoked**. It contains portfolio-level checks — max total positions, max positions per stock, max exposure per ticker, min cash reserve, portfolio allocation — that today are partially duplicated in `wheel_engine._can_open_new_positions` and partially absent. Only `validate_roll()` is wired (from `CallRoller`). Either consolidate the put/call seller paths through `validate_new_position` (and dedupe the engine-level checks) or formally retire the method and document where each portfolio-level check actually lives.
+
+**Open questions:**
+- Consolidate (route puts/calls through `validate_new_position`) or retire (delete the method, ensure engine-level checks cover everything)?
+- If consolidating, do the engine-level early checks stay as a fast-fail before scanning, with the seller-level call as the authoritative gate?
+- Are `max_exposure_per_ticker` and `min_cash_reserve` actually checked anywhere today, or are they silently disabled?
+
+**Links:** FC-013 Phase-1 audit, `risk_manager.py:23-120`, `wheel_engine.py:220-249`.
+
+---
+
+### FC-015: Centralize hold-period state in WheelStateManager (cold-start safe)
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** Both `PutSeller._entry_times` (put_seller.py:30) and `CallSeller._entry_times` (call_seller.py:32) are local in-memory dicts that do not survive Cloud Run cold starts. The `profit_taking_min_hold_hours` gate inside `should_close_*_early()` silently fails open when the dict is empty (no `entry_time` → loop falls through). This is the same class of bug as FC-009 (the `_closed_today` cold-start dedup issue). Persist `_entry_times` to GCS alongside the existing wheel state so the hold-period gate enforces correctly across cold starts and parallel cycles.
+
+**Open questions:**
+- Persist to GCS (existing `WheelStateManager` GCS layer) or query Alpaca for fill timestamps?
+- Should this share infrastructure with FC-009's `_closed_today` fix or stay independent?
+- What's the migration path for currently-held positions whose entry times are unknown?
+
+**Links:** FC-009, `put_seller.py:30,378,544`, `call_seller.py:32,300,557`.
+
+---
+
+### FC-016: Test coverage for orchestration & account-level gates
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** The Phase-1 gate audit for FC-013 found ~0 unit-test coverage for orchestration STAGES 3/4/5/6/9 in `wheel_engine._find_new_opportunities` (max stocks evaluated per cycle, execution gap check, wheel state phase guard, existing position blocking, max new positions per cycle) and account-level gates (`_can_open_new_positions`: max total positions, minimum buying power). These gates run on every cycle but no test asserts they fire when their conditions are met. Add unit-test coverage for each gate's positive and negative paths.
+
+**Open questions:**
+- Test directly against `WheelEngine` with mocked Alpaca, or extract the gates into pure helpers first?
+- Does coverage of the Cloud-Run-server market-open / strategy-lock gates belong here too, or in a separate FC?
+
+**Links:** FC-013 Phase-1 audit, `wheel_engine.py:220-400`.
+
+---
+
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration

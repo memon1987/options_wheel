@@ -28,3 +28,4 @@ _List active plans here as they are added._
 - [fc-007.md](fc-007.md) — FC-007: Earnings calendar service, status: done
 - [fc-010.md](fc-010.md) — FC-010: Disable call stop-losses, status: done
 - [fc-012.md](fc-012.md) — FC-012: Shift dashboard logging to Alpaca queries, status: done
+- [fc-013.md](fc-013.md) — FC-013: Gate health audit & earnings blackout symmetry, status: draft
