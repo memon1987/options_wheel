@@ -10,6 +10,9 @@ interface CycleRow {
   call_date: string | null;
   call_strike: number | null;
   call_premium: number | null;
+  calls_in_cycle: number | null;
+  cycle_call_gross_premium: number | null;
+  cycle_call_net_realized: number | null;
   capital_gain: number | null;
   total_premium: number | null;
   total_return: number | null;
@@ -36,7 +39,7 @@ export default function CycleTable({ rows }: Props) {
       <div className="px-5 py-3 border-b border-gray-700">
         <h3 className="text-base font-semibold text-white">Cycles</h3>
         <p className="text-xs text-gray-400 mt-1">
-          Each row is one wheel: put sold → assigned → call sold → called away
+          Each row = one wheel from put assignment to called-away. Call premium and Cycle P&amp;L roll up across every covered call sold during the cycle (includes rolls).
         </p>
       </div>
       <div className="overflow-x-auto">
@@ -48,9 +51,10 @@ export default function CycleTable({ rows }: Props) {
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Put Prem</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-left text-gray-400">Assigned</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Call Strike</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Call Prem</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Cap Gain</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Total</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Number of covered calls sold during this cycle (rolls inflate this)">Calls</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Sum of every call premium collected during the cycle, gross of buyback costs">Gross Call Prem</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Capital gain on the share lot (call_strike − put_strike) × 100">Cap Gain</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Net realized P&L for the cycle: put kept + sum of call realized P&L (after roll buybacks)">Cycle P&L</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Return</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Days</th>
             </tr>
@@ -80,12 +84,15 @@ export default function CycleTable({ rows }: Props) {
                     {r.call_strike !== null ? `$${r.call_strike.toFixed(2)}` : '—'}
                   </td>
                   <td className="px-3 py-2 text-sm text-right text-gray-200">
-                    {fmtCurrency(r.call_premium)}
+                    {fmtNumber(r.calls_in_cycle)}
+                  </td>
+                  <td className="px-3 py-2 text-sm text-right text-gray-200">
+                    {fmtCurrency(r.cycle_call_gross_premium)}
                   </td>
                   <td className={`px-3 py-2 text-sm text-right ${pnlColor(r.capital_gain)}`}>
                     {fmtCurrency(r.capital_gain)}
                   </td>
-                  <td className={`px-3 py-2 text-sm text-right ${pnlColor(r.total_premium)}`}>
+                  <td className={`px-3 py-2 text-sm text-right font-semibold ${pnlColor(r.total_premium)}`}>
                     {fmtCurrency(r.total_premium)}
                   </td>
                   <td className={`px-3 py-2 text-sm text-right ${pnlColor(totalReturn)}`}>
