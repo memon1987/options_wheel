@@ -78,6 +78,23 @@ async def vs_buy_and_hold(underlying: str) -> Dict[str, Any]:
     return result
 
 
+@router.get("/symbol/{underlying}/cycles")
+async def symbol_cycles(
+    underlying: str,
+    days: int = Query(default=730, ge=1, le=3650),
+) -> List[Dict[str, Any]]:
+    """Completed wheel cycles for one underlying. Reads the FC-018 view directly.
+
+    Replaces the legacy /api/history/wheel-cycles call from the per-symbol
+    drilldown — that endpoint capped at 90 days and read from a stale
+    legacy table.
+    """
+    if not underlying or len(underlying) > 10:
+        raise HTTPException(status_code=400, detail="Invalid underlying")
+    bq = get_bigquery_service()
+    return bq.get_wheel_cycles_for_symbol(symbol=underlying.upper(), days=days)
+
+
 @router.get("/symbol/{underlying}/stock-history")
 async def stock_history(
     underlying: str,
