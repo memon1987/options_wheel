@@ -29,3 +29,4 @@ _List active plans here as they are added._
 - [fc-010.md](fc-010.md) — FC-010: Disable call stop-losses, status: done
 - [fc-012.md](fc-012.md) — FC-012: Shift dashboard logging to Alpaca queries, status: done
 - [fc-013.md](fc-013.md) — FC-013: Gate health audit & earnings blackout symmetry, status: draft
+- [fc-018.md](fc-018.md) — FC-018: Wheel-centric dashboard rebuild (frontend only), status: draft

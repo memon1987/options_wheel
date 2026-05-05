@@ -245,6 +245,23 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 
 ---
 
+### FC-018: Wheel-centric dashboard rebuild (frontend only)
+
+**Status:** Plan published
+**Size estimate:** L
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-018.md`
+
+**Problem / opportunity:** Current dashboard frontend was built without product input, surfaces raw data, and tries to do too much. Per the 2026-05-04 audit (1,210 frontend LOC, 962 backend LOC), the code works (1 real bug, all endpoints return 200) but the product doesn't fit. Replace with a focused 3-page dashboard organized around the underlying symbol as primary lens.
+
+3 pages: **Overview** (NLV/XIRR + monthly stacked premium + per-symbol scorecard with vs-buy-and-hold), **Per-symbol drilldown** (ACB walk, cycle list, decision-quality histogram, vs-B&H for that symbol), **Bot Health** (gate hit counts, errors, scan cadence). Honesty principles baked in: XIRR-on-NLV as the headline metric, premium-collected always paired with unrealized P&L on assigned shares, vs-buy-and-hold as a first-class per-symbol column, win-rate de-emphasized. Backend largely unchanged (FC-012 data layer is solid); a few new SQL views for ACB walk + per-symbol scorecard. Old frontend archived to `dashboard/frontend.archive/` for reference, not deployed. Strangler migration via `/v2/...` routes, page-by-page cutover.
+
+**Open questions:** see plan file.
+
+**Links:** FC-012 (backend data layer this builds on), FC-017 (chain snapshotting — prerequisite for counterfactual decision-quality views in v2 of this dashboard, deferred). External research: r/thetagang spreadsheet roundup, OptionWheelTracker, QuantWheel, premium-tracker, Wheeler, Early Retirement Now's wheel-tracking critique.
+
+---
+
 ### FC-017: Option chain snapshots at decision points (for retrospective decision-quality analysis)
 
 **Status:** Consideration
