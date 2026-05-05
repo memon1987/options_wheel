@@ -245,6 +245,34 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 
 ---
 
+### FC-017: Option chain snapshots at decision points (for retrospective decision-quality analysis)
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** The dashboard rebuild (proposed FC-018) would benefit from retrospective decision-quality analysis: "could I have rolled to a higher-strike call instead of closing?", "was there a same-DTE put at a similar delta with better premium I should have picked instead?", "how does my close-time strike compare to the strike chain that existed at that moment?". These questions are not retrospectively computable from current data — they require a snapshot of the option chain at decision time. EOD prices are not enough; we need the strikes/premiums that existed *when the close or open decision was made*.
+
+**Scope:** capture option chain snapshots at three decision points:
+1. **Close decision** — when `should_close_*_early()` returns True. Snapshot the chain near the position being closed (same expiry, ±5 strikes), plus next-week's chain (±5 strikes near current price) so a "should I have rolled?" counterfactual is possible.
+2. **Open decision** — when an opportunity is selected for execution. Snapshot the chain wider for the selected symbol (±10 strikes, all available expirations within target DTE band) so a "was there a better strike?" counterfactual is possible.
+3. **Skip decision** — when the scanner had a candidate but skipped it for a gate reason. Just the candidate's chain row (so we can later validate "was the gate right?").
+
+**Storage:** new BQ table `options_wheel.option_chain_snapshots` partitioned by `snapshot_date`, clustered by `underlying`. Schema captures `snapshot_id`, `decision_type`, `decision_id` (FK to the trade/scan/close event), `underlying`, `snapshot_time`, `chain` (REPEATED RECORD with strike, expiration, type, bid, ask, mid, delta, theta, iv, volume, oi). Append-only, idempotent by `snapshot_id`.
+
+**Open questions:**
+- Storage cost — option chains can be 50-200 rows each. If we snapshot every scan + every close, that's potentially 5-10k chain rows/day. At BQ pricing this is trivial ($X/month) but worth a back-of-envelope check.
+- Alpaca rate limits — pulling chains adds API load. Are we already pulling them for these decisions and just not persisting? (Yes for opens — `find_suitable_*` already calls the chain. Closes likely don't pull a wider chain — would be net-new API calls.)
+- Decision-id schema — how does a close-decision row in this table link back to the actual close FILL? Use `order_id` of the buy-to-close as the natural FK.
+- Retention — do we want this forever or roll off after 1 year?
+
+**Why deferred from FC-018 (dashboard rebuild):** counterfactual analysis is high-value but expensive to build correctly. FC-018 ships v1 of the new dashboard with retrospective views that *don't* require chain snapshots (closed-trade % of max profit, vs-buy-and-hold per symbol, ACB walk). FC-017 unlocks a follow-up dashboard iteration that adds the harder counterfactual surfaces.
+
+**Links:** FC-018 (dashboard rebuild — depends on this for full decision-quality views); `src/strategy/put_seller.py:should_close_put_early`, `src/strategy/call_seller.py:should_close_call_early`, `src/api/market_data.py:find_suitable_puts/find_suitable_calls`.
+
+---
+
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
