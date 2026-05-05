@@ -123,117 +123,142 @@ WHERE rn = 1 OR rn IS NULL;
 -- not appear here — those are visible in ``trades_with_outcomes`` as
 -- ``outcome='expiration'`` with no stock leg.
 
+-- A wheel cycle = put assigned -> stock held -> covered call(s) sold -> called
+-- away (or still in flight). During the held period the same shares are often
+-- covered by MULTIPLE rolled calls; the cycle aggregation must sum premium
+-- and net P&L across all of them, not just the first.
 CREATE OR REPLACE VIEW `options_wheel.wheel_cycles_from_activities` AS
 WITH
--- All put FILLs that were assigned (via matching OPASN on same symbol).
--- Upstream view exposes close_* columns; the close-side for an assignment
--- is the OPASN activity itself.
+-- Each put assignment starts a cycle.
 assigned_puts AS (
   SELECT
-    activity_id             AS put_activity_id,
-    transaction_time        AS put_transaction_time,
-    activity_date           AS put_activity_date,
+    activity_id            AS put_activity_id,
+    transaction_time       AS put_transaction_time,
     underlying,
-    strike_price            AS put_strike,
-    premium_total           AS put_premium,
-    qty                     AS put_qty,
-    close_transaction_time  AS put_assignment_time,
-    close_activity_id       AS opasn_activity_id
+    strike_price           AS put_strike,
+    premium_total          AS put_premium,
+    qty                    AS put_qty,
+    close_transaction_time AS put_assignment_time,
+    close_activity_id      AS opasn_activity_id
   FROM `options_wheel.trades_with_outcomes`
-  WHERE option_type = 'put'
-    AND outcome = 'assignment'
+  WHERE option_type = 'put' AND outcome = 'assignment'
 ),
--- All call FILLs on assigned underlyings, with their outcome.
-covered_calls AS (
+-- A called_away call ends a cycle. Pair each assigned put to the EARLIEST
+-- subsequent called_away on the same underlying. If none exists, the cycle
+-- is still in flight (call_outcome_time IS NULL).
+ending_calls AS (
   SELECT
-    activity_id             AS call_activity_id,
-    transaction_time        AS call_transaction_time,
-    activity_date           AS call_activity_date,
+    activity_id            AS call_activity_id,
+    transaction_time       AS call_transaction_time,
+    close_transaction_time AS call_outcome_time,
     underlying,
-    strike_price            AS call_strike,
-    premium_total           AS call_premium,
-    qty                     AS call_qty,
-    outcome                 AS call_outcome,
-    close_transaction_time  AS call_outcome_time,
-    outcome_price           AS call_outcome_price
+    strike_price           AS call_strike,
+    premium_total          AS call_terminating_premium,
+    qty                    AS call_qty
   FROM `options_wheel.trades_with_outcomes`
-  WHERE option_type = 'call'
+  WHERE option_type = 'call' AND outcome = 'called_away'
 ),
--- Pair each assigned put to the NEXT covered call on same underlying.
 paired AS (
   SELECT
     p.*,
-    c.call_activity_id,
-    c.call_transaction_time,
-    c.call_activity_date,
-    c.call_strike,
-    c.call_premium,
-    c.call_qty,
-    c.call_outcome,
-    c.call_outcome_time,
-    c.call_outcome_price,
+    e.call_activity_id,
+    e.call_transaction_time,
+    e.call_outcome_time,
+    e.call_strike,
+    e.call_terminating_premium,
+    e.call_qty,
     ROW_NUMBER() OVER (
       PARTITION BY p.put_activity_id
-      ORDER BY c.call_transaction_time ASC
+      ORDER BY e.call_outcome_time ASC
     ) AS rn
   FROM assigned_puts p
-  LEFT JOIN covered_calls c
-    ON c.underlying = p.underlying
-    AND c.call_transaction_time > p.put_assignment_time
+  LEFT JOIN ending_calls e
+    ON e.underlying = p.underlying
+    AND e.call_outcome_time > p.put_assignment_time
+),
+cycles AS (
+  SELECT * FROM paired WHERE rn = 1 OR rn IS NULL
+),
+-- Aggregate every option event between the put assignment and the cycle's
+-- end (or the present, for in-flight cycles). This is the cycle's full
+-- realized contribution: includes the put's premium kept on assignment,
+-- every covered call sold during the held period (whether early-closed and
+-- rolled or held to assignment/expiration), and the buyback costs of those
+-- early-closed calls.
+cycle_aggregates AS (
+  -- Aggregate every CALL event between assignment and the cycle's end (or now,
+  -- for in-flight cycles). The put's own $premium is counted via put_premium
+  -- below — including it here would double-count, since the put's
+  -- transaction_time is before put_assignment_time anyway.
+  SELECT
+    c.put_activity_id,
+    SUM(COALESCE(t.realized_pnl, 0))   AS cycle_call_net_realized,
+    SUM(COALESCE(t.premium_total, 0))  AS cycle_call_gross_premium,
+    COUNTIF(t.outcome != 'open')       AS calls_in_cycle
+  FROM cycles c
+  JOIN `options_wheel.trades_with_outcomes` t
+    ON t.underlying = c.underlying
+    AND t.option_type = 'call'
+    AND t.outcome != 'open'
+    AND t.transaction_time > c.put_assignment_time
+    AND (c.call_outcome_time IS NULL OR t.transaction_time <= c.call_outcome_time)
+  GROUP BY c.put_activity_id
 )
 SELECT
-  -- Identity
-  put_activity_id,
-  opasn_activity_id,
-  call_activity_id,
-  underlying,
-  put_transaction_time,
-  put_assignment_time,
-  call_transaction_time,
-  call_outcome_time,
+  c.put_activity_id,
+  c.opasn_activity_id,
+  c.call_activity_id,
+  c.underlying,
+  c.put_transaction_time,
+  c.put_assignment_time,
+  c.call_transaction_time,
+  c.call_outcome_time,
   -- Put side
-  DATE(put_transaction_time, 'America/New_York')  AS put_date,
-  put_strike,
-  put_premium,
-  put_qty,
-  DATE(put_assignment_time, 'America/New_York')   AS assignment_date,
-  -- Call side
-  DATE(call_transaction_time, 'America/New_York') AS call_date,
-  call_strike,
-  call_premium,
-  call_qty,
-  call_outcome,
-  DATE(call_outcome_time, 'America/New_York')     AS call_outcome_date,
-  -- Matched quantity: the number of contracts the put/call pair covers.
-  -- If a call was sold for fewer contracts than the put provides collateral
-  -- for, capital_gain / total_return apply only to the matched subset.
-  LEAST(ABS(COALESCE(put_qty, 0)), ABS(COALESCE(call_qty, 0))) AS matched_contracts,
-  -- Computed metrics
-  COALESCE(put_premium, 0) + COALESCE(call_premium, 0) AS total_premium,
+  DATE(c.put_transaction_time,  'America/New_York') AS put_date,
+  c.put_strike,
+  c.put_premium,
+  c.put_qty,
+  DATE(c.put_assignment_time,   'America/New_York') AS assignment_date,
+  -- Call side (terminating call only — the called_away one).
+  DATE(c.call_transaction_time, 'America/New_York') AS call_date,
+  c.call_strike,
+  c.call_terminating_premium AS call_premium,
+  c.call_qty,
+  CASE WHEN c.call_outcome_time IS NULL THEN 'open' ELSE 'called_away' END AS call_outcome,
+  DATE(c.call_outcome_time,     'America/New_York') AS call_outcome_date,
+  LEAST(ABS(COALESCE(c.put_qty, 0)), ABS(COALESCE(c.call_qty, 0))) AS matched_contracts,
+  -- Aggregated cycle metrics (the fix).
+  ca.calls_in_cycle,
+  ca.cycle_call_gross_premium,
+  ca.cycle_call_net_realized,
+  -- total_premium is now the cycle's net realized P&L:
+  --   put kept on assignment + sum of all call realized P&L (rolls included)
+  -- For an in-flight cycle, calls-side includes only events through today.
+  COALESCE(c.put_premium, 0) + COALESCE(ca.cycle_call_net_realized, 0) AS total_premium,
   CASE
-    WHEN call_strike IS NOT NULL AND put_strike IS NOT NULL THEN
-      (call_strike - put_strike) * 100
-        * LEAST(ABS(COALESCE(put_qty, 0)), ABS(COALESCE(call_qty, 0)))
+    WHEN c.call_strike IS NOT NULL AND c.put_strike IS NOT NULL THEN
+      (c.call_strike - c.put_strike) * 100
+        * LEAST(ABS(COALESCE(c.put_qty, 0)), ABS(COALESCE(c.call_qty, 0)))
   END AS capital_gain,
   CASE
-    WHEN put_strike IS NOT NULL AND put_strike > 0 AND put_qty IS NOT NULL THEN
+    WHEN c.put_strike IS NOT NULL AND c.put_strike > 0 AND c.put_qty IS NOT NULL THEN
       SAFE_DIVIDE(
-        COALESCE(put_premium, 0) + COALESCE(call_premium, 0)
+        COALESCE(c.put_premium, 0)
+          + COALESCE(ca.cycle_call_net_realized, 0)
           + CASE
-              WHEN call_strike IS NOT NULL THEN
-                (call_strike - put_strike) * 100
-                  * LEAST(ABS(put_qty), ABS(COALESCE(call_qty, 0)))
+              WHEN c.call_strike IS NOT NULL THEN
+                (c.call_strike - c.put_strike) * 100
+                  * LEAST(ABS(c.put_qty), ABS(COALESCE(c.call_qty, 0)))
               ELSE 0
             END,
-        put_strike * 100 * ABS(put_qty)
+        c.put_strike * 100 * ABS(c.put_qty)
       )
   END AS total_return,
   DATE_DIFF(
-    DATE(COALESCE(call_outcome_time, call_transaction_time, put_assignment_time),
-         'America/New_York'),
-    DATE(put_assignment_time, 'America/New_York'),
+    DATE(COALESCE(c.call_outcome_time, CURRENT_TIMESTAMP()), 'America/New_York'),
+    DATE(c.put_assignment_time, 'America/New_York'),
     DAY
   ) AS duration_days,
-  CAST(ABS(COALESCE(put_qty, 0)) * 100 AS INT64) AS shares
-FROM paired
-WHERE rn = 1 OR rn IS NULL;
+  CAST(ABS(COALESCE(c.put_qty, 0)) * 100 AS INT64) AS shares
+FROM cycles c
+LEFT JOIN cycle_aggregates ca USING (put_activity_id);

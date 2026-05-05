@@ -22,6 +22,9 @@ interface CycleRow {
   call_date: string | null;
   call_strike: number | null;
   call_premium: number | null;
+  calls_in_cycle: number | null;
+  cycle_call_gross_premium: number | null;
+  cycle_call_net_realized: number | null;
   capital_gain: number | null;
   total_premium: number | null;
   total_return: number | null;
