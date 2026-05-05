@@ -172,3 +172,14 @@ async def get_premium_by_day(
     """
     bq = get_bigquery_service()
     return bq.get_premium_by_day(days=days)
+
+
+@router.get("/account-baseline")
+async def account_baseline() -> Dict[str, Any]:
+    """Starting capital for inception-P&L calculations.
+
+    See ``BigQueryService.get_account_baseline`` — currently sourced from the
+    ``BASELINE_DEPOSITS`` env var; FC-019 will replace with a JNLC ingest sum.
+    """
+    bq = get_bigquery_service()
+    return bq.get_account_baseline()

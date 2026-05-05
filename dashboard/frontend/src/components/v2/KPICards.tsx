@@ -1,4 +1,4 @@
-import { fmtCurrency, fmtCurrencyDetail, pnlColor } from '../../utils/format';
+import { fmtCurrency, fmtCurrencyDetail, fmtPercent, pnlColor } from '../../utils/format';
 
 interface KPI {
   label: string;
@@ -42,28 +42,34 @@ export const buildHeadlineKpis = (args: {
   nlv: number | null;
   cash: number | null;
   buyingPower: number | null;
+  startingCapital: number | null;    // sum of net deposits (JNLC) since account inception
   grossPremium: number | null;       // sum of every option premium collected
   netRealizedPnl: number | null;     // gross − roll buybacks
   boughtBack: number | null;         // gross − net (paid out to roll)
-  unrealizedOnShares: number | null;
   daysRunning: number | null;
 }): KPI[] => {
   const {
     nlv,
     cash,
     buyingPower,
+    startingCapital,
     grossPremium,
     netRealizedPnl,
     boughtBack,
-    unrealizedOnShares,
     daysRunning,
   } = args;
 
-  // Most-honest P&L number = realized + unrealized on assigned shares.
-  // Realized already accounts for buyback costs on rolls.
+  // Bulletproof total return: NLV − sum of net deposits since inception.
+  // This is the bank-statement number — what your account actually grew by —
+  // and avoids the accounting noise of trying to reconcile realized P&L with
+  // share-side cash flow (OPTRD events, capital gains across overlapping lots).
   const totalReturn =
-    netRealizedPnl !== null && unrealizedOnShares !== null
-      ? netRealizedPnl + unrealizedOnShares
+    nlv !== null && startingCapital !== null
+      ? nlv - startingCapital
+      : null;
+  const totalReturnPct =
+    nlv !== null && startingCapital !== null && startingCapital > 0
+      ? (nlv - startingCapital) / startingCapital
       : null;
 
   return [
@@ -76,14 +82,12 @@ export const buildHeadlineKpis = (args: {
       label: 'Total Return',
       value: fmtCurrencyDetail(totalReturn),
       sub:
-        unrealizedOnShares !== null && unrealizedOnShares !== 0
-          ? `Realized ${fmtCurrency(netRealizedPnl)} · Unreal ${fmtCurrency(unrealizedOnShares)}`
-          : netRealizedPnl !== null
-            ? `Realized ${fmtCurrency(netRealizedPnl)} · No assigned shares`
-            : undefined,
+        startingCapital !== null
+          ? `${fmtPercent(totalReturnPct ?? 0)} since inception · started ${fmtCurrency(startingCapital)}`
+          : undefined,
       tone: 'pnl',
       rawPnl: totalReturn,
-      hint: 'Net realized P&L from closed options + unrealized P&L on currently-assigned shares. This is the cash + paper-gain figure that tracks your actual account growth.',
+      hint: 'Current NLV minus net deposits since inception. The bank-statement number — what your account actually grew by, free of accounting noise from realized vs unrealized vs share-side cash flow.',
     },
     {
       label: 'Net Realized P&L',

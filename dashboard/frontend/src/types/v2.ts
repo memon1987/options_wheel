@@ -97,6 +97,11 @@ export interface PortfolioHistoryPoint {
   buying_power: number | null;
 }
 
+export interface AccountBaseline {
+  starting_capital: number;
+  source: string;
+}
+
 export interface PremiumByDayPoint {
   date: string;
   total_premium: number;
