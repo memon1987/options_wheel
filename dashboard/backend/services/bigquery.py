@@ -344,6 +344,204 @@ class BigQueryService:
             'return_30d': None,
         }
 
+    # ================================================================
+    # FC-018: wheel-centric dashboard data sources
+    # ================================================================
+
+    def get_per_symbol_scorecard(self, days: int = 365) -> List[Dict[str, Any]]:
+        """Per-underlying summary for the FC-018 Overview matrix.
+
+        Joins the FC-018 scorecard view with vs-buy-and-hold deltas. Returns
+        one row per underlying with cycle counts, premium, realized P&L,
+        current ACB, and wheel-vs-buy-and-hold comparison.
+        """
+        try:
+            query = f"""
+            SELECT
+                s.underlying AS symbol,
+                s.trade_count,
+                s.cycles_completed,
+                s.total_premium,
+                s.put_premium,
+                s.call_premium,
+                s.realized_pnl,
+                s.open_count,
+                s.put_assignment_count,
+                s.called_away_count,
+                s.early_close_count,
+                s.expiration_count,
+                s.cycle_capital_gain,
+                s.avg_cycle_days,
+                s.first_trade_time,
+                s.last_trade_time,
+                s.current_shares,
+                s.current_acb_per_share,
+                s.current_cumulative_net_premium,
+                bh.price_now,
+                bh.bh_dollar_pnl,
+                bh.wheel_minus_bh
+            FROM `{self.dataset}.fc018_per_symbol_scorecard` s
+            LEFT JOIN `{self.dataset}.fc018_vs_buy_and_hold_per_symbol` bh
+                USING (underlying)
+            WHERE s.last_trade_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+            ORDER BY s.total_premium DESC
+            """
+            return self._run_query(query)
+        except Exception:
+            logger.info("per_symbol_scorecard query failed — returning empty list")
+            return []
+
+    def get_acb_timeline(self, symbol: str, days: int = 730) -> List[Dict[str, Any]]:
+        """ACB walk events for one underlying. Powers the per-symbol drilldown chart."""
+        # Bind symbol via parameterized query — defensive against injection
+        # even though this comes from a route param, not user form input.
+        query = f"""
+        SELECT
+            event_time,
+            event_date,
+            activity_type,
+            option_type,
+            side,
+            qty,
+            strike_price,
+            premium_total,
+            outcome,
+            realized_pnl,
+            net_premium_delta,
+            shares_delta,
+            cumulative_net_premium,
+            running_shares,
+            running_share_cost,
+            acb_per_share,
+            event_label
+        FROM `{self.dataset}.fc018_acb_timeline_per_symbol`
+        WHERE underlying = @symbol
+          AND event_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+        ORDER BY event_time ASC
+        """
+        try:
+            from google.cloud.bigquery import ScalarQueryParameter, QueryJobConfig
+            job_config = QueryJobConfig(query_parameters=[
+                ScalarQueryParameter("symbol", "STRING", symbol),
+                ScalarQueryParameter("days", "INT64", days),
+            ])
+            results = self.client.query(query, job_config=job_config).result(timeout=60)
+            return [dict(row.items()) for row in results]
+        except Exception as e:
+            logger.error(f"acb_timeline query failed for {symbol}: {e}")
+            return []
+
+    def get_decision_quality(self, symbol: str, days: int = 365) -> List[Dict[str, Any]]:
+        """% of max profit captured at close, per closed trade for one symbol.
+
+        Derived from `trades_with_outcomes`: for each opening FILL with an
+        early_close outcome, capture_pct = (premium_total - close_cost) / premium_total.
+        """
+        query = f"""
+        SELECT
+            transaction_time AS open_time,
+            close_transaction_time AS close_time,
+            symbol AS occ_symbol,
+            option_type,
+            strike_price,
+            premium_total,
+            close_price,
+            close_qty,
+            outcome,
+            realized_pnl,
+            CASE
+                WHEN outcome = 'early_close'
+                     AND premium_total IS NOT NULL AND premium_total > 0
+                THEN realized_pnl / premium_total
+                WHEN outcome IN ('expiration', 'assignment', 'called_away')
+                THEN 1.0
+                ELSE NULL
+            END AS capture_ratio,
+            DATE_DIFF(
+                DATE(COALESCE(close_transaction_time, transaction_time), 'America/New_York'),
+                DATE(transaction_time, 'America/New_York'),
+                DAY
+            ) AS days_held
+        FROM `{self.dataset}.trades_with_outcomes`
+        WHERE underlying = @symbol
+          AND outcome != 'open'
+          AND DATE(transaction_time, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL @days DAY)
+        ORDER BY transaction_time DESC
+        """
+        try:
+            from google.cloud.bigquery import ScalarQueryParameter, QueryJobConfig
+            job_config = QueryJobConfig(query_parameters=[
+                ScalarQueryParameter("symbol", "STRING", symbol),
+                ScalarQueryParameter("days", "INT64", days),
+            ])
+            results = self.client.query(query, job_config=job_config).result(timeout=60)
+            return [dict(row.items()) for row in results]
+        except Exception as e:
+            logger.error(f"decision_quality query failed for {symbol}: {e}")
+            return []
+
+    def get_vs_buy_and_hold(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Wheel-vs-buy-and-hold summary for a single underlying."""
+        query = f"""
+        SELECT *
+        FROM `{self.dataset}.fc018_vs_buy_and_hold_per_symbol`
+        WHERE underlying = @symbol
+        LIMIT 1
+        """
+        try:
+            from google.cloud.bigquery import ScalarQueryParameter, QueryJobConfig
+            job_config = QueryJobConfig(query_parameters=[
+                ScalarQueryParameter("symbol", "STRING", symbol),
+            ])
+            results = list(self.client.query(query, job_config=job_config).result(timeout=60))
+            return dict(results[0].items()) if results else None
+        except Exception as e:
+            logger.error(f"vs_buy_and_hold query failed for {symbol}: {e}")
+            return None
+
+    def get_stock_history(self, symbol: str, days: int = 365) -> List[Dict[str, Any]]:
+        """Daily OHLC bars for one symbol over the last N days."""
+        query = f"""
+        SELECT date, open, high, low, close, volume
+        FROM `{self.dataset}.stock_history_from_alpaca`
+        WHERE symbol = @symbol
+          AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL @days DAY)
+        ORDER BY date ASC
+        """
+        try:
+            from google.cloud.bigquery import ScalarQueryParameter, QueryJobConfig
+            job_config = QueryJobConfig(query_parameters=[
+                ScalarQueryParameter("symbol", "STRING", symbol),
+                ScalarQueryParameter("days", "INT64", days),
+            ])
+            results = self.client.query(query, job_config=job_config).result(timeout=60)
+            return [dict(row.items()) for row in results]
+        except Exception:
+            logger.info(f"stock_history query failed for {symbol} — returning empty list")
+            return []
+
+    def get_ingest_health(self) -> Dict[str, Any]:
+        """Last-successful-ingest timestamps for the FC-012/FC-018 ingestors.
+
+        Used by the Bot Health page to surface stale-data warnings.
+        """
+        out: Dict[str, Any] = {}
+        sources = [
+            ("trades_from_activities", "ingested_at"),
+            ("equity_history_from_alpaca", "ingested_at"),
+            ("stock_history_from_alpaca", "ingested_at"),
+        ]
+        for table, ts_field in sources:
+            try:
+                row = next(iter(self.client.query(
+                    f"SELECT MAX({ts_field}) AS last FROM `{self.dataset}.{table}`"
+                ).result(timeout=30)), None)
+                last = row["last"] if row else None
+                out[table] = last.isoformat() if last else None
+            except Exception:
+                out[table] = None
+        return out
+
     def get_call_rolls(self, days: int = 30) -> List[Dict[str, Any]]:
         """Call roll history (FC-006) — out of FC-012 scope, unchanged."""
         try:
