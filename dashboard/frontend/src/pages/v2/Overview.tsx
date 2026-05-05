@@ -23,7 +23,9 @@ export default function Overview() {
   const { data: summary } = useApi<MetricsSummary>('/api/metrics/summary?days=365');
 
   // Derive headline numbers
-  const totalPremium = summary?.total_premium ?? null;
+  const grossPremium = summary?.total_premium ?? null;
+  const netRealizedPnl = summary?.net_realized_pnl ?? null;
+  const boughtBack = summary?.bought_back ?? null;
   const cash = account?.cash ?? null;
   const buyingPower = account?.buying_power ?? null;
   const nlv = account?.portfolio_value ?? null;
@@ -44,11 +46,6 @@ export default function Overview() {
     }
     return counted > 0 ? sum : 0;
   })();
-
-  const netPnl =
-    totalPremium !== null && unrealizedOnShares !== null
-      ? totalPremium + unrealizedOnShares
-      : null;
 
   // Days running: from first trade time across the scorecard.
   const daysRunning = (() => {
@@ -84,9 +81,10 @@ export default function Overview() {
     nlv,
     cash,
     buyingPower,
-    totalPremium,
+    grossPremium,
+    netRealizedPnl,
+    boughtBack,
     unrealizedOnShares,
-    netPnl,
     daysRunning,
   });
 

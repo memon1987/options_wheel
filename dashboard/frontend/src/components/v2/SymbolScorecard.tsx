@@ -102,8 +102,8 @@ export default function SymbolScorecard({ rows }: Props) {
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-400 text-left">State</th>
               <SortHeader k="cycles_completed" label="Cycles" align="right" />
               <SortHeader k="trade_count" label="Trades" align="right" />
-              <SortHeader k="total_premium" label="Premium" align="right" />
-              <SortHeader k="realized_pnl" label="Realized P&L" align="right" />
+              <SortHeader k="total_premium" label="Gross Prem" align="right" />
+              <SortHeader k="realized_pnl" label="Net P&L" align="right" />
               <SortHeader k="wheel_minus_bh" label="vs B&H" align="right" />
             </tr>
           </thead>
@@ -151,8 +151,13 @@ export default function SymbolScorecard({ rows }: Props) {
           </tbody>
         </table>
       </div>
-      <div className="px-5 py-2 border-t border-gray-700 text-xs text-gray-500">
-        {fmtPercent(sorted.filter((r) => r.wheel_minus_bh !== null && r.wheel_minus_bh > 0).length / Math.max(sorted.length, 1))} of symbols beat buy-and-hold this period.
+      <div className="px-5 py-2 border-t border-gray-700 text-xs text-gray-500 flex justify-between gap-4">
+        <span>
+          {fmtPercent(sorted.filter((r) => r.wheel_minus_bh !== null && r.wheel_minus_bh > 0).length / Math.max(sorted.length, 1))} of symbols beat buy-and-hold this period.
+        </span>
+        <span>
+          <span title="Gross premium = sum of every option premium collected when sold">Gross Prem</span> = total collected before roll buybacks · <span title="Net P&L = gross premium kept on assigned/expired/called-away positions, plus (premium − buyback) for early-closes">Net P&L</span> = actual cash earned
+        </span>
       </div>
     </div>
   );

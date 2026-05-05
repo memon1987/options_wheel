@@ -51,8 +51,7 @@ export default function CycleTable({ rows }: Props) {
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Put Prem</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-left text-gray-400">Assigned</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Call Strike</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Number of covered calls sold during this cycle (rolls inflate this)">Calls</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Sum of every call premium collected during the cycle, gross of buyback costs">Gross Call Prem</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Number of covered calls sold during this cycle (rolls inflate this — each early-closed-and-resold call counts separately)">Calls Rolled</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Capital gain on the share lot (call_strike − put_strike) × 100">Cap Gain</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Net realized P&L for the cycle: put kept + sum of call realized P&L (after roll buybacks)">Cycle P&L</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Return</th>
@@ -85,9 +84,6 @@ export default function CycleTable({ rows }: Props) {
                   </td>
                   <td className="px-3 py-2 text-sm text-right text-gray-200">
                     {fmtNumber(r.calls_in_cycle)}
-                  </td>
-                  <td className="px-3 py-2 text-sm text-right text-gray-200">
-                    {fmtCurrency(r.cycle_call_gross_premium)}
                   </td>
                   <td className={`px-3 py-2 text-sm text-right ${pnlColor(r.capital_gain)}`}>
                     {fmtCurrency(r.capital_gain)}
