@@ -1,20 +1,18 @@
 import { useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
-import { useApi } from '../hooks/useApi';
+import { useApi } from '../../hooks/useApi';
 
 interface AccountData {
   paper_trading?: boolean;
 }
 
 const navItems = [
-  { path: '/', label: 'Dashboard' },
-  { path: '/positions', label: 'Positions' },
-  { path: '/trades', label: 'Trades' },
-  { path: '/performance', label: 'Performance' },
-  { path: '/cycles', label: 'Wheel Cycles' },
+  { path: '/v2/overview', label: 'Overview' },
+  { path: '/v2/symbol', label: 'By Symbol' },
+  { path: '/v2/bot-health', label: 'Bot Health' },
 ];
 
-export default function Layout() {
+export default function LayoutV2() {
   const [menuOpen, setMenuOpen] = useState(false);
   const { data: account } = useApi<AccountData>('/api/live/account', { refreshInterval: 60_000 });
 
@@ -27,6 +25,9 @@ export default function Layout() {
         <div className="flex items-center justify-between px-4 py-3">
           <div className="flex items-center gap-2">
             <h1 className="text-lg font-bold text-white">Options Wheel</h1>
+            <span className="px-2 py-0.5 bg-purple-900 text-purple-300 text-xs font-medium rounded">
+              v2 PREVIEW
+            </span>
             {isPaperTrading && (
               <span className="px-2 py-0.5 bg-yellow-900 text-yellow-300 text-xs font-medium rounded">
                 PAPER
@@ -54,7 +55,6 @@ export default function Layout() {
               <NavLink
                 key={item.path}
                 to={item.path}
-                end={item.path === '/'}
                 onClick={() => setMenuOpen(false)}
                 className={({ isActive }) =>
                   `block py-3 px-4 rounded-lg mb-1 transition-colors ${
@@ -65,36 +65,40 @@ export default function Layout() {
                 {item.label}
               </NavLink>
             ))}
-
             <NavLink
-              to="/v2/overview"
+              to="/"
               onClick={() => setMenuOpen(false)}
-              className="block py-3 px-4 rounded-lg mt-3 border border-purple-700 bg-purple-900/20 text-purple-200 hover:bg-purple-900/40"
+              className="block py-3 px-4 rounded-lg mb-1 mt-3 border-t border-gray-700 text-gray-400 hover:bg-gray-700 hover:text-white text-sm"
             >
-              v2 Preview →
+              ← Back to legacy dashboard
             </NavLink>
           </nav>
         )}
       </header>
 
       {/* Desktop Sidebar */}
-      <aside className="hidden lg:flex lg:flex-col lg:fixed lg:inset-y-0 lg:w-60 bg-gray-800 border-r border-gray-700">
-        <div className="p-6">
-          <h1 className="text-xl font-bold text-white">Options Wheel</h1>
-          <p className="text-sm text-gray-400 mt-1">Trading Dashboard</p>
-          {isPaperTrading && (
-            <span className="inline-block mt-2 px-2 py-0.5 bg-yellow-900 text-yellow-300 text-xs font-medium rounded">
-              PAPER TRADING
-            </span>
-          )}
+      <aside className="hidden lg:flex fixed top-0 left-0 h-full w-60 bg-gray-800 border-r border-gray-700 flex-col">
+        <div className="px-6 py-5 border-b border-gray-700">
+          <div className="flex flex-col gap-1">
+            <h1 className="text-xl font-bold text-white">Options Wheel</h1>
+            <div className="flex gap-2">
+              <span className="px-2 py-0.5 bg-purple-900 text-purple-300 text-xs font-medium rounded w-fit">
+                v2 PREVIEW
+              </span>
+              {isPaperTrading && (
+                <span className="px-2 py-0.5 bg-yellow-900 text-yellow-300 text-xs font-medium rounded w-fit">
+                  PAPER
+                </span>
+              )}
+            </div>
+          </div>
         </div>
 
-        <nav className="flex-1 px-4">
+        <nav className="flex-1 px-4 py-4">
           {navItems.map((item) => (
             <NavLink
               key={item.path}
               to={item.path}
-              end={item.path === '/'}
               className={({ isActive }) =>
                 `flex items-center py-3 px-4 rounded-lg mb-1 transition-colors ${
                   isActive ? 'bg-blue-600 text-white' : 'text-gray-300 hover:bg-gray-700'
@@ -104,16 +108,16 @@ export default function Layout() {
               {item.label}
             </NavLink>
           ))}
-
-          {/* FC-018 v2 preview entry point. Removed at PR G when v2 becomes canonical. */}
-          <NavLink
-            to="/v2/overview"
-            className="flex items-center justify-between py-3 px-4 rounded-lg mt-4 mb-1 border border-purple-700 bg-purple-900/20 text-purple-200 hover:bg-purple-900/40"
-          >
-            <span>v2 Preview</span>
-            <span className="text-xs opacity-75">→</span>
-          </NavLink>
         </nav>
+
+        <div className="px-4 py-4 border-t border-gray-700">
+          <NavLink
+            to="/"
+            className="block py-2 px-4 rounded text-gray-400 hover:bg-gray-700 hover:text-white text-sm"
+          >
+            ← Back to legacy dashboard
+          </NavLink>
+        </div>
       </aside>
 
       {/* Main Content */}
