@@ -7,9 +7,9 @@ interface AccountData {
 }
 
 const navItems = [
-  { path: '/v2/overview', label: 'Overview' },
-  { path: '/v2/symbol', label: 'By Symbol' },
-  { path: '/v2/bot-health', label: 'Bot Health' },
+  { path: '/overview', label: 'Overview' },
+  { path: '/symbol', label: 'By Symbol' },
+  { path: '/bot-health', label: 'Bot Health' },
 ];
 
 export default function LayoutV2() {
@@ -25,9 +25,6 @@ export default function LayoutV2() {
         <div className="flex items-center justify-between px-4 py-3">
           <div className="flex items-center gap-2">
             <h1 className="text-lg font-bold text-white">Options Wheel</h1>
-            <span className="px-2 py-0.5 bg-purple-900 text-purple-300 text-xs font-medium rounded">
-              v2 PREVIEW
-            </span>
             {isPaperTrading && (
               <span className="px-2 py-0.5 bg-yellow-900 text-yellow-300 text-xs font-medium rounded">
                 PAPER
@@ -65,13 +62,6 @@ export default function LayoutV2() {
                 {item.label}
               </NavLink>
             ))}
-            <NavLink
-              to="/"
-              onClick={() => setMenuOpen(false)}
-              className="block py-3 px-4 rounded-lg mb-1 mt-3 border-t border-gray-700 text-gray-400 hover:bg-gray-700 hover:text-white text-sm"
-            >
-              ← Back to legacy dashboard
-            </NavLink>
           </nav>
         )}
       </header>
@@ -81,16 +71,11 @@ export default function LayoutV2() {
         <div className="px-6 py-5 border-b border-gray-700">
           <div className="flex flex-col gap-1">
             <h1 className="text-xl font-bold text-white">Options Wheel</h1>
-            <div className="flex gap-2">
-              <span className="px-2 py-0.5 bg-purple-900 text-purple-300 text-xs font-medium rounded w-fit">
-                v2 PREVIEW
+            {isPaperTrading && (
+              <span className="px-2 py-0.5 bg-yellow-900 text-yellow-300 text-xs font-medium rounded w-fit mt-1">
+                PAPER
               </span>
-              {isPaperTrading && (
-                <span className="px-2 py-0.5 bg-yellow-900 text-yellow-300 text-xs font-medium rounded w-fit">
-                  PAPER
-                </span>
-              )}
-            </div>
+            )}
           </div>
         </div>
 
@@ -109,15 +94,6 @@ export default function LayoutV2() {
             </NavLink>
           ))}
         </nav>
-
-        <div className="px-4 py-4 border-t border-gray-700">
-          <NavLink
-            to="/"
-            className="block py-2 px-4 rounded text-gray-400 hover:bg-gray-700 hover:text-white text-sm"
-          >
-            ← Back to legacy dashboard
-          </NavLink>
-        </div>
       </aside>
 
       {/* Main Content */}

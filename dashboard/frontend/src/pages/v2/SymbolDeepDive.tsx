@@ -74,7 +74,7 @@ export default function SymbolDeepDive() {
               {universe.map((u) => (
                 <Link
                   key={u}
-                  to={`/v2/symbol/${u}`}
+                  to={`/symbol/${u}`}
                   className="px-3 py-1.5 text-sm font-mono rounded border border-gray-600 text-blue-300 hover:bg-gray-700"
                 >
                   {u}
@@ -101,7 +101,7 @@ export default function SymbolDeepDive() {
         </div>
         <div className="flex items-center gap-2">
           <Link
-            to="/v2/overview"
+            to="/overview"
             className="text-sm px-3 py-1.5 rounded border border-gray-600 text-gray-300 hover:bg-gray-700"
           >
             ← Overview
@@ -109,7 +109,7 @@ export default function SymbolDeepDive() {
           <select
             className="text-sm px-2 py-1.5 rounded border border-gray-600 bg-gray-800 text-gray-200"
             value={symbol}
-            onChange={(e) => navigate(`/v2/symbol/${e.target.value}`)}
+            onChange={(e) => navigate(`/symbol/${e.target.value}`)}
           >
             {universe.map((u) => (
               <option key={u} value={u}>{u}</option>
