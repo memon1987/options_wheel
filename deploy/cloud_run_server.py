@@ -1170,6 +1170,59 @@ def ingest_portfolio_history():
             'timestamp': datetime.now().isoformat(),
         }), 500
 
+@app.route('/ingest-stock-history', methods=['POST'])
+@require_api_key
+def ingest_stock_history():
+    """Pull daily Alpaca stock bars for the traded universe and append to BQ (FC-018 PR B).
+
+    Idempotent, append-only, one row per (date, symbol). Universe is derived
+    from `trades_with_outcomes.underlying` so we only fetch for symbols
+    actually traded. Default backfill window: 365 days on first run; daily
+    incremental thereafter.
+    """
+    logger.info("Endpoint called",
+                event_category="system",
+                event_type="ingest_stock_history_endpoint",
+                endpoint="/ingest-stock-history")
+
+    try:
+        from src.api.alpaca_client import AlpacaClient
+        from src.data.stock_history_ingestor import StockHistoryIngestor
+
+        config = Config()
+        alpaca_client = AlpacaClient(config)
+        ingestor = StockHistoryIngestor(alpaca_client)
+
+        if not ingestor.enabled:
+            return jsonify({
+                'status': 'disabled',
+                'reason': 'StockHistoryIngestor not enabled',
+                'timestamp': datetime.now().isoformat(),
+            }), 503
+
+        backfill_days = int(request.args.get('backfill_days', 365))
+        result = ingestor.run_once(backfill_days=backfill_days)
+        result['timestamp'] = datetime.now().isoformat()
+
+        status = result.get('status')
+        if status in ('ok', 'disabled', 'partial'):
+            http_status = 200
+        else:
+            http_status = 500
+        return jsonify(result), http_status
+
+    except Exception as e:
+        logger.error("Stock history ingest failed",
+                    event_category="error",
+                    event_type="ingest_stock_history_failed",
+                    error=str(e),
+                    exc_info=True)
+        return jsonify({
+            'status': 'failed',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat(),
+        }), 500
+
 @app.route('/health')
 def detailed_health():
     """Detailed health check including dependencies."""

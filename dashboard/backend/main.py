@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import os
 
-from routers import live, history, metrics, errors
+from routers import live, history, metrics, errors, v2
 
 app = FastAPI(
     title="Options Wheel Dashboard API",
@@ -39,6 +39,7 @@ app.include_router(live.router, prefix="/api/live", tags=["live"])
 app.include_router(history.router, prefix="/api/history", tags=["history"])
 app.include_router(metrics.router, prefix="/api/metrics", tags=["metrics"])
 app.include_router(errors.router, prefix="/api/errors", tags=["errors"])
+app.include_router(v2.router, prefix="/api/v2", tags=["v2"])
 
 
 @app.get("/api/health")
