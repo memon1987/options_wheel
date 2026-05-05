@@ -245,6 +245,36 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 
 ---
 
+### FC-019: True P&L reconciliation — ingest JNLC/OPTRD and rewrite wheel_cycles for concurrent lots
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** During FC-018 dashboard work we found two related accounting gaps that combine to make the dashboard's option-sourced P&L disagree with actual account growth (~$2k discrepancy on a paper account that funded $100k and grew to $120k):
+
+1. **`wheel_cycles_from_activities` view assumes 1 put → 1 called_away.** When the bot sells a second put on a symbol whose shares are already held (overlapping share lots — observed on AMD: 200 concurrent shares for ~3 months), the view's `(call_strike − put_strike) × 100` capital-gain calculation fails. The actual share-side cash flow is recorded by Alpaca as **OPTRD** activities — net for AMD across all lots is -$24,250, while the view computed +$1,000.
+
+2. **JNLC and OPTRD are not ingested.** `activities_ingestor` only pulls `FILL`, `OPASN`, `OPEXP`. Cash deposits/withdrawals (JNLC) and share-movement cash flow (OPTRD) are invisible to BigQuery. FC-018's headline "Total Return" tile has to fall back to a hardcoded `BASELINE_DEPOSITS=$100,000` env var because there's no other source.
+
+**Scope:**
+- Extend `activities_ingestor.py` `ACTIVITY_TYPES` to include `JNLC, OPTRD` and update `_normalize` to handle their schemas (no OCC symbol, has `net_amount`).
+- Add `net_amount` column to `trades_from_activities` schema.
+- Backfill 9 months of JNLC + OPTRD events.
+- Replace `BigQueryService.get_account_baseline()` to query `SUM(net_amount) WHERE activity_type='JNLC'`.
+- Rewrite `wheel_cycles_from_activities`: track concurrent share lots via OPASN buy events and OPTRD/called_away sell events, FIFO-paired, with capital_gain computed from actual OPTRD net_amount rather than `(call_strike − put_strike) × 100`.
+- Reconcile against NLV: realized P&L from options + OPTRD share-side cash + unrealized on open positions + fees ≈ NLV − sum(deposits).
+
+**Open questions:**
+- Does Alpaca emit OPTRD for partial fills or unusual share movements (corporate actions, splits)? Need to validate.
+- Should the rewrite handle ACATC/MA/SPLIT/REORG activities for completeness, or scope strictly to OPTRD/OPASN/OPEXP/JNLC?
+- The 100 missing AMD shares — need to confirm whether it's an Alpaca paper-account quirk or a bot bug. Investigate before the rewrite assumes share counts always reconcile.
+
+**Links:** FC-018 (dashboard rebuild — currently relies on the env-var workaround); `src/data/activities_ingestor.py`; `docs/bigquery/fc012_views.sql` (`wheel_cycles_from_activities`).
+
+---
+
 ### FC-018: Wheel-centric dashboard rebuild (frontend only)
 
 **Status:** Plan published

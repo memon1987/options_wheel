@@ -2,6 +2,7 @@ import { useApi } from '../../hooks/useApi';
 import type {
   ScorecardRow,
   AccountData,
+  AccountBaseline,
   LivePosition,
   PortfolioHistoryPoint,
   PremiumByDayPoint,
@@ -21,6 +22,7 @@ export default function Overview() {
   const { data: equity } = useApi<PortfolioHistoryPoint[]>('/api/history/portfolio-history?days=180');
   const { data: premium } = useApi<PremiumByDayPoint[]>('/api/metrics/premium-by-day?days=365');
   const { data: summary } = useApi<MetricsSummary>('/api/metrics/summary?days=365');
+  const { data: baseline } = useApi<AccountBaseline>('/api/metrics/account-baseline');
 
   // Derive headline numbers
   const grossPremium = summary?.total_premium ?? null;
@@ -30,22 +32,8 @@ export default function Overview() {
   const buyingPower = account?.buying_power ?? null;
   const nlv = account?.portfolio_value ?? null;
 
-  // Unrealized P&L on currently-assigned shares: sum of unrealized_pl on
-  // positions where asset_class is stock (i.e., side != short option).
-  const unrealizedOnShares = (() => {
-    if (!positions) return null;
-    let sum = 0;
-    let counted = 0;
-    for (const p of positions) {
-      const symbol = p.symbol ?? '';
-      // Crude: option symbols match the OCC pattern (>=15 chars, has digits).
-      const isOption = symbol.length >= 15 && /\d/.test(symbol);
-      if (isOption) continue;
-      sum += parseFloat(String(p.unrealized_pl ?? 0));
-      counted++;
-    }
-    return counted > 0 ? sum : 0;
-  })();
+  // (Removed: unrealized-on-shares calc — Total Return now uses NLV − deposits,
+  //  which already includes mark-to-market on every open position.)
 
   // Days running: from first trade time across the scorecard.
   const daysRunning = (() => {
@@ -81,10 +69,10 @@ export default function Overview() {
     nlv,
     cash,
     buyingPower,
+    startingCapital: baseline?.starting_capital ?? null,
     grossPremium,
     netRealizedPnl,
     boughtBack,
-    unrealizedOnShares,
     daysRunning,
   });
 

@@ -585,6 +585,24 @@ class BigQueryService:
             logger.info(f"stock_history query failed for {symbol} — returning empty list")
             return []
 
+    def get_account_baseline(self) -> Dict[str, Any]:
+        """Return the account's starting capital for inception-P&L calculations.
+
+        Today this comes from the ``BASELINE_DEPOSITS`` env var (default
+        100_000.0), matching this paper account's single JNLC funding event
+        on 2025-10-06. FC-019 will replace this with a query over an ingested
+        JNLC + OPTRD stream so accounts with multiple deposits / withdrawals
+        compute correctly.
+        """
+        try:
+            baseline = float(os.environ.get("BASELINE_DEPOSITS", "100000"))
+        except (TypeError, ValueError):
+            baseline = 100000.0
+        return {
+            "starting_capital": baseline,
+            "source": "env:BASELINE_DEPOSITS (default $100k) — FC-019 will replace with ingested JNLC sum",
+        }
+
     def get_ingest_health(self) -> Dict[str, Any]:
         """Last-successful-ingest timestamps for the FC-012/FC-018 ingestors.
 
