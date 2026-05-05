@@ -112,9 +112,11 @@ export interface MetricsSummary {
   total_scans: number;
   total_errors: number;
   trading_days: number;
-  total_premium: number;
+  total_premium: number;     // gross
   put_premium_30d: number;
   call_premium_30d: number;
+  net_realized_pnl: number;  // sum of realized_pnl across closed events
+  bought_back: number;       // gross − net (cash paid in roll buybacks)
   win_rate: number | null;
   avg_premium: number;
   return_30d: number | null;

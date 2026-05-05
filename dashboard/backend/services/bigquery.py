@@ -124,12 +124,24 @@ class BigQueryService:
         return self._run_query(query)
 
     def get_premium_summary(self, days: int = 30) -> Dict[str, Any]:
-        """Premium collection summary."""
+        """Premium collection summary.
+
+        Returns gross AND net numbers so the dashboard can show both:
+          - total_premium (gross): sum of every option premium collected when
+            sold to open. Counts $5 collected even if the position was closed
+            for $4 the next day.
+          - net_realized_pnl: sum of realized_pnl across closed trades. Equals
+            gross premium kept on assigned/expired/called-away positions, plus
+            (premium_collected − buyback_cost) for early-closed positions.
+            This is the "actual cash earned" number.
+          - bought_back: gross − net. Money paid out in buyback costs.
+        """
         query = f"""
         SELECT
             SUM(COALESCE(premium_total, 0)) AS total_premium,
             SUM(CASE WHEN option_type = 'put'  THEN COALESCE(premium_total, 0) ELSE 0 END) AS put_premium,
             SUM(CASE WHEN option_type = 'call' THEN COALESCE(premium_total, 0) ELSE 0 END) AS call_premium,
+            SUM(CASE WHEN outcome != 'open' THEN COALESCE(realized_pnl, 0) ELSE 0 END) AS net_realized_pnl,
             COUNT(*) AS trade_count
         FROM `{self.dataset}.trades_with_outcomes`
         WHERE DATE(transaction_time, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
@@ -137,13 +149,20 @@ class BigQueryService:
         results = self._run_query(query)
         if results:
             row = results[0]
+            gross = row.get('total_premium') or 0
+            net = row.get('net_realized_pnl') or 0
             return {
-                'total_premium': row.get('total_premium') or 0,
+                'total_premium': gross,
                 'put_premium':   row.get('put_premium')   or 0,
                 'call_premium':  row.get('call_premium')  or 0,
+                'net_realized_pnl': net,
+                'bought_back': gross - net,
                 'trade_count':   row.get('trade_count')   or 0,
             }
-        return {'total_premium': 0, 'put_premium': 0, 'call_premium': 0, 'trade_count': 0}
+        return {
+            'total_premium': 0, 'put_premium': 0, 'call_premium': 0,
+            'net_realized_pnl': 0, 'bought_back': 0, 'trade_count': 0,
+        }
 
     def get_premium_by_symbol(self, days: int = 30) -> List[Dict[str, Any]]:
         """Premium breakdown by underlying."""
@@ -339,6 +358,8 @@ class BigQueryService:
             'total_premium': total_premium,
             'put_premium_30d': premium_data.get('put_premium', 0),
             'call_premium_30d': premium_data.get('call_premium', 0),
+            'net_realized_pnl': premium_data.get('net_realized_pnl', 0),
+            'bought_back': premium_data.get('bought_back', 0),
             'win_rate': None,
             'avg_premium': avg_premium,
             'return_30d': None,

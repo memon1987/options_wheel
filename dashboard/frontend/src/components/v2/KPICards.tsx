@@ -1,4 +1,4 @@
-import { fmtCurrency, fmtCurrencyDetail, fmtPercent, pnlColor } from '../../utils/format';
+import { fmtCurrency, fmtCurrencyDetail, pnlColor } from '../../utils/format';
 
 interface KPI {
   label: string;
@@ -42,20 +42,29 @@ export const buildHeadlineKpis = (args: {
   nlv: number | null;
   cash: number | null;
   buyingPower: number | null;
-  totalPremium: number | null;
+  grossPremium: number | null;       // sum of every option premium collected
+  netRealizedPnl: number | null;     // gross − roll buybacks
+  boughtBack: number | null;         // gross − net (paid out to roll)
   unrealizedOnShares: number | null;
-  netPnl: number | null;
   daysRunning: number | null;
 }): KPI[] => {
   const {
     nlv,
     cash,
     buyingPower,
-    totalPremium,
+    grossPremium,
+    netRealizedPnl,
+    boughtBack,
     unrealizedOnShares,
-    netPnl,
     daysRunning,
   } = args;
+
+  // Most-honest P&L number = realized + unrealized on assigned shares.
+  // Realized already accounts for buyback costs on rolls.
+  const totalReturn =
+    netRealizedPnl !== null && unrealizedOnShares !== null
+      ? netRealizedPnl + unrealizedOnShares
+      : null;
 
   return [
     {
@@ -64,26 +73,33 @@ export const buildHeadlineKpis = (args: {
       sub: cash !== null ? `Cash ${fmtCurrency(cash)} · BP ${fmtCurrency(buyingPower)}` : undefined,
     },
     {
-      label: 'Net P&L',
-      value: fmtCurrencyDetail(netPnl),
-      sub: 'Premium − unrealized on shares',
-      tone: 'pnl',
-      rawPnl: netPnl,
-      hint: 'Total premium collected minus unrealized P&L on currently-assigned shares. The "honest" P&L number.',
-    },
-    {
-      label: 'Total Premium',
-      value: fmtCurrencyDetail(totalPremium),
+      label: 'Total Return',
+      value: fmtCurrencyDetail(totalReturn),
       sub:
         unrealizedOnShares !== null && unrealizedOnShares !== 0
-          ? `Unreal on shares ${fmtCurrency(unrealizedOnShares)}`
-          : 'No assigned shares',
-      hint: 'Cumulative premium collected. Always read alongside unrealized P&L on assigned shares.',
+          ? `Realized ${fmtCurrency(netRealizedPnl)} · Unreal ${fmtCurrency(unrealizedOnShares)}`
+          : netRealizedPnl !== null
+            ? `Realized ${fmtCurrency(netRealizedPnl)} · No assigned shares`
+            : undefined,
+      tone: 'pnl',
+      rawPnl: totalReturn,
+      hint: 'Net realized P&L from closed options + unrealized P&L on currently-assigned shares. This is the cash + paper-gain figure that tracks your actual account growth.',
+    },
+    {
+      label: 'Net Realized P&L',
+      value: fmtCurrencyDetail(netRealizedPnl),
+      sub:
+        boughtBack !== null && boughtBack > 0 && grossPremium !== null
+          ? `Gross ${fmtCurrency(grossPremium)} − ${fmtCurrency(boughtBack)} bought back`
+          : 'Premium kept across all closed positions',
+      tone: 'pnl',
+      rawPnl: netRealizedPnl,
+      hint: 'Sum of realized P&L across every closed option. Equals gross premium kept on assigned/expired/called-away positions, plus (premium − buyback) for early-closed positions. This is "actual cash earned from options."',
     },
     {
       label: 'Days Running',
       value: daysRunning !== null ? `${daysRunning}d` : '—',
-      sub: daysRunning !== null && daysRunning > 0 ? `~${fmtPercent(365 / daysRunning - 1)} extrapolation hint` : undefined,
+      sub: daysRunning !== null && daysRunning > 0 ? `since first trade` : undefined,
       hint: 'Days since the first trade in this account.',
     },
   ];
