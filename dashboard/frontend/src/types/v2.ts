@@ -4,10 +4,12 @@ export interface ScorecardRow {
   symbol: string;
   trade_count: number | null;
   cycles_completed: number | null;
-  total_premium: number | null;
+  total_premium: number | null;            // gross option premium
   put_premium: number | null;
   call_premium: number | null;
-  realized_pnl: number | null;
+  realized_pnl: number | null;             // net option-side P&L (post-rolls)
+  share_side_pnl: number | null;           // FC-019: OPTRD net (stock leg)
+  total_realized_pnl: number | null;       // FC-019: realized + share_side
   open_count: number | null;
   put_assignment_count: number | null;
   called_away_count: number | null;
@@ -100,6 +102,7 @@ export interface PortfolioHistoryPoint {
 export interface AccountBaseline {
   starting_capital: number;
   source: string;
+  jnlc_event_count?: number;
 }
 
 export interface PremiumByDayPoint {

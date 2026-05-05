@@ -76,6 +76,31 @@ SAMPLE_OPEXP = {
     "currency": "USD",
 }
 
+SAMPLE_OPTRD = {
+    "id": "20260422000000000::optrd-amzn-2026-04-22",
+    "activity_type": "OPTRD",
+    "date": "2026-04-22",
+    "created_at": "2026-04-23T08:23:24.973256Z",
+    "net_amount": "24000",
+    "description": "Options Trade",
+    "symbol": "AMZN",
+    "qty": "-100",
+    "price": "240",
+    "status": "executed",
+    "group_id": "53054182-24d5-41df-9911-a534b061e1d8",
+    "currency": "USD",
+}
+
+SAMPLE_JNLC = {
+    "id": "20251006000000000::jnlc-funding",
+    "activity_type": "JNLC",
+    "date": "2025-10-06",
+    "created_at": "2025-10-06T13:00:00.000000Z",
+    "net_amount": "100000",
+    "description": "Initial deposit",
+    "currency": "USD",
+}
+
 SAMPLE_STOCK_FILL = {
     "id": "20260420130000000::ffffffff-1111-2222-3333-444455556666",
     "activity_type": "FILL",
@@ -158,6 +183,40 @@ class TestNormalize:
 
     def test_missing_id_returns_none(self):
         assert ActivitiesIngestor._normalize({"activity_type": "FILL"}) is None
+
+    def test_optrd_normalized_with_net_amount(self):
+        row = ActivitiesIngestor._normalize(SAMPLE_OPTRD)
+        assert row is not None
+        assert row["activity_type"] == "OPTRD"
+        assert row["symbol"] == "AMZN"
+        assert row["underlying"] == "AMZN"
+        assert row["option_type"] is None  # ticker, not OCC
+        assert row["qty"] == -100.0
+        assert row["price"] == 240.0
+        assert row["net_amount"] == 24000.0
+        assert row["activity_date"] == "2026-04-22"
+
+    def test_jnlc_funding_event(self):
+        row = ActivitiesIngestor._normalize(SAMPLE_JNLC)
+        assert row is not None
+        assert row["activity_type"] == "JNLC"
+        assert row["net_amount"] == 100000.0
+        assert row["activity_date"] == "2025-10-06"
+        # No symbol on JNLC
+        assert row["symbol"] == ""
+        assert row["option_type"] is None
+        # transaction_time falls back to created_at
+        assert row["transaction_time"] == "2025-10-06T13:00:00.000000Z"
+
+    def test_synthesizes_timestamp_from_date_only(self):
+        """An activity with only `date` (no transaction_time, no created_at)
+        should synthesize a midnight UTC timestamp rather than be dropped.
+        """
+        activity = dict(SAMPLE_OPTRD)
+        activity.pop("created_at")
+        row = ActivitiesIngestor._normalize(activity)
+        assert row is not None
+        assert row["transaction_time"] == "2026-04-22T00:00:00Z"
 
     def test_blank_numeric_fields_stay_none(self):
         activity = dict(SAMPLE_FILL_PUT_SELL)

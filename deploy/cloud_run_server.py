@@ -1094,7 +1094,10 @@ def ingest_activities():
                 'timestamp': datetime.now().isoformat(),
             }), 503
 
-        result = ingestor.run_once()
+        # Optional ?after=YYYY-MM-DD overrides the cursor for one-off
+        # backfills (e.g., FC-019 backfill of new activity types).
+        after_override = request.args.get('after')
+        result = ingestor.run_once(after_override=after_override)
         result['timestamp'] = datetime.now().isoformat()
 
         # Map ingest status to HTTP. 'ok' and 'partial' return 200 so the

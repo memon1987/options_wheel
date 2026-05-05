@@ -167,6 +167,22 @@ WITH trade_agg AS (
   WHERE underlying IS NOT NULL
   GROUP BY underlying
 ),
+-- Share-side P&L: sum of OPTRD net_amount per underlying. Captures the
+-- actual cash flow on assignment (negative — cash leaves to buy shares)
+-- and called-away (positive — cash comes in when shares sell). Net of
+-- all share movements is the true P&L from the stock leg of the wheel.
+-- This is what the wheel_cycles view's (call_strike − put_strike)
+-- approximation gets wrong when share lots overlap.
+share_side_agg AS (
+  SELECT
+    symbol AS underlying,
+    SUM(COALESCE(net_amount, 0)) AS share_side_pnl,
+    COUNT(*) AS share_event_count
+  FROM `options_wheel.trades_from_activities`
+  WHERE activity_type = 'OPTRD'
+    AND symbol IS NOT NULL AND symbol != ''
+  GROUP BY symbol
+),
 cycle_agg AS (
   SELECT
     underlying,
@@ -186,6 +202,16 @@ SELECT
   t.put_premium,
   t.call_premium,
   t.realized_pnl,
+  -- Share-side P&L from actual OPTRD cash flow (FC-019). This is the
+  -- truth for capital gains/losses on share movements, replacing the
+  -- (call_strike − put_strike) approximation that fails on overlapping
+  -- share lots.
+  COALESCE(s.share_side_pnl, 0) AS share_side_pnl,
+  -- Total realized P&L = realized option P&L + share-side P&L.
+  -- This is what should reconcile to the headline Total Return
+  -- (modulo unrealized on currently-open positions and fees).
+  COALESCE(t.realized_pnl, 0) + COALESCE(s.share_side_pnl, 0)
+    AS total_realized_pnl,
   t.open_count,
   t.put_assignment_count,
   t.called_away_count,
@@ -195,16 +221,12 @@ SELECT
   c.avg_cycle_days,
   t.first_trade_time,
   t.last_trade_time,
-  -- Position state at scorecard-render time:
-  --   active_short_put  = at least one open put
-  --   holding_stock     = current_shares > 0 and no open call
-  --   covered_position  = current_shares > 0 with open call(s)
-  --   waiting           = no open puts, no shares
   acb.running_shares AS current_shares,
   acb.acb_per_share AS current_acb_per_share,
   acb.cumulative_net_premium AS current_cumulative_net_premium
 FROM trade_agg t
 FULL OUTER JOIN cycle_agg c USING (underlying)
+LEFT JOIN share_side_agg s USING (underlying)
 LEFT JOIN `options_wheel.fc018_acb_per_symbol_current` acb
   ON acb.underlying = COALESCE(t.underlying, c.underlying);
 

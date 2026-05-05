@@ -203,6 +203,23 @@ cycle_aggregates AS (
     AND t.transaction_time > c.put_assignment_time
     AND (c.call_outcome_time IS NULL OR t.transaction_time <= c.call_outcome_time)
   GROUP BY c.put_activity_id
+),
+-- FC-019: actual share-side cash flow from OPTRD activities within the cycle
+-- window. Replaces the (call_strike − put_strike) approximation that
+-- breaks on overlapping share lots. Each OPTRD records the real cash that
+-- moved when shares were assigned (negative) or called away (positive).
+cycle_share_cash AS (
+  SELECT
+    c.put_activity_id,
+    SUM(COALESCE(o.net_amount, 0)) AS cycle_optrd_net,
+    COUNT(*) AS optrd_event_count
+  FROM cycles c
+  JOIN `options_wheel.trades_from_activities` o
+    ON o.symbol = c.underlying
+    AND o.activity_type = 'OPTRD'
+    AND o.transaction_time >= c.put_assignment_time
+    AND (c.call_outcome_time IS NULL OR o.transaction_time <= c.call_outcome_time)
+  GROUP BY c.put_activity_id
 )
 SELECT
   c.put_activity_id,
@@ -231,26 +248,35 @@ SELECT
   ca.calls_in_cycle,
   ca.cycle_call_gross_premium,
   ca.cycle_call_net_realized,
-  -- total_premium is now the cycle's net realized P&L:
-  --   put kept on assignment + sum of all call realized P&L (rolls included)
-  -- For an in-flight cycle, calls-side includes only events through today.
+  -- total_premium = the cycle's net realized P&L from option events.
+  -- (Stock leg is in capital_gain, computed from OPTRD net_amount below.)
   COALESCE(c.put_premium, 0) + COALESCE(ca.cycle_call_net_realized, 0) AS total_premium,
-  CASE
-    WHEN c.call_strike IS NOT NULL AND c.put_strike IS NOT NULL THEN
-      (c.call_strike - c.put_strike) * 100
-        * LEAST(ABS(COALESCE(c.put_qty, 0)), ABS(COALESCE(c.call_qty, 0)))
-  END AS capital_gain,
+  -- FC-019: capital_gain now uses real OPTRD cash flow within the cycle
+  -- window, not the (call_strike − put_strike) × 100 approximation. This
+  -- handles overlapping share lots correctly. Falls back to the old
+  -- formula if no OPTRD data is ingested yet (FC-019 backfill prerequisite).
+  COALESCE(
+    sc.cycle_optrd_net,
+    CASE
+      WHEN c.call_strike IS NOT NULL AND c.put_strike IS NOT NULL THEN
+        (c.call_strike - c.put_strike) * 100
+          * LEAST(ABS(COALESCE(c.put_qty, 0)), ABS(COALESCE(c.call_qty, 0)))
+    END
+  ) AS capital_gain,
+  sc.optrd_event_count,
   CASE
     WHEN c.put_strike IS NOT NULL AND c.put_strike > 0 AND c.put_qty IS NOT NULL THEN
       SAFE_DIVIDE(
         COALESCE(c.put_premium, 0)
           + COALESCE(ca.cycle_call_net_realized, 0)
-          + CASE
-              WHEN c.call_strike IS NOT NULL THEN
-                (c.call_strike - c.put_strike) * 100
-                  * LEAST(ABS(c.put_qty), ABS(COALESCE(c.call_qty, 0)))
-              ELSE 0
-            END,
+          + COALESCE(
+              sc.cycle_optrd_net,
+              CASE
+                WHEN c.call_strike IS NOT NULL THEN
+                  (c.call_strike - c.put_strike) * 100
+                    * LEAST(ABS(c.put_qty), ABS(COALESCE(c.call_qty, 0)))
+                ELSE 0
+              END),
         c.put_strike * 100 * ABS(c.put_qty)
       )
   END AS total_return,
@@ -261,4 +287,5 @@ SELECT
   ) AS duration_days,
   CAST(ABS(COALESCE(c.put_qty, 0)) * 100 AS INT64) AS shares
 FROM cycles c
-LEFT JOIN cycle_aggregates ca USING (put_activity_id);
+LEFT JOIN cycle_aggregates ca USING (put_activity_id)
+LEFT JOIN cycle_share_cash sc USING (put_activity_id);
