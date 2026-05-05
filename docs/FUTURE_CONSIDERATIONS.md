@@ -247,10 +247,10 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 
 ### FC-020: FIFO cycle pairing in wheel_cycles_from_activities
 
-**Status:** Consideration
+**Status:** Plan published
 **Size estimate:** S-M
-**Owner:** unassigned
-**Plan file:** not yet
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-020.md`
 
 **Problem / opportunity:** After FC-019 landed, the per-symbol scorecard reconciles correctly to actual cash flow (sum of Total P&L ~= account growth, modulo small Alpaca-side data anomalies). But the per-cycle drilldown still has a pairing bug: when multiple put assignments happen on the same underlying before any are called away (overlapping share lots), the view pairs each assigned put to the earliest subsequent called_away, so two puts can both pair to the same called_away. The result: OPTRD events get summed into the wrong cycle window, inflating one cycle's `capital_gain` and treating another cycle as still open.
 
@@ -280,36 +280,6 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 - How to handle the AMD-style data anomaly where OPTRDs net to non-zero shares but Alpaca reports zero? Surface as an "unaccounted_shares_loss" column in the per-symbol scorecard, computed as `current_shares (from OPTRD net) − live_alpaca_shares`?
 
 **Links:** FC-018 (dashboard), FC-019 (the OPTRD ingest that exposed this).
-
----
-
-### FC-019: True P&L reconciliation — ingest JNLC/OPTRD and rewrite wheel_cycles for concurrent lots
-
-**Status:** Consideration
-**Size estimate:** M
-**Owner:** unassigned
-**Plan file:** not yet
-
-**Problem / opportunity:** During FC-018 dashboard work we found two related accounting gaps that combine to make the dashboard's option-sourced P&L disagree with actual account growth (~$2k discrepancy on a paper account that funded $100k and grew to $120k):
-
-1. **`wheel_cycles_from_activities` view assumes 1 put → 1 called_away.** When the bot sells a second put on a symbol whose shares are already held (overlapping share lots — observed on AMD: 200 concurrent shares for ~3 months), the view's `(call_strike − put_strike) × 100` capital-gain calculation fails. The actual share-side cash flow is recorded by Alpaca as **OPTRD** activities — net for AMD across all lots is -$24,250, while the view computed +$1,000.
-
-2. **JNLC and OPTRD are not ingested.** `activities_ingestor` only pulls `FILL`, `OPASN`, `OPEXP`. Cash deposits/withdrawals (JNLC) and share-movement cash flow (OPTRD) are invisible to BigQuery. FC-018's headline "Total Return" tile has to fall back to a hardcoded `BASELINE_DEPOSITS=$100,000` env var because there's no other source.
-
-**Scope:**
-- Extend `activities_ingestor.py` `ACTIVITY_TYPES` to include `JNLC, OPTRD` and update `_normalize` to handle their schemas (no OCC symbol, has `net_amount`).
-- Add `net_amount` column to `trades_from_activities` schema.
-- Backfill 9 months of JNLC + OPTRD events.
-- Replace `BigQueryService.get_account_baseline()` to query `SUM(net_amount) WHERE activity_type='JNLC'`.
-- Rewrite `wheel_cycles_from_activities`: track concurrent share lots via OPASN buy events and OPTRD/called_away sell events, FIFO-paired, with capital_gain computed from actual OPTRD net_amount rather than `(call_strike − put_strike) × 100`.
-- Reconcile against NLV: realized P&L from options + OPTRD share-side cash + unrealized on open positions + fees ≈ NLV − sum(deposits).
-
-**Open questions:**
-- Does Alpaca emit OPTRD for partial fills or unusual share movements (corporate actions, splits)? Need to validate.
-- Should the rewrite handle ACATC/MA/SPLIT/REORG activities for completeness, or scope strictly to OPTRD/OPASN/OPEXP/JNLC?
-- The 100 missing AMD shares — need to confirm whether it's an Alpaca paper-account quirk or a bot bug. Investigate before the rewrite assumes share counts always reconcile.
-
-**Links:** FC-018 (dashboard rebuild — currently relies on the env-var workaround); `src/data/activities_ingestor.py`; `docs/bigquery/fc012_views.sql` (`wheel_cycles_from_activities`).
 
 ---
 
@@ -415,3 +385,9 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - No dedicated PR — superseded by FC-010 + FC-012.
 - Closed: 2026-04-24
 - Notes: Two independent mechanisms neutralized this. (1) FC-010 disabled call stop-losses, so `should_close_call_early` no longer returns True for losses — the mislabeling trigger is gone. (2) FC-012 cut dashboard reads over to `trades_with_outcomes` (Alpaca-sourced), so the corrupted `event_type=early_close_executed` + `reason=profit_target_reached` rows in the v1 `trades` table no longer affect analytics. Historical rows remain dirty but unread; the v1 table itself is scheduled for drop on 2026-05-01 via the FC-012 cleanup routine. If put early-closes ever start showing the same mislabel in structlog events, re-file as a new FC focused on the put-side path only.
+
+### FC-019: True P&L reconciliation — JNLC + OPTRD ingest, share-side P&L
+- Plan: `docs/plans/fc-019.md` (written retroactively)
+- PR: https://github.com/memon1987/options_wheel/pull/19 (merged 2026-05-05)
+- Commit: `78acf92` (preceded by `4862159` — interim env-var-baseline fix that this PR replaces with the real JNLC sum)
+- Notes: Per-symbol scorecard now reconciles to actual account growth (sum of Total P&L = $21,808 vs account growth $20,080, with the ~$1,600 unexplained gap concentrated entirely on AMD's Alpaca-side data anomaly). New scorecard columns: Option P&L (renamed from Net P&L), Share P&L (FC-019), Total P&L (sum). `wheel_cycles_from_activities.capital_gain` now uses real OPTRD cash flow within the cycle window. `BASELINE_DEPOSITS` env var becomes a fallback only — primary source is `SUM(net_amount) WHERE activity_type='JNLC'`. Per-cycle pairing for overlapping share lots is filed as **FC-020** for follow-up.

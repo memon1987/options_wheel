@@ -30,3 +30,5 @@ _List active plans here as they are added._
 - [fc-012.md](fc-012.md) — FC-012: Shift dashboard logging to Alpaca queries, status: done
 - [fc-013.md](fc-013.md) — FC-013: Gate health audit & earnings blackout symmetry, status: draft
 - [fc-018.md](fc-018.md) — FC-018: Wheel-centric dashboard rebuild (frontend only), status: draft
+- [fc-019.md](fc-019.md) — FC-019: True P&L reconciliation (JNLC + OPTRD ingest), status: done
+- [fc-020.md](fc-020.md) — FC-020: FIFO cycle pairing for overlapping share lots, status: draft
