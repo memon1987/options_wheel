@@ -5,12 +5,14 @@ import type {
   DecisionQualityRow,
   VsBuyAndHold,
   ScorecardRow,
+  PhaseTiming,
 } from '../../types/v2';
 import AcbWalkChart from '../../components/v2/AcbWalkChart';
 import DecisionQuality from '../../components/v2/DecisionQuality';
 import CycleTable from '../../components/v2/CycleTable';
 import TradeLog from '../../components/v2/TradeLog';
 import VsBuyAndHoldCard from '../../components/v2/VsBuyAndHoldCard';
+import PhaseTimingBar from '../../components/v2/PhaseTimingBar';
 import { fmtCurrency, fmtCurrencyDetail, fmtNumber, pnlColor } from '../../utils/format';
 
 interface CycleRow {
@@ -44,6 +46,7 @@ export default function SymbolDeepDive() {
   const { data: decision } = useApi<DecisionQualityRow[]>(skip ? null : `/api/v2/symbol/${symbol}/decision-quality?days=365`);
   const { data: vsBh } = useApi<VsBuyAndHold>(skip ? null : `/api/v2/symbol/${symbol}/vs-buy-and-hold`);
   const { data: cycles } = useApi<CycleRow[]>(skip ? null : `/api/v2/symbol/${symbol}/cycles?days=730`);
+  const { data: phase } = useApi<PhaseTiming>(skip ? null : `/api/v2/symbol/${symbol}/phase-timing?days=730`);
   const { data: scorecard } = useApi<ScorecardRow[]>('/api/v2/scorecard?days=365');
 
   // Symbol-summary header data is the matching scorecard row.
@@ -157,6 +160,8 @@ export default function SymbolDeepDive() {
         <DecisionQuality rows={decision ?? []} />
         <VsBuyAndHoldCard data={vsBh ?? null} />
       </div>
+
+      <PhaseTimingBar data={phase ?? null} />
 
       <CycleTable rows={symbolCycles} />
 

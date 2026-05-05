@@ -78,6 +78,18 @@ async def vs_buy_and_hold(underlying: str) -> Dict[str, Any]:
     return result
 
 
+@router.get("/symbol/{underlying}/phase-timing")
+async def phase_timing(
+    underlying: str,
+    days: int = Query(default=730, ge=1, le=3650),
+) -> Dict[str, Any]:
+    """Days spent in each phase (cash / short put / long stock / covered)."""
+    if not underlying or len(underlying) > 10:
+        raise HTTPException(status_code=400, detail="Invalid underlying")
+    bq = get_bigquery_service()
+    return bq.get_phase_timing(symbol=underlying.upper(), days=days)
+
+
 @router.get("/symbol/{underlying}/cycles")
 async def symbol_cycles(
     underlying: str,

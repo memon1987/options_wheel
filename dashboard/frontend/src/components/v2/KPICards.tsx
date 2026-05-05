@@ -72,6 +72,18 @@ export const buildHeadlineKpis = (args: {
       ? (nlv - startingCapital) / startingCapital
       : null;
 
+  // Annualized return — for an account with a single deposit, this is the
+  // CAGR-like expression (NLV/deposit)^(365/days) − 1. With multiple
+  // deposits/withdrawals a true XIRR is needed; FC-019's BASELINE_DEPOSITS
+  // sum doesn't carry timing data per-deposit, so this is single-deposit
+  // approximate. Suppress display below 30 days running (extrapolation
+  // from <30d of data is misleading per the wheel-research consensus).
+  const annualizedReturn =
+    nlv !== null && startingCapital !== null && startingCapital > 0
+      && daysRunning !== null && daysRunning >= 30
+      ? Math.pow(nlv / startingCapital, 365 / daysRunning) - 1
+      : null;
+
   return [
     {
       label: 'Net Liquidation Value',
@@ -82,12 +94,14 @@ export const buildHeadlineKpis = (args: {
       label: 'Total Return',
       value: fmtCurrencyDetail(totalReturn),
       sub:
-        startingCapital !== null
-          ? `${fmtPercent(totalReturnPct ?? 0)} since inception · started ${fmtCurrency(startingCapital)}`
-          : undefined,
+        annualizedReturn !== null
+          ? `${fmtPercent(totalReturnPct ?? 0)} since inception · ${fmtPercent(annualizedReturn)} annualized`
+          : startingCapital !== null
+            ? `${fmtPercent(totalReturnPct ?? 0)} since inception · started ${fmtCurrency(startingCapital)}`
+            : undefined,
       tone: 'pnl',
       rawPnl: totalReturn,
-      hint: 'Current NLV minus net deposits since inception. The bank-statement number — what your account actually grew by, free of accounting noise from realized vs unrealized vs share-side cash flow.',
+      hint: 'Current NLV minus net deposits since inception. The bank-statement number — what your account actually grew by, free of accounting noise from realized vs unrealized vs share-side cash flow. Annualized = (NLV/deposits)^(365/days) − 1, suppressed under 30 days.',
     },
     {
       label: 'Net Realized P&L',

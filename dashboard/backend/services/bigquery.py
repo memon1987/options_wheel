@@ -454,6 +454,126 @@ class BigQueryService:
             logger.error(f"acb_timeline query failed for {symbol}: {e}")
             return []
 
+    def get_phase_timing(self, symbol: str, days: int = 730) -> Dict[str, Any]:
+        """Days spent in each phase for one underlying.
+
+        Phases:
+          - cash_waiting: no open puts, no shares
+          - short_put: open put(s), no shares
+          - long_stock: holding shares, no open call
+          - covered: holding shares + open call
+
+        Computed by walking events chronologically (Python; SQL for this is
+        more pain than it's worth at <100 events per symbol). Returns
+        seconds-in-phase totals + a normalized days breakdown for charting.
+        """
+        # Pull every option event for this symbol, with running_shares from
+        # acb_timeline_per_symbol so we already know stock state at each point.
+        query = f"""
+        SELECT
+            event_time,
+            activity_type,
+            option_type,
+            side,
+            outcome,
+            running_shares
+        FROM `{self.dataset}.fc018_acb_timeline_per_symbol`
+        WHERE underlying = @symbol
+          AND event_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+        ORDER BY event_time ASC
+        """
+        try:
+            from google.cloud.bigquery import ScalarQueryParameter, QueryJobConfig
+            job_config = QueryJobConfig(query_parameters=[
+                ScalarQueryParameter("symbol", "STRING", symbol),
+                ScalarQueryParameter("days", "INT64", days),
+            ])
+            results = list(self.client.query(query, job_config=job_config).result(timeout=60))
+        except Exception as e:
+            logger.error(f"phase_timing query failed for {symbol}: {e}")
+            return {"cash_waiting": 0, "short_put": 0, "long_stock": 0, "covered": 0,
+                    "first_event": None, "last_event": None}
+
+        if not results:
+            return {"cash_waiting": 0, "short_put": 0, "long_stock": 0, "covered": 0,
+                    "first_event": None, "last_event": None}
+
+        from datetime import datetime, timezone
+        # Walk events; track open-put count and open-call count.
+        open_puts = 0
+        open_calls = 0
+        in_phase = "cash_waiting"
+        prev_time = None
+        totals = {"cash_waiting": 0.0, "short_put": 0.0, "long_stock": 0.0, "covered": 0.0}
+
+        def classify(open_puts: int, open_calls: int, shares: int) -> str:
+            if shares > 0 and open_calls > 0:
+                return "covered"
+            if shares > 0:
+                return "long_stock"
+            if open_puts > 0:
+                return "short_put"
+            return "cash_waiting"
+
+        for row in results:
+            t = row["event_time"]
+            shares = int(row["running_shares"] or 0)
+            atype = row["activity_type"]
+            otype = row["option_type"]
+            side = row["side"]
+            outcome = row["outcome"]
+
+            # Accumulate time-in-phase since previous event.
+            if prev_time is not None:
+                delta = (t - prev_time).total_seconds()
+                totals[in_phase] = totals.get(in_phase, 0.0) + delta
+
+            # Update open-position counters from this event.
+            if atype == "FILL":
+                if side in ("sell_short", "sell"):
+                    if otype == "put":
+                        open_puts += 1
+                    elif otype == "call":
+                        open_calls += 1
+                elif side in ("buy_to_close", "buy"):
+                    if otype == "put":
+                        open_puts = max(0, open_puts - 1)
+                    elif otype == "call":
+                        open_calls = max(0, open_calls - 1)
+            elif atype == "OPASN":
+                # Assignment closes a short option. running_shares already
+                # reflects the share movement.
+                if otype == "put":
+                    open_puts = max(0, open_puts - 1)
+                elif otype == "call":
+                    open_calls = max(0, open_calls - 1)
+            elif atype == "OPEXP":
+                if otype == "put":
+                    open_puts = max(0, open_puts - 1)
+                elif otype == "call":
+                    open_calls = max(0, open_calls - 1)
+
+            in_phase = classify(open_puts, open_calls, shares)
+            prev_time = t
+
+        # Trail to "now" with the final phase.
+        if prev_time is not None:
+            now = datetime.now(timezone.utc)
+            if prev_time.tzinfo is None:
+                prev_time = prev_time.replace(tzinfo=timezone.utc)
+            delta = (now - prev_time).total_seconds()
+            totals[in_phase] = totals.get(in_phase, 0.0) + delta
+
+        return {
+            "cash_waiting": round(totals["cash_waiting"] / 86400, 2),
+            "short_put": round(totals["short_put"] / 86400, 2),
+            "long_stock": round(totals["long_stock"] / 86400, 2),
+            "covered": round(totals["covered"] / 86400, 2),
+            "first_event": results[0]["event_time"].isoformat() if results else None,
+            "last_event": results[-1]["event_time"].isoformat() if results else None,
+            "current_phase": in_phase,
+        }
+
     def get_decision_quality(self, symbol: str, days: int = 365) -> List[Dict[str, Any]]:
         """% of max profit captured at close, per closed trade for one symbol.
 

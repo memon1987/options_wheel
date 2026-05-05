@@ -86,6 +86,16 @@ export interface StockBar {
   volume: number;
 }
 
+export interface PhaseTiming {
+  cash_waiting: number;   // days
+  short_put: number;
+  long_stock: number;
+  covered: number;
+  first_event: string | null;
+  last_event: string | null;
+  current_phase: 'cash_waiting' | 'short_put' | 'long_stock' | 'covered';
+}
+
 export interface IngestHealth {
   trades_from_activities: string | null;
   equity_history_from_alpaca: string | null;

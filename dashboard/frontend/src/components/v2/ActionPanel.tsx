@@ -1,8 +1,9 @@
-import type { LivePosition } from '../../types/v2';
+import type { LivePosition, ScorecardRow } from '../../types/v2';
 import { fmtCurrency, fmtPercent, parseOcc, cls } from '../../utils/format';
 
 interface Props {
   positions: LivePosition[];
+  scorecard?: ScorecardRow[]; // for current_price lookup per underlying
 }
 
 interface Annotated {
@@ -12,11 +13,18 @@ interface Annotated {
   strike: number | null;
   expiration: string | null;
   daysToExpiry: number | null;
+  pctToStrike: number | null;        // NEW: |strike − underlying| / underlying
+  captureRatio: number | null;       // NEW: % of max profit currently captured
   badges: string[];
 }
 
-const annotate = (positions: LivePosition[]): Annotated[] => {
+const annotate = (positions: LivePosition[], scorecard: ScorecardRow[] | undefined): Annotated[] => {
   const today = new Date();
+  const priceBySymbol = new Map<string, number>();
+  for (const r of scorecard ?? []) {
+    if (r.price_now !== null) priceBySymbol.set(r.symbol, r.price_now);
+  }
+
   return positions.map((pos) => {
     const occ = parseOcc(pos.symbol);
     let dte: number | null = null;
@@ -24,15 +32,37 @@ const annotate = (positions: LivePosition[]): Annotated[] => {
       const exp = new Date(occ.expiration + 'T16:00:00Z');
       dte = Math.max(0, Math.ceil((exp.getTime() - today.getTime()) / 86_400_000));
     }
+
+    const underlyingPrice = priceBySymbol.get(occ.underlying) ?? null;
+    const strike = occ.strike;
+    const pctToStrike =
+      strike !== null && underlyingPrice !== null && underlyingPrice > 0
+        ? Math.abs(strike - underlyingPrice) / underlyingPrice
+        : null;
+
+    // % of max profit captured for a SHORT option:
+    // max profit = original premium received. current "remaining" = current
+    // option market value (cost to close). captured = (premium − cost_to_close) / premium.
+    // We have cost_basis (negative when short) representing initial credit, and
+    // market_value (negative) representing current cost-to-close.
+    const credit = Math.abs(parseFloat(String(pos.cost_basis ?? 0)));
+    const cost = Math.abs(parseFloat(String(pos.market_value ?? 0)));
+    const captureRatio = credit > 0 ? (credit - cost) / credit : null;
+
     const badges: string[] = [];
     if (dte !== null && dte <= 7) badges.push('≤7 DTE');
+    if (pctToStrike !== null && pctToStrike < 0.05) badges.push('Near strike');
+    if (captureRatio !== null && captureRatio >= 0.5) badges.push('≥50% captured');
+
     return {
       pos,
       underlying: occ.underlying,
       optionType: occ.optionType,
-      strike: occ.strike,
+      strike,
       expiration: occ.expiration,
       daysToExpiry: dte,
+      pctToStrike,
+      captureRatio,
       badges,
     };
   });
@@ -42,8 +72,8 @@ const Badge = ({ children, color }: { children: React.ReactNode; color: string }
   <span className={cls('px-2 py-0.5 text-xs font-medium rounded', color)}>{children}</span>
 );
 
-export default function ActionPanel({ positions }: Props) {
-  const annotated = annotate(positions ?? []);
+export default function ActionPanel({ positions, scorecard }: Props) {
+  const annotated = annotate(positions ?? [], scorecard);
   // Sort by DTE ascending (most urgent first); positions without expiry last.
   annotated.sort((a, b) => {
     if (a.daysToExpiry === null && b.daysToExpiry === null) return 0;
@@ -75,13 +105,15 @@ export default function ActionPanel({ positions }: Props) {
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-left text-gray-400">Type</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Strike</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">DTE</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Distance from underlying price to strike, as a percent of underlying">% to Strike</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="% of max profit captured if closed now: (premium − current cost to close) / premium">% Captured</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Mkt Value</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Unrealized</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-left text-gray-400">Flags</th>
             </tr>
           </thead>
           <tbody>
-            {annotated.map(({ pos, underlying, optionType, strike, daysToExpiry, badges }) => {
+            {annotated.map(({ pos, underlying, optionType, strike, daysToExpiry, pctToStrike, captureRatio, badges }) => {
               const mv = parseFloat(String(pos.market_value ?? 0));
               const upl = parseFloat(String(pos.unrealized_pl ?? 0));
               const pnlPct = mv !== 0 ? upl / Math.abs(mv) : 0;
@@ -105,6 +137,18 @@ export default function ActionPanel({ positions }: Props) {
                   <td className="px-3 py-2 text-sm text-right text-gray-200">
                     {daysToExpiry !== null ? `${daysToExpiry}d` : '—'}
                   </td>
+                  <td className={cls(
+                    'px-3 py-2 text-sm text-right',
+                    pctToStrike !== null && pctToStrike < 0.05 ? 'text-yellow-300' : 'text-gray-200'
+                  )}>
+                    {pctToStrike !== null ? fmtPercent(pctToStrike, 1) : <span className="text-gray-500">—</span>}
+                  </td>
+                  <td className={cls(
+                    'px-3 py-2 text-sm text-right',
+                    captureRatio !== null && captureRatio >= 0.5 ? 'text-green-300' : 'text-gray-200'
+                  )}>
+                    {captureRatio !== null ? fmtPercent(captureRatio, 0) : <span className="text-gray-500">—</span>}
+                  </td>
                   <td className="px-3 py-2 text-sm text-right text-gray-200">
                     {fmtCurrency(mv)}
                   </td>
@@ -116,14 +160,13 @@ export default function ActionPanel({ positions }: Props) {
                   </td>
                   <td className="px-3 py-2 text-sm">
                     <div className="flex gap-1 flex-wrap">
-                      {badges.map((b) => (
-                        <Badge
-                          key={b}
-                          color={b.includes('DTE') ? 'bg-yellow-900/40 text-yellow-300' : 'bg-gray-700 text-gray-300'}
-                        >
-                          {b}
-                        </Badge>
-                      ))}
+                      {badges.map((b) => {
+                        let color = 'bg-gray-700 text-gray-300';
+                        if (b.includes('DTE')) color = 'bg-yellow-900/40 text-yellow-300';
+                        else if (b === 'Near strike') color = 'bg-orange-900/40 text-orange-300';
+                        else if (b.includes('captured')) color = 'bg-green-900/40 text-green-300';
+                        return <Badge key={b} color={color}>{b}</Badge>;
+                      })}
                     </div>
                   </td>
                 </tr>
