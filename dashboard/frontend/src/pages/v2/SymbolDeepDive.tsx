@@ -9,6 +9,7 @@ import type {
 import AcbWalkChart from '../../components/v2/AcbWalkChart';
 import DecisionQuality from '../../components/v2/DecisionQuality';
 import CycleTable from '../../components/v2/CycleTable';
+import TradeLog from '../../components/v2/TradeLog';
 import VsBuyAndHoldCard from '../../components/v2/VsBuyAndHoldCard';
 import { fmtCurrency, fmtCurrencyDetail, fmtNumber, pnlColor } from '../../utils/format';
 
@@ -158,6 +159,8 @@ export default function SymbolDeepDive() {
       </div>
 
       <CycleTable rows={symbolCycles} />
+
+      <TradeLog events={acb ?? []} />
     </div>
   );
 }
