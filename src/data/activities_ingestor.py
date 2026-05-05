@@ -37,7 +37,7 @@ except ImportError:
     bigquery = None  # type: ignore
 
 
-ACTIVITY_TYPES = "FILL,OPASN,OPEXP"
+ACTIVITY_TYPES = "FILL,OPASN,OPEXP,OPTRD,JNLC"
 TABLE_NAME = "trades_from_activities"
 
 
@@ -46,14 +46,14 @@ if _HAS_BIGQUERY:
         bigquery.SchemaField("activity_id", "STRING", mode="REQUIRED",
                              description="Unique Alpaca activity ID (idempotency key)"),
         bigquery.SchemaField("activity_type", "STRING",
-                             description="FILL, OPASN, or OPEXP"),
+                             description="FILL, OPASN, OPEXP, OPTRD, JNLC"),
         bigquery.SchemaField("transaction_time", "TIMESTAMP",
-                             description="FILL: transaction_time; OPASN/OPEXP: created_at"),
+                             description="FILL: transaction_time; others: created_at"),
         bigquery.SchemaField("activity_date", "DATE",
                              description="ET calendar date of the activity"),
         bigquery.SchemaField("order_id", "STRING"),
         bigquery.SchemaField("symbol", "STRING",
-                             description="OCC symbol for options, ticker for stocks"),
+                             description="OCC for option FILLs, ticker for stock OPTRD, blank for JNLC"),
         bigquery.SchemaField("underlying", "STRING"),
         bigquery.SchemaField("side", "STRING",
                              description="sell_short, buy_to_close, buy, sell, etc."),
@@ -71,6 +71,10 @@ if _HAS_BIGQUERY:
         bigquery.SchemaField("dte_at_event", "INTEGER"),
         bigquery.SchemaField("premium_total", "FLOAT",
                              description="price * qty * 100 for option FILLs"),
+        bigquery.SchemaField("net_amount", "FLOAT",
+                             description="Cash flow from this activity. Critical for OPTRD "
+                                         "(share-side cash flow on assignment/called-away) and "
+                                         "JNLC (account deposits/withdrawals). Null for FILL/OPASN/OPEXP."),
         bigquery.SchemaField("ingested_at", "TIMESTAMP",
                              description="When this row was written to BQ"),
     ]
@@ -145,18 +149,18 @@ class ActivitiesIngestor:
     # ------------------------------------------------------------------
 
     def _read_cursor(self) -> tuple[Optional[str], bool]:
-        """Return the earliest 'after' date that covers both FILL and OPASN/OPEXP.
+        """Return the earliest 'after' date that covers every ingested activity type.
 
-        FILL rows use ``transaction_time``; OPASN/OPEXP use ``activity_date``.
-        We take the MIN of both maxes as the cursor so neither type is missed.
-        The idempotency check drops any rows re-fetched from the cursor day.
+        FILL rows use ``transaction_time``; everything else (OPASN, OPEXP,
+        OPTRD, JNLC) uses ``activity_date``. We take the MIN of all maxes as
+        the cursor so no type is missed. If a type has no rows yet (e.g.,
+        first run after adding JNLC/OPTRD to ACTIVITY_TYPES), its date is
+        NULL and excluded from the MIN; the dedup check on activity_id then
+        prevents re-ingesting any rows the existing types overlap.
 
-        Returns a tuple ``(cursor, ok)``:
-          - ``cursor``: ISO date string, or ``None`` if the table is empty (full
-            backfill) *or* the cursor query failed.
-          - ``ok``: ``True`` on success (including empty-table); ``False`` if
-            the query itself failed. Callers surface ``ok=False`` in the result
-            dict so a failed cursor read does not masquerade as a fresh start.
+        For a true clean-slate backfill of newly-added activity types when the
+        existing types already have rows past the historical window of the
+        new types, callers should pass ``after_override`` to ``run_once``.
         """
         if not self._enabled:
             return None, True
@@ -164,16 +168,17 @@ class ActivitiesIngestor:
         query = f"""
             SELECT
               MAX(CASE WHEN activity_type = 'FILL' THEN DATE(transaction_time, 'America/New_York') END) AS max_fill_date,
-              MAX(CASE WHEN activity_type IN ('OPASN','OPEXP') THEN activity_date END) AS max_opevent_date
+              MAX(CASE WHEN activity_type IN ('OPASN','OPEXP') THEN activity_date END) AS max_opevent_date,
+              MAX(CASE WHEN activity_type IN ('OPTRD','JNLC') THEN activity_date END) AS max_cash_date
             FROM `{self._project_id}.{self._dataset_id}.{TABLE_NAME}`
         """
         try:
             row = next(iter(self._client.query(query).result()), None)
             if row is None:
                 return None, True
-            fill_date = row["max_fill_date"]
-            opevent_date = row["max_opevent_date"]
-            candidates = [d for d in (fill_date, opevent_date) if d is not None]
+            candidates = [d for d in (row["max_fill_date"],
+                                      row["max_opevent_date"],
+                                      row["max_cash_date"]) if d is not None]
             if not candidates:
                 return None, True
             cursor_date = min(candidates)
@@ -250,7 +255,21 @@ class ActivitiesIngestor:
     def _normalize(activity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Convert a raw Alpaca activity dict into a table row.
 
-        Returns ``None`` if the activity is malformed (no ID).
+        Handles five activity types with subtly different shapes:
+          - FILL: per-contract execution. OCC symbol, transaction_time (ms),
+            side, qty, price.
+          - OPASN: assignment/called-away. OCC symbol, date + created_at,
+            qty, no price (net_amount=0).
+          - OPEXP: expiration. OCC symbol, date + created_at, qty.
+          - OPTRD: daily share-side rollup per underlying. Symbol = ticker
+            (NOT OCC), date + created_at, qty (signed: + buy, − sell), price,
+            net_amount (real cash flow on share movement).
+          - JNLC: cash journal (deposits/withdrawals). No symbol, no qty,
+            date + created_at, net_amount.
+
+        Returns ``None`` if the activity is malformed (no ID, no usable
+        timestamp). Activities with no ``transaction_time`` and no
+        ``created_at`` and no ``date`` are dropped.
         """
         activity_id = activity.get("id")
         if not activity_id:
@@ -259,16 +278,16 @@ class ActivitiesIngestor:
         activity_type = activity.get("activity_type", "")
         symbol = activity.get("symbol", "") or ""
 
-        # Timestamp normalization — BQ partition field must be non-null.
-        # FILL: ``transaction_time``. OPASN/OPEXP: ``created_at``. If neither
-        # is present, the row is malformed and is skipped (returning None).
+        # Timestamp normalization. BQ partition field must be non-null.
+        # Preference order: transaction_time (FILL) → created_at (OP*)
+        # → synthesized from date (oldest fallback for malformed payloads).
         tx_time = activity.get("transaction_time") or activity.get("created_at")
+        activity_date = activity.get("date")
+        if not tx_time and activity_date:
+            tx_time = f"{activity_date}T00:00:00Z"
         if not tx_time:
             return None
 
-        activity_date = activity.get("date")  # present on OPASN/OPEXP
-
-        # Numeric fields
         def _f(key: str) -> Optional[float]:
             v = activity.get(key)
             if v is None or v == "":
@@ -280,16 +299,18 @@ class ActivitiesIngestor:
 
         qty = _f("qty")
         price = _f("price")
+        net_amount = _f("net_amount")
 
-        # OCC symbol parse — only meaningful for option symbols
+        # OCC symbol parsing — only for FILL on option contracts.
+        # OPTRD symbol is the underlying ticker (e.g., 'AMZN'), not OCC.
+        # OPASN/OPEXP symbol is OCC (e.g., 'AMZN260422C00240000').
+        # JNLC has no symbol.
         option_type: Optional[str] = None
         strike_price: Optional[float] = None
         expiration: Optional[str] = None
         dte_at_event: Optional[int] = None
         underlying = symbol
 
-        # Option symbols look like e.g. AMD260501P00277500 (>=15 chars + letters+digits).
-        # For OPTRD the symbol is an underlying ticker — skip parse in that case.
         if symbol and len(symbol) >= 15 and any(c.isdigit() for c in symbol):
             parsed = parse_option_symbol(symbol)
             if parsed.get("option_type") in ("put", "call"):
@@ -301,7 +322,6 @@ class ActivitiesIngestor:
 
         premium_total: Optional[float] = None
         if option_type and qty is not None and price is not None:
-            # qty may be negative (sell); premium_total is signed by convention
             premium_total = price * abs(qty) * 100
 
         return {
@@ -324,6 +344,7 @@ class ActivitiesIngestor:
             "expiration": expiration,
             "dte_at_event": dte_at_event,
             "premium_total": premium_total,
+            "net_amount": net_amount,
             "ingested_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -331,20 +352,31 @@ class ActivitiesIngestor:
     # Public entrypoint
     # ------------------------------------------------------------------
 
-    def run_once(self) -> Dict[str, Any]:
+    def run_once(self, after_override: Optional[str] = None) -> Dict[str, Any]:
         """Pull new activities and append them to BigQuery. Idempotent.
+
+        Args:
+            after_override: ISO date string. When provided, bypasses the
+                normal cursor logic and starts the pull from this date.
+                Used for backfills when newly-added activity types
+                (e.g., JNLC, OPTRD added in FC-019) have no rows in the
+                table yet.
 
         Returns a summary dict for the endpoint response.
         """
         if not self._enabled:
             return {"status": "disabled", "reason": "BigQuery unavailable"}
 
-        after, cursor_ok = self._read_cursor()
+        if after_override:
+            after, cursor_ok = after_override, True
+        else:
+            after, cursor_ok = self._read_cursor()
         logger.info("ActivitiesIngestor run_once starting",
                     event_category="system",
                     event_type="activities_ingest_started",
                     after=after,
-                    cursor_ok=cursor_ok)
+                    cursor_ok=cursor_ok,
+                    override=bool(after_override))
 
         try:
             raw_activities = self._pull_all(after)

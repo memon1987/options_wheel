@@ -374,7 +374,7 @@ class BigQueryService:
 
         Joins the FC-018 scorecard view with vs-buy-and-hold deltas. Returns
         one row per underlying with cycle counts, premium, realized P&L,
-        current ACB, and wheel-vs-buy-and-hold comparison.
+        share-side P&L (FC-019), and wheel-vs-buy-and-hold comparison.
         """
         try:
             query = f"""
@@ -386,6 +386,8 @@ class BigQueryService:
                 s.put_premium,
                 s.call_premium,
                 s.realized_pnl,
+                s.share_side_pnl,
+                s.total_realized_pnl,
                 s.open_count,
                 s.put_assignment_count,
                 s.called_away_count,
@@ -405,7 +407,7 @@ class BigQueryService:
             LEFT JOIN `{self.dataset}.fc018_vs_buy_and_hold_per_symbol` bh
                 USING (underlying)
             WHERE s.last_trade_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
-            ORDER BY s.total_premium DESC
+            ORDER BY s.total_realized_pnl DESC
             """
             return self._run_query(query)
         except Exception:
@@ -542,6 +544,7 @@ class BigQueryService:
             calls_in_cycle,
             cycle_call_gross_premium,
             cycle_call_net_realized,
+            optrd_event_count,
             capital_gain,
             total_premium,
             total_return,
@@ -588,19 +591,41 @@ class BigQueryService:
     def get_account_baseline(self) -> Dict[str, Any]:
         """Return the account's starting capital for inception-P&L calculations.
 
-        Today this comes from the ``BASELINE_DEPOSITS`` env var (default
-        100_000.0), matching this paper account's single JNLC funding event
-        on 2025-10-06. FC-019 will replace this with a query over an ingested
-        JNLC + OPTRD stream so accounts with multiple deposits / withdrawals
-        compute correctly.
+        Sums every JNLC (cash journal) activity ever ingested. Net deposits
+        minus withdrawals gives the actual amount of capital the user put in.
+        For a single-deposit paper account this is just the funding amount.
+
+        Falls back to the ``BASELINE_DEPOSITS`` env var (default 100_000.0)
+        if the JNLC ingest hasn't run yet (e.g., during initial deploy of
+        FC-019 before the backfill triggers). The fallback path is logged so
+        operators can spot when they're seeing stale data.
         """
+        query = f"""
+        SELECT SUM(COALESCE(net_amount, 0)) AS total_jnlc, COUNT(*) AS event_count
+        FROM `{self.dataset}.trades_from_activities`
+        WHERE activity_type = 'JNLC'
+        """
+        try:
+            results = self._run_query(query)
+            if results and results[0].get('event_count', 0) > 0:
+                total = float(results[0].get('total_jnlc') or 0)
+                return {
+                    "starting_capital": total,
+                    "jnlc_event_count": int(results[0].get('event_count') or 0),
+                    "source": f"BQ:trades_from_activities (sum of {results[0].get('event_count')} JNLC events)",
+                }
+        except Exception as e:
+            logger.warning(f"JNLC sum query failed; falling back to env: {e}")
+
+        # Fallback path
         try:
             baseline = float(os.environ.get("BASELINE_DEPOSITS", "100000"))
         except (TypeError, ValueError):
             baseline = 100000.0
         return {
             "starting_capital": baseline,
-            "source": "env:BASELINE_DEPOSITS (default $100k) — FC-019 will replace with ingested JNLC sum",
+            "jnlc_event_count": 0,
+            "source": "env:BASELINE_DEPOSITS fallback (no JNLC rows ingested yet)",
         }
 
     def get_ingest_health(self) -> Dict[str, Any]:
