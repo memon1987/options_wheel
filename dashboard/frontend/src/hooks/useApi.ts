@@ -60,11 +60,11 @@ async function fetchWithRetry<T>(url: string): Promise<T> {
   throw lastError ?? new Error('Fetch failed after retries');
 }
 
-export function useApi<T>(url: string, options: UseApiOptions = {}): UseApiResult<T> {
+export function useApi<T>(url: string | null, options: UseApiOptions = {}): UseApiResult<T> {
   const { refreshInterval = 0, immediate = true } = options;
 
   const [data, setData] = useState<T | null>(null);
-  const [loading, setLoading] = useState<boolean>(immediate);
+  const [loading, setLoading] = useState<boolean>(immediate && !!url);
   const [error, setError] = useState<string | null>(null);
 
   const mountedRef = useRef(true);
@@ -72,6 +72,12 @@ export function useApi<T>(url: string, options: UseApiOptions = {}): UseApiResul
   urlRef.current = url;
 
   const fetchData = useCallback(async () => {
+    if (!url) {
+      // Skip mode — pages pass null to suspend a request that depends on
+      // a value (e.g., a route param) that isn't available yet.
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
 
@@ -96,17 +102,21 @@ export function useApi<T>(url: string, options: UseApiOptions = {}): UseApiResul
   useEffect(() => {
     mountedRef.current = true;
 
-    if (immediate) {
+    if (immediate && url) {
       fetchData();
+    } else if (!url) {
+      // Clear stale data when URL becomes null (e.g., navigating away from a symbol).
+      setData(null);
+      setLoading(false);
     }
 
     return () => {
       mountedRef.current = false;
     };
-  }, [fetchData, immediate]);
+  }, [fetchData, immediate, url]);
 
   useEffect(() => {
-    if (refreshInterval <= 0) return;
+    if (refreshInterval <= 0 || !url) return;
 
     const interval = setInterval(() => {
       if (mountedRef.current) {
@@ -115,7 +125,7 @@ export function useApi<T>(url: string, options: UseApiOptions = {}): UseApiResul
     }, refreshInterval);
 
     return () => clearInterval(interval);
-  }, [fetchData, refreshInterval]);
+  }, [fetchData, refreshInterval, url]);
 
   return { data, loading, error, refetch: fetchData };
 }

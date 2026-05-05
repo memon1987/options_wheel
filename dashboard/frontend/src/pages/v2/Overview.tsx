@@ -1,50 +1,133 @@
-import { Link } from 'react-router-dom';
+import { useApi } from '../../hooks/useApi';
+import type {
+  ScorecardRow,
+  AccountData,
+  LivePosition,
+  PortfolioHistoryPoint,
+  PremiumByDayPoint,
+  MetricsSummary,
+} from '../../types/v2';
+import KPICards, { buildHeadlineKpis } from '../../components/v2/KPICards';
+import EquityCurve from '../../components/v2/EquityCurve';
+import MonthlyPremiumBars from '../../components/v2/MonthlyPremiumBars';
+import SymbolScorecard from '../../components/v2/SymbolScorecard';
+import ActionPanel from '../../components/v2/ActionPanel';
+import { fmtCurrency, fmtRelativeAge } from '../../utils/format';
 
 export default function Overview() {
+  const { data: scorecard, loading: scorecardLoading } = useApi<ScorecardRow[]>('/api/v2/scorecard?days=365');
+  const { data: account } = useApi<AccountData>('/api/live/account', { refreshInterval: 60_000 });
+  const { data: positions } = useApi<LivePosition[]>('/api/live/positions', { refreshInterval: 30_000 });
+  const { data: equity } = useApi<PortfolioHistoryPoint[]>('/api/history/portfolio-history?days=180');
+  const { data: premium } = useApi<PremiumByDayPoint[]>('/api/metrics/premium-by-day?days=365');
+  const { data: summary } = useApi<MetricsSummary>('/api/metrics/summary?days=365');
+
+  // Derive headline numbers
+  const totalPremium = summary?.total_premium ?? null;
+  const cash = account?.cash ?? null;
+  const buyingPower = account?.buying_power ?? null;
+  const nlv = account?.portfolio_value ?? null;
+
+  // Unrealized P&L on currently-assigned shares: sum of unrealized_pl on
+  // positions where asset_class is stock (i.e., side != short option).
+  const unrealizedOnShares = (() => {
+    if (!positions) return null;
+    let sum = 0;
+    let counted = 0;
+    for (const p of positions) {
+      const symbol = p.symbol ?? '';
+      // Crude: option symbols match the OCC pattern (>=15 chars, has digits).
+      const isOption = symbol.length >= 15 && /\d/.test(symbol);
+      if (isOption) continue;
+      sum += parseFloat(String(p.unrealized_pl ?? 0));
+      counted++;
+    }
+    return counted > 0 ? sum : 0;
+  })();
+
+  const netPnl =
+    totalPremium !== null && unrealizedOnShares !== null
+      ? totalPremium + unrealizedOnShares
+      : null;
+
+  // Days running: from first trade time across the scorecard.
+  const daysRunning = (() => {
+    if (!scorecard || scorecard.length === 0) return null;
+    let earliest: number | null = null;
+    for (const r of scorecard) {
+      if (!r.first_trade_time) continue;
+      const t = new Date(r.first_trade_time).getTime();
+      if (earliest === null || t < earliest) earliest = t;
+    }
+    if (earliest === null) return null;
+    return Math.floor((Date.now() - earliest) / 86_400_000);
+  })();
+
+  // Stress: if every short put assigned at strike, mark-to-market loss = sum
+  // of (strike - current_price) × 100 × qty for each short put.
+  const stressMTM = (() => {
+    if (!positions) return null;
+    let stress = 0;
+    for (const p of positions) {
+      const symbol = p.symbol ?? '';
+      const isOption = symbol.length >= 15 && /\d/.test(symbol);
+      if (!isOption) continue;
+      // Just sum the absolute unrealized loss to avoid pulling current
+      // option chain. Underestimates true stress; flagged in the tooltip.
+      const upl = parseFloat(String(p.unrealized_pl ?? 0));
+      if (upl < 0) stress += upl;
+    }
+    return stress;
+  })();
+
+  const kpis = buildHeadlineKpis({
+    nlv,
+    cash,
+    buyingPower,
+    totalPremium,
+    unrealizedOnShares,
+    netPnl,
+    daysRunning,
+  });
+
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold text-white">Overview</h1>
-        <p className="text-gray-400 mt-1">FC-018 v2 dashboard preview — placeholder.</p>
+      <header className="flex items-baseline justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-white">Overview</h1>
+          <p className="text-gray-400 mt-1 text-sm">
+            Headline P&amp;L, portfolio equity, and per-symbol scorecard.
+          </p>
+        </div>
+        {scorecardLoading && (
+          <span className="text-xs text-gray-400">Loading…</span>
+        )}
       </header>
 
-      <div className="rounded-lg border border-purple-700 bg-purple-900/20 p-5">
-        <h2 className="text-lg font-semibold text-purple-200">Under construction</h2>
-        <p className="text-sm text-gray-300 mt-2">
-          This page will show portfolio-level performance and a per-symbol scorecard. See
-          {' '}<a href="https://github.com/memon1987/options_wheel/blob/main/docs/plans/fc-018.md"
-                 className="text-purple-300 underline hover:text-purple-200"
-                 target="_blank"
-                 rel="noopener noreferrer">docs/plans/fc-018.md</a> for the full plan.
-        </p>
+      <KPICards kpis={kpis} />
+
+      {stressMTM !== null && stressMTM < 0 && (
+        <div className="rounded-lg border border-yellow-700/50 bg-yellow-900/10 px-4 py-3 text-sm text-yellow-200">
+          <span className="font-semibold">Open option exposure:</span>{' '}
+          {fmtCurrency(stressMTM)} unrealized loss across open option positions.{' '}
+          <span className="text-xs opacity-75 ml-2">
+            (Approximate — does not include re-pricing assigned shares to strike.)
+          </span>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <EquityCurve data={equity ?? []} />
+        <MonthlyPremiumBars data={premium ?? []} />
       </div>
 
-      <section className="rounded-lg border border-gray-700 bg-gray-800 p-5">
-        <h3 className="text-base font-semibold text-white mb-3">Coming in this view</h3>
-        <ul className="text-sm text-gray-300 space-y-2 list-disc list-inside">
-          <li>Headline KPIs: NLV, XIRR-on-NLV, cumulative net P&amp;L (premium − unrealized), days running</li>
-          <li>Equity curve over time</li>
-          <li>Monthly stacked premium bars (put / call / stock-gain split)</li>
-          <li>Stress row: max simultaneous-assignment mark-to-market</li>
-          <li>Per-symbol scorecard table — sortable, with vs-buy-and-hold delta column</li>
-          <li>Action panel: open positions needing attention</li>
-        </ul>
-      </section>
+      <SymbolScorecard rows={scorecard ?? []} />
 
-      <section className="rounded-lg border border-gray-700 bg-gray-800 p-5">
-        <h3 className="text-base font-semibold text-white mb-3">For comparison</h3>
-        <p className="text-sm text-gray-300 mb-3">
-          The current legacy pages remain available while v2 is built:
-        </p>
-        <div className="flex flex-wrap gap-2">
-          <Link to="/" className="text-sm px-3 py-1.5 rounded border border-gray-600 text-gray-300 hover:bg-gray-700">
-            Legacy Dashboard
-          </Link>
-          <Link to="/performance" className="text-sm px-3 py-1.5 rounded border border-gray-600 text-gray-300 hover:bg-gray-700">
-            Legacy Performance
-          </Link>
-        </div>
-      </section>
+      <ActionPanel positions={positions ?? []} />
+
+      <div className="text-xs text-gray-500 text-center pt-2">
+        Account data refreshed {fmtRelativeAge(new Date().toISOString())} · v2 preview · FC-018
+      </div>
     </div>
   );
 }

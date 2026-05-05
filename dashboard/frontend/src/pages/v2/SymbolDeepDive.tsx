@@ -1,51 +1,160 @@
-import { useParams, Link } from 'react-router-dom';
+import { useParams, Link, useNavigate } from 'react-router-dom';
+import { useApi } from '../../hooks/useApi';
+import type {
+  AcbTimelineRow,
+  DecisionQualityRow,
+  VsBuyAndHold,
+  ScorecardRow,
+} from '../../types/v2';
+import AcbWalkChart from '../../components/v2/AcbWalkChart';
+import DecisionQuality from '../../components/v2/DecisionQuality';
+import CycleTable from '../../components/v2/CycleTable';
+import VsBuyAndHoldCard from '../../components/v2/VsBuyAndHoldCard';
+import { fmtCurrency, fmtCurrencyDetail, fmtNumber, pnlColor } from '../../utils/format';
+
+interface CycleRow {
+  timestamp: string;
+  symbol: string;
+  put_date: string | null;
+  put_strike: number | null;
+  put_premium: number | null;
+  assignment_date: string | null;
+  call_date: string | null;
+  call_strike: number | null;
+  call_premium: number | null;
+  capital_gain: number | null;
+  total_premium: number | null;
+  total_return: number | null;
+  duration_days: number | null;
+  shares: number | null;
+}
 
 export default function SymbolDeepDive() {
   const { underlying } = useParams<{ underlying?: string }>();
+  const navigate = useNavigate();
+  const symbol = (underlying ?? '').toUpperCase();
+
+  const skip = !symbol;
+
+  const { data: acb } = useApi<AcbTimelineRow[]>(skip ? null : `/api/v2/symbol/${symbol}/acb-timeline?days=730`);
+  const { data: decision } = useApi<DecisionQualityRow[]>(skip ? null : `/api/v2/symbol/${symbol}/decision-quality?days=365`);
+  const { data: vsBh } = useApi<VsBuyAndHold>(skip ? null : `/api/v2/symbol/${symbol}/vs-buy-and-hold`);
+  const { data: cycles } = useApi<CycleRow[]>(skip ? null : `/api/history/wheel-cycles?days=730`);
+  const { data: scorecard } = useApi<ScorecardRow[]>('/api/v2/scorecard?days=365');
+
+  // Symbol-summary header data is the matching scorecard row.
+  const summary = scorecard?.find((r) => r.symbol === symbol) ?? null;
+
+  // Filter cycles to this symbol — backend returns all, but we only need this one's.
+  const symbolCycles = (cycles ?? []).filter((c) => (c.symbol ?? '').toUpperCase() === symbol);
+
+  // Symbol picker — uses scorecard for the canonical universe.
+  const universe = (scorecard ?? []).map((r) => r.symbol).sort();
+
+  if (skip) {
+    return (
+      <div className="space-y-6">
+        <header>
+          <h1 className="text-2xl font-bold text-white">By Symbol</h1>
+          <p className="text-gray-400 mt-1 text-sm">Pick a symbol to drill down.</p>
+        </header>
+        <div className="rounded-lg border border-gray-700 bg-gray-800 p-5">
+          <h3 className="text-base font-semibold text-white mb-3">Available symbols</h3>
+          {universe.length === 0 ? (
+            <p className="text-sm text-gray-400">No traded symbols yet.</p>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {universe.map((u) => (
+                <Link
+                  key={u}
+                  to={`/v2/symbol/${u}`}
+                  className="px-3 py-1.5 text-sm font-mono rounded border border-gray-600 text-blue-300 hover:bg-gray-700"
+                >
+                  {u}
+                </Link>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold text-white">
-          By Symbol{underlying ? `: ${underlying.toUpperCase()}` : ''}
-        </h1>
-        <p className="text-gray-400 mt-1">FC-018 v2 dashboard preview — placeholder.</p>
+      <header className="flex items-baseline justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-white font-mono">{symbol}</h1>
+          {summary && (
+            <p className="text-gray-400 mt-1 text-sm">
+              {summary.cycles_completed} cycles · {summary.trade_count} trades ·
+              {' '}premium {fmtCurrency(summary.total_premium)}
+            </p>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <Link
+            to="/v2/overview"
+            className="text-sm px-3 py-1.5 rounded border border-gray-600 text-gray-300 hover:bg-gray-700"
+          >
+            ← Overview
+          </Link>
+          <select
+            className="text-sm px-2 py-1.5 rounded border border-gray-600 bg-gray-800 text-gray-200"
+            value={symbol}
+            onChange={(e) => navigate(`/v2/symbol/${e.target.value}`)}
+          >
+            {universe.map((u) => (
+              <option key={u} value={u}>{u}</option>
+            ))}
+          </select>
+        </div>
       </header>
 
-      <div className="rounded-lg border border-purple-700 bg-purple-900/20 p-5">
-        <h2 className="text-lg font-semibold text-purple-200">Under construction</h2>
-        <p className="text-sm text-gray-300 mt-2">
-          This page is the wheel-centric heart of the new dashboard. One symbol at a time, full
-          history. See
-          {' '}<a href="https://github.com/memon1987/options_wheel/blob/main/docs/plans/fc-018.md#page-2--per-symbol-drilldown-v2symbolunderlying"
-                 className="text-purple-300 underline hover:text-purple-200"
-                 target="_blank"
-                 rel="noopener noreferrer">plan §Page 2</a>.
-        </p>
+      {summary && (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <div className="rounded-lg border border-gray-700 bg-gray-800 p-3">
+            <div className="text-xs uppercase tracking-wide text-gray-400">Total Premium</div>
+            <div className="text-lg font-semibold text-white mt-1">{fmtCurrencyDetail(summary.total_premium)}</div>
+            <div className="text-xs text-gray-400 mt-0.5">
+              put {fmtCurrency(summary.put_premium)} · call {fmtCurrency(summary.call_premium)}
+            </div>
+          </div>
+          <div className="rounded-lg border border-gray-700 bg-gray-800 p-3">
+            <div className="text-xs uppercase tracking-wide text-gray-400">Realized P&amp;L</div>
+            <div className={`text-lg font-semibold mt-1 ${pnlColor(summary.realized_pnl)}`}>
+              {fmtCurrencyDetail(summary.realized_pnl)}
+            </div>
+          </div>
+          <div className="rounded-lg border border-gray-700 bg-gray-800 p-3">
+            <div className="text-xs uppercase tracking-wide text-gray-400">Cycles Completed</div>
+            <div className="text-lg font-semibold text-white mt-1">{fmtNumber(summary.cycles_completed)}</div>
+            <div className="text-xs text-gray-400 mt-0.5">
+              avg {summary.avg_cycle_days !== null ? `${Math.round(summary.avg_cycle_days)}d` : '—'} per cycle
+            </div>
+          </div>
+          <div className="rounded-lg border border-gray-700 bg-gray-800 p-3">
+            <div className="text-xs uppercase tracking-wide text-gray-400">Outcomes</div>
+            <div className="text-sm text-gray-200 mt-1">
+              {fmtNumber(summary.put_assignment_count)} assigned ·{' '}
+              {fmtNumber(summary.called_away_count)} called
+            </div>
+            <div className="text-xs text-gray-400 mt-0.5">
+              {fmtNumber(summary.early_close_count)} early closes ·{' '}
+              {fmtNumber(summary.expiration_count)} expired
+            </div>
+          </div>
+        </div>
+      )}
+
+      <AcbWalkChart data={acb ?? []} />
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <DecisionQuality rows={decision ?? []} />
+        <VsBuyAndHoldCard data={vsBh ?? null} />
       </div>
 
-      <section className="rounded-lg border border-gray-700 bg-gray-800 p-5">
-        <h3 className="text-base font-semibold text-white mb-3">Coming in this view</h3>
-        <ul className="text-sm text-gray-300 space-y-2 list-disc list-inside">
-          <li>ACB walk chart — adjusted cost basis over time, annotated with each event</li>
-          <li>Cycle table — every wheel cycle on this symbol with annualized return</li>
-          <li>Decision quality histogram — % of max profit captured at close</li>
-          <li>Trade log — chronological event stream</li>
-          <li>Phase timing — days in CSP / CC / waiting</li>
-          <li>vs-buy-and-hold for this symbol — actual wheel contribution against synthetic B&amp;H</li>
-        </ul>
-      </section>
-
-      {!underlying && (
-        <section className="rounded-lg border border-gray-700 bg-gray-800 p-5">
-          <h3 className="text-base font-semibold text-white mb-3">No symbol selected</h3>
-          <p className="text-sm text-gray-300 mb-3">
-            Once Page 1 (Overview) lands, click any row in the per-symbol scorecard to deep-dive
-            into that symbol. For now, navigate manually — e.g.,
-            {' '}<Link to="/v2/symbol/AMD" className="text-purple-300 underline hover:text-purple-200">/v2/symbol/AMD</Link>.
-          </p>
-        </section>
-      )}
+      <CycleTable rows={symbolCycles} />
     </div>
   );
 }
