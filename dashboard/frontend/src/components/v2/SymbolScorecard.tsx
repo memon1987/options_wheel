@@ -108,6 +108,9 @@ export default function SymbolScorecard({ rows }: Props) {
               <SortHeader k="realized_pnl" label="Option P&L" align="right" />
               <SortHeader k="share_side_pnl" label="Share P&L" align="right" />
               <SortHeader k="total_realized_pnl" label="Total P&L" align="right" />
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-400 text-right" title="Adjusted cost basis per share — only meaningful when shares are held">ACB</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-400 text-right" title="Most recent close price for the underlying (from daily bars)">Price</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-400 text-right" title="Unrealized P&L on currently-held shares: (price − ACB) × shares">Unreal</th>
               <SortHeader k="wheel_minus_bh" label="vs B&H" align="right" />
             </tr>
           </thead>
@@ -149,6 +152,26 @@ export default function SymbolScorecard({ rows }: Props) {
                     <span title="Option-side realized P&L plus stock-side realized P&L from share movements. This number plus unrealized on open positions = your account growth.">
                       {fmtCurrency(r.total_realized_pnl)}
                     </span>
+                  </td>
+                  <td className="px-3 py-2 text-sm text-right text-gray-200">
+                    {r.current_shares !== null && r.current_shares > 0 && r.current_acb_per_share !== null
+                      ? `$${r.current_acb_per_share.toFixed(2)}`
+                      : <span className="text-gray-500">—</span>}
+                  </td>
+                  <td className="px-3 py-2 text-sm text-right text-gray-200">
+                    {r.price_now !== null
+                      ? `$${r.price_now.toFixed(2)}`
+                      : <span className="text-gray-500">—</span>}
+                  </td>
+                  <td className={cls(
+                    'px-3 py-2 text-sm text-right',
+                    r.current_shares && r.current_shares > 0 && r.price_now !== null && r.current_acb_per_share !== null
+                      ? pnlColor((r.price_now - r.current_acb_per_share) * r.current_shares)
+                      : 'text-gray-500'
+                  )}>
+                    {r.current_shares && r.current_shares > 0 && r.price_now !== null && r.current_acb_per_share !== null
+                      ? fmtCurrency((r.price_now - r.current_acb_per_share) * r.current_shares)
+                      : '—'}
                   </td>
                   <td className={cls('px-3 py-2 text-sm text-right', pnlColor(r.wheel_minus_bh))}>
                     {r.wheel_minus_bh !== null ? (

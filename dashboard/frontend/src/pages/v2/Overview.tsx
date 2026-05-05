@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useApi } from '../../hooks/useApi';
 import type {
   ScorecardRow,
@@ -16,12 +17,21 @@ import ActionPanel from '../../components/v2/ActionPanel';
 import { fmtCurrency, fmtRelativeAge } from '../../utils/format';
 
 export default function Overview() {
-  const { data: scorecard, loading: scorecardLoading } = useApi<ScorecardRow[]>('/api/v2/scorecard?days=365');
+  const RANGES = [
+    { label: '30d', days: 30 },
+    { label: '90d', days: 90 },
+    { label: '1Y',  days: 365 },
+    { label: 'All', days: 3650 },
+  ] as const;
+  const [range, setRange] = useState<typeof RANGES[number]>(RANGES[2]);
+  const days = range.days;
+
+  const { data: scorecard, loading: scorecardLoading } = useApi<ScorecardRow[]>(`/api/v2/scorecard?days=${days}`);
   const { data: account } = useApi<AccountData>('/api/live/account', { refreshInterval: 60_000 });
   const { data: positions } = useApi<LivePosition[]>('/api/live/positions', { refreshInterval: 30_000 });
-  const { data: equity } = useApi<PortfolioHistoryPoint[]>('/api/history/portfolio-history?days=180');
-  const { data: premium } = useApi<PremiumByDayPoint[]>('/api/metrics/premium-by-day?days=365');
-  const { data: summary } = useApi<MetricsSummary>('/api/metrics/summary?days=365');
+  const { data: equity } = useApi<PortfolioHistoryPoint[]>(`/api/history/portfolio-history?days=${Math.min(days, 365)}`);
+  const { data: premium } = useApi<PremiumByDayPoint[]>(`/api/metrics/premium-by-day?days=${days}`);
+  const { data: summary } = useApi<MetricsSummary>(`/api/metrics/summary?days=${days}`);
   const { data: baseline } = useApi<AccountBaseline>('/api/metrics/account-baseline');
 
   // Derive headline numbers
@@ -48,21 +58,36 @@ export default function Overview() {
     return Math.floor((Date.now() - earliest) / 86_400_000);
   })();
 
-  // Stress: if every short put assigned at strike, mark-to-market loss = sum
-  // of (strike - current_price) × 100 × qty for each short put.
+  // Stress: if every open short PUT assigned at the current underlying price,
+  // immediate mark-to-market = (current_price − strike) × 100 × abs(qty).
+  // Negative = unrealized loss, since you'd be buying shares above market.
+  // Underlying prices come from the scorecard (price_now, daily-bar latest).
   const stressMTM = (() => {
-    if (!positions) return null;
+    if (!positions || !scorecard) return null;
+    const priceBy: Record<string, number> = {};
+    for (const r of scorecard) {
+      if (r.price_now !== null) priceBy[r.symbol] = r.price_now;
+    }
     let stress = 0;
+    let countedPuts = 0;
     for (const p of positions) {
       const symbol = p.symbol ?? '';
-      const isOption = symbol.length >= 15 && /\d/.test(symbol);
-      if (!isOption) continue;
-      // Just sum the absolute unrealized loss to avoid pulling current
-      // option chain. Underestimates true stress; flagged in the tooltip.
-      const upl = parseFloat(String(p.unrealized_pl ?? 0));
-      if (upl < 0) stress += upl;
+      const m = symbol.match(/^([A-Z]{1,6})\d{6}([CP])(\d{8})$/);
+      if (!m) continue;
+      const [, underlying, type, strikeStr] = m;
+      if (type !== 'P') continue; // calls don't carry assignment-cash risk on the user's side
+      const strike = parseInt(strikeStr, 10) / 1000;
+      const qty = parseFloat(String(p.qty ?? 0));
+      const cur = priceBy[underlying];
+      if (cur === undefined) continue;
+      // If the put is OTM (cur >= strike), assignment is unlikely; contribute 0.
+      // If ITM (cur < strike), assigned shares are immediately worth less than paid.
+      if (cur < strike) {
+        stress += (cur - strike) * 100 * Math.abs(qty);
+      }
+      countedPuts++;
     }
-    return stress;
+    return countedPuts > 0 ? stress : null;
   })();
 
   const kpis = buildHeadlineKpis({
@@ -78,27 +103,50 @@ export default function Overview() {
 
   return (
     <div className="space-y-6">
-      <header className="flex items-baseline justify-between">
+      <header className="flex items-start justify-between gap-4 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold text-white">Overview</h1>
           <p className="text-gray-400 mt-1 text-sm">
             Headline P&amp;L, portfolio equity, and per-symbol scorecard.
           </p>
         </div>
-        {scorecardLoading && (
-          <span className="text-xs text-gray-400">Loading…</span>
-        )}
+        <div className="flex items-center gap-2">
+          {scorecardLoading && (
+            <span className="text-xs text-gray-400">Loading…</span>
+          )}
+          <div className="inline-flex rounded-md border border-gray-700 overflow-hidden">
+            {RANGES.map((r) => (
+              <button
+                key={r.label}
+                onClick={() => setRange(r)}
+                className={`px-3 py-1.5 text-xs font-medium transition-colors ${
+                  range.label === r.label
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
+                }`}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+        </div>
       </header>
 
       <KPICards kpis={kpis} />
 
       {stressMTM !== null && stressMTM < 0 && (
         <div className="rounded-lg border border-yellow-700/50 bg-yellow-900/10 px-4 py-3 text-sm text-yellow-200">
-          <span className="font-semibold">Open option exposure:</span>{' '}
-          {fmtCurrency(stressMTM)} unrealized loss across open option positions.{' '}
+          <span className="font-semibold">Stress test:</span>{' '}
+          if every open put assigned at current underlying price, mark-to-market loss = {fmtCurrency(stressMTM)}.{' '}
           <span className="text-xs opacity-75 ml-2">
-            (Approximate — does not include re-pricing assigned shares to strike.)
+            Sums (current_price − strike) × 100 across in-the-money short puts.
           </span>
+        </div>
+      )}
+      {stressMTM === 0 && (
+        <div className="rounded-lg border border-green-700/40 bg-green-900/10 px-4 py-3 text-sm text-green-200">
+          <span className="font-semibold">Stress test:</span>{' '}
+          all open puts are out-of-the-money; no immediate MTM loss if all assigned today.
         </div>
       )}
 
@@ -109,7 +157,7 @@ export default function Overview() {
 
       <SymbolScorecard rows={scorecard ?? []} />
 
-      <ActionPanel positions={positions ?? []} />
+      <ActionPanel positions={positions ?? []} scorecard={scorecard ?? []} />
 
       <div className="text-xs text-gray-500 text-center pt-2">
         Account data refreshed {fmtRelativeAge(new Date().toISOString())} · v2 preview · FC-018
