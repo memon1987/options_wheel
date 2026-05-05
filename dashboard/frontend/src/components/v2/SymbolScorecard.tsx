@@ -124,7 +124,7 @@ export default function SymbolScorecard({ rows }: Props) {
                 >
                   <td className="px-3 py-2">
                     <Link
-                      to={`/v2/symbol/${r.symbol}`}
+                      to={`/symbol/${r.symbol}`}
                       className="font-mono text-sm font-semibold text-blue-300 hover:text-blue-200"
                     >
                       {r.symbol}
