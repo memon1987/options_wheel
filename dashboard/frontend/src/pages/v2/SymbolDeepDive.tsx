@@ -39,14 +39,14 @@ export default function SymbolDeepDive() {
   const { data: acb } = useApi<AcbTimelineRow[]>(skip ? null : `/api/v2/symbol/${symbol}/acb-timeline?days=730`);
   const { data: decision } = useApi<DecisionQualityRow[]>(skip ? null : `/api/v2/symbol/${symbol}/decision-quality?days=365`);
   const { data: vsBh } = useApi<VsBuyAndHold>(skip ? null : `/api/v2/symbol/${symbol}/vs-buy-and-hold`);
-  const { data: cycles } = useApi<CycleRow[]>(skip ? null : `/api/history/wheel-cycles?days=730`);
+  const { data: cycles } = useApi<CycleRow[]>(skip ? null : `/api/v2/symbol/${symbol}/cycles?days=730`);
   const { data: scorecard } = useApi<ScorecardRow[]>('/api/v2/scorecard?days=365');
 
   // Symbol-summary header data is the matching scorecard row.
   const summary = scorecard?.find((r) => r.symbol === symbol) ?? null;
 
-  // Filter cycles to this symbol — backend returns all, but we only need this one's.
-  const symbolCycles = (cycles ?? []).filter((c) => (c.symbol ?? '').toUpperCase() === symbol);
+  // The v2/cycles endpoint already filters by underlying — use as-is.
+  const symbolCycles = cycles ?? [];
 
   // Symbol picker — uses scorecard for the canonical universe.
   const universe = (scorecard ?? []).map((r) => r.symbol).sort();

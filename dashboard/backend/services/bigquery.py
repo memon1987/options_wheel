@@ -499,6 +499,47 @@ class BigQueryService:
             logger.error(f"vs_buy_and_hold query failed for {symbol}: {e}")
             return None
 
+    def get_wheel_cycles_for_symbol(self, symbol: str, days: int = 730) -> List[Dict[str, Any]]:
+        """Wheel cycles for a single underlying.
+
+        Reads from `wheel_cycles_from_activities` (FC-018/FC-012 view), filtered
+        by underlying. Used by the per-symbol drilldown's CycleTable. Wider
+        window than the legacy `/api/history/wheel-cycles` endpoint, which
+        caps at 90 days.
+        """
+        query = f"""
+        SELECT
+            put_assignment_time AS timestamp,
+            underlying AS symbol,
+            put_date,
+            put_strike,
+            put_premium,
+            assignment_date,
+            call_date,
+            call_strike,
+            call_premium,
+            capital_gain,
+            total_premium,
+            total_return,
+            duration_days,
+            shares
+        FROM `{self.dataset}.wheel_cycles_from_activities`
+        WHERE underlying = @symbol
+          AND assignment_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @days DAY)
+        ORDER BY assignment_date DESC
+        """
+        try:
+            from google.cloud.bigquery import ScalarQueryParameter, QueryJobConfig
+            job_config = QueryJobConfig(query_parameters=[
+                ScalarQueryParameter("symbol", "STRING", symbol),
+                ScalarQueryParameter("days", "INT64", days),
+            ])
+            results = self.client.query(query, job_config=job_config).result(timeout=60)
+            return [dict(row.items()) for row in results]
+        except Exception as e:
+            logger.error(f"wheel_cycles_for_symbol query failed for {symbol}: {e}")
+            return []
+
     def get_stock_history(self, symbol: str, days: int = 365) -> List[Dict[str, Any]]:
         """Daily OHLC bars for one symbol over the last N days."""
         query = f"""
