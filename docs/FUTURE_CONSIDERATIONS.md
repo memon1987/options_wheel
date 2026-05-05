@@ -245,6 +245,44 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 
 ---
 
+### FC-020: FIFO cycle pairing in wheel_cycles_from_activities
+
+**Status:** Consideration
+**Size estimate:** S-M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** After FC-019 landed, the per-symbol scorecard reconciles correctly to actual cash flow (sum of Total P&L ~= account growth, modulo small Alpaca-side data anomalies). But the per-cycle drilldown still has a pairing bug: when multiple put assignments happen on the same underlying before any are called away (overlapping share lots), the view pairs each assigned put to the earliest subsequent called_away, so two puts can both pair to the same called_away. The result: OPTRD events get summed into the wrong cycle window, inflating one cycle's `capital_gain` and treating another cycle as still open.
+
+**Concrete example (AMD):**
+- 2025-11-22: put assigned at $230 (Lot A starts)
+- 2025-11-29: called away at $192.50 (Lot A ends)
+- 2026-01-10: put assigned at $212.50 (Lot B starts)
+- 2026-01-31: put assigned at $245 (Lot C starts — concurrent with Lot B)
+- 2026-04-17: called away at $252.50 (one lot ends)
+
+The view shows:
+- Cycle 1 (correct): put $230 → call $192.50, cap_gain -$3,750
+- Cycle 2 (WRONG): put $212.50 → call $252.50, cap_gain -$20,500 — sums OPTRDs from the second assignment too
+- Cycle 3 (WRONG): put $245 → call $252.50 — pairs to same called_away as Cycle 2
+
+**Fix:** FIFO pairing. For each underlying:
+1. Sort all OPTRD-buy events by `transaction_time` ascending → assigned-put queue.
+2. Sort all OPTRD-sell events by `transaction_time` ascending → called-away queue.
+3. Walk the events in time order. Each OPTRD-buy opens a lot; each OPTRD-sell closes the oldest open lot.
+4. Each lot pair = one cycle. `capital_gain = sell_price − buy_price` × shares (using actual OPTRD prices, not put_strike/call_strike).
+5. Lots without a matching sell remain open.
+
+This requires a stateful walk over events, which BigQuery can express via `ARRAY_AGG` + `OFFSET` tricks or a JavaScript UDF. Alternative: do the walk in Python in the backend's `BigQueryService.get_wheel_cycles_for_symbol` method.
+
+**Open questions:**
+- SQL-only or Python-side walk? Python is simpler to write but harder to test against the view abstraction; SQL keeps the view as source of truth.
+- How to handle the AMD-style data anomaly where OPTRDs net to non-zero shares but Alpaca reports zero? Surface as an "unaccounted_shares_loss" column in the per-symbol scorecard, computed as `current_shares (from OPTRD net) − live_alpaca_shares`?
+
+**Links:** FC-018 (dashboard), FC-019 (the OPTRD ingest that exposed this).
+
+---
+
 ### FC-019: True P&L reconciliation — ingest JNLC/OPTRD and rewrite wheel_cycles for concurrent lots
 
 **Status:** Consideration
