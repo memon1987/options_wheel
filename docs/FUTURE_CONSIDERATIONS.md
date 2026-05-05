@@ -283,23 +283,6 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-018: Wheel-centric dashboard rebuild (frontend only)
-
-**Status:** Plan published
-**Size estimate:** L
-**Owner:** Claude
-**Plan file:** `docs/plans/fc-018.md`
-
-**Problem / opportunity:** Current dashboard frontend was built without product input, surfaces raw data, and tries to do too much. Per the 2026-05-04 audit (1,210 frontend LOC, 962 backend LOC), the code works (1 real bug, all endpoints return 200) but the product doesn't fit. Replace with a focused 3-page dashboard organized around the underlying symbol as primary lens.
-
-3 pages: **Overview** (NLV/XIRR + monthly stacked premium + per-symbol scorecard with vs-buy-and-hold), **Per-symbol drilldown** (ACB walk, cycle list, decision-quality histogram, vs-B&H for that symbol), **Bot Health** (gate hit counts, errors, scan cadence). Honesty principles baked in: XIRR-on-NLV as the headline metric, premium-collected always paired with unrealized P&L on assigned shares, vs-buy-and-hold as a first-class per-symbol column, win-rate de-emphasized. Backend largely unchanged (FC-012 data layer is solid); a few new SQL views for ACB walk + per-symbol scorecard. Old frontend archived to `dashboard/frontend.archive/` for reference, not deployed. Strangler migration via `/v2/...` routes, page-by-page cutover.
-
-**Open questions:** see plan file.
-
-**Links:** FC-012 (backend data layer this builds on), FC-017 (chain snapshotting — prerequisite for counterfactual decision-quality views in v2 of this dashboard, deferred). External research: r/thetagang spreadsheet roundup, OptionWheelTracker, QuantWheel, premium-tracker, Wheeler, Early Retirement Now's wheel-tracking critique.
-
----
-
 ### FC-017: Option chain snapshots at decision points (for retrospective decision-quality analysis)
 
 **Status:** Consideration
@@ -385,6 +368,12 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - No dedicated PR — superseded by FC-010 + FC-012.
 - Closed: 2026-04-24
 - Notes: Two independent mechanisms neutralized this. (1) FC-010 disabled call stop-losses, so `should_close_call_early` no longer returns True for losses — the mislabeling trigger is gone. (2) FC-012 cut dashboard reads over to `trades_with_outcomes` (Alpaca-sourced), so the corrupted `event_type=early_close_executed` + `reason=profit_target_reached` rows in the v1 `trades` table no longer affect analytics. Historical rows remain dirty but unread; the v1 table itself is scheduled for drop on 2026-05-01 via the FC-012 cleanup routine. If put early-closes ever start showing the same mislabel in structlog events, re-file as a new FC focused on the put-side path only.
+
+### FC-018: Wheel-centric dashboard rebuild (frontend only)
+- Plan: `docs/plans/fc-018.md`
+- PRs: #12 (skeleton), #13 (backend), #14 (pages), #15-#18 (review fixes), #22 (Trade Log), #23 (gap-closing), #24 (PR F cutover), #25 (PR G cleanup) — final merge 2026-05-05
+- Commits: `b7b9184` → `4eb74d2` (PR G)
+- Notes: 3-page dashboard (Overview / By Symbol / Bot Health) shipped via strangler migration. Canonical paths are now bare (`/overview`, `/symbol`, `/bot-health`); `/v2/*` and legacy `/positions`, `/trades`, `/performance`, `/cycles` redirect for bookmark compatibility. Legacy frontend preserved under `dashboard/frontend.archive/` with emergency-revert README — recommend deletion after ~2 weeks of bake time. Mid-execution the gross-vs-net premium audit triggered FC-019; FIFO cycle pairing for overlapping share lots was scoped out as FC-020.
 
 ### FC-019: True P&L reconciliation — JNLC + OPTRD ingest, share-side P&L
 - Plan: `docs/plans/fc-019.md` (written retroactively)
