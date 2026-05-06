@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fmtCurrency, fmtCurrencyDetail, fmtPercent, fmtNumber, parseOcc, pnlColor } from './format';
+import { fmtCurrency, fmtCurrencyDetail, fmtPercent, fmtNumber, parseOcc, pnlColor, fmtDate, fmtDateShort, fmtDateTime } from './format';
 
 describe('format helpers', () => {
   describe('fmtCurrency', () => {
@@ -72,6 +72,33 @@ describe('format helpers', () => {
     it('returns empties for null', () => {
       const r = parseOcc(null);
       expect(r.underlying).toBe('');
+    });
+  });
+
+  describe('date helpers (FC-022 ET-anchored)', () => {
+    // Pick an instant that crosses a date boundary in some timezones but not ET.
+    // 2026-04-15 03:00Z = 2026-04-14 23:00 ET (previous day)
+    const lateNightET = '2026-04-15T03:00:00.000Z';
+
+    it('fmtDate renders ET-anchored date regardless of system locale', () => {
+      // In ET, this instant is April 14, not April 15.
+      expect(fmtDate(lateNightET)).toContain('Apr 14');
+    });
+
+    it('fmtDateShort renders ET-anchored short date', () => {
+      expect(fmtDateShort(lateNightET)).toContain('Apr 14');
+    });
+
+    it('fmtDateTime includes a TZ marker (ET) on output', () => {
+      // The output should include either "EST" or "EDT" depending on DST.
+      const out = fmtDateTime(lateNightET);
+      expect(out).toMatch(/E[SD]T/);
+    });
+
+    it('em-dashes null and undefined', () => {
+      expect(fmtDate(null)).toBe('—');
+      expect(fmtDateShort(undefined)).toBe('—');
+      expect(fmtDateTime(null)).toBe('—');
     });
   });
 

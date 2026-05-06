@@ -13,6 +13,7 @@ import CycleTable from '../../components/v2/CycleTable';
 import TradeLog from '../../components/v2/TradeLog';
 import VsBuyAndHoldCard from '../../components/v2/VsBuyAndHoldCard';
 import PhaseTimingBar from '../../components/v2/PhaseTimingBar';
+import SymbolUniverseTable from '../../components/v2/SymbolUniverseTable';
 import { fmtCurrency, fmtCurrencyDetail, fmtNumber, pnlColor } from '../../utils/format';
 
 interface CycleRow {
@@ -48,6 +49,8 @@ export default function SymbolDeepDive() {
   const { data: cycles } = useApi<CycleRow[]>(skip ? null : `/api/v2/symbol/${symbol}/cycles?days=730`);
   const { data: phase } = useApi<PhaseTiming>(skip ? null : `/api/v2/symbol/${symbol}/phase-timing?days=730`);
   const { data: scorecard } = useApi<ScorecardRow[]>('/api/v2/scorecard?days=365');
+  const { data: account } = useApi<{ paper_trading?: boolean }>('/api/live/account', { refreshInterval: 60_000 });
+  const isPaperTrading = account?.paper_trading ?? true;
 
   // Symbol-summary header data is the matching scorecard row.
   const summary = scorecard?.find((r) => r.symbol === symbol) ?? null;
@@ -63,26 +66,11 @@ export default function SymbolDeepDive() {
       <div className="space-y-6">
         <header>
           <h1 className="text-2xl font-bold text-white">By Symbol</h1>
-          <p className="text-gray-400 mt-1 text-sm">Pick a symbol to drill down.</p>
+          <p className="text-gray-400 mt-1 text-sm">
+            Pick a symbol to drill down. Sort to find the highest-P&L or most-active names.
+          </p>
         </header>
-        <div className="rounded-lg border border-gray-700 bg-gray-800 p-5">
-          <h3 className="text-base font-semibold text-white mb-3">Available symbols</h3>
-          {universe.length === 0 ? (
-            <p className="text-sm text-gray-400">No traded symbols yet.</p>
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              {universe.map((u) => (
-                <Link
-                  key={u}
-                  to={`/symbol/${u}`}
-                  className="px-3 py-1.5 text-sm font-mono rounded border border-gray-600 text-blue-300 hover:bg-gray-700"
-                >
-                  {u}
-                </Link>
-              ))}
-            </div>
-          )}
-        </div>
+        <SymbolUniverseTable rows={scorecard ?? []} />
       </div>
     );
   }
@@ -165,7 +153,7 @@ export default function SymbolDeepDive() {
 
       <CycleTable rows={symbolCycles} />
 
-      <TradeLog events={acb ?? []} />
+      <TradeLog events={acb ?? []} paperTrading={isPaperTrading} />
     </div>
   );
 }
