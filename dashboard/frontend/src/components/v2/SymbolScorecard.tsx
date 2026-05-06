@@ -2,6 +2,7 @@ import { useState, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import type { ScorecardRow } from '../../types/v2';
 import { fmtCurrency, fmtNumber, fmtPercent, pnlColor, cls } from '../../utils/format';
+import { positionState, stateColor } from './positionState';
 
 interface Props {
   rows: ScorecardRow[];
@@ -21,23 +22,6 @@ interface SortState {
   key: SortKey;
   dir: 'asc' | 'desc';
 }
-
-const positionState = (row: ScorecardRow): string => {
-  const shares = row.current_shares ?? 0;
-  const open = row.open_count ?? 0;
-  if (shares > 0) return open > 0 ? 'Long + Short Call' : 'Long Stock';
-  if (open > 0) return 'Short Put';
-  return 'Cash';
-};
-
-const stateColor = (state: string): string => {
-  switch (state) {
-    case 'Long + Short Call': return 'text-purple-300';
-    case 'Long Stock': return 'text-blue-300';
-    case 'Short Put': return 'text-green-300';
-    default: return 'text-gray-400';
-  }
-};
 
 export default function SymbolScorecard({ rows }: Props) {
   const [sort, setSort] = useState<SortState>({ key: 'total_premium', dir: 'desc' });

@@ -3,6 +3,7 @@ import { fmtCurrency, fmtDate, fmtNumber, pnlColor, cls } from '../../utils/form
 
 interface Props {
   events: AcbTimelineRow[];
+  paperTrading?: boolean;
 }
 
 const eventBadge = (label: string): { text: string; classes: string } => {
@@ -17,7 +18,17 @@ const eventBadge = (label: string): { text: string; classes: string } => {
   }
 };
 
-export default function TradeLog({ events }: Props) {
+// Build the Alpaca order detail link for an event row. Synthetic FC-021
+// rows have order_ids prefixed `synthetic-` and shouldn't link out.
+const alpacaOrderLink = (orderId: string | null, paperTrading: boolean): string | null => {
+  if (!orderId || orderId.startsWith('synthetic-')) return null;
+  const base = paperTrading
+    ? 'https://app.alpaca.markets/paper/dashboard/orders'
+    : 'https://app.alpaca.markets/live/dashboard/orders';
+  return `${base}/${orderId}`;
+};
+
+export default function TradeLog({ events, paperTrading = true }: Props) {
   if (!events || events.length === 0) {
     return (
       <div className="rounded-lg border border-gray-700 bg-gray-800 p-5">
@@ -38,7 +49,7 @@ export default function TradeLog({ events }: Props) {
         <div>
           <h3 className="text-base font-semibold text-white">Trade Log</h3>
           <p className="text-xs text-gray-400 mt-1">
-            Every event for this symbol, newest first. Includes opens, closes, assignments, and expirations.
+            Every event for this symbol, newest first (all dates ET). Includes opens, closes, assignments, and expirations.
           </p>
         </div>
         <span className="text-xs text-gray-500">{sorted.length} events</span>
@@ -51,10 +62,12 @@ export default function TradeLog({ events }: Props) {
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-left text-gray-400">Event</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-left text-gray-400">Type</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Strike</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-left text-gray-400">Expiry</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Qty</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Premium</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Realized</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-left text-gray-400">Outcome</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-center text-gray-400" title="Open this order in Alpaca">↗</th>
             </tr>
           </thead>
           <tbody>
@@ -83,7 +96,22 @@ export default function TradeLog({ events }: Props) {
                     )}
                   </td>
                   <td className="px-3 py-2 text-sm text-right text-gray-200">
-                    {e.strike_price !== null ? `$${e.strike_price.toFixed(2)}` : '—'}
+                    {e.strike_price !== null ? (
+                      <div>
+                        <div>${e.strike_price.toFixed(2)}</div>
+                        {e.occ_symbol && (
+                          <div
+                            className="font-mono text-[10px] text-gray-500 mt-0.5"
+                            title="OCC contract symbol"
+                          >
+                            {e.occ_symbol}
+                          </div>
+                        )}
+                      </div>
+                    ) : '—'}
+                  </td>
+                  <td className="px-3 py-2 text-sm text-gray-300 whitespace-nowrap">
+                    {e.expiration ? fmtDate(e.expiration) : <span className="text-gray-500">—</span>}
                   </td>
                   <td className="px-3 py-2 text-sm text-right text-gray-200">
                     {fmtNumber(e.qty)}
@@ -107,6 +135,28 @@ export default function TradeLog({ events }: Props) {
                     ) : (
                       <span className="text-gray-500">—</span>
                     )}
+                  </td>
+                  <td className="px-3 py-2 text-sm text-center">
+                    {(() => {
+                      const url = alpacaOrderLink(e.order_id, paperTrading);
+                      return url ? (
+                        <a
+                          href={url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-400 hover:text-blue-300"
+                          title={`Open order ${e.order_id} in Alpaca`}
+                        >
+                          ↗
+                        </a>
+                      ) : (
+                        <span className="text-gray-600" title={
+                          e.order_id?.startsWith('synthetic-')
+                            ? 'Synthetic FC-021 row — no Alpaca order to link to'
+                            : 'No order id recorded for this event'
+                        }>—</span>
+                      );
+                    })()}
                   </td>
                 </tr>
               );

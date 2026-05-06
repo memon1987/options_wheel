@@ -41,6 +41,19 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 
 ## Active Considerations
 
+### FC-022: Trade Log contract identifiers + ET timezone + By-Symbol summary table
+
+**Status:** Plan published
+**Size estimate:** M
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-022.md`
+
+**Problem / opportunity:** Three small UX gaps surfaced during AMD-trade investigation. (1) Trade Log doesn't show OCC contract symbol or expiration, so pinpointing a specific contract requires bouncing to Alpaca's UI manually. (2) Date display uses browser-default locale; needs explicit ET. (3) `/symbol` landing page is an uninformative pill grid when the same data could power a summary table.
+
+**Links:** Surfaced from FC-018/FC-021 follow-up investigation.
+
+---
+
 ### FC-001: Symbol universe optimization
 
 **Status:** Consideration

@@ -31,6 +31,9 @@ export interface AcbTimelineRow {
   event_time: string;
   event_date: string;
   activity_type: string;
+  occ_symbol: string | null;
+  order_id: string | null;
+  expiration: string | null;
   option_type: string | null;
   side: string | null;
   qty: number | null;

@@ -1,5 +1,9 @@
 // FC-018 v2: shared formatters for dashboard display.
 
+// FC-022: All trading is anchored to NYSE hours; render dates in ET regardless
+// of the viewer's locale so the dashboard matches Alpaca's UI and the bot logs.
+export const ET_TZ = 'America/New_York';
+
 export const fmtCurrency = (n: number | null | undefined, opts: { compact?: boolean } = {}): string => {
   if (n === null || n === undefined || Number.isNaN(n)) return '—';
   if (opts.compact && Math.abs(n) >= 1000) {
@@ -42,6 +46,7 @@ export const fmtDate = (s: string | null | undefined): string => {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
+      timeZone: ET_TZ,
     });
   } catch {
     return s;
@@ -51,7 +56,11 @@ export const fmtDate = (s: string | null | undefined): string => {
 export const fmtDateShort = (s: string | null | undefined): string => {
   if (!s) return '—';
   try {
-    return new Date(s).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    return new Date(s).toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      timeZone: ET_TZ,
+    });
   } catch {
     return s;
   }
@@ -65,6 +74,8 @@ export const fmtDateTime = (s: string | null | undefined): string => {
       day: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
+      timeZone: ET_TZ,
+      timeZoneName: 'short',
     });
   } catch {
     return s;
