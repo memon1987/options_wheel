@@ -41,19 +41,6 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 
 ## Active Considerations
 
-### FC-022: Trade Log contract identifiers + ET timezone + By-Symbol summary table
-
-**Status:** Plan published
-**Size estimate:** M
-**Owner:** Claude
-**Plan file:** `docs/plans/fc-022.md`
-
-**Problem / opportunity:** Three small UX gaps surfaced during AMD-trade investigation. (1) Trade Log doesn't show OCC contract symbol or expiration, so pinpointing a specific contract requires bouncing to Alpaca's UI manually. (2) Date display uses browser-default locale; needs explicit ET. (3) `/symbol` landing page is an uninformative pill grid when the same data could power a summary table.
-
-**Links:** Surfaced from FC-018/FC-021 follow-up investigation.
-
----
-
 ### FC-001: Symbol universe optimization
 
 **Status:** Consideration
@@ -387,6 +374,12 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - PRs: #12 (skeleton), #13 (backend), #14 (pages), #15-#18 (review fixes), #22 (Trade Log), #23 (gap-closing), #24 (PR F cutover), #25 (PR G cleanup) — final merge 2026-05-05
 - Commits: `b7b9184` → `4eb74d2` (PR G)
 - Notes: 3-page dashboard (Overview / By Symbol / Bot Health) shipped via strangler migration. Canonical paths are now bare (`/overview`, `/symbol`, `/bot-health`); `/v2/*` and legacy `/positions`, `/trades`, `/performance`, `/cycles` redirect for bookmark compatibility. Legacy frontend preserved under `dashboard/frontend.archive/` with emergency-revert README — recommend deletion after ~2 weeks of bake time. Mid-execution the gross-vs-net premium audit triggered FC-019; FIFO cycle pairing for overlapping share lots was scoped out as FC-020.
+
+### FC-022: Trade Log contract IDs + ET timezone + By-Symbol summary table
+- Plan: `docs/plans/fc-022.md`
+- PR: https://github.com/memon1987/options_wheel/pull/26 (merged 2026-05-06)
+- Commit: `cd1d47d`
+- Notes: Trade Log gains OCC symbol + expiration + Alpaca order ↗ link per row. All date helpers (`fmtDate`, `fmtDateShort`, `fmtDateTime`) now ET-anchored with explicit `timeZone: 'America/New_York'` and `fmtDateTime` shows the EST/EDT marker. `/symbol` landing page replaces the pill grid with a sortable summary table (`SymbolUniverseTable`) backed by existing scorecard data. Backend `fc018_acb_timeline_per_symbol` view extended with `occ_symbol`, `order_id`, `expiration` columns. `positionState`/`stateColor` extracted from SymbolScorecard into a shared util. 4 new vitest tests assert ET-stability across system locales.
 
 ### FC-021: Synthetic activity correction for Alpaca paper-engine silent settlements
 - Plan: `docs/plans/fc-021.md`
