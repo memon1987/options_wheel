@@ -4,6 +4,18 @@
 // of the viewer's locale so the dashboard matches Alpaca's UI and the bot logs.
 export const ET_TZ = 'America/New_York';
 
+// FC-028: pure calendar-date strings (no time component) — e.g. an option's
+// `expiration` or BQ's `DATE(event_time, 'America/New_York')` — must NOT be
+// run through timezone conversion. JS parses "2026-04-24" as UTC midnight;
+// converting to ET (UTC-4) rolls back to "Apr 23" — wrong by a day. We detect
+// the YYYY-MM-DD shape and render directly from the parts.
+const MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const dateOnlyMatch = (s: string): { year: number; month: number; day: number } | null => {
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  return { year: parseInt(m[1], 10), month: parseInt(m[2], 10), day: parseInt(m[3], 10) };
+};
+
 export const fmtCurrency = (n: number | null | undefined, opts: { compact?: boolean } = {}): string => {
   if (n === null || n === undefined || Number.isNaN(n)) return '—';
   if (opts.compact && Math.abs(n) >= 1000) {
@@ -42,6 +54,10 @@ export const fmtNumber = (n: number | null | undefined): string => {
 export const fmtDate = (s: string | null | undefined): string => {
   if (!s) return '—';
   try {
+    const parts = dateOnlyMatch(s);
+    if (parts) {
+      return `${MONTH_SHORT[parts.month - 1]} ${parts.day}, ${parts.year}`;
+    }
     return new Date(s).toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'short',
@@ -56,6 +72,10 @@ export const fmtDate = (s: string | null | undefined): string => {
 export const fmtDateShort = (s: string | null | undefined): string => {
   if (!s) return '—';
   try {
+    const parts = dateOnlyMatch(s);
+    if (parts) {
+      return `${MONTH_SHORT[parts.month - 1]} ${parts.day}`;
+    }
     return new Date(s).toLocaleDateString('en-US', {
       month: 'short',
       day: 'numeric',

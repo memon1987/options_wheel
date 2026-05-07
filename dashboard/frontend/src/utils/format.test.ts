@@ -100,6 +100,31 @@ describe('format helpers', () => {
       expect(fmtDateShort(undefined)).toBe('—');
       expect(fmtDateTime(null)).toBe('—');
     });
+
+    // FC-028: pure-date strings (no time component) must render the literal
+    // calendar date — no timezone shift. Pre-FC-028 they were parsed as UTC
+    // midnight and converted to ET, rolling back to the prior day.
+    it('fmtDate renders YYYY-MM-DD as the literal calendar date (no TZ shift)', () => {
+      expect(fmtDate('2026-04-24')).toBe('Apr 24, 2026');
+      // The prior-fix bug would have rendered this as "Apr 23, 2026".
+      expect(fmtDate('2026-04-24')).not.toContain('Apr 23');
+    });
+
+    it('fmtDateShort renders YYYY-MM-DD as the literal calendar date', () => {
+      expect(fmtDateShort('2026-04-24')).toBe('Apr 24');
+      expect(fmtDateShort('2026-04-24')).not.toContain('Apr 23');
+    });
+
+    it('fmtDate still ET-anchors full ISO 8601 timestamps', () => {
+      // 03:00 UTC on Apr 15 is 23:00 ET on Apr 14 — calendar-date branch
+      // does NOT match this input (it has a T and Z), so ET conversion still
+      // applies. Asserts the FC-028 fix didn't regress FC-022 behavior.
+      expect(fmtDate('2026-04-15T03:00:00.000Z')).toContain('Apr 14');
+    });
+
+    it('fmtDateShort still ET-anchors full ISO 8601 timestamps', () => {
+      expect(fmtDateShort('2026-04-15T03:00:00.000Z')).toContain('Apr 14');
+    });
   });
 
   describe('pnlColor', () => {
