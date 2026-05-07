@@ -59,4 +59,34 @@ describe('VsBuyAndHoldCard', () => {
     render(<VsBuyAndHoldCard data={null} />);
     expect(screen.getByText('No comparison available.')).toBeInTheDocument();
   });
+
+  it('Wheel total is total_realized_pnl, not recomputed from option+share legs', () => {
+    // Construct a fixture where total_realized_pnl deliberately diverges
+    // from realized_pnl + share_side_pnl. The view is the authoritative
+    // source — frontend must read total_realized_pnl directly, not derive it.
+    const divergent: VsBuyAndHold = {
+      ...unhData,
+      realized_pnl: 1000,
+      share_side_pnl: 500,
+      total_realized_pnl: 9999, // intentionally not 1500
+    };
+    render(<VsBuyAndHoldCard data={divergent} />);
+    expect(screen.getByText('$9,999.00')).toBeInTheDocument();
+    expect(screen.queryByText('$1,500.00')).toBeNull();
+  });
+
+  it('Δ vs B&H comes from wheel_minus_bh field, not recomputed from total − bh', () => {
+    // Set wheel_minus_bh to a value that does NOT equal
+    // total_realized_pnl − bh_dollar_pnl. The view is the source of truth
+    // for the delta; the frontend must not re-derive it.
+    const divergentDelta: VsBuyAndHold = {
+      ...unhData,
+      total_realized_pnl: 5000,
+      bh_dollar_pnl: 1000,
+      wheel_minus_bh: 12345, // intentionally not 4000
+    };
+    render(<VsBuyAndHoldCard data={divergentDelta} />);
+    expect(screen.getByText('$12,345.00')).toBeInTheDocument();
+    expect(screen.queryByText('$4,000.00')).toBeNull();
+  });
 });
