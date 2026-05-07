@@ -98,6 +98,9 @@ WITH events AS (
   -- 3. OPASN (assignments / called-aways) — pair with the matching OPTRD on
   --    same underlying within ±120s and matching qty sign so we get the real
   --    cash flow (net_amount). Falls back to strike*qty*100 if no OPTRD match.
+  --    QUALIFY caps the join to one OPTRD per OPASN (closest-by-time) — guards
+  --    against multi-OPASN+multi-OPTRD same-direction collisions on triple-
+  --    witching Fridays or batched paper-engine settlements.
   SELECT
     a.underlying,
     a.transaction_time AS event_time,
@@ -121,8 +124,11 @@ WITH events AS (
       ELSE 0
     END AS shares_delta,
     -- Negate net_amount so positive = cash out (assignment) and negative =
-    -- cash in (called away). running_share_cost then accumulates true cash
-    -- spent on shares net of called-away proceeds.
+    -- cash in (called away). running_share_cost accumulates true cash spent
+    -- on shares net of called-away proceeds — note this is cumulative since
+    -- inception per fc-024 Non-goals (cycle-isolated ACB is deferred), so
+    -- residual losses from a prior closed cycle carry into the next cycle's
+    -- ACB. See docs/plans/fc-024.md.
     COALESCE(
       -o.net_amount,
       CASE
@@ -145,6 +151,12 @@ WITH events AS (
       OR (a.option_type = 'call' AND o.qty < 0))
   WHERE a.activity_type = 'OPASN'
     AND a.underlying IS NOT NULL
+  -- Cap to one OPTRD per OPASN (closest by absolute time delta) so multi-
+  -- OPASN/multi-OPTRD same-direction collisions don't multiply rows.
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY a.activity_id
+    ORDER BY ABS(TIMESTAMP_DIFF(o.transaction_time, a.transaction_time, SECOND))
+  ) = 1
 
   UNION ALL
 
@@ -177,16 +189,45 @@ WITH events AS (
 running AS (
   SELECT
     *,
+    -- Tie-breaker for events sharing a transaction_time: closes (cash out)
+    -- sort before opens (cash in), then assignments/expirations, then
+    -- activity_id as the final deterministic tiebreaker. Keeps the
+    -- cumulative_net_premium curve from briefly going negative-then-positive
+    -- during same-second roll fills.
     SUM(net_premium_delta) OVER (
-      PARTITION BY underlying ORDER BY event_time, activity_id
+      PARTITION BY underlying
+      ORDER BY event_time,
+               CASE event_label
+                 WHEN 'option_closed' THEN 0
+                 WHEN 'put_sold'      THEN 1
+                 WHEN 'call_sold'     THEN 1
+                 ELSE 2
+               END,
+               activity_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS cumulative_net_premium,
     SUM(shares_delta) OVER (
-      PARTITION BY underlying ORDER BY event_time, activity_id
+      PARTITION BY underlying
+      ORDER BY event_time,
+               CASE event_label
+                 WHEN 'option_closed' THEN 0
+                 WHEN 'put_sold'      THEN 1
+                 WHEN 'call_sold'     THEN 1
+                 ELSE 2
+               END,
+               activity_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS running_shares,
     SUM(share_cost_delta) OVER (
-      PARTITION BY underlying ORDER BY event_time, activity_id
+      PARTITION BY underlying
+      ORDER BY event_time,
+               CASE event_label
+                 WHEN 'option_closed' THEN 0
+                 WHEN 'put_sold'      THEN 1
+                 WHEN 'call_sold'     THEN 1
+                 ELSE 2
+               END,
+               activity_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS running_share_cost
   FROM events

@@ -18,6 +18,21 @@ const labelColor = (label: string): string => {
   }
 };
 
+// FC-024: pick the Y axis a reference dot rides on. During share-holding
+// phases (acb_per_share is set) dots ride the ACB axis at the actual ACB
+// value. During cash phases (no shares held) dots ride the cumulative-
+// premium axis at the current premium level. Pre-FC-024 every dot fell
+// back to y=0 on the ACB axis, which made them invisible at the chart
+// floor when acb was null. Exported for unit testing.
+export const dotAxisFor = (
+  row: Pick<AcbTimelineRow, 'acb_per_share' | 'cumulative_net_premium'>
+): { yAxisId: 'acb' | 'prem'; y: number } => {
+  if (row.acb_per_share !== null && row.acb_per_share !== undefined) {
+    return { yAxisId: 'acb', y: row.acb_per_share };
+  }
+  return { yAxisId: 'prem', y: row.cumulative_net_premium };
+};
+
 const eventLegendItems: Array<{ label: string; color: string }> = [
   { label: 'put sold', color: '#34d399' },
   { label: 'call sold', color: '#a78bfa' },
@@ -114,17 +129,13 @@ export default function AcbWalkChart({ data }: Props) {
               strokeDasharray="3 3"
             />
             {series.map((s, i) => {
-              // Position dots on the ACB axis when shares are held (acb is set);
-              // otherwise on the cumulative-premium axis at the current premium
-              // level. Pre-FC-024 dots collapsed to y=0 on the ACB axis when
-              // acb was null, which made them invisible.
-              const onAcbAxis = s.acb !== null && s.acb !== undefined;
+              const { yAxisId, y } = dotAxisFor(s);
               return (
                 <ReferenceDot
                   key={`${s.x}-${i}`}
-                  yAxisId={onAcbAxis ? 'acb' : 'prem'}
+                  yAxisId={yAxisId}
                   x={s.x}
-                  y={onAcbAxis ? (s.acb as number) : s.cumulative_premium}
+                  y={y}
                   r={3}
                   fill={labelColor(s.event_label)}
                   stroke="none"
