@@ -266,6 +266,8 @@ ws AS (
   SELECT
     underlying,
     realized_pnl,
+    share_side_pnl,
+    total_realized_pnl,
     total_premium,
     current_shares,
     current_acb_per_share
@@ -287,6 +289,8 @@ SELECT
   ft.first_trade_date,
   ft.first_strike,
   ws.realized_pnl,
+  ws.share_side_pnl,
+  ws.total_realized_pnl,
   ws.total_premium,
   ws.current_shares,
   ws.current_acb_per_share,
@@ -294,6 +298,8 @@ SELECT
   p.price_now,
   -- Hypothetical buy-and-hold: the dollar amount equal to first_strike * 100 * first_qty
   -- (a CSP's collateral) bought at price_at_start and held to today.
+  -- NOTE: price-only — does not reinvest dividends. Symbols that pay dividends
+  -- are understated on the buy-and-hold side.
   CASE
     WHEN p.price_at_start IS NOT NULL AND p.price_at_start > 0
          AND ft.first_strike IS NOT NULL AND ft.first_qty IS NOT NULL
@@ -304,12 +310,14 @@ SELECT
          AND p.price_at_start > 0 AND ft.first_strike IS NOT NULL AND ft.first_qty IS NOT NULL
       THEN ((ft.first_strike * 100 * ABS(ft.first_qty)) / p.price_at_start) * (p.price_now - p.price_at_start)
   END AS bh_dollar_pnl,
-  -- Wheel "value-add": realized P&L + premium − bh_dollar_pnl
-  -- Positive = wheel beat buy-and-hold for this name; negative = lagged.
+  -- Wheel "value-add": total realized P&L (option leg + share leg, FC-019)
+  -- minus buy-and-hold dollar P&L. Positive = wheel beat buy-and-hold for
+  -- this name; negative = lagged. Pre-FC-023 this used
+  -- `realized_pnl + total_premium`, which double-counted gross premium.
   CASE
     WHEN p.price_at_start IS NOT NULL AND p.price_now IS NOT NULL
          AND p.price_at_start > 0 AND ft.first_strike IS NOT NULL AND ft.first_qty IS NOT NULL
-      THEN (COALESCE(ws.realized_pnl, 0) + COALESCE(ws.total_premium, 0))
+      THEN COALESCE(ws.total_realized_pnl, 0)
            - (((ft.first_strike * 100 * ABS(ft.first_qty)) / p.price_at_start) * (p.price_now - p.price_at_start))
   END AS wheel_minus_bh
 FROM ws

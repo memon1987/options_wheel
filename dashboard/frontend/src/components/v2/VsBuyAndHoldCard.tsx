@@ -15,8 +15,7 @@ export default function VsBuyAndHoldCard({ data }: Props) {
     );
   }
 
-  const wheelTotal =
-    (data.realized_pnl ?? 0) + (data.total_premium ?? 0);
+  const wheelTotal = data.total_realized_pnl ?? 0;
   const bhTotal = data.bh_dollar_pnl;
   const delta = data.wheel_minus_bh;
 
@@ -45,7 +44,7 @@ export default function VsBuyAndHoldCard({ data }: Props) {
               {fmtCurrencyDetail(wheelTotal)}
             </div>
             <div className="text-xs text-gray-500 mt-0.5">
-              prem {fmtCurrency(data.total_premium)} + realized {fmtCurrency(data.realized_pnl)}
+              option {fmtCurrency(data.realized_pnl)} + share {fmtCurrency(data.share_side_pnl)}
             </div>
           </div>
           <div>
@@ -55,7 +54,7 @@ export default function VsBuyAndHoldCard({ data }: Props) {
             </div>
             <div className="text-xs text-gray-500 mt-0.5">
               {data.price_at_start !== null && data.price_now !== null && (
-                <>${data.price_at_start?.toFixed(2)} → ${data.price_now?.toFixed(2)}</>
+                <>${data.price_at_start?.toFixed(2)} → ${data.price_now?.toFixed(2)} <span title="Buy-and-hold figure is price-only and does not reinvest dividends.">(price only)</span></>
               )}
             </div>
           </div>
