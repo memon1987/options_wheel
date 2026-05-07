@@ -419,7 +419,7 @@ _Move entries here once a plan has been published, executed, and merged. Include
 ### FC-025: AMZN silent-exercise correction (paper-engine, Jan 16 2026)
 - Plan: `docs/plans/fc-025.md`
 - Investigation: `docs/investigations/amzn-reconciliation.md`
-- Commit: filled by execution commit (no PR — data-only correction direct to `main`, mirroring FC-021)
+- Commit: `15625ce` (no PR — data-only correction direct to `main`, mirroring FC-021)
 - Date: 2026-05-07
 - Notes: Twin of FC-021's AMD silent-exercise bug. AMZN $240 put `AMZN260116P00240000` (sold 2026-01-12 at $0.73, expired 2026-01-16 with AMZN at $239.09 = $0.91 ITM) was auto-exercised silently — no OPASN/OPTRD ingested. Confirmed by behavioral evidence (Jan 23 covered call written, Apr 22 called-away at exact $240 strike). Inserted two synthetic rows into `options_wheel.trades_from_activities` (`activity_id LIKE 'synthetic-fc-025-%'`). Effect on AMZN scorecard: `share_side_pnl` +$20,500 → **−$3,500**, `total_realized_pnl` $26,206 → **$2,279**, `cycles_completed` 1 → 2, `wheel_minus_bh` +$21,094 → **−$2,833** (sign reversal — wheel actually lagged B&H on AMZN). Audit query: `WHERE activity_id LIKE 'synthetic-%'` (returns 4 rows: 2 FC-021 + 2 FC-025). Rollback: `DELETE WHERE activity_id LIKE 'synthetic-fc-025-%'`.
 
