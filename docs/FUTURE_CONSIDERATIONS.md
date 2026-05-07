@@ -311,6 +311,21 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
+### FC-024: ACB walk view rewrite — restore missing event types and ACB computation
+
+**Status:** Plan published
+**Size estimate:** M
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-024.md`
+
+**Problem / opportunity:** `fc018_acb_timeline_per_symbol` is structurally broken across every symbol. It sources from `trades_with_outcomes` ([fc018_views.sql:69](docs/bigquery/fc018_views.sql#L69)) which is filtered to opening sell_short FILLs only. As a result the view never emits `option_closed`/`put_assigned`/`called_away`/`expired` rows; `running_shares` is always 0; `acb_per_share` is always NULL. The dashboard's ACB Walk chart only ever shows the cumulative-premium line — yellow ACB line never renders, and reference-dot legend lists 6 event types but only 2 (put_sold, call_sold) ever appear, all positioned at `y=0` (i.e., invisible at the chart floor) because the dot Y-coordinate falls back to `acb ?? 0`. Cross-symbol verification: 7/7 symbols have `rows_w_acb=0`. Trade Log on the per-symbol page is similarly missing close/assignment/expiration rows. Phase Timing (also reading this view) silently emits only `short_put` because the state machine never observes an OPASN/OPEXP transition.
+
+**Open questions:** see plan file.
+
+**Links:** FC-023 (sister observation in the same dashboard accuracy review), FC-018 (introduced the view), FC-019 (introduced `share_side_pnl` from raw OPTRD; this FC adopts the same pattern for share-cost flow). Phase Timing investigation (observation #4) becomes a verification task post-FC-024 rather than a separate fix.
+
+---
+
 ### FC-023: Per-symbol Realized P&L reconciliation — single canonical number across drilldown
 
 **Status:** Plan published
