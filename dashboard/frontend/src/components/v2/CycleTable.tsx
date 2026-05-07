@@ -39,7 +39,7 @@ export default function CycleTable({ rows }: Props) {
       <div className="px-5 py-3 border-b border-gray-700">
         <h3 className="text-base font-semibold text-white">Cycles</h3>
         <p className="text-xs text-gray-400 mt-1">
-          Each row = one wheel from put assignment to called-away. Call premium and Cycle P&amp;L roll up across every covered call sold during the cycle (includes rolls).
+          Each row = one wheel from put assignment to called-away. Total Premium rolls up every covered call sold during the cycle (includes rolls). Cycle P&amp;L = Total Premium + Cap Gain.
         </p>
       </div>
       <div className="overflow-x-auto">
@@ -52,14 +52,24 @@ export default function CycleTable({ rows }: Props) {
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-left text-gray-400">Assigned</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Call Strike</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Number of covered calls sold during this cycle (rolls inflate this — each early-closed-and-resold call counts separately)">Calls Rolled</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Capital gain on the share lot (call_strike − put_strike) × 100">Cap Gain</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Net realized P&L for the cycle: put kept + sum of call realized P&L (after roll buybacks)">Cycle P&L</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Realized capital gain on shares during the cycle window — actual cash in (called-away) minus actual cash out (assigned), per Alpaca activity history.">Cap Gain</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Net option premium kept across the cycle: put kept + sum of call realized P&L (after roll buybacks). Does NOT include share-side capital gain.">Total Premium</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="True cycle P&L = Total Premium + Cap Gain. Includes both option-side (premium kept after rolls) and share-side (called-away vs assigned strike) cash flow.">Cycle P&L</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Return</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Days</th>
             </tr>
           </thead>
           <tbody>
             {rows.map((r, i) => {
+              // True cycle P&L = option-side net premium kept + share-side
+              // capital gain. FC-027: previously displayed as a single
+              // "Cycle P&L" column showing only total_premium, which masked
+              // share-side losses (e.g., UNH cycle 1: $1,218 option vs −$532
+              // true cycle outcome).
+              const cyclePnl =
+                r.total_premium === null && r.capital_gain === null
+                  ? null
+                  : (r.total_premium ?? 0) + (r.capital_gain ?? 0);
               const totalReturn =
                 r.total_premium !== null &&
                 r.put_strike !== null &&
@@ -88,8 +98,11 @@ export default function CycleTable({ rows }: Props) {
                   <td className={`px-3 py-2 text-sm text-right ${pnlColor(r.capital_gain)}`}>
                     {fmtCurrency(r.capital_gain)}
                   </td>
-                  <td className={`px-3 py-2 text-sm text-right font-semibold ${pnlColor(r.total_premium)}`}>
+                  <td className={`px-3 py-2 text-sm text-right ${pnlColor(r.total_premium)}`}>
                     {fmtCurrency(r.total_premium)}
+                  </td>
+                  <td className={`px-3 py-2 text-sm text-right font-semibold ${pnlColor(cyclePnl)}`}>
+                    {cyclePnl !== null ? fmtCurrency(cyclePnl) : '—'}
                   </td>
                   <td className={`px-3 py-2 text-sm text-right ${pnlColor(totalReturn)}`}>
                     {fmtPercent(totalReturn, 2)}
