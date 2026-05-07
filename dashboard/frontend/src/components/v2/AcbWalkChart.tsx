@@ -50,7 +50,9 @@ export default function AcbWalkChart({ data }: Props) {
         <div>
           <h3 className="text-base font-semibold text-white">ACB Walk</h3>
           <p className="text-xs text-gray-400 mt-1">
-            Adjusted cost basis per share over time. Annotated by event.
+            Yellow line: average cost per assigned share (only while shares are held).
+            Blue dashed: cumulative net premium received across all option events.
+            Dots mark events; color encodes type.
           </p>
         </div>
         <div className="hidden md:flex flex-wrap gap-x-3 gap-y-1 text-xs">
@@ -111,17 +113,24 @@ export default function AcbWalkChart({ data }: Props) {
               name="Cumulative premium"
               strokeDasharray="3 3"
             />
-            {series.map((s, i) => (
-              <ReferenceDot
-                key={`${s.x}-${i}`}
-                yAxisId="acb"
-                x={s.x}
-                y={s.acb ?? 0}
-                r={3}
-                fill={labelColor(s.event_label)}
-                stroke="none"
-              />
-            ))}
+            {series.map((s, i) => {
+              // Position dots on the ACB axis when shares are held (acb is set);
+              // otherwise on the cumulative-premium axis at the current premium
+              // level. Pre-FC-024 dots collapsed to y=0 on the ACB axis when
+              // acb was null, which made them invisible.
+              const onAcbAxis = s.acb !== null && s.acb !== undefined;
+              return (
+                <ReferenceDot
+                  key={`${s.x}-${i}`}
+                  yAxisId={onAcbAxis ? 'acb' : 'prem'}
+                  x={s.x}
+                  y={onAcbAxis ? (s.acb as number) : s.cumulative_premium}
+                  r={3}
+                  fill={labelColor(s.event_label)}
+                  stroke="none"
+                />
+              );
+            })}
           </ComposedChart>
         </ResponsiveContainer>
       </div>

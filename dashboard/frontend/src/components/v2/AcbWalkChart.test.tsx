@@ -1,0 +1,89 @@
+import { describe, expect, it } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import AcbWalkChart from './AcbWalkChart';
+import type { AcbTimelineRow } from '../../types/v2';
+
+// FC-024: the ACB Walk chart used to drop reference dots to y=0 on the ACB
+// axis whenever `acb_per_share` was null (which was always, due to a broken
+// view). After FC-024 we expect:
+//   - The chart renders for fixtures that include all 6 event types
+//   - The legend lists all 6 event-marker colors regardless of data
+//   - Dots during cash phases (acb=null) ride the cumulative-premium axis,
+//     not the ACB axis at y=0
+
+function row(partial: Partial<AcbTimelineRow>): AcbTimelineRow {
+  return {
+    event_time: '2025-10-06T15:28:00Z',
+    event_date: '2025-10-06',
+    activity_type: 'FILL',
+    occ_symbol: null,
+    order_id: null,
+    expiration: null,
+    option_type: null,
+    side: null,
+    qty: null,
+    strike_price: null,
+    premium_total: null,
+    outcome: null,
+    realized_pnl: null,
+    net_premium_delta: 0,
+    shares_delta: 0,
+    cumulative_net_premium: 0,
+    running_shares: 0,
+    running_share_cost: 0,
+    acb_per_share: null,
+    event_label: 'put_sold',
+    ...partial,
+  };
+}
+
+const sixEventTypeFixture: AcbTimelineRow[] = [
+  row({ event_time: '2025-10-06T15:28:00Z', event_label: 'put_sold',      cumulative_net_premium: 159 }),
+  row({ event_time: '2025-10-14T04:20:00Z', event_label: 'expired',       cumulative_net_premium: 159 }),
+  row({ event_time: '2025-10-15T15:51:00Z', event_label: 'put_sold',      cumulative_net_premium: 260 }),
+  row({ event_time: '2025-10-17T09:55:00Z', event_label: 'option_closed', cumulative_net_premium: 210 }),
+  row({ event_time: '2025-11-08T04:21:00Z', event_label: 'put_assigned',  cumulative_net_premium: 864,  running_shares: 100, acb_per_share: 323.86 }),
+  row({ event_time: '2025-11-10T10:15:00Z', event_label: 'call_sold',     cumulative_net_premium: 1849, running_shares: 100, acb_per_share: 314.01 }),
+  row({ event_time: '2025-11-15T04:24:00Z', event_label: 'called_away',   cumulative_net_premium: 1849 }),
+];
+
+describe('AcbWalkChart', () => {
+  it('renders empty state when no events provided', () => {
+    render(<AcbWalkChart data={[]} />);
+    expect(screen.getByText('No events recorded for this symbol.')).toBeInTheDocument();
+  });
+
+  it('renders when fixture covers all 6 event types', () => {
+    render(<AcbWalkChart data={sixEventTypeFixture} />);
+    expect(screen.getByText('ACB Walk')).toBeInTheDocument();
+  });
+
+  it('legend lists all 6 event-marker labels', () => {
+    render(<AcbWalkChart data={sixEventTypeFixture} />);
+    // Hidden on small screens but present in DOM via `hidden md:flex`.
+    expect(screen.getByText('put sold')).toBeInTheDocument();
+    expect(screen.getByText('call sold')).toBeInTheDocument();
+    expect(screen.getByText('closed')).toBeInTheDocument();
+    expect(screen.getByText('assigned')).toBeInTheDocument();
+    expect(screen.getByText('called away')).toBeInTheDocument();
+    expect(screen.getByText('expired')).toBeInTheDocument();
+  });
+
+  it('subtitle explains both lines and the dot color encoding', () => {
+    render(<AcbWalkChart data={sixEventTypeFixture} />);
+    const heading = screen.getByText('ACB Walk');
+    const card = heading.closest('div')!.parentElement!.parentElement!;
+    expect(card.textContent).toMatch(/yellow line/i);
+    expect(card.textContent).toMatch(/cumulative net premium/i);
+    expect(card.textContent).toMatch(/dots mark events/i);
+  });
+
+  it('legend renders all 6 colors even if data is sparse (only put_sold)', () => {
+    // Single-event fixture: legend should still advertise the full event taxonomy
+    // because users picking different symbols in the dropdown should always see
+    // the same legend.
+    render(<AcbWalkChart data={[row({ event_label: 'put_sold' })]} />);
+    expect(screen.getByText('put sold')).toBeInTheDocument();
+    expect(screen.getByText('called away')).toBeInTheDocument();
+  });
+});
