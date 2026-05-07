@@ -343,21 +343,6 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-027: Cycle Table — separate "Total Premium" from "Cycle P&L"
-
-**Status:** Plan published
-**Size estimate:** S
-**Owner:** Claude
-**Plan file:** `docs/plans/fc-027.md`
-
-**Problem / opportunity:** On `/symbol/<X>` the per-cycle table currently has a column labeled "Cycle P&L" that actually displays `total_premium` — option-side net P&L only (put kept + sum of call realized after roll buybacks). It does NOT include `capital_gain` (share-side cash flow during the cycle window), so for cycles where shares were called-away below the assignment strike the displayed "Cycle P&L" is misleadingly higher than the true cycle P&L. Surfaced during the FC-023/024/026 manual trace walkthrough on UNH Cycle 1: column reads $1,218 ("Cycle P&L") but the true cycle outcome was $1,218 − $1,750 = −$532. Fix is two columns: rename the existing one to "Total Premium" (matches the data) and add a new "Cycle P&L" column that displays `total_premium + capital_gain`.
-
-**Open questions:** see plan file.
-
-**Links:** FC-019 (introduced share-side cash flow), FC-023 (sister fix on the realized-P&L card surface — this is the same class of bug at the cycle granularity).
-
----
-
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
@@ -451,6 +436,12 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - PR: https://github.com/memon1987/options_wheel/pull/29 (merged 2026-05-07)
 - Commit: `1b5559c`
 - Notes: Capture-ratio math validated as correct against raw activities (no data fixes shipped). Three new dollar-magnitude aggregates rendered in the chart card: Received / Captured / Foregone (buybacks). UNH macros: **$5,888 / $4,334 (73.6%) / $1,554 (26.4%)** (verified 2026-05-07 against raw Alpaca activity feed). "Foregone" is qualified "(buybacks)" to disambiguate from the counterfactual reading (which would require option-chain snapshots — FC-017). Frontend-only; no view, no backend, no payload change.
+
+### FC-027: Cycle Table — separate "Total Premium" from "Cycle P&L"
+- Plan: `docs/plans/fc-027.md`
+- PR: https://github.com/memon1987/options_wheel/pull/31 (merged 2026-05-07)
+- Commit: `9928db8`
+- Notes: Surfaced mid-trace during the FC-023/024/026 manual reconcile when the user noticed the Cycle Table column labeled "Cycle P&L" actually displayed `total_premium` only (option-side net), silently excluding `capital_gain` (share-side cash flow). For UNH Cycle 1 the column read +$1,218 but the true cycle outcome was $1,218 − $1,750 = −$532. Fix: rename existing column → "Total Premium" (matches the data), add new "Cycle P&L" column = `total_premium + capital_gain`. Same class of bug as FC-023 at cycle granularity. Peer review caught one defect (Cap Gain tooltip leaked internal nomenclature `Post-FC-019`/`OPTRD` — reverted to user-readable copy) and two test-strength suggestions (cell-position assertions) — all addressed pre-merge.
 
 ### FC-019: True P&L reconciliation — JNLC + OPTRD ingest, share-side P&L
 - Plan: `docs/plans/fc-019.md` (written retroactively)
