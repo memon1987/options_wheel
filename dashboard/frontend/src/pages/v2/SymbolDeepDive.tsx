@@ -117,8 +117,11 @@ export default function SymbolDeepDive() {
           </div>
           <div className="rounded-lg border border-gray-700 bg-gray-800 p-3">
             <div className="text-xs uppercase tracking-wide text-gray-400">Realized P&amp;L</div>
-            <div className={`text-lg font-semibold mt-1 ${pnlColor(summary.realized_pnl)}`}>
-              {fmtCurrencyDetail(summary.realized_pnl)}
+            <div className={`text-lg font-semibold mt-1 ${pnlColor(summary.total_realized_pnl)}`}>
+              {fmtCurrencyDetail(summary.total_realized_pnl)}
+            </div>
+            <div className="text-xs text-gray-400 mt-0.5">
+              option {fmtCurrency(summary.realized_pnl)} + share {fmtCurrency(summary.share_side_pnl)}
             </div>
           </div>
           <div className="rounded-lg border border-gray-700 bg-gray-800 p-3">
