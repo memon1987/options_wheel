@@ -311,21 +311,6 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-026: Decision Quality — surface Premium Received / Captured / Foregone macro stats
-
-**Status:** Plan published
-**Size estimate:** S
-**Owner:** Claude
-**Plan file:** `docs/plans/fc-026.md`
-
-**Problem / opportunity:** The Decision Quality histogram on the per-symbol page shows distribution of capture ratios but not the total dollar magnitude of what was captured vs. given back through early-close buybacks. User asked for "total premium captured vs premium foregone for early close" alongside the chart. Data validation confirmed the underlying capture-ratio computation is correct (UNH 27 closed trades validated against raw activities: $5,723 received, $4,279 captured = 75%, $1,444 foregone via buybacks). Enhancement is purely additive — three new aggregate stats rendered in the chart card, no view change, no payload change (fields already on `DecisionQualityRow`).
-
-**Open questions:** see plan file.
-
-**Links:** FC-018 (introduced the chart); the underlying `bigquery.py:get_decision_quality()` query is unchanged.
-
----
-
 ### FC-025: AMZN silent-exercise correction (paper-engine, Jan 16 2026)
 
 **Status:** Consideration
@@ -355,36 +340,6 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 - Should the synthetic-row writer be promoted to a reusable utility (`tools/diagnostics/correct_silent_exercise.py`) given this is the second occurrence (FC-021 was the first)? Two data points isn't enough to justify pulling out a generic tool, but if a third occurs the answer becomes yes.
 
 **Links:** FC-021 (AMD silent-exercise, same root cause), FC-024 (the view rewrite that surfaced this), FC-019 (introduced `share_side_pnl`), `docs/investigations/amd-reconciliation.md` (the prior playbook).
-
----
-
-### FC-024: ACB walk view rewrite — restore missing event types and ACB computation
-
-**Status:** Plan published
-**Size estimate:** M
-**Owner:** Claude
-**Plan file:** `docs/plans/fc-024.md`
-
-**Problem / opportunity:** `fc018_acb_timeline_per_symbol` is structurally broken across every symbol. It sources from `trades_with_outcomes` ([fc018_views.sql:69](docs/bigquery/fc018_views.sql#L69)) which is filtered to opening sell_short FILLs only. As a result the view never emits `option_closed`/`put_assigned`/`called_away`/`expired` rows; `running_shares` is always 0; `acb_per_share` is always NULL. The dashboard's ACB Walk chart only ever shows the cumulative-premium line — yellow ACB line never renders, and reference-dot legend lists 6 event types but only 2 (put_sold, call_sold) ever appear, all positioned at `y=0` (i.e., invisible at the chart floor) because the dot Y-coordinate falls back to `acb ?? 0`. Cross-symbol verification: 7/7 symbols have `rows_w_acb=0`. Trade Log on the per-symbol page is similarly missing close/assignment/expiration rows. Phase Timing (also reading this view) silently emits only `short_put` because the state machine never observes an OPASN/OPEXP transition.
-
-**Open questions:** see plan file.
-
-**Links:** FC-023 (sister observation in the same dashboard accuracy review), FC-018 (introduced the view), FC-019 (introduced `share_side_pnl` from raw OPTRD; this FC adopts the same pattern for share-cost flow). Phase Timing investigation (observation #4) becomes a verification task post-FC-024 rather than a separate fix.
-
----
-
-### FC-023: Per-symbol Realized P&L reconciliation — single canonical number across drilldown
-
-**Status:** Plan published
-**Size estimate:** S-M
-**Owner:** Claude
-**Plan file:** `docs/plans/fc-023.md`
-
-**Problem / opportunity:** The per-symbol drilldown shows two different P&L numbers that disagree, neither of which is the true realized P&L. Top-of-page "Realized P&L" card shows option-leg only (`realized_pnl` from `fc018_per_symbol_scorecard`) — silently excludes share-side cash flow on assigned-then-called-away cycles. Wheel-vs-B&H card's "Wheel" total computes `realized_pnl + total_premium`, which double-counts gross premium (since `realized_pnl` already nets premium against close costs). UNH trace: top card $4,334, wheel card $10,222, true `total_realized_pnl = $2,584`. The "Δ Wheel − B&H" delta on the same card propagates the bug — currently overstates wheel advantage by $7,638 for UNH. The correct number `total_realized_pnl = realized_pnl + share_side_pnl` is already computed in the scorecard view (since FC-019) but is not the displayed value on either surface.
-
-**Open questions:** see plan file.
-
-**Links:** FC-019 (introduced `total_realized_pnl`), `dashboard/frontend/src/components/v2/VsBuyAndHoldCard.tsx`, `dashboard/frontend/src/pages/v2/SymbolDeepDive.tsx`, `docs/bigquery/fc018_views.sql`.
 
 ---
 
@@ -463,6 +418,24 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - Commit: `133ebb0` (no PR — data-only correction)
 - Date: 2026-05-06
 - Notes: Inserted two synthetic rows into `options_wheel.trades_from_activities` (`activity_id LIKE 'synthetic-fc-021-%'`) to reconcile the dashboard for `AMD260116C00212500`'s silent 2026-01-16 paper-engine exercise. Discovered during reconciliation diving (see `docs/investigations/amd-reconciliation.md`) — Alpaca's paper engine settled the deep-ITM call without logging OPASN/OPEXP/OPTRD; daily-P&L hypothesis fit confirmed only one silent event occurred, no second discrepancy. Effect on AMD scorecard: `share_pnl` −$24,250 → −$3,000, `total_pnl` −$17,319 → +$5,309, Cycle 2 `cap_gain` −$20,500 → $0 (clean wash). Headline Total Return remains pinned to NLV − sum(deposits) so it's unaffected; per-symbol sum across symbols ($44.9k) no longer ≈ headline ($20.1k) — accepted divergence reflecting the off-book silent settlement. Audit query: `WHERE activity_id LIKE 'synthetic-%'`. Rollback: `DELETE` same predicate.
+
+### FC-023: Per-symbol Realized P&L reconciliation — single canonical number across drilldown
+- Plan: `docs/plans/fc-023.md`
+- PR: https://github.com/memon1987/options_wheel/pull/27 (merged 2026-05-07)
+- Commit: `83bbd57`
+- Notes: Top-of-page "Realized P&L" card and Wheel-vs-B&H "Wheel" total now both display canonical `total_realized_pnl` (option leg + share leg, FC-019) instead of two different disagreeing numbers. UNH pre-fix: top $4,334, wheel $10,222 (double-counted premium). UNH post-fix: both $2,584. View `fc018_vs_buy_and_hold_per_symbol.wheel_minus_bh` formula corrected from `realized_pnl + total_premium` to `total_realized_pnl`. B&H labeled "(price only)" — dividend-reinvested B&H is a deferred concern (FC-017's neighborhood).
+
+### FC-024: ACB walk view rewrite — restore missing event types and ACB computation
+- Plan: `docs/plans/fc-024.md`
+- PRs: https://github.com/memon1987/options_wheel/pull/30 (merged 2026-05-07; replaces auto-closed [#28](https://github.com/memon1987/options_wheel/pull/28) which lost its base on FC-023's merge)
+- Commit: `1a4e401`
+- Notes: `fc018_acb_timeline_per_symbol` rewritten to source from `trades_from_activities` directly via four UNION-ALL blocks (opens / closes / OPASN with QUALIFY-guarded OPTRD pairing / OPEXP). Pre-fix every symbol had `rows_w_acb=0`; post-fix all 6 event types render correctly with ACB transitions during share-holding windows. Reference-dot positioning fixed (`dotAxisFor()` helper rides ACB axis when shares held, premium axis otherwise). Incidentally fixed Phase Timing observation #4 (UNH state machine now returns 4-phase split: cash 124d / short_put 61d / long_stock 10d / covered 17d). Surfaced AMZN silent-exercise data anomaly as a side discovery, filed as FC-025.
+
+### FC-026: Decision Quality — surface Premium Received / Captured / Foregone macro stats
+- Plan: `docs/plans/fc-026.md`
+- PR: https://github.com/memon1987/options_wheel/pull/29 (merged 2026-05-07)
+- Commit: `1b5559c`
+- Notes: Capture-ratio math validated as correct against raw activities (no data fixes shipped). Three new dollar-magnitude aggregates rendered in the chart card: Received / Captured / Foregone (buybacks). UNH macros: $5,723 / $4,279 (75%) / $1,444 (25%). "Foregone" is qualified "(buybacks)" to disambiguate from the counterfactual reading (which would require option-chain snapshots — FC-017). Frontend-only; no view, no backend, no payload change.
 
 ### FC-019: True P&L reconciliation — JNLC + OPTRD ingest, share-side P&L
 - Plan: `docs/plans/fc-019.md` (written retroactively)
