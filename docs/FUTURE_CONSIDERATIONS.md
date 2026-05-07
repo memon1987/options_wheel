@@ -343,19 +343,6 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-028: fmtDate calendar-date off-by-one (timezone shift on pure dates)
-
-**Status:** Plan-exempt (single-file utility bug fix)
-**Size estimate:** S
-**Owner:** Claude
-**Plan file:** none — plan-exempt per CLAUDE.md "Single-file, isolated bug fixes"
-
-**Problem / opportunity:** Surfaced during the UNH cross-check: Trade Log column "Expiration" shows Apr 23 for `UNH260424P00302500` (encoded expiration Apr 24). Root cause: `fmtDate()` parses pure-date strings like `"2026-04-24"` as UTC midnight, then converts to ET (UTC−4 EDT) — rolls back to Apr 23 8pm and renders as "Apr 23". Same bug affects the Trade Log "Date" column (BQ's `event_date` is a `DATE` type, identical shape). Fix: detect `YYYY-MM-DD`-shaped inputs and render directly from year/month/day with no TZ conversion. Full ISO 8601 timestamps continue to ET-anchor as before. Plan-exempt because it's a single-file bug fix; branch+PR per project policy.
-
-**Links:** FC-022 (introduced ET-anchored date helpers — this plugs a gap in that fix for the calendar-date case).
-
----
-
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
@@ -455,6 +442,11 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - PR: https://github.com/memon1987/options_wheel/pull/31 (merged 2026-05-07)
 - Commit: `9928db8`
 - Notes: Surfaced mid-trace during the FC-023/024/026 manual reconcile when the user noticed the Cycle Table column labeled "Cycle P&L" actually displayed `total_premium` only (option-side net), silently excluding `capital_gain` (share-side cash flow). For UNH Cycle 1 the column read +$1,218 but the true cycle outcome was $1,218 − $1,750 = −$532. Fix: rename existing column → "Total Premium" (matches the data), add new "Cycle P&L" column = `total_premium + capital_gain`. Same class of bug as FC-023 at cycle granularity. Peer review caught one defect (Cap Gain tooltip leaked internal nomenclature `Post-FC-019`/`OPTRD` — reverted to user-readable copy) and two test-strength suggestions (cell-position assertions) — all addressed pre-merge.
+
+### FC-028: fmtDate calendar-date off-by-one (TZ shift on pure dates)
+- PR: https://github.com/memon1987/options_wheel/pull/32 (merged 2026-05-07)
+- Commit: `0c4d20d`
+- Notes: Plan-exempt (single-file utility bug fix). User caught on Trade Log: OCC `UNH260424P00302500` (Apr 24 expiry) rendered "Apr 23" in the Expiration column. Root cause: `fmtDate()` parsed pure-date strings as UTC midnight then converted to ET (UTC−4) — rolled back to prior day. Same bug affected `event_date` Date column. Fix detects `YYYY-MM-DD`-shaped inputs and renders from year/month/day directly with no TZ conversion. Full ISO 8601 timestamps still ET-anchor per FC-022. 4 new vitests pin the contract; FC-022's ISO behavior verified preserved.
 
 ### FC-019: True P&L reconciliation — JNLC + OPTRD ingest, share-side P&L
 - Plan: `docs/plans/fc-019.md` (written retroactively)
