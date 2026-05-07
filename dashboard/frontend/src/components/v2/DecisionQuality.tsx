@@ -81,7 +81,7 @@ export default function DecisionQuality({ rows }: Props) {
       <p className="text-xs text-gray-400 mb-3">
         % of max profit captured at close. 100% = held to expiry; 50% = closed at half premium.
       </p>
-      <div className="grid grid-cols-3 gap-2 mb-3 text-xs">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-3 text-xs">
         <div className="rounded border border-gray-700 bg-gray-900/30 px-2 py-1.5">
           <div className="uppercase tracking-wide text-gray-500">Received</div>
           <div className="text-sm font-semibold text-gray-200 mt-0.5">{fmtCurrency(premiumReceived)}</div>
