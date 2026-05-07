@@ -311,6 +311,21 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
+### FC-026: Decision Quality — surface Premium Received / Captured / Foregone macro stats
+
+**Status:** Plan published
+**Size estimate:** S
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-026.md`
+
+**Problem / opportunity:** The Decision Quality histogram on the per-symbol page shows distribution of capture ratios but not the total dollar magnitude of what was captured vs. given back through early-close buybacks. User asked for "total premium captured vs premium foregone for early close" alongside the chart. Data validation confirmed the underlying capture-ratio computation is correct (UNH 27 closed trades validated against raw activities: $5,723 received, $4,279 captured = 75%, $1,444 foregone via buybacks). Enhancement is purely additive — three new aggregate stats rendered in the chart card, no view change, no payload change (fields already on `DecisionQualityRow`).
+
+**Open questions:** see plan file.
+
+**Links:** FC-018 (introduced the chart); the underlying `bigquery.py:get_decision_quality()` query is unchanged.
+
+---
+
 ### FC-025: AMZN silent-exercise correction (paper-engine, Jan 16 2026)
 
 **Status:** Consideration
