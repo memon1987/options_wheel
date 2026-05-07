@@ -8,7 +8,6 @@ import type { DecisionQualityRow } from '../../types/v2';
 // same stub at setup level — leaving this local keeps FC-026 self-contained
 // and avoids a merge-time conflict on setup.ts).
 class ResizeObserverStub { observe() {} unobserve() {} disconnect() {} }
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).ResizeObserver = (globalThis as any).ResizeObserver ?? ResizeObserverStub;
 
 // FC-026: dollar-weighted aggregates surfaced in the chart header.
