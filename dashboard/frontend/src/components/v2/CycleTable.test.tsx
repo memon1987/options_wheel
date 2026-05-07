@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import CycleTable from './CycleTable';
 
 // FC-027: split the previously-conflated "Cycle P&L" column into
@@ -58,14 +58,7 @@ describe('CycleTable FC-027 — Total Premium vs Cycle P&L split', () => {
 
   it('renders BOTH the option-only Total Premium and the true Cycle P&L for UNH cycle 1', () => {
     render(<CycleTable rows={[row({})]} />);
-    // Total Premium (option-only, no share leg): $1,218
-    expect(screen.getByText('$1,218')).toBeInTheDocument();
-    // Cycle P&L (true outcome including share leg): $1,218 − $1,750 = −$532
-    expect(screen.getByText(/-\$532/)).toBeInTheDocument();
-    // Cap Gain column: −$1,750
-    expect(screen.getByText(/-\$1,750/)).toBeInTheDocument();
-    // Pre-FC-027 the column header was "Cycle P&L" but the cell showed
-    // total_premium only. Verify column ordering: Cap Gain → Total Premium → Cycle P&L.
+    // Verify column ordering: Cap Gain → Total Premium → Cycle P&L → Return.
     const headers = screen.getAllByRole('columnheader').map((h) => h.textContent);
     const capGainIdx = headers.indexOf('Cap Gain');
     const totalPremIdx = headers.indexOf('Total Premium');
@@ -73,15 +66,29 @@ describe('CycleTable FC-027 — Total Premium vs Cycle P&L split', () => {
     expect(capGainIdx).toBeGreaterThanOrEqual(0);
     expect(totalPremIdx).toBe(capGainIdx + 1);
     expect(cyclePnlIdx).toBe(totalPremIdx + 1);
+
+    // Assert values land in the RIGHT cells. A regression that swapped the
+    // Total Premium and Cycle P&L <td>s while keeping headers in place would
+    // slip past a getByText check, so we scope assertions to cell positions.
+    const dataRows = screen.getAllByRole('row').slice(1);  // skip header row
+    const cells = within(dataRows[0]).getAllByRole('cell');
+    expect(cells[capGainIdx].textContent).toMatch(/-\$1,750/);
+    expect(cells[totalPremIdx].textContent).toBe('$1,218');
+    expect(cells[cyclePnlIdx].textContent).toMatch(/-\$532/);
   });
 
   it('Cycle P&L column equals total_premium + capital_gain, not total_premium alone', () => {
-    // Construct a fixture where total_premium and total_premium+capital_gain
-    // diverge so a regression to the pre-FC-027 single-column display would fail.
-    const r = row({ total_premium: 500, capital_gain: 2000 });  // cycle P&L = 2,500
+    // Divergent fixture: total_premium=$500, capital_gain=$2,000 → Cycle P&L
+    // should be $2,500. Scope to specific cells so a swap of columns fails.
+    const r = row({ total_premium: 500, capital_gain: 2000 });
     render(<CycleTable rows={[r]} />);
-    expect(screen.getByText('$500')).toBeInTheDocument();   // Total Premium
-    expect(screen.getByText('$2,500')).toBeInTheDocument(); // Cycle P&L
+    const headers = screen.getAllByRole('columnheader').map((h) => h.textContent);
+    const totalPremIdx = headers.indexOf('Total Premium');
+    const cyclePnlIdx = headers.indexOf('Cycle P&L');
+    const dataRows = screen.getAllByRole('row').slice(1);
+    const cells = within(dataRows[0]).getAllByRole('cell');
+    expect(cells[totalPremIdx].textContent).toBe('$500');
+    expect(cells[cyclePnlIdx].textContent).toBe('$2,500');
   });
 
   it('handles all-null capital_gain by treating it as zero in Cycle P&L', () => {
