@@ -311,38 +311,6 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-025: AMZN silent-exercise correction (paper-engine, Jan 16 2026)
-
-**Status:** Consideration
-**Size estimate:** S (data-only correction, same shape as FC-021)
-**Owner:** unassigned
-**Plan file:** not yet
-
-**Problem / opportunity:** Same Alpaca paper-engine bug as FC-021 (AMD silent-exercise), surfaced for AMZN by FC-024's view rewrite. Pre-FC-024 the `running_shares` field was always 0 so this anomaly was invisible. Post-FC-024, `acb_per_symbol_current` shows AMZN `current_shares = −100` — i.e., 1 OPASN put-assigned but 2 OPASN called-aways with no second matching assignment.
-
-**Evidence:**
-- AMZN $240 put `AMZN260116P00240000` sold 2026-01-12 for $73 premium, expiring 2026-01-16. `trades_with_outcomes.outcome = 'open'` despite the option having expired ~4 months ago.
-- AMZN closed 2026-01-16 at **$239.09** — $0.91 ITM. Would auto-exercise on standard option settlement. No OPASN or OPTRD ingested.
-- 2026-04-23 called-away `AMZN260422C00240000` at strike **$240** for OPTRD net `+$24,000`. Exact strike match to the silent-assignment cost basis is consistent with the bot writing covered calls against shares it knew it had.
-- Net OPTRD: +$24,000 (Apr 23 call called-away) with no offsetting −$24,000 from a missing Jan 16 OPTRD-in. AMZN's `share_side_pnl` is currently inflated by exactly +$24,000.
-
-**Expected impact post-correction (mirroring FC-021's pattern):**
-- Insert one synthetic OPASN put + one synthetic OPTRD pair, prefix `synthetic-fc-025-`, dated 2026-01-16
-- OPTRD `net_amount = -$24,000` (cash out for 100 shares × $240 strike)
-- AMZN `share_side_pnl`: $20,500 → −$3,500 (matches actual cycle math: cycle 1 −$3,500 + cycle 2 round-trip $0)
-- AMZN `total_realized_pnl`: $26,206 → $2,206 (option $5,706 + share −$3,500)
-- AMZN `current_shares` returns to 0 (clean books)
-
-**Cross-symbol scan for other silent exercises:** Ran `SELECT * FROM trades_with_outcomes WHERE outcome = 'open' AND expiration < CURRENT_DATE()` on 2026-05-07 — only AMZN260116P00240000 returned. Bug is confined to this single occurrence; no other corrections needed.
-
-**Open questions:**
-- Confirm via Alpaca account history that the 2026-01-16 silent assignment occurred (their order detail page may show it even though their activity API doesn't).
-- Should the synthetic-row writer be promoted to a reusable utility (`tools/diagnostics/correct_silent_exercise.py`) given this is the second occurrence (FC-021 was the first)? Two data points isn't enough to justify pulling out a generic tool, but if a third occurs the answer becomes yes.
-
-**Links:** FC-021 (AMD silent-exercise, same root cause), FC-024 (the view rewrite that surfaced this), FC-019 (introduced `share_side_pnl`), `docs/investigations/amd-reconciliation.md` (the prior playbook).
-
----
-
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
@@ -447,6 +415,13 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - PR: https://github.com/memon1987/options_wheel/pull/32 (merged 2026-05-07)
 - Commit: `0c4d20d`
 - Notes: Plan-exempt (single-file utility bug fix). User caught on Trade Log: OCC `UNH260424P00302500` (Apr 24 expiry) rendered "Apr 23" in the Expiration column. Root cause: `fmtDate()` parsed pure-date strings as UTC midnight then converted to ET (UTC−4) — rolled back to prior day. Same bug affected `event_date` Date column. Fix detects `YYYY-MM-DD`-shaped inputs and renders from year/month/day directly with no TZ conversion. Full ISO 8601 timestamps still ET-anchor per FC-022. 4 new vitests pin the contract; FC-022's ISO behavior verified preserved.
+
+### FC-025: AMZN silent-exercise correction (paper-engine, Jan 16 2026)
+- Plan: `docs/plans/fc-025.md`
+- Investigation: `docs/investigations/amzn-reconciliation.md`
+- Commit: filled by execution commit (no PR — data-only correction direct to `main`, mirroring FC-021)
+- Date: 2026-05-07
+- Notes: Twin of FC-021's AMD silent-exercise bug. AMZN $240 put `AMZN260116P00240000` (sold 2026-01-12 at $0.73, expired 2026-01-16 with AMZN at $239.09 = $0.91 ITM) was auto-exercised silently — no OPASN/OPTRD ingested. Confirmed by behavioral evidence (Jan 23 covered call written, Apr 22 called-away at exact $240 strike). Inserted two synthetic rows into `options_wheel.trades_from_activities` (`activity_id LIKE 'synthetic-fc-025-%'`). Effect on AMZN scorecard: `share_side_pnl` +$20,500 → **−$3,500**, `total_realized_pnl` $26,206 → **$2,279**, `cycles_completed` 1 → 2, `wheel_minus_bh` +$21,094 → **−$2,833** (sign reversal — wheel actually lagged B&H on AMZN). Audit query: `WHERE activity_id LIKE 'synthetic-%'` (returns 4 rows: 2 FC-021 + 2 FC-025). Rollback: `DELETE WHERE activity_id LIKE 'synthetic-fc-025-%'`.
 
 ### FC-019: True P&L reconciliation — JNLC + OPTRD ingest, share-side P&L
 - Plan: `docs/plans/fc-019.md` (written retroactively)
