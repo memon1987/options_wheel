@@ -311,6 +311,53 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
+### FC-025: AMZN silent-exercise correction (paper-engine, Jan 16 2026)
+
+**Status:** Consideration
+**Size estimate:** S (data-only correction, same shape as FC-021)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** Same Alpaca paper-engine bug as FC-021 (AMD silent-exercise), surfaced for AMZN by FC-024's view rewrite. Pre-FC-024 the `running_shares` field was always 0 so this anomaly was invisible. Post-FC-024, `acb_per_symbol_current` shows AMZN `current_shares = −100` — i.e., 1 OPASN put-assigned but 2 OPASN called-aways with no second matching assignment.
+
+**Evidence:**
+- AMZN $240 put `AMZN260116P00240000` sold 2026-01-12 for $73 premium, expiring 2026-01-16. `trades_with_outcomes.outcome = 'open'` despite the option having expired ~4 months ago.
+- AMZN closed 2026-01-16 at **$239.09** — $0.91 ITM. Would auto-exercise on standard option settlement. No OPASN or OPTRD ingested.
+- 2026-04-23 called-away `AMZN260422C00240000` at strike **$240** for OPTRD net `+$24,000`. Exact strike match to the silent-assignment cost basis is consistent with the bot writing covered calls against shares it knew it had.
+- Net OPTRD: +$24,000 (Apr 23 call called-away) with no offsetting −$24,000 from a missing Jan 16 OPTRD-in. AMZN's `share_side_pnl` is currently inflated by exactly +$24,000.
+
+**Expected impact post-correction (mirroring FC-021's pattern):**
+- Insert one synthetic OPASN put + one synthetic OPTRD pair, prefix `synthetic-fc-025-`, dated 2026-01-16
+- OPTRD `net_amount = -$24,000` (cash out for 100 shares × $240 strike)
+- AMZN `share_side_pnl`: $20,500 → −$3,500 (matches actual cycle math: cycle 1 −$3,500 + cycle 2 round-trip $0)
+- AMZN `total_realized_pnl`: $26,206 → $2,206 (option $5,706 + share −$3,500)
+- AMZN `current_shares` returns to 0 (clean books)
+
+**Cross-symbol scan for other silent exercises:** Ran `SELECT * FROM trades_with_outcomes WHERE outcome = 'open' AND expiration < CURRENT_DATE()` on 2026-05-07 — only AMZN260116P00240000 returned. Bug is confined to this single occurrence; no other corrections needed.
+
+**Open questions:**
+- Confirm via Alpaca account history that the 2026-01-16 silent assignment occurred (their order detail page may show it even though their activity API doesn't).
+- Should the synthetic-row writer be promoted to a reusable utility (`tools/diagnostics/correct_silent_exercise.py`) given this is the second occurrence (FC-021 was the first)? Two data points isn't enough to justify pulling out a generic tool, but if a third occurs the answer becomes yes.
+
+**Links:** FC-021 (AMD silent-exercise, same root cause), FC-024 (the view rewrite that surfaced this), FC-019 (introduced `share_side_pnl`), `docs/investigations/amd-reconciliation.md` (the prior playbook).
+
+---
+
+### FC-024: ACB walk view rewrite — restore missing event types and ACB computation
+
+**Status:** Plan published
+**Size estimate:** M
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-024.md`
+
+**Problem / opportunity:** `fc018_acb_timeline_per_symbol` is structurally broken across every symbol. It sources from `trades_with_outcomes` ([fc018_views.sql:69](docs/bigquery/fc018_views.sql#L69)) which is filtered to opening sell_short FILLs only. As a result the view never emits `option_closed`/`put_assigned`/`called_away`/`expired` rows; `running_shares` is always 0; `acb_per_share` is always NULL. The dashboard's ACB Walk chart only ever shows the cumulative-premium line — yellow ACB line never renders, and reference-dot legend lists 6 event types but only 2 (put_sold, call_sold) ever appear, all positioned at `y=0` (i.e., invisible at the chart floor) because the dot Y-coordinate falls back to `acb ?? 0`. Cross-symbol verification: 7/7 symbols have `rows_w_acb=0`. Trade Log on the per-symbol page is similarly missing close/assignment/expiration rows. Phase Timing (also reading this view) silently emits only `short_put` because the state machine never observes an OPASN/OPEXP transition.
+
+**Open questions:** see plan file.
+
+**Links:** FC-023 (sister observation in the same dashboard accuracy review), FC-018 (introduced the view), FC-019 (introduced `share_side_pnl` from raw OPTRD; this FC adopts the same pattern for share-cost flow). Phase Timing investigation (observation #4) becomes a verification task post-FC-024 rather than a separate fix.
+
+---
+
 ### FC-023: Per-symbol Realized P&L reconciliation — single canonical number across drilldown
 
 **Status:** Plan published

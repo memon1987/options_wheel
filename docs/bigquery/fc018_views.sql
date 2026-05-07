@@ -26,15 +26,21 @@
 -- This view IS the data source for the per-symbol drilldown's
 -- ACB walk chart and for `acb_per_symbol_current`.
 
+-- FC-024 rewrite: source from trades_from_activities directly so all event
+-- types reach the timeline (not just opening fills). The pre-FC-024 view
+-- sourced from trades_with_outcomes which filters to sell_short opens only,
+-- so OPASN/OPEXP/buy_to_close/OPTRD events were silently excluded —
+-- running_shares was always 0, acb_per_share was always NULL, only
+-- put_sold/call_sold dots ever rendered. See docs/plans/fc-024.md.
 CREATE OR REPLACE VIEW `options_wheel.fc018_acb_timeline_per_symbol` AS
 WITH events AS (
-  -- All option-side events (puts and calls) with the underlying.
+  -- 1. Opens (sell_short FILL) — sourced from trades_with_outcomes to inherit
+  --    the existing outcome + realized_pnl projection that the Trade Log relies on.
   SELECT
     underlying,
     transaction_time AS event_time,
     activity_id,
     activity_type,
-    -- OCC contract symbol (e.g. AMD260417C00245000) for diagnosing/linking back to Alpaca
     symbol AS occ_symbol,
     order_id,
     expiration,
@@ -46,42 +52,182 @@ WITH events AS (
     premium_total,
     outcome,
     realized_pnl,
-    -- Premium contribution (positive when collected, negative on close)
+    COALESCE(premium_total, 0) AS net_premium_delta,
+    0 AS shares_delta,
+    0 AS share_cost_delta,
     CASE
-      WHEN side IN ('sell_short', 'sell') THEN COALESCE(premium_total, 0)
-      WHEN side IN ('buy_to_close', 'buy') THEN -COALESCE(premium_total, 0)
-      ELSE 0
-    END AS net_premium_delta,
-    -- Share-count change (positive on assignment, negative on called-away)
-    CASE
-      WHEN activity_type = 'OPASN' AND option_type = 'put' THEN ABS(COALESCE(qty, 0)) * 100
-      WHEN activity_type = 'OPASN' AND option_type = 'call' THEN -ABS(COALESCE(qty, 0)) * 100
-      ELSE 0
-    END AS shares_delta,
-    -- Share-cost contribution at strike on assignment
-    CASE
-      WHEN activity_type = 'OPASN' AND option_type = 'put'
-        THEN COALESCE(strike_price, 0) * ABS(COALESCE(qty, 0)) * 100
-      WHEN activity_type = 'OPASN' AND option_type = 'call'
-        THEN -COALESCE(strike_price, 0) * ABS(COALESCE(qty, 0)) * 100
-      ELSE 0
-    END AS share_cost_delta
+      WHEN option_type = 'put'  THEN 'put_sold'
+      WHEN option_type = 'call' THEN 'call_sold'
+      ELSE 'other'
+    END AS event_label
   FROM `options_wheel.trades_with_outcomes`
   WHERE underlying IS NOT NULL
+
+  UNION ALL
+
+  -- 2. Closes (buy_to_close FILL) — emit one row per close fill so the
+  --    cumulative premium line and the option_closed dot both appear.
+  SELECT
+    underlying,
+    transaction_time AS event_time,
+    activity_id,
+    activity_type,
+    symbol AS occ_symbol,
+    order_id,
+    expiration,
+    option_type,
+    side,
+    qty,
+    price,
+    strike_price,
+    premium_total,
+    CAST(NULL AS STRING) AS outcome,
+    CAST(NULL AS FLOAT64) AS realized_pnl,
+    -COALESCE(premium_total, 0) AS net_premium_delta,
+    0 AS shares_delta,
+    0 AS share_cost_delta,
+    'option_closed' AS event_label
+  FROM `options_wheel.trades_from_activities`
+  WHERE activity_type = 'FILL'
+    AND option_type IN ('put', 'call')
+    AND side IN ('buy_to_close', 'buy')
+    AND underlying IS NOT NULL
+
+  UNION ALL
+
+  -- 3. OPASN (assignments / called-aways) — pair with the matching OPTRD on
+  --    same underlying within ±120s and matching qty sign so we get the real
+  --    cash flow (net_amount). Falls back to strike*qty*100 if no OPTRD match.
+  --    QUALIFY caps the join to one OPTRD per OPASN (closest-by-time) — guards
+  --    against multi-OPASN+multi-OPTRD same-direction collisions on triple-
+  --    witching Fridays or batched paper-engine settlements.
+  SELECT
+    a.underlying,
+    a.transaction_time AS event_time,
+    a.activity_id,
+    a.activity_type,
+    a.symbol AS occ_symbol,
+    a.order_id,
+    a.expiration,
+    a.option_type,
+    a.side,
+    a.qty,
+    a.price,
+    a.strike_price,
+    a.premium_total,
+    CAST(NULL AS STRING) AS outcome,
+    CAST(NULL AS FLOAT64) AS realized_pnl,
+    0 AS net_premium_delta,
+    CASE
+      WHEN a.option_type = 'put'  THEN  ABS(COALESCE(a.qty, 0)) * 100
+      WHEN a.option_type = 'call' THEN -ABS(COALESCE(a.qty, 0)) * 100
+      ELSE 0
+    END AS shares_delta,
+    -- Negate net_amount so positive = cash out (assignment) and negative =
+    -- cash in (called away). running_share_cost accumulates true cash spent
+    -- on shares net of called-away proceeds — note this is cumulative since
+    -- inception per fc-024 Non-goals (cycle-isolated ACB is deferred), so
+    -- residual losses from a prior closed cycle carry into the next cycle's
+    -- ACB. See docs/plans/fc-024.md.
+    COALESCE(
+      -o.net_amount,
+      CASE
+        WHEN a.option_type = 'put'  THEN  COALESCE(a.strike_price, 0) * ABS(COALESCE(a.qty, 0)) * 100
+        WHEN a.option_type = 'call' THEN -COALESCE(a.strike_price, 0) * ABS(COALESCE(a.qty, 0)) * 100
+        ELSE 0
+      END
+    ) AS share_cost_delta,
+    CASE
+      WHEN a.option_type = 'put'  THEN 'put_assigned'
+      WHEN a.option_type = 'call' THEN 'called_away'
+      ELSE 'other'
+    END AS event_label
+  FROM `options_wheel.trades_from_activities` a
+  LEFT JOIN `options_wheel.trades_from_activities` o
+    ON o.activity_type = 'OPTRD'
+    AND o.symbol = a.underlying
+    AND ABS(TIMESTAMP_DIFF(o.transaction_time, a.transaction_time, SECOND)) <= 120
+    AND ((a.option_type = 'put'  AND o.qty > 0)
+      OR (a.option_type = 'call' AND o.qty < 0))
+  WHERE a.activity_type = 'OPASN'
+    AND a.underlying IS NOT NULL
+  -- Cap to one OPTRD per OPASN (closest by absolute time delta) so multi-
+  -- OPASN/multi-OPTRD same-direction collisions don't multiply rows.
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY a.activity_id
+    ORDER BY ABS(TIMESTAMP_DIFF(o.transaction_time, a.transaction_time, SECOND))
+  ) = 1
+
+  UNION ALL
+
+  -- 4. OPEXP (expirations) — option expired worthless. No share movement, no
+  --    cash flow; just an event marker.
+  SELECT
+    underlying,
+    transaction_time AS event_time,
+    activity_id,
+    activity_type,
+    symbol AS occ_symbol,
+    order_id,
+    expiration,
+    option_type,
+    side,
+    qty,
+    price,
+    strike_price,
+    premium_total,
+    CAST(NULL AS STRING) AS outcome,
+    CAST(NULL AS FLOAT64) AS realized_pnl,
+    0 AS net_premium_delta,
+    0 AS shares_delta,
+    0 AS share_cost_delta,
+    'expired' AS event_label
+  FROM `options_wheel.trades_from_activities`
+  WHERE activity_type = 'OPEXP'
+    AND underlying IS NOT NULL
 ),
 running AS (
   SELECT
     *,
+    -- Tie-breaker for events sharing a transaction_time: closes (cash out)
+    -- sort before opens (cash in), then assignments/expirations, then
+    -- activity_id as the final deterministic tiebreaker. Keeps the
+    -- cumulative_net_premium curve from briefly going negative-then-positive
+    -- during same-second roll fills.
     SUM(net_premium_delta) OVER (
-      PARTITION BY underlying ORDER BY event_time
+      PARTITION BY underlying
+      ORDER BY event_time,
+               CASE event_label
+                 WHEN 'option_closed' THEN 0
+                 WHEN 'put_sold'      THEN 1
+                 WHEN 'call_sold'     THEN 1
+                 ELSE 2
+               END,
+               activity_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS cumulative_net_premium,
     SUM(shares_delta) OVER (
-      PARTITION BY underlying ORDER BY event_time
+      PARTITION BY underlying
+      ORDER BY event_time,
+               CASE event_label
+                 WHEN 'option_closed' THEN 0
+                 WHEN 'put_sold'      THEN 1
+                 WHEN 'call_sold'     THEN 1
+                 ELSE 2
+               END,
+               activity_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS running_shares,
     SUM(share_cost_delta) OVER (
-      PARTITION BY underlying ORDER BY event_time
+      PARTITION BY underlying
+      ORDER BY event_time,
+               CASE event_label
+                 WHEN 'option_closed' THEN 0
+                 WHEN 'put_sold'      THEN 1
+                 WHEN 'call_sold'     THEN 1
+                 ELSE 2
+               END,
+               activity_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS running_share_cost
   FROM events
@@ -114,16 +260,7 @@ SELECT
       THEN SAFE_DIVIDE(running_share_cost - cumulative_net_premium, running_shares)
     ELSE NULL
   END AS acb_per_share,
-  -- Event label for chart annotations
-  CASE
-    WHEN activity_type = 'FILL' AND side IN ('sell_short', 'sell') AND option_type = 'put' THEN 'put_sold'
-    WHEN activity_type = 'FILL' AND side IN ('sell_short', 'sell') AND option_type = 'call' THEN 'call_sold'
-    WHEN activity_type = 'FILL' AND side IN ('buy_to_close', 'buy') THEN 'option_closed'
-    WHEN activity_type = 'OPASN' AND option_type = 'put' THEN 'put_assigned'
-    WHEN activity_type = 'OPASN' AND option_type = 'call' THEN 'called_away'
-    WHEN activity_type = 'OPEXP' THEN 'expired'
-    ELSE 'other'
-  END AS event_label
+  event_label
 FROM running;
 
 

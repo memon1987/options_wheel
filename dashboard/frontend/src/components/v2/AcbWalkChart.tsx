@@ -18,6 +18,21 @@ const labelColor = (label: string): string => {
   }
 };
 
+// FC-024: pick the Y axis a reference dot rides on. During share-holding
+// phases (acb_per_share is set) dots ride the ACB axis at the actual ACB
+// value. During cash phases (no shares held) dots ride the cumulative-
+// premium axis at the current premium level. Pre-FC-024 every dot fell
+// back to y=0 on the ACB axis, which made them invisible at the chart
+// floor when acb was null. Exported for unit testing.
+export const dotAxisFor = (
+  row: Pick<AcbTimelineRow, 'acb_per_share' | 'cumulative_net_premium'>
+): { yAxisId: 'acb' | 'prem'; y: number } => {
+  if (row.acb_per_share !== null && row.acb_per_share !== undefined) {
+    return { yAxisId: 'acb', y: row.acb_per_share };
+  }
+  return { yAxisId: 'prem', y: row.cumulative_net_premium };
+};
+
 const eventLegendItems: Array<{ label: string; color: string }> = [
   { label: 'put sold', color: '#34d399' },
   { label: 'call sold', color: '#a78bfa' },
@@ -50,7 +65,9 @@ export default function AcbWalkChart({ data }: Props) {
         <div>
           <h3 className="text-base font-semibold text-white">ACB Walk</h3>
           <p className="text-xs text-gray-400 mt-1">
-            Adjusted cost basis per share over time. Annotated by event.
+            Yellow line: average cost per assigned share (only while shares are held).
+            Blue dashed: cumulative net premium received across all option events.
+            Dots mark events; color encodes type.
           </p>
         </div>
         <div className="hidden md:flex flex-wrap gap-x-3 gap-y-1 text-xs">
@@ -111,17 +128,20 @@ export default function AcbWalkChart({ data }: Props) {
               name="Cumulative premium"
               strokeDasharray="3 3"
             />
-            {series.map((s, i) => (
-              <ReferenceDot
-                key={`${s.x}-${i}`}
-                yAxisId="acb"
-                x={s.x}
-                y={s.acb ?? 0}
-                r={3}
-                fill={labelColor(s.event_label)}
-                stroke="none"
-              />
-            ))}
+            {series.map((s, i) => {
+              const { yAxisId, y } = dotAxisFor(s);
+              return (
+                <ReferenceDot
+                  key={`${s.x}-${i}`}
+                  yAxisId={yAxisId}
+                  x={s.x}
+                  y={y}
+                  r={3}
+                  fill={labelColor(s.event_label)}
+                  stroke="none"
+                />
+              );
+            })}
           </ComposedChart>
         </ResponsiveContainer>
       </div>
