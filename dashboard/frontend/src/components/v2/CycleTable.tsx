@@ -52,7 +52,7 @@ export default function CycleTable({ rows }: Props) {
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-left text-gray-400">Assigned</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Call Strike</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Number of covered calls sold during this cycle (rolls inflate this — each early-closed-and-resold call counts separately)">Calls Rolled</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Capital gain on the share lot. Post-FC-019: real OPTRD cash flow within the cycle window.">Cap Gain</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Realized capital gain on shares during the cycle window — actual cash in (called-away) minus actual cash out (assigned), per Alpaca activity history.">Cap Gain</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Net option premium kept across the cycle: put kept + sum of call realized P&L (after roll buybacks). Does NOT include share-side capital gain.">Total Premium</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="True cycle P&L = Total Premium + Cap Gain. Includes both option-side (premium kept after rolls) and share-side (called-away vs assigned strike) cash flow.">Cycle P&L</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Return</th>
