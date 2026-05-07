@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Cell } from 'recharts';
 import type { DecisionQualityRow } from '../../types/v2';
-import { fmtPercent } from '../../utils/format';
+import { fmtCurrency, fmtPercent, pnlColor } from '../../utils/format';
 
 interface Props {
   rows: DecisionQualityRow[];
@@ -47,6 +47,20 @@ export default function DecisionQuality({ rows }: Props) {
     ? rows.reduce((s, r) => s + (r.capture_ratio ?? 0), 0) / counted
     : 0;
 
+  // Dollar-weighted aggregates (FC-026). Distinct from avgCapture, which is
+  // the trade-weighted mean of per-trade capture ratios.
+  //   - received: gross premium taken in across all closed trades
+  //   - captured: realized P&L kept after any early-close buybacks
+  //   - foregone: premium given back via buy-to-close orders = received − captured
+  // Foregone is labeled "(buybacks)" in the UI to disambiguate from the
+  // counterfactual "would-have-made" reading, which would require option-chain
+  // snapshots (filed as FC-017).
+  const premiumReceived = rows.reduce((s, r) => s + (r.premium_total ?? 0), 0);
+  const premiumCaptured = rows.reduce((s, r) => s + (r.realized_pnl ?? 0), 0);
+  const premiumForegone = premiumReceived - premiumCaptured;
+  const captureRatePct = premiumReceived !== 0 ? premiumCaptured / premiumReceived : 0;
+  const foregoneRatePct = premiumReceived !== 0 ? premiumForegone / premiumReceived : 0;
+
   if (rows.length === 0) {
     return (
       <div className="rounded-lg border border-gray-700 bg-gray-800 p-5">
@@ -67,6 +81,31 @@ export default function DecisionQuality({ rows }: Props) {
       <p className="text-xs text-gray-400 mb-3">
         % of max profit captured at close. 100% = held to expiry; 50% = closed at half premium.
       </p>
+      <div className="grid grid-cols-3 gap-2 mb-3 text-xs">
+        <div className="rounded border border-gray-700 bg-gray-900/30 px-2 py-1.5">
+          <div className="uppercase tracking-wide text-gray-500">Received</div>
+          <div className="text-sm font-semibold text-gray-200 mt-0.5">{fmtCurrency(premiumReceived)}</div>
+        </div>
+        <div className="rounded border border-gray-700 bg-gray-900/30 px-2 py-1.5">
+          <div className="uppercase tracking-wide text-gray-500">Captured</div>
+          <div className={`text-sm font-semibold mt-0.5 ${pnlColor(premiumCaptured)}`}>
+            {fmtCurrency(premiumCaptured)}
+            <span className="ml-1 text-gray-500 text-xs font-normal">({fmtPercent(captureRatePct)})</span>
+          </div>
+        </div>
+        <div className="rounded border border-gray-700 bg-gray-900/30 px-2 py-1.5">
+          <div
+            className="uppercase tracking-wide text-gray-500"
+            title="Cash spent buying back early-close orders. Distinct from a counterfactual 'what would I have made by holding' (which is FC-017)."
+          >
+            Foregone (buybacks)
+          </div>
+          <div className="text-sm font-semibold text-gray-200 mt-0.5">
+            {fmtCurrency(premiumForegone)}
+            <span className="ml-1 text-gray-500 text-xs font-normal">({fmtPercent(foregoneRatePct)})</span>
+          </div>
+        </div>
+      </div>
       <div className="h-48">
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={bins} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
