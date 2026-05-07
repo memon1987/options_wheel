@@ -343,6 +343,19 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
+### FC-028: fmtDate calendar-date off-by-one (timezone shift on pure dates)
+
+**Status:** Plan-exempt (single-file utility bug fix)
+**Size estimate:** S
+**Owner:** Claude
+**Plan file:** none — plan-exempt per CLAUDE.md "Single-file, isolated bug fixes"
+
+**Problem / opportunity:** Surfaced during the UNH cross-check: Trade Log column "Expiration" shows Apr 23 for `UNH260424P00302500` (encoded expiration Apr 24). Root cause: `fmtDate()` parses pure-date strings like `"2026-04-24"` as UTC midnight, then converts to ET (UTC−4 EDT) — rolls back to Apr 23 8pm and renders as "Apr 23". Same bug affects the Trade Log "Date" column (BQ's `event_date` is a `DATE` type, identical shape). Fix: detect `YYYY-MM-DD`-shaped inputs and render directly from year/month/day with no TZ conversion. Full ISO 8601 timestamps continue to ET-anchor as before. Plan-exempt because it's a single-file bug fix; branch+PR per project policy.
+
+**Links:** FC-022 (introduced ET-anchored date helpers — this plugs a gap in that fix for the calendar-date case).
+
+---
+
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
