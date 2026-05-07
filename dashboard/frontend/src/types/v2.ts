@@ -69,14 +69,16 @@ export interface VsBuyAndHold {
   underlying: string;
   first_trade_date: string | null;
   first_strike: number | null;
-  realized_pnl: number | null;
-  total_premium: number | null;
+  realized_pnl: number | null;            // option-leg net P&L
+  share_side_pnl: number | null;          // FC-019: OPTRD net (stock leg)
+  total_realized_pnl: number | null;      // FC-019: realized + share_side (canonical wheel total)
+  total_premium: number | null;           // gross option premium received
   current_shares: number | null;
   current_acb_per_share: number | null;
   price_at_start: number | null;
   price_now: number | null;
   hypothetical_shares: number | null;
-  bh_dollar_pnl: number | null;
+  bh_dollar_pnl: number | null;           // price-only — does not reinvest dividends
   wheel_minus_bh: number | null;
 }
 

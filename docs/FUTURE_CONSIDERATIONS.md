@@ -311,6 +311,21 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
+### FC-023: Per-symbol Realized P&L reconciliation — single canonical number across drilldown
+
+**Status:** Plan published
+**Size estimate:** S-M
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-023.md`
+
+**Problem / opportunity:** The per-symbol drilldown shows two different P&L numbers that disagree, neither of which is the true realized P&L. Top-of-page "Realized P&L" card shows option-leg only (`realized_pnl` from `fc018_per_symbol_scorecard`) — silently excludes share-side cash flow on assigned-then-called-away cycles. Wheel-vs-B&H card's "Wheel" total computes `realized_pnl + total_premium`, which double-counts gross premium (since `realized_pnl` already nets premium against close costs). UNH trace: top card $4,334, wheel card $10,222, true `total_realized_pnl = $2,584`. The "Δ Wheel − B&H" delta on the same card propagates the bug — currently overstates wheel advantage by $7,638 for UNH. The correct number `total_realized_pnl = realized_pnl + share_side_pnl` is already computed in the scorecard view (since FC-019) but is not the displayed value on either surface.
+
+**Open questions:** see plan file.
+
+**Links:** FC-019 (introduced `total_realized_pnl`), `dashboard/frontend/src/components/v2/VsBuyAndHoldCard.tsx`, `dashboard/frontend/src/pages/v2/SymbolDeepDive.tsx`, `docs/bigquery/fc018_views.sql`.
+
+---
+
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
