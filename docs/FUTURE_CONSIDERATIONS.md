@@ -311,6 +311,21 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
+### FC-029: Wheel strategy Phase 1 risk re-tune (call delta + cost-basis floor + drawdown pause)
+
+**Status:** Plan published
+**Size estimate:** M
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-029.md`
+
+**Problem / opportunity:** 2026-05-07 senior-trader strategy review found the wheel achieved 54% of B&H dollar P&L; 3 cycles caused −$9k share losses (40% of total option-side P&L). Validation confirmed the cost-basis floor is non-functional in production — Alpaca returns `cost_basis=0` for assigned positions, both safety guards are gated on `> 0`, and the bot's existing canonical cost-basis source (`wheel_state.symbol_states[symbol]['stock_cost_basis']`, populated from put strike at OPASN time) is not read by `call_seller`. Phase 1 ships R1+R2+R3 together: tighten `call_delta_range` to `[0.15, 0.25]`; route call-seller cost-basis read through `wheel_state` (with BQ fallback for silent assignments + Alpaca fallback for manual buys); add an explicit drawdown pause when shares are 5% below cost basis.
+
+**Open questions:** see plan file (BQ-lookup TTL, drawdown threshold tuning, per-symbol overrides).
+
+**Links:** `docs/investigations/strategy-review-2026-05-07.md` (analysis), `docs/investigations/cost-basis-floor-validation-2026-05-08.md` (validation that floor is non-functional).
+
+---
+
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
