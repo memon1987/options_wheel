@@ -311,21 +311,6 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-029: Wheel strategy Phase 1 risk re-tune (call delta + cost-basis floor + drawdown pause)
-
-**Status:** Plan published
-**Size estimate:** M
-**Owner:** Claude
-**Plan file:** `docs/plans/fc-029.md`
-
-**Problem / opportunity:** 2026-05-07 senior-trader strategy review found the wheel achieved 54% of B&H dollar P&L; 3 cycles caused −$9k share losses (40% of total option-side P&L). Validation confirmed the cost-basis floor is non-functional in production — Alpaca returns `cost_basis=0` for assigned positions, both safety guards are gated on `> 0`, and the bot's existing canonical cost-basis source (`wheel_state.symbol_states[symbol]['stock_cost_basis']`, populated from put strike at OPASN time) is not read by `call_seller`. Phase 1 ships R1+R2+R3 together: tighten `call_delta_range` to `[0.15, 0.25]`; route call-seller cost-basis read through `wheel_state` (with BQ fallback for silent assignments + Alpaca fallback for manual buys); add an explicit drawdown pause when shares are 5% below cost basis.
-
-**Open questions:** see plan file (BQ-lookup TTL, drawdown threshold tuning, per-symbol overrides).
-
-**Links:** `docs/investigations/strategy-review-2026-05-07.md` (analysis), `docs/investigations/cost-basis-floor-validation-2026-05-08.md` (validation that floor is non-functional).
-
----
-
 ### FC-030: Drawdown-pause observability — daily metric for paused symbols
 
 **Status:** Consideration
@@ -455,6 +440,13 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - Commit: `15625ce` (no PR — data-only correction direct to `main`, mirroring FC-021)
 - Date: 2026-05-07
 - Notes: Twin of FC-021's AMD silent-exercise bug. AMZN $240 put `AMZN260116P00240000` (sold 2026-01-12 at $0.73, expired 2026-01-16 with AMZN at $239.09 = $0.91 ITM) was auto-exercised silently — no OPASN/OPTRD ingested. Confirmed by behavioral evidence (Jan 23 covered call written, Apr 22 called-away at exact $240 strike). Inserted two synthetic rows into `options_wheel.trades_from_activities` (`activity_id LIKE 'synthetic-fc-025-%'`). Effect on AMZN scorecard: `share_side_pnl` +$20,500 → **−$3,500**, `total_realized_pnl` $26,206 → **$2,279**, `cycles_completed` 1 → 2, `wheel_minus_bh` +$21,094 → **−$2,833** (sign reversal — wheel actually lagged B&H on AMZN). Audit query: `WHERE activity_id LIKE 'synthetic-%'` (returns 4 rows: 2 FC-021 + 2 FC-025). Rollback: `DELETE WHERE activity_id LIKE 'synthetic-fc-025-%'`.
+
+### FC-029: Wheel strategy Phase 1 risk re-tune (call delta + cost-basis floor + drawdown pause)
+- Plan: `docs/plans/fc-029.md`
+- Investigations: `docs/investigations/strategy-review-2026-05-07.md`, `docs/investigations/cost-basis-floor-validation-2026-05-08.md`
+- PR: https://github.com/memon1987/options_wheel/pull/34 (merged 2026-05-08)
+- Commit: `692f64e`
+- Notes: Three complementary changes addressing the 3-loss-cycle pattern (-$9k share losses) found in the senior-trader strategy review. **R1**: tightened `call_delta_range` from `[0.30, 0.70]` to `[0.15, 0.25]` (calls 2-4% further OTM, 30-70% → 15-25% assignment probability). **R2**: cost-basis floor source-order rewrite — Alpaca's `cost_basis` returns 0 for assigned paper positions (both safety guards were gated on `> 0` and silently bypassed), now `CallSeller._resolve_cost_basis_floor` reads `wheel_state.stock_cost_basis` (canonical, populated from put strike at OPASN) → BQ lookup of last 90-day OPASN-put strike (handles silent assignments + cold starts; back-fills wheel_state) → Alpaca (last-resort fallback for non-wheel positions); when ALL three fail with shares > 0 the call write is blocked with `event_type=cost_basis_floor_unresolved` (operator intervention). **R3**: drawdown pause — skip covered call writes when shares ≥ 5% below cost basis with `event_type=covered_call_drawdown_pause`. Bad/missing quote now defers (`event_type=covered_call_quote_missing`) instead of failing-open. Two-reviewer process (new ~/CLAUDE.md rule for high-stakes changes) caught 4 HIGH + 3 MEDIUM the first review missed — see PR comments. Tests 27 in `TestCallSellerCostBasisFloorFC029`; 253/253 pytest green. Follow-up FC-030 filed for drawdown-pause observability metric.
 
 ### FC-019: True P&L reconciliation — JNLC + OPTRD ingest, share-side P&L
 - Plan: `docs/plans/fc-019.md` (written retroactively)
