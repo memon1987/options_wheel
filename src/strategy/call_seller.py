@@ -72,10 +72,14 @@ class CallSeller:
             # explicit, observable decision instead of relying on the (now
             # working) cost-basis filter to silently return no candidates.
             try:
-                quote = self.alpaca.get_stock_quote(symbol)
-                current_price = (
-                    float(quote.get('bid', 0)) + float(quote.get('ask', 0))
-                ) / 2 if quote else 0
+                quote = self.alpaca.get_stock_quote(symbol) or {}
+                bid = float(quote.get('bid', 0) or 0)
+                ask = float(quote.get('ask', 0) or 0)
+                # Defensive: a malformed quote with one side zero would yield
+                # a wildly-wrong mid (e.g. bid=$10, ask=$0 → mid=$5) and could
+                # cause a false-negative on the drawdown pause. Require both
+                # sides to be positive; otherwise treat the quote as missing.
+                current_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0
             except Exception:
                 current_price = 0
 

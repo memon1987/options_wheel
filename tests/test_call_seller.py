@@ -493,6 +493,83 @@ class TestCallSellerCostBasisFloorFC029:
             'AMZN', min_strike_price=247.5
         )
 
+    def test_drawdown_pause_at_exact_threshold_boundary(self):
+        """FC-029 R3: pause uses ``>=`` semantics, so exactly 5.00% triggers.
+
+        Concern from peer review (concern #1) — get the boundary nailed.
+        """
+        wheel_state = Mock()
+        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 100.0}
+        seller = self._make_seller(wheel_state=wheel_state)
+
+        # 5.00% exact: cost $100, current $95 → drawdown_pct = 0.05 ≥ 0.05 → pause.
+        self.mock_alpaca.get_stock_quote.return_value = {'bid': 94.5, 'ask': 95.5}
+        position = {'symbol': 'AMZN', 'qty': 100, 'cost_basis': 0.0, 'market_value': 9500.0}
+
+        result = seller.evaluate_covered_call_opportunity(position)
+
+        assert result is None
+        self.mock_market_data.find_suitable_calls.assert_not_called()
+
+    def test_drawdown_pause_quote_fetch_failure_proceeds(self):
+        """When quote fetch fails or returns empty, drawdown pause must NOT
+        false-positive — bot proceeds to call evaluation.
+
+        Concern from peer review (concern #4).
+        """
+        wheel_state = Mock()
+        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 247.5}
+        seller = self._make_seller(wheel_state=wheel_state)
+
+        # Quote fetch raises.
+        self.mock_alpaca.get_stock_quote.side_effect = Exception("network blip")
+        self.mock_market_data.find_suitable_calls.return_value = [self._candidate_call(250.0)]
+
+        result = seller.evaluate_covered_call_opportunity(self._amzn_position())
+
+        # Bot proceeded past the pause check despite no quote.
+        assert result is not None
+        self.mock_market_data.find_suitable_calls.assert_called_once_with(
+            'AMZN', min_strike_price=247.5
+        )
+
+    def test_drawdown_pause_one_sided_quote_treated_as_missing(self):
+        """A quote with bid=$10, ask=$0 must NOT compute mid=$5 (false-negative
+        risk: would miss the pause when the stock is actually well below cost).
+
+        Concern from peer review (concern #2): require both sides > 0.
+        """
+        wheel_state = Mock()
+        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 247.5}
+        seller = self._make_seller(wheel_state=wheel_state)
+
+        # Malformed quote (one side zero). Treat as missing → skip pause check
+        # and proceed (fail-open is correct here; we never want a false-positive
+        # pause that idle-locks the bot, but we also never want a false-negative
+        # pause based on garbage data — the right answer is to proceed).
+        self.mock_alpaca.get_stock_quote.return_value = {'bid': 230.0, 'ask': 0}
+        self.mock_market_data.find_suitable_calls.return_value = [self._candidate_call(250.0)]
+
+        result = seller.evaluate_covered_call_opportunity(self._amzn_position())
+
+        assert result is not None
+        self.mock_market_data.find_suitable_calls.assert_called_once_with(
+            'AMZN', min_strike_price=247.5
+        )
+
+    def test_lookup_last_opasn_put_strike_handles_bq_failure(self):
+        """``_lookup_last_opasn_put_strike`` must return 0 on any BQ exception.
+
+        Concern from peer review (concern #3): the try/except is the only thing
+        keeping the bot alive when BQ is unavailable. Pin it.
+        """
+        seller = self._make_seller()
+        with patch('google.cloud.bigquery.Client',
+                   side_effect=Exception("no creds in test env")):
+            result = seller._lookup_last_opasn_put_strike('AMZN')
+
+        assert result == 0.0
+
     def test_amzn_cycle_1_failure_mode_now_blocked(self):
         """End-to-end regression: AMZN cycle 1 (Nov 2025) loss scenario.
 
