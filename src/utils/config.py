@@ -271,6 +271,16 @@ class Config:
     def call_delta_range(self) -> List[float]:
         """Delta range for call options."""
         return self._config["strategy"]["call_delta_range"]
+
+    @property
+    def call_drawdown_pause_threshold(self) -> float:
+        """FC-029 (R3): drawdown pause threshold for covered call writes.
+
+        When shares are this fraction (or more) below cost basis,
+        ``evaluate_covered_call_opportunity`` skips with reason
+        ``drawdown_pause`` and logs the decision. Default 0.05 (5%).
+        """
+        return self._config["strategy"].get("call_drawdown_pause_threshold", 0.05)
     
     @property
     def min_put_premium(self) -> float:

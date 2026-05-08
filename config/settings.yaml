@@ -23,11 +23,22 @@ strategy:
   
   # Delta thresholds for option selection
   put_delta_range: [0.10, 0.20]
-  call_delta_range: [0.30, 0.70]
+  # FC-029 (R1): tightened from [0.30, 0.70] to reduce called-away exposure.
+  # See docs/plans/fc-029.md and docs/investigations/strategy-review-2026-05-07.md.
+  call_delta_range: [0.15, 0.25]
+
+  # FC-029 (R3): drawdown pause — skip covered call writes when shares are
+  # this fraction (or more) below cost basis. Avoids writing into the
+  # falling-knife scenario where every delta-range strike is at-or-below
+  # cost. 0.05 = 5%; tune empirically over the first 30 days.
+  call_drawdown_pause_threshold: 0.05
 
   # CRITICAL: Cost basis protection for covered calls
   # Never sell calls below stock cost basis to avoid guaranteed losses
   # This is automatically enforced in code - strikes below cost basis are rejected
+  # FC-029 (R2): cost basis is sourced from wheel_state (the put-strike-of-the-
+  # assigning-OPASN, captured at OPASN time), with BQ fallback for silent
+  # assignments and Alpaca fallback for non-wheel positions. See docs/plans/fc-029.md.
   
   # Minimum premium thresholds (in dollars)
   min_put_premium: 0.50

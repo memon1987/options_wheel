@@ -326,6 +326,24 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
+### FC-030: Drawdown-pause observability — daily metric for paused symbols
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** Surfaced by the FC-029 second-reviewer (peer review LOW 8). The R3 drawdown pause is a passive `return None` with `event_type=covered_call_drawdown_pause` events. AMZN cycle 2's 62-day idle is the existence proof that an extended pause can silently cost meaningful opportunity (~$1,500–3,000 in foregone premium across the period). Add a daily dashboard metric / alert: number of days each symbol has been continuously paused, with a threshold (e.g., 7 days) that triggers an operator notification. Could escalate further (e.g., ≥ 14 days → allow far-OTM strike below cost basis with explicit operator approval).
+
+**Open questions:**
+- Threshold day count for alert — 7? 10? 14?
+- Should we surface paused symbols in the per-symbol dashboard page, or only as a Bot Health card?
+- Is there an automated escalation path that's safe (e.g., allow one far-OTM call below cost) vs always operator-in-the-loop?
+
+**Links:** FC-029 (introduces the drawdown pause), `docs/investigations/strategy-review-2026-05-07.md` §R3.
+
+---
+
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
