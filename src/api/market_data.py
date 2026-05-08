@@ -392,10 +392,15 @@ class MarketDataManager:
                    delta_range=self.config.call_delta_range,
                    min_strike_price=min_strike_price)
 
-        # Warn if cost basis protection is not being used
-        if min_strike_price == 0.0:
+        # Warn if cost basis protection is not being used. Pre-FC-029 this
+        # warning fired for legitimate put-only scans too (no shares held);
+        # post-FC-029 callers (`call_seller.evaluate_covered_call_opportunity`)
+        # always pass a non-zero floor when shares are held, so this warning
+        # now only fires when the floor genuinely failed to resolve from any
+        # source — a real risk signal worth investigating.
+        if min_strike_price <= 0.0:
             logger.warning("find_suitable_calls called without cost basis protection",
-                          event_category="warning",
+                          event_category="risk",
                           event_type="missing_cost_basis_filter",
                           symbol=symbol)
 

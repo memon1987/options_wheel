@@ -58,9 +58,40 @@ class CallSeller:
                        event_type="call_opportunity_evaluation",
                        symbol=symbol,
                        shares=shares_owned)
-            
-            # Get cost basis per share for filtering
-            stock_cost_basis = float(stock_position['cost_basis']) / shares_owned
+
+            # FC-029 (R2): cost basis = strike of the assigning put. Resolved
+            # via wheel_state (canonical) → BQ lookup of last OPASN → Alpaca
+            # fallback. Alpaca's `cost_basis` returns 0 for assigned positions
+            # in paper trading, so the historical direct read was a no-op.
+            stock_cost_basis = self._resolve_cost_basis_floor(
+                symbol, stock_position, shares_owned
+            )
+
+            # FC-029 (R3): drawdown pause — when shares are deeply underwater
+            # every delta-range strike is at-or-below cost basis. Make this an
+            # explicit, observable decision instead of relying on the (now
+            # working) cost-basis filter to silently return no candidates.
+            try:
+                quote = self.alpaca.get_stock_quote(symbol)
+                current_price = (
+                    float(quote.get('bid', 0)) + float(quote.get('ask', 0))
+                ) / 2 if quote else 0
+            except Exception:
+                current_price = 0
+
+            if current_price > 0 and stock_cost_basis > 0:
+                drawdown_pct = (stock_cost_basis - current_price) / stock_cost_basis
+                threshold = self.config.call_drawdown_pause_threshold
+                if drawdown_pct >= threshold:
+                    logger.info("Covered call skipped: drawdown pause",
+                               event_category="trade",
+                               event_type="covered_call_drawdown_pause",
+                               symbol=symbol,
+                               cost_basis=stock_cost_basis,
+                               current_price=current_price,
+                               drawdown_pct=round(drawdown_pct, 4),
+                               threshold_pct=threshold)
+                    return None
 
             # Get suitable calls for this stock (with cost basis protection)
             suitable_calls = self.market_data.find_suitable_calls(symbol, min_strike_price=stock_cost_basis)
@@ -100,7 +131,9 @@ class CallSeller:
                 'contracts': position_details['contracts'],
                 'shares_covered': position_details['shares_covered'],
                 'max_profit': position_details['max_profit'],
-                'stock_cost_basis': float(stock_position['cost_basis']),
+                # FC-029 (R2): canonical floor (per-share × shares_covered).
+                # Used by the defensive check in execute_call_sale.
+                'stock_cost_basis': stock_cost_basis * position_details['shares_covered'],
                 'current_stock_price': position_details['current_stock_price'],
                 'total_return_if_called': position_details['total_return_if_called'],
                 'timestamp': datetime.now().isoformat()
@@ -158,7 +191,10 @@ class CallSeller:
             
             # Calculate returns
             premium_income = contracts * premium_per_contract * 100
-            stock_cost_basis = float(stock_position['cost_basis']) / shares_owned  # Cost per share
+            # FC-029 (R2): same canonical-source resolution as the entry path.
+            stock_cost_basis = self._resolve_cost_basis_floor(
+                symbol, stock_position, shares_owned
+            )
             
             # If called away, calculate total return
             if current_price > 0:
@@ -350,6 +386,107 @@ class CallSeller:
                 'timestamp': datetime.now().isoformat()
             }
     
+    def _resolve_cost_basis_floor(
+        self, symbol: str, stock_position: Dict[str, Any], shares_owned: int
+    ) -> float:
+        """Resolve the per-share cost basis for covered-call strike floor.
+
+        FC-029 (R2): cost basis = strike of the assigning put. Sources, in order:
+
+        1. ``wheel_state.symbol_states[symbol]['stock_cost_basis']`` — populated
+           at OPASN time from the put strike, persisted to GCS.
+        2. Most recent OPASN-put strike for ``symbol`` from
+           ``options_wheel.trades_from_activities`` (handles silent assignments,
+           cold starts, and synthetic-row corrections like FC-021/FC-025). When
+           this path resolves, the result is back-filled into wheel_state so
+           subsequent reads in the same cycle hit the fast path.
+        3. Alpaca's reported ``cost_basis`` field — known-broken for assigned
+           positions in paper trading (returns 0), but works for non-wheel
+           positions like manual buys. Last-resort fallback.
+
+        Returns 0 only if no source resolves; the caller treats that as
+        "no floor" (preserves prior behavior so this change can never make
+        the floor more permissive than before).
+
+        Args:
+            symbol: Underlying ticker (e.g. ``"AMD"``).
+            stock_position: Alpaca position dict (provides the Alpaca fallback).
+            shares_owned: Current share count for fallback per-share division.
+        """
+        # 1. wheel_state — canonical, in-memory + GCS persisted
+        if self.wheel_state:
+            try:
+                state = self.wheel_state.get_position_summary(symbol)
+                cb = float(state.get('stock_cost_basis', 0) or 0)
+                if cb > 0:
+                    return cb
+            except Exception as e:
+                logger.warning(
+                    "wheel_state cost-basis read failed; trying BQ fallback",
+                    event_category="risk",
+                    event_type="cost_basis_state_read_failed",
+                    symbol=symbol, error=str(e),
+                )
+
+        # 2. BQ — last OPASN-put strike for this symbol
+        cb = self._lookup_last_opasn_put_strike(symbol)
+        if cb > 0:
+            if self.wheel_state:
+                try:
+                    self.wheel_state.set_stock_cost_basis(symbol, cb)
+                except Exception as e:
+                    logger.warning(
+                        "wheel_state cost-basis backfill failed",
+                        event_category="risk",
+                        event_type="cost_basis_state_backfill_failed",
+                        symbol=symbol, error=str(e),
+                    )
+            return cb
+
+        # 3. Alpaca — last resort. Broken for assigned paper positions but
+        #    correct for manual buys (qty * avg_entry_price).
+        try:
+            alpaca_cb = float(stock_position.get('cost_basis', 0) or 0)
+            return alpaca_cb / max(shares_owned, 1)
+        except Exception:
+            return 0.0
+
+    def _lookup_last_opasn_put_strike(self, symbol: str) -> float:
+        """Return strike of the most recent OPASN-put for ``symbol``.
+
+        Returns 0 if no assigning put found, BQ unavailable, or any error.
+        Logged at WARNING when the lookup fails so missed floors are observable.
+        """
+        try:
+            from google.cloud import bigquery
+            client = bigquery.Client()
+            query = """
+            SELECT strike_price
+            FROM `options_wheel.trades_from_activities`
+            WHERE underlying = @symbol
+              AND activity_type = 'OPASN'
+              AND option_type = 'put'
+              AND transaction_time <= CURRENT_TIMESTAMP()
+            ORDER BY transaction_time DESC
+            LIMIT 1
+            """
+            job_config = bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter('symbol', 'STRING', symbol),
+            ])
+            job = client.query(query, job_config=job_config)
+            for row in job.result(timeout=10):
+                strike = row.get('strike_price')
+                return float(strike) if strike is not None else 0.0
+            return 0.0
+        except Exception as e:
+            logger.warning(
+                "OPASN-strike lookup failed; falling back to Alpaca cost_basis",
+                event_category="risk",
+                event_type="opasn_strike_lookup_failed",
+                symbol=symbol, error=str(e),
+            )
+            return 0.0
+
     def _parse_dte_from_option_symbol(self, option_symbol: str) -> int:
         """
         Extract DTE (Days to Expiration) from option symbol.

@@ -300,6 +300,36 @@ class WheelStateManager:
         self._save_state()
         return result
 
+    def set_stock_cost_basis(self, symbol: str, cost_basis: float) -> None:
+        """Backfill ``stock_cost_basis`` for a symbol's state entry.
+
+        FC-029 (R2): used by ``CallSeller._resolve_cost_basis_floor`` after
+        a BQ lookup recovers the assigning OPASN-put strike (e.g. on cold
+        start with empty GCS state, or for silent-assignment positions
+        that bypassed the activities-API path).
+
+        Idempotent. Persists immediately via ``_save_state``.
+        """
+        if symbol not in self.symbol_states:
+            self.symbol_states[symbol] = {
+                'stock_shares': 0,
+                'stock_cost_basis': 0.0,
+                'acquisition_date': None,
+                'active_puts': 0,
+                'active_calls': 0,
+                'wheel_cycle_start': None,
+                'total_premium_collected': 0.0,
+                'put_premium_collected': 0.0,
+                'call_premium_collected': 0.0,
+            }
+        self.symbol_states[symbol]['stock_cost_basis'] = float(cost_basis)
+        logger.info("Cost basis backfilled from BQ lookup",
+                   event_category="trade",
+                   event_type="cost_basis_backfilled",
+                   symbol=symbol,
+                   cost_basis=cost_basis)
+        self._save_state()
+
     def handle_call_assignment(self, symbol: str, shares: int, strike_price: float,
                              assignment_date: datetime, trade_info: Dict[str, Any] = None) -> Dict[str, Any]:
         """Handle call assignment and update wheel state.
