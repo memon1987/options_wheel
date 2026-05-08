@@ -1,5 +1,6 @@
 """Call selling module for options wheel strategy."""
 
+import os
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 import structlog
@@ -30,6 +31,10 @@ class CallSeller:
         self.config = config
         self.wheel_state = wheel_state_manager
         self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
+        # FC-029: cache the BigQuery client (constructed lazily on first cost-basis
+        # lookup) so cold-start cycles don't pay the Client() construction cost
+        # twice within a single evaluate_covered_call_opportunity call.
+        self._bq_client = None
         
     def evaluate_covered_call_opportunity(self, stock_position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Evaluate covered call opportunity for an assigned stock position.
@@ -67,6 +72,26 @@ class CallSeller:
                 symbol, stock_position, shares_owned
             )
 
+            # FC-029 review fix (MEDIUM 6): when shares are held but no source
+            # resolved a cost basis, we have no floor — this is unsafe. Block
+            # the call write entirely with a structured error rather than
+            # writing at any strike. Operator intervention required.
+            if stock_cost_basis <= 0:
+                log_error_event(
+                    logger,
+                    error_type="cost_basis_floor_unresolved",
+                    error_message=(
+                        f"No cost-basis floor resolved from any source for {symbol} "
+                        f"(wheel_state, BQ, Alpaca all returned 0). Holding "
+                        f"{shares_owned} shares with no protection. Blocking call write."
+                    ),
+                    component="call_seller",
+                    recoverable=True,
+                    symbol=symbol,
+                    shares=shares_owned,
+                )
+                return None
+
             # FC-029 (R3): drawdown pause — when shares are deeply underwater
             # every delta-range strike is at-or-below cost basis. Make this an
             # explicit, observable decision instead of relying on the (now
@@ -76,26 +101,37 @@ class CallSeller:
                 bid = float(quote.get('bid', 0) or 0)
                 ask = float(quote.get('ask', 0) or 0)
                 # Defensive: a malformed quote with one side zero would yield
-                # a wildly-wrong mid (e.g. bid=$10, ask=$0 → mid=$5) and could
-                # cause a false-negative on the drawdown pause. Require both
-                # sides to be positive; otherwise treat the quote as missing.
+                # a wildly-wrong mid (e.g. bid=$10, ask=$0 → mid=$5).
                 current_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0
             except Exception:
                 current_price = 0
 
-            if current_price > 0 and stock_cost_basis > 0:
-                drawdown_pct = (stock_cost_basis - current_price) / stock_cost_basis
-                threshold = self.config.call_drawdown_pause_threshold
-                if drawdown_pct >= threshold:
-                    logger.info("Covered call skipped: drawdown pause",
-                               event_category="trade",
-                               event_type="covered_call_drawdown_pause",
-                               symbol=symbol,
-                               cost_basis=stock_cost_basis,
-                               current_price=current_price,
-                               drawdown_pct=round(drawdown_pct, 4),
-                               threshold_pct=threshold)
-                    return None
+            # FC-029 review fix (HIGH 2): no usable quote → defer to next cycle
+            # rather than writing without drawdown protection. The pause IS the
+            # protection; failing open means LESS protection precisely when
+            # quotes are noisy (premarket, illiquid intraday, halts) — exactly
+            # the regimes the pause exists for. Monitor cycle re-evaluates in
+            # ~5 min; cost of deferring is negligible.
+            if current_price <= 0:
+                logger.info("Covered call deferred: quote unavailable",
+                           event_category="trade",
+                           event_type="covered_call_quote_missing",
+                           symbol=symbol,
+                           cost_basis=stock_cost_basis)
+                return None
+
+            drawdown_pct = (stock_cost_basis - current_price) / stock_cost_basis
+            threshold = self.config.call_drawdown_pause_threshold
+            if drawdown_pct >= threshold:
+                logger.info("Covered call skipped: drawdown pause",
+                           event_category="trade",
+                           event_type="covered_call_drawdown_pause",
+                           symbol=symbol,
+                           cost_basis=stock_cost_basis,
+                           current_price=current_price,
+                           drawdown_pct=round(drawdown_pct, 4),
+                           threshold_pct=threshold)
+                return None
 
             # Get suitable calls for this stock (with cost basis protection)
             suitable_calls = self.market_data.find_suitable_calls(symbol, min_strike_price=stock_cost_basis)
@@ -455,15 +491,32 @@ class CallSeller:
         except Exception:
             return 0.0
 
-    def _lookup_last_opasn_put_strike(self, symbol: str) -> float:
+    def _lookup_last_opasn_put_strike(self, symbol: str, lookback_days: int = 90) -> float:
         """Return strike of the most recent OPASN-put for ``symbol``.
 
-        Returns 0 if no assigning put found, BQ unavailable, or any error.
-        Logged at WARNING when the lookup fails so missed floors are observable.
+        FC-029 review fixes:
+          - HIGH 1: pass ``project=`` to ``bigquery.Client()`` so the lookup
+            targets the right GCP project even when env vars are unset/wrong.
+            Matches codebase pattern in `data/*_ingestor.py`.
+          - HIGH 3: cache the client on ``self._bq_client`` so repeated calls
+            within one evaluation don't pay the Client() construction cost.
+          - HIGH 4: age-bound to ``lookback_days`` (default 90) so stale OPASN
+            history doesn't get applied to long-after-the-fact manual buys
+            on a previously-traded symbol.
+
+        Returns 0 if no assigning put found within ``lookback_days``, BQ
+        unavailable, or any error. Logged at WARNING when the lookup fails so
+        missed floors are observable.
         """
         try:
             from google.cloud import bigquery
-            client = bigquery.Client()
+            if self._bq_client is None:
+                project_id = (
+                    os.environ.get('GCP_PROJECT')
+                    or os.environ.get('GOOGLE_CLOUD_PROJECT')
+                    or os.environ.get('GCP_PROJECT_ID')
+                )
+                self._bq_client = bigquery.Client(project=project_id) if project_id else bigquery.Client()
             query = """
             SELECT strike_price
             FROM `options_wheel.trades_from_activities`
@@ -471,13 +524,15 @@ class CallSeller:
               AND activity_type = 'OPASN'
               AND option_type = 'put'
               AND transaction_time <= CURRENT_TIMESTAMP()
+              AND transaction_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @lookback_days DAY)
             ORDER BY transaction_time DESC
             LIMIT 1
             """
             job_config = bigquery.QueryJobConfig(query_parameters=[
                 bigquery.ScalarQueryParameter('symbol', 'STRING', symbol),
+                bigquery.ScalarQueryParameter('lookback_days', 'INT64', lookback_days),
             ])
-            job = client.query(query, job_config=job_config)
+            job = self._bq_client.query(query, job_config=job_config)
             for row in job.result(timeout=10):
                 strike = row.get('strike_price')
                 return float(strike) if strike is not None else 0.0

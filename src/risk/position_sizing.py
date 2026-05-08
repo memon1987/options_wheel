@@ -132,17 +132,27 @@ class PositionSizer:
             logger.error("Failed to calculate put position size", event_category="error", event_type="put_position_size_failed", error=str(e))
             return {'recommended_contracts': 0, 'error': str(e)}
     
-    def calculate_call_position_size(self, 
-                                   call_option: Dict[str, Any], 
+    def calculate_call_position_size(self,
+                                   call_option: Dict[str, Any],
                                    shares_owned: int,
                                    stock_position: Dict[str, Any]) -> Dict[str, Any]:
         """Calculate position size for covered call selling.
-        
+
+        ⚠️ FC-029 NOTE: this method reads ``stock_position['cost_basis']`` directly
+        from Alpaca's API, which is known-broken for assigned positions in paper
+        trading (returns 0). It is currently UNUSED in production (no callers
+        outside tests). If you revive this code path, you MUST route the cost-
+        basis read through ``CallSeller._resolve_cost_basis_floor`` (or a
+        shared utility derived from it) so the wheel_state-canonical source
+        is consulted before falling back to Alpaca. See
+        ``docs/investigations/cost-basis-floor-validation-2026-05-08.md``
+        for the failure mode.
+
         Args:
             call_option: Call option details
             shares_owned: Number of shares owned
             stock_position: Stock position details
-            
+
         Returns:
             Position sizing details
         """

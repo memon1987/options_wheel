@@ -18,6 +18,9 @@ class TestCallSellerEvaluateOpportunity:
         self.mock_config = Mock(spec=Config)
         self.mock_config.call_target_dte = 7
         self.mock_config.min_call_premium = 0.30
+        # FC-029: drawdown pause threshold needs to be a real number, not a
+        # Mock (which would fail the `drawdown_pct >= threshold` comparison).
+        self.mock_config.call_drawdown_pause_threshold = 0.05
 
         self.call_seller = CallSeller(self.mock_alpaca, self.mock_market_data, self.mock_config)
 
@@ -25,6 +28,11 @@ class TestCallSellerEvaluateOpportunity:
         self.mock_market_data.get_stock_metrics.return_value = {
             'current_price': 175.0,
         }
+        # FC-029: default a usable quote so the drawdown-pause check doesn't
+        # defer in legacy tests that didn't anticipate the quote requirement.
+        # Cost basis is below stock price → drawdown_pct is negative (gain),
+        # so the pause won't fire — tests proceed to call evaluation.
+        self.mock_alpaca.get_stock_quote.return_value = {'bid': 174.5, 'ask': 175.5}
 
     def test_find_suitable_covered_calls(self):
         """Test finding suitable covered call opportunities."""
@@ -69,6 +77,10 @@ class TestCallSellerEvaluateOpportunity:
         }
 
         self.mock_market_data.find_suitable_calls.return_value = []
+        # FC-029: provide a quote near cost basis so drawdown pause doesn't
+        # fire (would block call evaluation). The test's intent is to verify
+        # the cost-basis floor is passed; need to clear the pause path first.
+        self.mock_alpaca.get_stock_quote.return_value = {'bid': 299.5, 'ask': 300.5}
 
         result = self.call_seller.evaluate_covered_call_opportunity(stock_position)
 
@@ -511,51 +523,65 @@ class TestCallSellerCostBasisFloorFC029:
         assert result is None
         self.mock_market_data.find_suitable_calls.assert_not_called()
 
-    def test_drawdown_pause_quote_fetch_failure_proceeds(self):
-        """When quote fetch fails or returns empty, drawdown pause must NOT
-        false-positive — bot proceeds to call evaluation.
+    def test_drawdown_pause_quote_fetch_failure_defers(self):
+        """FC-029 review HIGH 2: bad quote → defer call write, don't fail-open.
 
-        Concern from peer review (concern #4).
+        When the quote fetch raises, we must NOT proceed without the drawdown
+        protection. Defer to the next monitor cycle (re-evaluates in ~5 min).
         """
         wheel_state = Mock()
         wheel_state.get_position_summary.return_value = {'stock_cost_basis': 247.5}
         seller = self._make_seller(wheel_state=wheel_state)
 
-        # Quote fetch raises.
         self.mock_alpaca.get_stock_quote.side_effect = Exception("network blip")
-        self.mock_market_data.find_suitable_calls.return_value = [self._candidate_call(250.0)]
 
         result = seller.evaluate_covered_call_opportunity(self._amzn_position())
 
-        # Bot proceeded past the pause check despite no quote.
-        assert result is not None
-        self.mock_market_data.find_suitable_calls.assert_called_once_with(
-            'AMZN', min_strike_price=247.5
-        )
+        assert result is None
+        # Critical: no call evaluation/sale was attempted.
+        self.mock_market_data.find_suitable_calls.assert_not_called()
 
-    def test_drawdown_pause_one_sided_quote_treated_as_missing(self):
-        """A quote with bid=$10, ask=$0 must NOT compute mid=$5 (false-negative
-        risk: would miss the pause when the stock is actually well below cost).
+    def test_drawdown_pause_one_sided_quote_defers(self):
+        """FC-029 review HIGH 2: one-sided quote (bid OR ask = 0) → defer.
 
-        Concern from peer review (concern #2): require both sides > 0.
+        Pre-fix this was treated as "missing → proceed without pause check"
+        (fail-open). The pause IS the protection; failing open means LESS
+        protection precisely on noisy quotes (premarket, illiquid intraday,
+        halts) — exactly the regimes the pause exists for. Now defers.
         """
         wheel_state = Mock()
         wheel_state.get_position_summary.return_value = {'stock_cost_basis': 247.5}
         seller = self._make_seller(wheel_state=wheel_state)
 
-        # Malformed quote (one side zero). Treat as missing → skip pause check
-        # and proceed (fail-open is correct here; we never want a false-positive
-        # pause that idle-locks the bot, but we also never want a false-negative
-        # pause based on garbage data — the right answer is to proceed).
+        # Malformed quote (one side zero). Pre-FC-029-review proceeded; now defers.
         self.mock_alpaca.get_stock_quote.return_value = {'bid': 230.0, 'ask': 0}
-        self.mock_market_data.find_suitable_calls.return_value = [self._candidate_call(250.0)]
 
         result = seller.evaluate_covered_call_opportunity(self._amzn_position())
 
-        assert result is not None
-        self.mock_market_data.find_suitable_calls.assert_called_once_with(
-            'AMZN', min_strike_price=247.5
-        )
+        assert result is None
+        self.mock_market_data.find_suitable_calls.assert_not_called()
+
+    def test_no_cost_basis_floor_resolved_blocks_call_write(self):
+        """FC-029 review MEDIUM 6: when shares are held but no source resolved
+        a cost basis (wheel_state, BQ, AND Alpaca all return 0), block the
+        call write entirely. Prior behavior returned 0 ('no floor'); the new
+        behavior is structured-error-block.
+
+        This catches the failure mode: position acquired via a path the bot
+        doesn't know about + Alpaca lost the cost basis (or paper-engine
+        quirk) + no recent OPASN history. Operator intervention required.
+        """
+        # Empty wheel_state, no BQ history, Alpaca returns 0.
+        wheel_state = Mock()
+        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 0}
+        seller = self._make_seller(wheel_state=wheel_state)
+        ghost_position = {'symbol': 'AMZN', 'qty': 100, 'cost_basis': 0.0, 'market_value': 24700.0}
+
+        with patch.object(seller, '_lookup_last_opasn_put_strike', return_value=0.0):
+            result = seller.evaluate_covered_call_opportunity(ghost_position)
+
+        assert result is None
+        self.mock_market_data.find_suitable_calls.assert_not_called()
 
     def test_lookup_last_opasn_put_strike_handles_bq_failure(self):
         """``_lookup_last_opasn_put_strike`` must return 0 on any BQ exception.
