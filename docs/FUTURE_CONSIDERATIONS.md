@@ -329,6 +329,22 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
+### FC-032: Multi-strategy extensibility — covered-call strategy in a separate portfolio
+
+**Status:** Plan drafted
+**Size estimate:** L
+**Owner:** Zeshan
+**Plan file:** `docs/plans/fc-032.md`
+
+**Problem / opportunity:** We want to run a second strategy (standalone covered calls) reusing the existing engine, without the two strategies interfering. Research concluded: separate Alpaca account per strategy (position tagging is infeasible — Alpaca nets positions per symbol with no tags, assignments carry no client_order_id, and `reconcile_positions` adopts any untracked position into wheel state). Plan: extract extensibility seams (cost-basis provider, config namespacing, per-strategy state/dataset/order-id prefix), then a covered-call engine as a second Cloud Run service from the same image, in Alpaca paper account #2.
+
+**Open questions:**
+- Covered-call stock entry policy (symbols, entry criteria, sizing) — needs its own mini-plan.
+- Live go-live path (one live account per person at Alpaca retail): second entity account, second broker, or single-account consolidation under a disjoint-symbol-universe rule.
+- Strategy interface alignment with the backtest-rebuild branch.
+
+**Links:** `docs/plans/fc-032.md`; related: FC-005 (per-symbol params), FC-014 (RiskManager consolidation), FC-015 (state cold-start).
+
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
