@@ -1,40 +1,106 @@
+import { useState } from 'react';
 import { useApi } from '../../hooks/useApi';
 import type {
   IngestHealth,
   FilteringStat,
   ErrorEvent,
   DailySummary,
+  BotAnomaly,
+  DrawdownPauses,
 } from '../../types/v2';
 import IngestHealthCard from '../../components/v2/IngestHealthCard';
 import GateHitsHeatmap from '../../components/v2/GateHitsHeatmap';
-import { fmtDateTime, fmtNumber, cls } from '../../utils/format';
+import DecisionFunnel from '../../components/v2/DecisionFunnel';
+import AnomalyFlags from '../../components/v2/AnomalyFlags';
+import DrawdownPauseCard from '../../components/v2/DrawdownPauseCard';
+import { fmtDateTime, fmtNumber, fmtPercent, cls } from '../../utils/format';
 
 export default function BotHealth() {
-  const { data: ingest } = useApi<IngestHealth>('/api/v2/bot-health/ingest', { refreshInterval: 60_000 });
-  const { data: filtering } = useApi<FilteringStat[]>('/api/history/filtering?days=14');
-  const { data: errors } = useApi<ErrorEvent[]>('/api/history/errors?days=7');
-  const { data: daily } = useApi<DailySummary[]>('/api/history/daily-summary?days=14');
+  const WINDOWS = [
+    { label: '1d', days: 1 },
+    { label: '7d', days: 7 },
+    { label: '30d', days: 30 },
+  ] as const;
+  const [funnelWindow, setFunnelWindow] = useState<typeof WINDOWS[number]>(WINDOWS[1]);
 
-  // Aggregate error frequency by error_type for the summary table.
+  const { data: ingest } = useApi<IngestHealth>('/api/v2/bot-health/ingest', { refreshInterval: 60_000 });
+  const { data: filtering } = useApi<FilteringStat[]>(`/api/history/filtering?days=${funnelWindow.days}`);
+  // Skip the baseline fetch when the selected window IS 30d — it would be a
+  // byte-identical query (review E5).
+  const { data: filteringBaseline } = useApi<FilteringStat[]>(
+    funnelWindow.days === 30 ? null : '/api/history/filtering?days=30');
+  const baseline = funnelWindow.days === 30 ? filtering : filteringBaseline;
+  const { data: errors } = useApi<ErrorEvent[]>('/api/history/errors?days=7');
+  const { data: daily } = useApi<DailySummary[]>('/api/history/daily-summary?days=30');
+  const { data: anomalies } = useApi<BotAnomaly[]>('/api/v2/bot-health/anomalies', { refreshInterval: 300_000 });
+  const { data: pauses } = useApi<DrawdownPauses>('/api/v2/bot-health/drawdown-pauses', { refreshInterval: 300_000 });
+
+  // Explicit client-side ordering — never assume API order (FC-031).
+  const dailySorted = [...(daily ?? [])].sort((a, b) => (b.date_et ?? '').localeCompare(a.date_et ?? ''));
+  const recentDaily = dailySorted.slice(0, 7);
+
+  // Run reliability: share of days (with any scans scheduled) that completed
+  // without errors, over the 30d window.
+  const activeDays = dailySorted.filter((d) => (d.total_scans ?? 0) > 0);
+  const cleanDays = activeDays.filter((d) => (d.total_errors ?? 0) === 0);
+  const reliability = activeDays.length > 0 ? cleanDays.length / activeDays.length : null;
+
+  const errorsSorted = [...(errors ?? [])].sort((a, b) => (b.timestamp ?? '').localeCompare(a.timestamp ?? ''));
   const errorByType: Array<[string, number]> = (() => {
     const counts = new Map<string, number>();
-    for (const e of errors ?? []) {
+    for (const e of errorsSorted) {
       const k = e.error_type || e.event_type || 'unknown';
       counts.set(k, (counts.get(k) ?? 0) + 1);
     }
     return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10);
   })();
 
-  const recentDaily = (daily ?? []).slice(0, 7);
-
   return (
     <div className="space-y-6">
       <header>
         <h1 className="text-2xl font-bold text-white">Bot Health</h1>
         <p className="text-gray-400 mt-1 text-sm">
-          Operational view — what the bot has been doing and where it&apos;s been blocked.
+          Is the algo doing what it should — and if not, where is it blocked?
         </p>
       </header>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <AnomalyFlags data={anomalies ?? null} />
+        <DrawdownPauseCard data={pauses ?? null} />
+      </div>
+
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div className="text-sm text-gray-300">
+          <span title="Days with ≥1 scan and zero errors / days with ≥1 scan, trailing 30 days.">
+            Run reliability (30d):{' '}
+            <span className={cls('font-semibold', reliability !== null && reliability < 0.95 ? 'text-yellow-300' : 'text-green-300')}>
+              {reliability !== null ? fmtPercent(reliability, 0) : '—'}
+            </span>
+            {activeDays.length > 0 && <span className="text-xs text-gray-500"> ({cleanDays.length}/{activeDays.length} clean days)</span>}
+          </span>
+        </div>
+        <div className="inline-flex rounded-md border border-gray-700 overflow-hidden">
+          {WINDOWS.map((w) => (
+            <button
+              key={w.label}
+              onClick={() => setFunnelWindow(w)}
+              className={`px-3 py-1.5 text-xs font-medium transition-colors ${
+                funnelWindow.label === w.label
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
+              }`}
+            >
+              {w.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <DecisionFunnel
+        rows={filtering ?? []}
+        baselineRows={baseline ?? []}
+        windowLabel={funnelWindow.label}
+      />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-1">
@@ -43,7 +109,7 @@ export default function BotHealth() {
 
         <div className="lg:col-span-2 rounded-lg border border-gray-700 bg-gray-800 p-5">
           <h3 className="text-base font-semibold text-white">Scan Cadence</h3>
-          <p className="text-xs text-gray-400 mt-1 mb-3">Daily summary (last 7)</p>
+          <p className="text-xs text-gray-400 mt-1 mb-3">Daily summary (last 7 active days)</p>
           {recentDaily.length === 0 ? (
             <p className="text-sm text-gray-400">No execution data.</p>
           ) : (
@@ -110,11 +176,11 @@ export default function BotHealth() {
 
         <div className="rounded-lg border border-gray-700 bg-gray-800 p-5">
           <h3 className="text-base font-semibold text-white">Recent Errors</h3>
-          {(errors ?? []).length === 0 ? (
+          {errorsSorted.length === 0 ? (
             <p className="text-sm text-gray-400 mt-2">No recent errors.</p>
           ) : (
             <ul className="mt-3 space-y-2 max-h-64 overflow-y-auto">
-              {(errors ?? []).slice(0, 20).map((e, i) => (
+              {errorsSorted.slice(0, 20).map((e, i) => (
                 <li key={`${e.timestamp}-${i}`} className="text-xs">
                   <div className="flex items-baseline justify-between">
                     <span className="font-mono text-gray-300">{e.error_type || e.event_type}</span>

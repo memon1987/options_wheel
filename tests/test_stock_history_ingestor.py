@@ -161,3 +161,21 @@ class TestRunOnce:
         call = ingestor._client.insert_rows_json.call_args
         assert "row_ids" in call.kwargs
         assert call.kwargs["row_ids"] == ["2026-04-01|AMD"]
+
+
+class TestBenchmarkUniverse:
+    """FC-031: SPY benchmark bars ride the traded-symbol universe."""
+
+    def test_benchmark_included_with_traded(self):
+        ingestor = _ingestor()
+        mock_result = [{"underlying": "AMD"}, {"underlying": "NVDA"}]
+        ingestor._client.query.return_value.result.return_value = iter(mock_result)
+        universe = StockHistoryIngestor._traded_universe(ingestor)
+        assert "SPY" in universe
+        assert "AMD" in universe and "NVDA" in universe
+
+    def test_benchmark_included_when_query_fails(self):
+        ingestor = _ingestor()
+        ingestor._client.query.side_effect = RuntimeError("bq down")
+        universe = StockHistoryIngestor._traded_universe(ingestor)
+        assert universe == ["SPY"]

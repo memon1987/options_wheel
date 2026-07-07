@@ -61,21 +61,9 @@ async def get_metrics_summary(
     return metrics
 
 
-@router.get("/pnl-by-symbol")
-async def get_pnl_by_symbol(
-    days: int = Query(default=30, ge=1, le=365, description="Days to analyze")
-) -> List[Dict[str, Any]]:
-    """
-    Get P&L breakdown by underlying symbol.
-
-    Args:
-        days: Number of days to analyze (1-365)
-
-    Returns:
-        List of per-symbol metrics: trade count, win rate, total premium.
-    """
-    bq = get_bigquery_service()
-    return bq.get_pnl_by_symbol(days=days)
+# FC-031: /pnl-by-symbol removed. It reported the option leg only (no
+# OPTRD share cash), contradicting the reconciled /api/v2/scorecard
+# numbers, and had no v2 consumers. Use /api/v2/scorecard.
 
 
 @router.get("/portfolio-chart")

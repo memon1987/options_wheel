@@ -5,16 +5,22 @@ import type {
   AccountData,
   AccountBaseline,
   LivePosition,
-  PortfolioHistoryPoint,
-  PremiumByDayPoint,
-  MetricsSummary,
+  EquityCurvePoint,
+  MonthlyCashflow,
+  PortfolioReturns,
+  Reconciliation,
+  CycleStats,
+  OptionTradeStats,
 } from '../../types/v2';
 import KPICards, { buildHeadlineKpis } from '../../components/v2/KPICards';
 import EquityCurve from '../../components/v2/EquityCurve';
 import MonthlyPremiumBars from '../../components/v2/MonthlyPremiumBars';
 import SymbolScorecard from '../../components/v2/SymbolScorecard';
 import ActionPanel from '../../components/v2/ActionPanel';
-import { fmtCurrency, fmtRelativeAge } from '../../utils/format';
+import ReconciliationBanner from '../../components/v2/ReconciliationBanner';
+import CycleStatsCard from '../../components/v2/CycleStatsCard';
+import OptionStatsCard from '../../components/v2/OptionStatsCard';
+import { fmtCurrency, fmtPercent, parseOcc } from '../../utils/format';
 
 export default function Overview() {
   const RANGES = [
@@ -29,76 +35,82 @@ export default function Overview() {
   const { data: scorecard, loading: scorecardLoading } = useApi<ScorecardRow[]>(`/api/v2/scorecard?days=${days}`);
   const { data: account } = useApi<AccountData>('/api/live/account', { refreshInterval: 60_000 });
   const { data: positions } = useApi<LivePosition[]>('/api/live/positions', { refreshInterval: 30_000 });
-  const { data: equity } = useApi<PortfolioHistoryPoint[]>(`/api/history/portfolio-history?days=${Math.min(days, 365)}`);
-  const { data: premium } = useApi<PremiumByDayPoint[]>(`/api/metrics/premium-by-day?days=${days}`);
-  const { data: summary } = useApi<MetricsSummary>(`/api/metrics/summary?days=${days}`);
+  const { data: equityCurve } = useApi<EquityCurvePoint[]>(`/api/v2/portfolio/equity-curve?days=${days}`);
+  const { data: monthly } = useApi<MonthlyCashflow[]>('/api/v2/monthly-cashflow?months=24');
   const { data: baseline } = useApi<AccountBaseline>('/api/metrics/account-baseline');
+  const { data: returns } = useApi<PortfolioReturns>('/api/v2/portfolio/returns');
+  const { data: reconciliation } = useApi<Reconciliation>('/api/v2/reconciliation', { refreshInterval: 120_000 });
+  const { data: cycleStats } = useApi<CycleStats>(`/api/v2/cycle-stats?days=${days}`);
+  const { data: putStats } = useApi<OptionTradeStats>(`/api/v2/put-stats?days=${days}`);
+  const { data: callStats } = useApi<OptionTradeStats>(`/api/v2/call-stats?days=${days}`);
 
-  // Derive headline numbers
-  const grossPremium = summary?.total_premium ?? null;
-  const netRealizedPnl = summary?.net_realized_pnl ?? null;
-  const boughtBack = summary?.bought_back ?? null;
-  const cash = account?.cash ?? null;
-  const buyingPower = account?.buying_power ?? null;
   const nlv = account?.portfolio_value ?? null;
+  const startingCapital = baseline?.starting_capital ?? null;
+  const realizedCash = reconciliation?.realized_cash_pnl ?? null;
+  // Open value split comes from the reconciliation payload's OWN nlv so the
+  // realized/open components stay self-consistent — mixing the 60s-polled
+  // account NLV with the 120s-polled ledger sums made the split incoherent
+  // for up to two minutes after a fill (review AL4).
+  const openValue =
+    reconciliation?.nlv != null && realizedCash !== null
+      ? reconciliation.nlv - reconciliation.deposits - realizedCash
+      : null;
 
-  // (Removed: unrealized-on-shares calc — Total Return now uses NLV − deposits,
-  //  which already includes mark-to-market on every open position.)
+  // Stress + deployment stats from live positions. Underlying prices come
+  // from the scorecard (latest daily-bar close) — stamped below.
+  const priceBy: Record<string, number> = {};
+  for (const r of scorecard ?? []) {
+    if (r.price_now !== null) priceBy[r.symbol] = r.price_now;
+  }
+  const priceDate = (scorecard ?? []).find((r) => r.price_now_date)?.price_now_date ?? null;
 
-  // Days running: from first trade time across the scorecard.
-  const daysRunning = (() => {
-    if (!scorecard || scorecard.length === 0) return null;
-    let earliest: number | null = null;
-    for (const r of scorecard) {
-      if (!r.first_trade_time) continue;
-      const t = new Date(r.first_trade_time).getTime();
-      if (earliest === null || t < earliest) earliest = t;
-    }
-    if (earliest === null) return null;
-    return Math.floor((Date.now() - earliest) / 86_400_000);
-  })();
-
-  // Stress: if every open short PUT assigned at the current underlying price,
-  // immediate mark-to-market = (current_price − strike) × 100 × abs(qty).
-  // Negative = unrealized loss, since you'd be buying shares above market.
-  // Underlying prices come from the scorecard (price_now, daily-bar latest).
-  const stressMTM = (() => {
-    if (!positions || !scorecard) return null;
-    const priceBy: Record<string, number> = {};
-    for (const r of scorecard) {
-      if (r.price_now !== null) priceBy[r.symbol] = r.price_now;
-    }
-    let stress = 0;
-    let countedPuts = 0;
-    for (const p of positions) {
-      const symbol = p.symbol ?? '';
-      const m = symbol.match(/^([A-Z]{1,6})\d{6}([CP])(\d{8})$/);
-      if (!m) continue;
-      const [, underlying, type, strikeStr] = m;
-      if (type !== 'P') continue; // calls don't carry assignment-cash risk on the user's side
-      const strike = parseInt(strikeStr, 10) / 1000;
-      const qty = parseFloat(String(p.qty ?? 0));
-      const cur = priceBy[underlying];
-      if (cur === undefined) continue;
-      // If the put is OTM (cur >= strike), assignment is unlikely; contribute 0.
-      // If ITM (cur < strike), assigned shares are immediately worth less than paid.
-      if (cur < strike) {
-        stress += (cur - strike) * 100 * Math.abs(qty);
+  let stress = 0;
+  let countedPuts = 0;
+  let putCollateral = 0;
+  let stockMV = 0;
+  const exposureBySymbol: Record<string, number> = {};
+  for (const p of positions ?? []) {
+    const occ = parseOcc(p.symbol ?? '');
+    const qty = Math.abs(parseFloat(String(p.qty ?? 0)));
+    if (occ.optionType === 'P' && occ.strike !== null) {
+      const notional = occ.strike * 100 * qty;
+      putCollateral += notional;
+      exposureBySymbol[occ.underlying] = (exposureBySymbol[occ.underlying] ?? 0) + notional;
+      const cur = priceBy[occ.underlying];
+      // Only puts we can actually price count toward the stress figure — an
+      // unpriced put must not let the green "all OTM" banner show.
+      if (cur !== undefined) {
+        countedPuts++;
+        if (cur < occ.strike) {
+          stress += (cur - occ.strike) * 100 * qty;
+        }
       }
-      countedPuts++;
+    } else if (occ.optionType === null && !/\d/.test(p.symbol ?? '')) {
+      const mv = parseFloat(String(p.market_value ?? 0));
+      stockMV += mv;
+      exposureBySymbol[p.symbol] = (exposureBySymbol[p.symbol] ?? 0) + mv;
     }
-    return countedPuts > 0 ? stress : null;
-  })();
+  }
+  const stressMTM = countedPuts > 0 ? stress : null;
+  const notionalIfAssigned = putCollateral + stockMV;
+  const deployedPct = nlv !== null && nlv > 0 ? notionalIfAssigned / nlv : null;
+  const topExposure = Object.entries(exposureBySymbol).sort((a, b) => b[1] - a[1])[0] ?? null;
 
   const kpis = buildHeadlineKpis({
     nlv,
-    cash,
-    buyingPower,
-    startingCapital: baseline?.starting_capital ?? null,
-    grossPremium,
-    netRealizedPnl,
-    boughtBack,
-    daysRunning,
+    cash: account?.cash ?? null,
+    buyingPower: account?.buying_power ?? null,
+    startingCapital,
+    realizedCashPnl: realizedCash,
+    openValue,
+    xirr: returns?.xirr ?? null,
+    twrCumulative: returns?.twr_cumulative ?? null,
+    singleDeposit: returns?.single_deposit ?? true,
+    maxDrawdown: returns?.max_drawdown ?? null,
+    maxDrawdownDollars: returns?.max_drawdown_dollars ?? null,
+    currentDrawdown: returns?.current_drawdown ?? null,
+    daysRunning: returns?.days_since_first_deposit ?? null,
+    nlvSource: returns?.nlv_source ?? null,
   });
 
   return (
@@ -107,7 +119,7 @@ export default function Overview() {
         <div>
           <h1 className="text-2xl font-bold text-white">Overview</h1>
           <p className="text-gray-400 mt-1 text-sm">
-            Headline P&amp;L, portfolio equity, and per-symbol scorecard.
+            Headline P&amp;L, benchmark comparison, and per-symbol scorecard.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -132,14 +144,35 @@ export default function Overview() {
         </div>
       </header>
 
+      {reconciliation?.status === 'warn' && <ReconciliationBanner data={reconciliation} />}
+
       <KPICards kpis={kpis} />
+
+      <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-gray-400 px-1">
+        <span title="Put collateral at strike notional + market value of held shares, over NLV. Short-option marks are netted inside NLV (the denominator), not the numerator — the ratio can drift above the broker's buying-power view.">
+          Capital deployed:{' '}
+          <span className={deployedPct !== null && deployedPct > 1 ? 'text-red-300 font-semibold' : 'text-gray-200'}>
+            {deployedPct !== null ? fmtPercent(deployedPct, 0) : '—'}
+          </span>
+          {deployedPct !== null && deployedPct > 1 && ' ⚠ over-committed'}
+        </span>
+        <span title="Σ open put strike notionals + held share value — what the account would hold if every put assigned.">
+          Notional if assigned: <span className="text-gray-200">{fmtCurrency(notionalIfAssigned)}</span>
+        </span>
+        {topExposure && nlv !== null && nlv > 0 && (
+          <span title="Largest single-symbol exposure (put notional + share value) as % of NLV.">
+            Largest exposure: <span className="text-gray-200">{topExposure[0]} {fmtPercent(topExposure[1] / nlv, 0)}</span>
+          </span>
+        )}
+        {priceDate && <span>Underlying prices as of {priceDate} close.</span>}
+      </div>
 
       {stressMTM !== null && stressMTM < 0 && (
         <div className="rounded-lg border border-yellow-700/50 bg-yellow-900/10 px-4 py-3 text-sm text-yellow-200">
           <span className="font-semibold">Stress test:</span>{' '}
-          if every open put assigned at current underlying price, mark-to-market loss = {fmtCurrency(stressMTM)}.{' '}
+          if every open put assigned at the last close, mark-to-market loss = {fmtCurrency(stressMTM)}.{' '}
           <span className="text-xs opacity-75 ml-2">
-            Sums (current_price − strike) × 100 across in-the-money short puts.
+            Sums (close − strike) × 100 across in-the-money short puts{priceDate ? ` · prices as of ${priceDate}` : ''}.
           </span>
         </div>
       )}
@@ -151,17 +184,22 @@ export default function Overview() {
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <EquityCurve data={equity ?? []} />
-        <MonthlyPremiumBars data={premium ?? []} />
+        <EquityCurve data={equityCurve ?? []} />
+        <MonthlyPremiumBars data={monthly ?? []} />
+      </div>
+
+      <CycleStatsCard data={cycleStats ?? null} />
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <OptionStatsCard data={putStats ?? null} optionType="put" />
+        <OptionStatsCard data={callStats ?? null} optionType="call" />
       </div>
 
       <SymbolScorecard rows={scorecard ?? []} />
 
       <ActionPanel positions={positions ?? []} scorecard={scorecard ?? []} />
 
-      <div className="text-xs text-gray-500 text-center pt-2">
-        Account data refreshed {fmtRelativeAge(new Date().toISOString())} · v2 preview · FC-018
-      </div>
+      {reconciliation?.status === 'ok' && <ReconciliationBanner data={reconciliation} />}
     </div>
   );
 }

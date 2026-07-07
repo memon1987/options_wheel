@@ -55,7 +55,8 @@ export default function CycleTable({ rows }: Props) {
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Realized capital gain on shares during the cycle window — actual cash in (called-away) minus actual cash out (assigned), per Alpaca activity history.">Cap Gain</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Net option premium kept across the cycle: put kept + sum of call realized P&L (after roll buybacks). Does NOT include share-side capital gain.">Total Premium</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="True cycle P&L = Total Premium + Cap Gain. Includes both option-side (premium kept after rolls) and share-side (called-away vs assigned strike) cash flow.">Cycle P&L</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Return</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Return on collateral: Cycle P&L / (put strike × shares). Simple period return — NOT annualized, and collateral is approximated as put-strike notional throughout the cycle.">RoC</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400" title="Cycle P&L per day per $1,000 of collateral — compares cycles of different lengths without annualizing. Valid per row only: never average this column (aggregate = Σ P&L / Σ collateral·days, shown on the Overview cycle stats).">$/day/$1k</th>
               <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-right text-gray-400">Days</th>
             </tr>
           </thead>
@@ -70,13 +71,22 @@ export default function CycleTable({ rows }: Props) {
                 r.total_premium === null && r.capital_gain === null
                   ? null
                   : (r.total_premium ?? 0) + (r.capital_gain ?? 0);
-              const totalReturn =
-                r.total_premium !== null &&
-                r.put_strike !== null &&
-                r.shares !== null &&
-                r.put_strike * r.shares > 0
-                  ? (r.total_premium + (r.capital_gain ?? 0)) / (r.put_strike * r.shares)
-                  : r.total_return;
+              // FC-031: ONE definition (the old column silently fell back to
+              // a server total_return with different semantics). Collateral
+              // approximated as put-strike notional; shares default 100.
+              const collateral =
+                r.put_strike !== null ? r.put_strike * (r.shares ?? 100) : null;
+              const roc =
+                cyclePnl !== null && collateral !== null && collateral > 0
+                  ? cyclePnl / collateral
+                  : null;
+              // Hold-time normalizer. GREATEST(days, 1) guards same-day
+              // assignment/called-away rows (review F11).
+              const days = Math.max(r.duration_days ?? 1, 1);
+              const perDayPer1k =
+                cyclePnl !== null && collateral !== null && collateral > 0
+                  ? (cyclePnl / days / collateral) * 1000
+                  : null;
               return (
                 <tr key={`${r.put_date}-${i}`} className="border-t border-gray-700/50">
                   <td className="px-3 py-2 text-sm text-gray-200">{fmtDate(r.put_date)}</td>
@@ -104,8 +114,13 @@ export default function CycleTable({ rows }: Props) {
                   <td className={`px-3 py-2 text-sm text-right font-semibold ${pnlColor(cyclePnl)}`}>
                     {cyclePnl !== null ? fmtCurrency(cyclePnl) : '—'}
                   </td>
-                  <td className={`px-3 py-2 text-sm text-right ${pnlColor(totalReturn)}`}>
-                    {fmtPercent(totalReturn, 2)}
+                  <td className={`px-3 py-2 text-sm text-right ${pnlColor(roc)}`}>
+                    {roc !== null ? fmtPercent(roc, 2) : '—'}
+                  </td>
+                  <td className={`px-3 py-2 text-sm text-right ${pnlColor(perDayPer1k)}`}>
+                    {perDayPer1k !== null
+                      ? <span>{`$${perDayPer1k.toFixed(2)}`}{(r.duration_days ?? 1) < 1 && <span className="text-xs text-yellow-500" title="Same-day cycle — rate uses a 1-day floor"> &lt;1d</span>}</span>
+                      : '—'}
                   </td>
                   <td className="px-3 py-2 text-sm text-right text-gray-200">
                     {fmtNumber(r.duration_days)}

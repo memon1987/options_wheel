@@ -8,9 +8,13 @@ export interface ScorecardRow {
   put_premium: number | null;
   call_premium: number | null;
   realized_pnl: number | null;             // net option-side P&L (post-rolls)
-  share_side_pnl: number | null;           // FC-019: OPTRD net (stock leg)
-  total_realized_pnl: number | null;       // FC-019: realized + share_side
+  share_side_pnl: number | null;           // FC-019: OPTRD net cash (stock leg,
+                                           //   includes acquisition cost of held shares)
+  total_realized_pnl: number | null;       // FC-019: net CASH P&L (option + share cash)
   open_count: number | null;
+  open_put_count: number | null;           // FC-031
+  open_call_count: number | null;          // FC-031
+  open_option_premium: number | null;      // FC-031: premium on still-open shorts
   put_assignment_count: number | null;
   called_away_count: number | null;
   early_close_count: number | null;
@@ -20,11 +24,17 @@ export interface ScorecardRow {
   first_trade_time: string | null;
   last_trade_time: string | null;
   current_shares: number | null;
-  current_acb_per_share: number | null;
+  current_acb_per_share: number | null;    // effective breakeven — never summed into P&L
   current_cumulative_net_premium: number | null;
   price_now: number | null;
+  price_now_date: string | null;           // FC-031: bar date behind price_now
+  price_at_start_date: string | null;      // FC-031: B&H baseline bar date
   bh_dollar_pnl: number | null;
-  wheel_minus_bh: number | null;
+  wheel_mtm_pnl: number | null;            // FC-031: net cash + held-share market value
+  wheel_minus_bh: number | null;           // FC-031: wheel MTM − B&H (both marked)
+  open_lot_shares: number | null;          // FC-031: FIFO open-lot walk
+  open_lot_basis_per_share: number | null; // FC-031: display/breakeven only
+  open_lot_acquired_at: string | null;
 }
 
 export interface AcbTimelineRow {
@@ -70,16 +80,19 @@ export interface VsBuyAndHold {
   first_trade_date: string | null;
   first_strike: number | null;
   realized_pnl: number | null;            // option-leg net P&L
-  share_side_pnl: number | null;          // FC-019: OPTRD net (stock leg)
-  total_realized_pnl: number | null;      // FC-019: realized + share_side (canonical wheel total)
+  share_side_pnl: number | null;          // FC-019: OPTRD net cash (stock leg)
+  total_realized_pnl: number | null;      // FC-019: net cash P&L (option + share cash)
   total_premium: number | null;           // gross option premium received
   current_shares: number | null;
   current_acb_per_share: number | null;
   price_at_start: number | null;
+  price_at_start_date: string | null;     // FC-031
   price_now: number | null;
+  price_now_date: string | null;          // FC-031
   hypothetical_shares: number | null;
   bh_dollar_pnl: number | null;           // price-only — does not reinvest dividends
-  wheel_minus_bh: number | null;
+  wheel_mtm_pnl: number | null;           // FC-031: net cash + held-share market value
+  wheel_minus_bh: number | null;          // FC-031: MTM vs MTM
 }
 
 export interface StockBar {
@@ -140,9 +153,136 @@ export interface MetricsSummary {
   call_premium_30d: number;
   net_realized_pnl: number;  // sum of realized_pnl across closed events
   bought_back: number;       // gross − net (cash paid in roll buybacks)
-  win_rate: number | null;
   avg_premium: number;
-  return_30d: number | null;
+  // FC-031: win_rate / return_30d removed (were hardcoded null since FC-018).
+  // Cycle-level win rate: /api/v2/cycle-stats. Account returns: /api/v2/portfolio/returns.
+}
+
+// ---------------------------------------------------------------------
+// FC-031 types
+// ---------------------------------------------------------------------
+
+export interface PortfolioReturns {
+  xirr: number | null;
+  twr_cumulative: number | null;
+  twr_annualized: number | null;
+  max_drawdown: number | null;             // fraction ≤ 0, close-to-close
+  max_drawdown_peak: string | null;
+  max_drawdown_trough: string | null;
+  current_drawdown: number | null;
+  max_drawdown_dollars: number | null;     // flow-adjusted $
+  current_drawdown_dollars: number | null;
+  days_since_first_deposit: number | null;
+  deposit_count: number;
+  single_deposit: boolean;                 // XIRR ≡ CAGR when true — label it
+  nlv_source: string;
+  as_of: string | null;
+}
+
+export interface EquityCurvePoint {
+  date: string;
+  wheel: number | null;                    // TWR index, base 100
+  benchmark: number | null;                // SPY price index, base 100
+}
+
+export interface RegimeStats {
+  count: number;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  expectancy: number | null;
+  pnl_per_collateral_day: number | null;   // Σ P&L / Σ collateral·days — the only valid aggregate rate
+}
+
+export interface CycleStats extends RegimeStats {
+  closed_count: number;
+  open_count: number;
+  open_mtm_to_date: number;
+  excluded_overlapping_symbols: string[];  // FC-020 mis-pairing exclusions, disclosed
+  regime_pre_fc029: RegimeStats;
+  regime_post_fc029: RegimeStats;
+  fc029_deploy_date: string;
+}
+
+// Per-leg trade stats — one shape for puts AND calls (Wheel Strategy
+// Symmetry Principle). "Exercised" = assignment for puts, called-away for
+// calls; the held-to-expiry exercise rate calibrates against the leg's
+// delta band (sourced from the bot's live /config when reachable).
+export interface OptionTradeStats {
+  option_type: 'put' | 'call';
+  closed_count: number;
+  win_rate: number | null;
+  net_pnl: number | null;
+  exercised_count: number;
+  expiration_count: number;
+  early_close_count: number;
+  pct_closed_early: number | null;
+  exercise_rate_held_to_expiry: number | null;
+  delta_band: [number, number];
+}
+
+export interface KnownGap {
+  symbol: string;
+  amount: number;
+  as_of: string;
+  reason: string;
+}
+
+export interface ShareCountMismatch {
+  symbol: string;
+  view_shares: number;
+  live_shares: number;
+}
+
+export interface Reconciliation {
+  nlv: number | null;
+  deposits: number;
+  deposits_source: string | null;
+  realized_cash_pnl: number;
+  open_option_premium: number;
+  fees: number;
+  live_market_value: number | null;
+  residual: number | null;
+  residual_net_of_known_gaps: number | null;
+  known_gaps: KnownGap[];
+  share_count_mismatches: ShareCountMismatch[];
+  status: 'ok' | 'warn' | 'unknown';
+}
+
+export interface MonthlyCashflow {
+  month: string;                           // YYYY-MM
+  net_option_cashflow: number;
+  put_net_cashflow: number;
+  call_net_cashflow: number;
+  gross_premium: number;
+  buyback_cost: number;
+  event_count: number;
+}
+
+export interface BotAnomaly {
+  severity: 'critical' | 'warning';
+  code: string;
+  message: string;
+  since: string | null;
+  evidence: unknown;
+}
+
+export interface DrawdownPauseRow {
+  symbol: string;
+  shares: number;
+  assignment_strike: number;
+  pause_floor: number;
+  last_close: number;
+  last_close_date: string;
+  trading_days_paused: number;
+  pct_below_strike: number;
+}
+
+export interface DrawdownPauses {
+  threshold: number;
+  threshold_source: string;
+  paused: DrawdownPauseRow[];
+  share_count_mismatches: ShareCountMismatch[];
 }
 
 export interface AccountData {

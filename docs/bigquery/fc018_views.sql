@@ -301,6 +301,16 @@ WITH trade_agg AS (
     SUM(CASE WHEN option_type = 'call' THEN COALESCE(premium_total, 0) ELSE 0 END) AS call_premium,
     SUM(COALESCE(realized_pnl, 0)) AS realized_pnl,
     COUNTIF(outcome = 'open') AS open_count,
+    -- FC-031: put/call split of open positions so the frontend position-state
+    -- label stops guessing ("any open option + shares = call"). Subject to
+    -- activities-ingest lag like everything else in this view.
+    COUNTIF(outcome = 'open' AND option_type = 'put') AS open_put_count,
+    COUNTIF(outcome = 'open' AND option_type = 'call') AS open_call_count,
+    -- FC-031: premium received on still-open short options. Cash is in the
+    -- account but not yet in realized_pnl — the reconciliation identity
+    -- needs it as an explicit component.
+    SUM(CASE WHEN outcome = 'open' THEN COALESCE(premium_total, 0) ELSE 0 END)
+      AS open_option_premium,
     COUNTIF(outcome = 'assignment') AS put_assignment_count,
     COUNTIF(outcome = 'called_away') AS called_away_count,
     COUNTIF(outcome = 'early_close') AS early_close_count,
@@ -357,6 +367,9 @@ SELECT
   COALESCE(t.realized_pnl, 0) + COALESCE(s.share_side_pnl, 0)
     AS total_realized_pnl,
   t.open_count,
+  t.open_put_count,
+  t.open_call_count,
+  t.open_option_premium,
   t.put_assignment_count,
   t.called_away_count,
   t.early_close_count,
@@ -411,11 +424,16 @@ ws AS (
   FROM `options_wheel.fc018_per_symbol_scorecard`
 ),
 prices AS (
-  -- First-trade-date close and most-recent close per underlying.
+  -- Baseline close = first bar ON OR AFTER the first trade date (FC-031:
+  -- the previous exact-date match returned NULL whenever the first trade
+  -- fell on a non-bar day). price_at_start_date is surfaced so the frontend
+  -- can flag a late backfill silently re-basing the comparison.
   SELECT
     s.symbol AS underlying,
-    ANY_VALUE(IF(s.date = ft.first_trade_date, s.close, NULL)) AS price_at_start,
-    ARRAY_AGG(s.close ORDER BY s.date DESC LIMIT 1)[OFFSET(0)] AS price_now
+    ARRAY_AGG(s.close ORDER BY s.date ASC LIMIT 1)[OFFSET(0)] AS price_at_start,
+    ARRAY_AGG(s.date  ORDER BY s.date ASC LIMIT 1)[OFFSET(0)] AS price_at_start_date,
+    ARRAY_AGG(s.close ORDER BY s.date DESC LIMIT 1)[OFFSET(0)] AS price_now,
+    ARRAY_AGG(s.date  ORDER BY s.date DESC LIMIT 1)[OFFSET(0)] AS price_now_date
   FROM `options_wheel.stock_history_from_alpaca` s
   JOIN first_trade ft ON s.symbol = ft.underlying
   WHERE s.date >= ft.first_trade_date
@@ -432,7 +450,9 @@ SELECT
   ws.current_shares,
   ws.current_acb_per_share,
   p.price_at_start,
+  p.price_at_start_date,
   p.price_now,
+  p.price_now_date,
   -- Hypothetical buy-and-hold: the dollar amount equal to first_strike * 100 * first_qty
   -- (a CSP's collateral) bought at price_at_start and held to today.
   -- NOTE: price-only — does not reinvest dividends. Symbols that pay dividends
@@ -447,14 +467,33 @@ SELECT
          AND p.price_at_start > 0 AND ft.first_strike IS NOT NULL AND ft.first_qty IS NOT NULL
       THEN ((ft.first_strike * 100 * ABS(ft.first_qty)) / p.price_at_start) * (p.price_now - p.price_at_start)
   END AS bh_dollar_pnl,
-  -- Wheel "value-add": total realized P&L (option leg + share leg, FC-019)
-  -- minus buy-and-hold dollar P&L. Positive = wheel beat buy-and-hold for
-  -- this name; negative = lagged. Pre-FC-023 this used
-  -- `realized_pnl + total_premium`, which double-counted gross premium.
+  -- FC-031: wheel side marked-to-market, symmetric with the B&H side.
+  -- CONVENTION (do not change without reading fc-031 review F1):
+  -- total_realized_pnl is a NET CASH ledger — it already expensed the
+  -- acquisition cost of shares still held (OPTRD outflow). The MTM add-back
+  -- is therefore FULL MARKET VALUE of held shares, never (price − basis) ×
+  -- shares, which would subtract basis twice. Zero (not NULL) when no
+  -- shares are held so fully-cycled symbols pass through unchanged.
+  -- Open short-option marks are layered on in the backend from live
+  -- positions when available; this column excludes them.
+  COALESCE(ws.total_realized_pnl, 0)
+    + IF(COALESCE(ws.current_shares, 0) > 0,
+         ws.current_shares * p.price_now,
+         0) AS wheel_mtm_pnl,
+  -- Wheel "value-add": wheel MTM P&L minus buy-and-hold dollar P&L, both
+  -- marked to the same price_now. Positive = wheel beat buy-and-hold.
+  -- The B&H is a PERFECT-FORESIGHT reference: it assumes the first put's
+  -- full collateral deployed in this one name for the entire period, which
+  -- the account could not do for every symbol simultaneously.
+  -- Pre-FC-023 this used `realized_pnl + total_premium` (double-counted
+  -- gross premium); pre-FC-031 it compared realized-only wheel to MTM B&H.
   CASE
     WHEN p.price_at_start IS NOT NULL AND p.price_now IS NOT NULL
          AND p.price_at_start > 0 AND ft.first_strike IS NOT NULL AND ft.first_qty IS NOT NULL
       THEN COALESCE(ws.total_realized_pnl, 0)
+           + IF(COALESCE(ws.current_shares, 0) > 0,
+                ws.current_shares * p.price_now,
+                0)
            - (((ft.first_strike * 100 * ABS(ft.first_qty)) / p.price_at_start) * (p.price_now - p.price_at_start))
   END AS wheel_minus_bh
 FROM ws

@@ -16,7 +16,8 @@ export default function LayoutV2() {
   const [menuOpen, setMenuOpen] = useState(false);
   const { data: account } = useApi<AccountData>('/api/live/account', { refreshInterval: 60_000 });
 
-  const isPaperTrading = account?.paper_trading ?? false;
+  // FC-031: default to PAPER when the flag is missing — the safe direction.
+  const isPaperTrading = account?.paper_trading ?? true;
 
   return (
     <div className="min-h-screen bg-gray-900">

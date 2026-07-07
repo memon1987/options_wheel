@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 PROJECT_ID = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT", "gen-lang-client-0607444019")
 DATASET_ID = "options_wheel"
 
+# FC-031: benchmark symbol for the equity-curve overlay AND the independent
+# trading-day calendar used by anomaly detection. Must match the ingestor's
+# BENCHMARK_SYMBOLS (src/data/stock_history_ingestor.py) — both read the
+# same env var so a benchmark change is one setting, not two code edits.
+BENCHMARK_SYMBOL = os.getenv("BENCHMARK_SYMBOL", "SPY")
+
 
 class BigQueryService:
     """Service for querying BigQuery trading data."""
@@ -31,10 +37,17 @@ class BigQueryService:
         self.client = bigquery.Client(project=PROJECT_ID)
         self.dataset = f"{PROJECT_ID}.{DATASET_ID}"
 
-    def _run_query(self, query: str) -> List[Dict[str, Any]]:
-        """Execute a query and return results as list of dicts."""
+    def _run_query(self, query: str,
+                   params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
+        """Execute a query and return results as list of dicts.
+
+        ``params``: optional list of bigquery.ScalarQueryParameter /
+        ArrayQueryParameter — one place for parameterized queries instead of
+        per-call-site QueryJobConfig boilerplate (FC-031 review).
+        """
         try:
-            job = self.client.query(query)
+            job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
+            job = self.client.query(query, job_config=job_config)
             results = job.result(timeout=60)  # 60 second timeout
             return [dict(row.items()) for row in results]
         except GoogleCloudError as e:
@@ -43,6 +56,21 @@ class BigQueryService:
         except Exception as e:
             logger.error(f"Unexpected error in BigQuery query: {e}")
             raise Exception(f"Database query failed: {str(e)}")
+
+    # Tiny TTL memo for expensive, slow-moving reads (FC-031 review: the
+    # backend has no caching and Overview fires 10+ BQ jobs per load).
+    # Process-local, keyed per method — the service is a singleton.
+    _memo_store: Dict[str, Any] = {}
+
+    def _memo(self, key: str, ttl_seconds: int, fn):
+        import time
+        hit = self._memo_store.get(key)
+        now = time.monotonic()
+        if hit is not None and now - hit[0] < ttl_seconds:
+            return hit[1]
+        value = fn()
+        self._memo_store[key] = (now, value)
+        return value
 
     # ================================================================
     # FC-012: Alpaca-sourced trade queries (trades_with_outcomes view)
@@ -107,21 +135,9 @@ class BigQueryService:
         """
         return self._run_query(query)
 
-    def get_pnl_by_symbol(self, days: int = 30) -> List[Dict[str, Any]]:
-        """Trade count and P&L per underlying."""
-        query = f"""
-        SELECT
-            underlying AS symbol,
-            COUNT(*) AS trade_count,
-            SUM(COALESCE(realized_pnl, 0)) AS realized_pnl,
-            SUM(COALESCE(premium_total, 0)) AS total_premium
-        FROM `{self.dataset}.trades_with_outcomes`
-        WHERE DATE(transaction_time, 'America/New_York') >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-        GROUP BY underlying
-        ORDER BY trade_count DESC
-        LIMIT 20
-        """
-        return self._run_query(query)
+    # FC-031: get_pnl_by_symbol removed — option-leg-only P&L contradicted
+    # the reconciled scorecard (share_side_pnl absent). Use
+    # get_per_symbol_scorecard.
 
     def get_premium_summary(self, days: int = 30) -> Dict[str, Any]:
         """Premium collection summary.
@@ -360,9 +376,10 @@ class BigQueryService:
             'call_premium_30d': premium_data.get('call_premium', 0),
             'net_realized_pnl': premium_data.get('net_realized_pnl', 0),
             'bought_back': premium_data.get('bought_back', 0),
-            'win_rate': None,
+            # FC-031: win_rate/return_30d removed — they were hardcoded None
+            # since FC-018. Cycle-level win rate lives in get_wheel_cycle_stats;
+            # account returns live in get_portfolio_returns.
             'avg_premium': avg_premium,
-            'return_30d': None,
         }
 
     # ================================================================
@@ -389,6 +406,9 @@ class BigQueryService:
                 s.share_side_pnl,
                 s.total_realized_pnl,
                 s.open_count,
+                s.open_put_count,
+                s.open_call_count,
+                s.open_option_premium,
                 s.put_assignment_count,
                 s.called_away_count,
                 s.early_close_count,
@@ -401,7 +421,10 @@ class BigQueryService:
                 s.current_acb_per_share,
                 s.current_cumulative_net_premium,
                 bh.price_now,
+                bh.price_now_date,
+                bh.price_at_start_date,
                 bh.bh_dollar_pnl,
+                bh.wheel_mtm_pnl,
                 bh.wheel_minus_bh
             FROM `{self.dataset}.fc018_per_symbol_scorecard` s
             LEFT JOIN `{self.dataset}.fc018_vs_buy_and_hold_per_symbol` bh
@@ -409,7 +432,27 @@ class BigQueryService:
             WHERE s.last_trade_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
             ORDER BY s.total_realized_pnl DESC
             """
-            return self._run_query(query)
+            rows = self._run_query(query)
+            # FC-031: attach FIFO open-lot basis (display/breakeven only — never
+            # summed into P&L; acquisition cost is already expensed in the
+            # share_side_pnl cash ledger). Restricted to symbols actually
+            # holding shares — no full-history OPTRD scan per request.
+            try:
+                holding = [r["symbol"] for r in rows
+                           if float(r.get("current_shares") or 0) != 0]
+                lot_bases = self.get_open_lot_bases(symbols=holding) if holding else {}
+                for r in rows:
+                    lot = lot_bases.get(r.get("symbol"))
+                    r["open_lot_shares"] = lot["shares"] if lot else 0
+                    r["open_lot_basis_per_share"] = lot["basis_per_share"] if lot else None
+                    r["open_lot_acquired_at"] = lot["acquired_at"] if lot else None
+            except Exception:
+                logger.info("open-lot basis merge failed — scorecard ships without it")
+                for r in rows:
+                    r.setdefault("open_lot_shares", None)
+                    r.setdefault("open_lot_basis_per_share", None)
+                    r.setdefault("open_lot_acquired_at", None)
+            return rows
         except Exception:
             logger.info("per_symbol_scorecard query failed — returning empty list")
             return []
@@ -805,6 +848,775 @@ class BigQueryService:
         except Exception:
             logger.info("call_rolls query failed — returning empty list")
             return []
+
+    # ================================================================
+    # FC-031: vetted portfolio metrics + bot execution health
+    # (docs/plans/fc-031.md; adversarial review in docs/investigations/)
+    # ================================================================
+
+    # Deploy date of the FC-029 risk re-tune (call delta band, hard
+    # cost-basis floor, drawdown pause). Used to split cycle/put stats
+    # into before/after regimes so the parameter change is measurable.
+    FC029_DEPLOY_DATE = "2026-05-08"
+
+    # Known, dated reconciliation gaps. Each entry documents a measured
+    # broker-vs-ledger discrepancy we have investigated and accepted.
+    # NEVER add an entry without an investigation doc — this list exists to
+    # keep the banner honest, not to silence it.
+    KNOWN_RECONCILIATION_GAPS = [
+        {
+            "symbol": "AMD",
+            "amount": -1594.0,
+            "as_of": "2026-05-05",
+            "reason": "Alpaca paper-engine anomaly: OPTRDs net +100 shares but "
+                      "positions API reports 0 (FC-019 execution notes; "
+                      "docs/investigations/amd-reconciliation.md)",
+        },
+    ]
+
+    def get_cash_flows(self) -> List[Dict[str, Any]]:
+        """Dated external cash flows (JNLC): deposits positive."""
+        query = f"""
+        SELECT
+            COALESCE(activity_date, DATE(transaction_time, 'America/New_York')) AS flow_date,
+            SUM(COALESCE(net_amount, 0)) AS amount
+        FROM `{self.dataset}.trades_from_activities`
+        WHERE activity_type = 'JNLC'
+        GROUP BY flow_date
+        ORDER BY flow_date ASC
+        """
+        try:
+            return self._run_query(query)
+        except Exception:
+            logger.info("cash_flows query failed — returning empty list")
+            return []
+
+    def get_fees_total(self) -> float:
+        """Lifetime FEE cash (negative). First-class reconciliation component."""
+        try:
+            rows = self._run_query(f"""
+                SELECT SUM(COALESCE(net_amount, 0)) AS fees
+                FROM `{self.dataset}.trades_from_activities`
+                WHERE activity_type = 'FEE'
+            """)
+            return float(rows[0]["fees"] or 0) if rows else 0.0
+        except Exception:
+            return 0.0
+
+    def _equity_points(self, days: int = 3650):
+        """(date, equity) tuples from equity_history_from_alpaca."""
+        rows = self.get_portfolio_value_history(days=days)
+        return [(r["date"], float(r["portfolio_value"]))
+                for r in rows if r.get("portfolio_value") is not None]
+
+    def _flows(self):
+        """(date, amount) tuples from JNLC — the one place the row → tuple
+        conversion convention lives (deposit positive)."""
+        return [(r["flow_date"], float(r["amount"])) for r in self.get_cash_flows()]
+
+    def get_portfolio_returns(self, current_nlv: Optional[float] = None,
+                              nlv_source: str = "live") -> Dict[str, Any]:
+        """Account-level XIRR / TWR / drawdown from flows + equity history.
+
+        ``current_nlv`` (from the live bot proxy) REPLACES any same-date
+        equity row rather than appending (a duplicate date would create a
+        zero-length TWR sub-period). When None, the last equity row is the
+        terminal point and ``nlv_source`` should say so.
+        """
+        from datetime import date as _date
+        from services import returns as R
+
+        flows = self._flows()
+        equity = self._equity_points()
+
+        today = _date.today()
+        if current_nlv is not None:
+            equity = [(d, v) for d, v in equity if d != today]
+            equity.append((today, float(current_nlv)))
+        equity.sort()
+
+        terminal = equity[-1] if equity else None
+        first_deposit = min((d for d, _ in flows), default=None)
+        days_running = (terminal[0] - first_deposit).days if terminal and first_deposit else None
+
+        xirr_val = R.xirr(flows, terminal) if terminal and flows else None
+        twr_val = R.twr(equity, flows)
+        dd = R.max_drawdown(equity, flows)
+        dd_dollars = R.dollar_drawdown(equity, flows)
+
+        return {
+            "xirr": xirr_val,
+            "twr_cumulative": twr_val,
+            "twr_annualized": R.annualize(twr_val, days_running) if days_running else None,
+            "max_drawdown": dd["max_dd"],
+            "max_drawdown_peak": str(dd["max_dd_peak"]) if dd["max_dd_peak"] else None,
+            "max_drawdown_trough": str(dd["max_dd_trough"]) if dd["max_dd_trough"] else None,
+            "current_drawdown": dd["current_dd"],
+            "max_drawdown_dollars": dd_dollars["max_dd_dollars"],
+            "current_drawdown_dollars": dd_dollars["current_dd_dollars"],
+            "days_since_first_deposit": days_running,
+            "deposit_count": len(flows),
+            # Single-deposit accounts: XIRR is algebraically the CAGR since
+            # inception — the label must say so (review F9).
+            "single_deposit": len(flows) <= 1,
+            "nlv_source": nlv_source if current_nlv is not None else "last equity row (live proxy unavailable)",
+            "as_of": str(terminal[0]) if terminal else None,
+        }
+
+    def get_equity_curve_indexed(self, days: int = 3650) -> List[Dict[str, Any]]:
+        """TWR-indexed wheel curve vs SPY price index, base 100 at window start.
+
+        Caption context (frontend renders it): SPY is price-only (understates
+        buy-and-hold by ~1.2%/yr of dividends) and the paper account credits
+        0% on idle cash where a live account would earn T-bill yield.
+        """
+        from services import returns as R
+
+        flows = self._flows()
+        equity = self._equity_points(days=days)
+        wheel_series = R.twr_series(equity, flows)
+        wheel = {d.isoformat() if hasattr(d, "isoformat") else str(d): round(v, 4)
+                 for d, v in wheel_series}
+
+        spy_rows = self.get_stock_history(BENCHMARK_SYMBOL, days=days)
+        window_start = equity[0][0] if equity else None
+        spy_rows = [r for r in spy_rows if window_start is None or r["date"] >= window_start]
+        spy = {}
+        if spy_rows:
+            base = float(spy_rows[0]["close"])
+            if base > 0:
+                spy = {str(r["date"]): round(100.0 * float(r["close"]) / base, 4)
+                       for r in spy_rows}
+
+        dates = sorted(set(wheel) | set(spy))
+        return [{"date": d, "wheel": wheel.get(d), "benchmark": spy.get(d)} for d in dates]
+
+    def get_monthly_cashflow(self, months: int = 24) -> List[Dict[str, Any]]:
+        """Net option cash flow by month from the FC-031 view. Memoized 300s
+        — monthly aggregates move at ingest cadence, not page-load cadence."""
+        return self._memo(f"monthly_cashflow:{months}", 300,
+                          lambda: self._monthly_cashflow_uncached(months))
+
+    def _monthly_cashflow_uncached(self, months: int) -> List[Dict[str, Any]]:
+        try:
+            query = f"""
+            SELECT month, net_option_cashflow, put_net_cashflow, call_net_cashflow,
+                   gross_premium, buyback_cost, event_count
+            FROM `{self.dataset}.fc031_monthly_option_cashflow`
+            ORDER BY month DESC
+            LIMIT {int(months)}
+            """
+            rows = self._run_query(query)
+            rows.reverse()
+            return rows
+        except Exception:
+            logger.info("monthly_option_cashflow query failed — returning empty list")
+            return []
+
+    def _overlapping_lot_symbols(self) -> List[str]:
+        """Symbols that ever held >1 concurrent 100-share lot.
+
+        Their per-cycle rows are mis-paired until FC-020 lands; they are
+        EXCLUDED from cycle aggregates (and the exclusion disclosed) rather
+        than fabricating expectancy from known-wrong rows (review F3).
+        """
+        try:
+            rows = self._run_query(f"""
+                SELECT underlying
+                FROM `{self.dataset}.fc018_acb_timeline_per_symbol`
+                GROUP BY underlying
+                HAVING MAX(running_shares) > 100
+            """)
+            return [r["underlying"] for r in rows]
+        except Exception:
+            return []
+
+    def get_wheel_cycle_stats(self, days: int = 3650) -> Dict[str, Any]:
+        """Closed-wheel-cycle win rate / expectancy, with disclosures.
+
+        - Overlapping-lot symbols excluded (FC-020 mis-pairing) and counted.
+        - Open cycles reported beside closed stats with their MTM-to-date so
+          survivorship is visible (losing cycles stay open longest).
+        - FC-029 before/after regime split on the cycle's put date.
+        """
+        def _empty(excluded_syms):
+            # Full CycleStats shape — a truncated failure payload crashes the
+            # frontend card (review C2: regime_post_fc029 dereference).
+            zero = {"count": 0, "win_rate": None, "avg_win": None,
+                    "avg_loss": None, "expectancy": None,
+                    "pnl_per_collateral_day": None}
+            return {
+                **zero,
+                "closed_count": 0,
+                "open_count": 0,
+                "open_mtm_to_date": 0.0,
+                "excluded_overlapping_symbols": excluded_syms,
+                "regime_pre_fc029": zero,
+                "regime_post_fc029": zero,
+                "fc029_deploy_date": self.FC029_DEPLOY_DATE,
+            }
+
+        excluded = self._overlapping_lot_symbols()
+        excl_list = ", ".join(f"'{s}'" for s in excluded) or "''"
+        try:
+            closed = self._run_query(f"""
+                SELECT
+                    underlying,
+                    put_date,
+                    COALESCE(total_premium, 0) + COALESCE(capital_gain, 0) AS cycle_pnl,
+                    put_strike * 100 * ABS(COALESCE(shares, 100) / 100) AS collateral,
+                    GREATEST(COALESCE(duration_days, 1), 1) AS duration_days
+                FROM `{self.dataset}.wheel_cycles_from_activities`
+                WHERE call_date IS NOT NULL
+                  AND underlying NOT IN ({excl_list})
+                  AND assignment_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {int(days)} DAY)
+            """)
+            open_rows = self._run_query(f"""
+                SELECT
+                    c.underlying,
+                    COALESCE(c.total_premium, 0) + COALESCE(c.capital_gain, 0) AS cash_to_date,
+                    bh.current_shares,
+                    bh.price_now
+                FROM `{self.dataset}.wheel_cycles_from_activities` c
+                LEFT JOIN `{self.dataset}.fc018_vs_buy_and_hold_per_symbol` bh
+                    ON bh.underlying = c.underlying
+                WHERE c.call_date IS NULL
+                  AND c.underlying NOT IN ({excl_list})
+            """)
+        except Exception:
+            logger.info("wheel_cycle_stats queries failed")
+            return _empty(excluded)
+
+        def _stats(rows):
+            pnls = [float(r["cycle_pnl"]) for r in rows]
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p <= 0]
+            n = len(pnls)
+            win_rate = len(wins) / n if n else None
+            avg_win = sum(wins) / len(wins) if wins else None
+            avg_loss = sum(losses) / len(losses) if losses else None
+            expectancy = (sum(pnls) / n) if n else None
+            # ONLY permitted aggregate rate: Σ P&L / Σ collateral-days
+            # (averaging per-cycle ratios re-imports the annualization
+            # lie — review F11).
+            coll_days = sum(float(r["collateral"]) * float(r["duration_days"]) for r in rows)
+            per_dollar_day = (sum(pnls) / coll_days) if coll_days > 0 else None
+            return {
+                "count": n, "win_rate": win_rate, "avg_win": avg_win,
+                "avg_loss": avg_loss, "expectancy": expectancy,
+                "pnl_per_collateral_day": per_dollar_day,
+            }
+
+        # MTM for open cycles: cash-to-date already expensed acquisition, so
+        # add full share market value once per symbol (convention: F1).
+        seen_symbols = set()
+        open_mtm = 0.0
+        for r in open_rows:
+            open_mtm += float(r["cash_to_date"] or 0)
+            sym = r["underlying"]
+            if sym not in seen_symbols:
+                seen_symbols.add(sym)
+                shares = float(r["current_shares"] or 0)
+                price = float(r["price_now"] or 0)
+                if shares > 0 and price > 0:
+                    open_mtm += shares * price
+
+        pre = [r for r in closed if str(r["put_date"]) < self.FC029_DEPLOY_DATE]
+        post = [r for r in closed if str(r["put_date"]) >= self.FC029_DEPLOY_DATE]
+
+        return {
+            **_stats(closed),
+            "closed_count": len(closed),
+            "open_count": len(open_rows),
+            "open_mtm_to_date": round(open_mtm, 2) if open_rows else 0.0,
+            "excluded_overlapping_symbols": excluded,
+            "regime_pre_fc029": _stats(pre),
+            "regime_post_fc029": _stats(post),
+            "fc029_deploy_date": self.FC029_DEPLOY_DATE,
+        }
+
+    # Static fallbacks for the delta bands; the router passes the live values
+    # from the bot's /config when reachable (Wheel Strategy Symmetry
+    # Principle + review AL1 — one source of truth for strategy parameters).
+    DEFAULT_PUT_DELTA_BAND = [0.10, 0.20]
+    DEFAULT_CALL_DELTA_BAND = [0.15, 0.25]   # FC-029 R1
+
+    def get_option_trade_stats(self, option_type: str, days: int = 3650,
+                               delta_band: Optional[List[float]] = None) -> Dict[str, Any]:
+        """Per-leg trade stats, reported SEPARATELY from cycle stats — for
+        BOTH puts and calls (Wheel Strategy Symmetry Principle).
+
+        Blending legs into one "campaign win rate" re-imports the banned
+        per-contract delta artifact (review F4). The calibration stat is
+        held-to-expiry only — early closes never faced the expiry lottery
+        (review F5): puts calibrate assignment rate vs |put delta|, calls
+        calibrate called-away rate vs |call delta|.
+        """
+        exercised_outcome = "assignment" if option_type == "put" else "called_away"
+        band = delta_band or (self.DEFAULT_PUT_DELTA_BAND if option_type == "put"
+                              else self.DEFAULT_CALL_DELTA_BAND)
+        empty = {
+            "option_type": option_type,
+            "closed_count": 0, "win_rate": None, "net_pnl": None,
+            "exercised_count": 0, "expiration_count": 0, "early_close_count": 0,
+            "pct_closed_early": None, "exercise_rate_held_to_expiry": None,
+            "delta_band": band,
+        }
+        try:
+            from google.cloud.bigquery import ScalarQueryParameter
+            rows = self._run_query(f"""
+                SELECT
+                    outcome,
+                    COUNT(*) AS n,
+                    COUNTIF(COALESCE(realized_pnl, 0) > 0) AS wins,
+                    SUM(COALESCE(realized_pnl, 0)) AS pnl
+                FROM `{self.dataset}.trades_with_outcomes`
+                WHERE option_type = @option_type
+                  AND outcome != 'open'
+                  AND DATE(transaction_time, 'America/New_York')
+                      >= DATE_SUB(CURRENT_DATE(), INTERVAL @days DAY)
+                GROUP BY outcome
+            """, params=[
+                ScalarQueryParameter("option_type", "STRING", option_type),
+                ScalarQueryParameter("days", "INT64", days),
+            ])
+        except Exception:
+            logger.info(f"option_trade_stats query failed for {option_type}")
+            return empty
+
+        by = {r["outcome"]: r for r in rows}
+        n_exercised = int(by.get(exercised_outcome, {}).get("n", 0) or 0)
+        n_expire = int(by.get("expiration", {}).get("n", 0) or 0)
+        n_early = int(by.get("early_close", {}).get("n", 0) or 0)
+        closed_unexercised = [by[o] for o in ("expiration", "early_close") if o in by]
+        n_closed = sum(int(r["n"]) for r in closed_unexercised)
+        wins = sum(int(r["wins"]) for r in closed_unexercised)
+        pnl = sum(float(r["pnl"] or 0) for r in closed_unexercised)
+        held_to_expiry = n_exercised + n_expire
+
+        return {
+            "option_type": option_type,
+            "closed_count": n_closed,
+            "win_rate": (wins / n_closed) if n_closed else None,
+            "net_pnl": pnl,
+            "exercised_count": n_exercised,
+            "expiration_count": n_expire,
+            "early_close_count": n_early,
+            "pct_closed_early": ((n_early / (n_early + held_to_expiry))
+                                 if (n_early + held_to_expiry) else None),
+            "exercise_rate_held_to_expiry": ((n_exercised / held_to_expiry)
+                                             if held_to_expiry else None),
+            "delta_band": band,
+        }
+
+    def get_reconciliation(self, current_nlv: Optional[float],
+                           live_positions: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+        """Falsifiable broker-vs-ledger reconciliation (review F6/F15).
+
+        Identity: NLV − deposits = closed net cash P&L + open-option premium
+        + fees + market value of live positions (stocks + options, signed).
+        Residual ≈ 0 unless the BQ ledger disagrees with the broker — missed
+        activities or paper-engine anomalies, which is what this detects.
+        """
+        baseline = self.get_account_baseline()
+        deposits = float(baseline.get("starting_capital") or 0)
+        fees = self.get_fees_total()
+
+        # One query for both the ledger sums and the per-symbol share counts
+        # (was two round-trips against the same view — review E3).
+        view_rows: List[Dict[str, Any]] = []
+        try:
+            view_rows = self._run_query(f"""
+                SELECT underlying,
+                       COALESCE(current_shares, 0) AS current_shares,
+                       COALESCE(total_realized_pnl, 0) AS total_realized_pnl,
+                       COALESCE(open_option_premium, 0) AS open_option_premium
+                FROM `{self.dataset}.fc018_per_symbol_scorecard`
+            """)
+        except Exception:
+            pass
+        realized_cash = sum(float(r["total_realized_pnl"]) for r in view_rows)
+        open_premium = sum(float(r["open_option_premium"]) for r in view_rows)
+
+        live_mv = None
+        live_shares_by_symbol: Dict[str, float] = {}
+        if live_positions is not None:
+            live_mv = 0.0
+            for p in live_positions:
+                try:
+                    live_mv += float(p.get("market_value") or 0)
+                except (TypeError, ValueError):
+                    continue
+                sym = str(p.get("symbol") or "")
+                # Stock rows: plain ticker (no OCC digits tail)
+                if sym and not any(c.isdigit() for c in sym):
+                    try:
+                        live_shares_by_symbol[sym] = (
+                            live_shares_by_symbol.get(sym, 0.0)
+                            + float(p.get("qty") or 0))
+                    except (TypeError, ValueError):
+                        pass
+
+        # View-vs-live share count mismatches (the AMD anomaly surface).
+        mismatches: List[Dict[str, Any]] = []
+        if live_positions is not None:
+            view_by = {r["underlying"]: float(r["current_shares"])
+                       for r in view_rows if float(r["current_shares"]) != 0}
+            for sym in set(view_by) | set(live_shares_by_symbol):
+                v = view_by.get(sym, 0.0)
+                live_qty = live_shares_by_symbol.get(sym, 0.0)
+                if v != live_qty:
+                    mismatches.append(
+                        {"symbol": sym, "view_shares": v, "live_shares": live_qty})
+
+        residual = None
+        status = "unknown"
+        known_total = sum(g["amount"] for g in self.KNOWN_RECONCILIATION_GAPS)
+        if current_nlv is not None and live_mv is not None:
+            residual = (float(current_nlv) - deposits) - (
+                realized_cash + open_premium + fees + live_mv)
+            threshold = max(500.0, 0.005 * float(current_nlv))
+            net = residual - known_total
+            known_syms = {g["symbol"] for g in self.KNOWN_RECONCILIATION_GAPS}
+            new_mismatch = any(m["symbol"] not in known_syms for m in mismatches)
+            stale_gap = any(g["symbol"] not in {m["symbol"] for m in mismatches}
+                            for g in self.KNOWN_RECONCILIATION_GAPS)
+            status = "warn" if (abs(net) > threshold or new_mismatch or stale_gap) else "ok"
+
+        return {
+            "nlv": current_nlv,
+            "deposits": deposits,
+            "deposits_source": baseline.get("source"),
+            "realized_cash_pnl": realized_cash,
+            "open_option_premium": open_premium,
+            "fees": fees,
+            "live_market_value": live_mv,
+            "residual": residual,
+            "residual_net_of_known_gaps": ((residual - known_total)
+                                           if residual is not None else None),
+            "known_gaps": self.KNOWN_RECONCILIATION_GAPS,
+            "share_count_mismatches": mismatches,
+            "status": status,
+        }
+
+    def get_bot_anomalies(self) -> List[Dict[str, Any]]:
+        """Bot-health anomaly flags on an INDEPENDENT trading calendar.
+
+        The calendar comes from benchmark bars (stock_history_from_alpaca),
+        not from the scheduler's own events — a totally dead scheduler must
+        still light up "zero scans on a trading day" (review F7). Memoized
+        300s: the inputs (daily bars, daily rollups) change once a day.
+        """
+        return self._memo("bot_anomalies", 300, self._bot_anomalies_uncached)
+
+    def _bot_anomalies_uncached(self) -> List[Dict[str, Any]]:
+        flags: List[Dict[str, Any]] = []
+
+        # Trading days (benchmark bars), most recent first. Bars land at
+        # 17:00 ET, so "today" is naturally excluded until after the close —
+        # no intraday false positives.
+        try:
+            from google.cloud.bigquery import ScalarQueryParameter
+            cal_rows = self._run_query(f"""
+                SELECT date FROM `{self.dataset}.stock_history_from_alpaca`
+                WHERE symbol = @benchmark
+                ORDER BY date DESC LIMIT 10
+            """, params=[ScalarQueryParameter("benchmark", "STRING", BENCHMARK_SYMBOL)])
+            trading_days = [str(r["date"]) for r in cal_rows]
+            calendar_source = f"{BENCHMARK_SYMBOL} bars"
+        except Exception:
+            trading_days = []
+            calendar_source = "unavailable"
+        if not trading_days:
+            # Fallback: self-derived calendar, labeled (blind to total outage).
+            try:
+                cal_rows = self._run_query(f"""
+                    SELECT DISTINCT DATE(timestamp, 'America/New_York') AS date
+                    FROM `{self.dataset}.executions`
+                    ORDER BY date DESC LIMIT 10
+                """)
+                trading_days = [str(r["date"]) for r in cal_rows]
+                calendar_source = (f"self-derived ({BENCHMARK_SYMBOL} bars unavailable "
+                                   "— blind to total outage)")
+            except Exception:
+                pass
+
+        # Daily scan/order counts.
+        daily = {}
+        try:
+            for r in self._run_query(f"""
+                SELECT DATE(timestamp, 'America/New_York') AS date,
+                       SUM(scan_count) AS scans, SUM(trades_executed) AS orders
+                FROM `{self.dataset}.executions`
+                WHERE DATE(timestamp, 'America/New_York')
+                      >= DATE_SUB(CURRENT_DATE(), INTERVAL 45 DAY)
+                GROUP BY date
+            """):
+                daily[str(r["date"])] = r
+        except Exception:
+            pass
+
+        recent = trading_days[:7]
+        zero_scan_days = [d for d in recent
+                          if float((daily.get(d) or {}).get("scans") or 0) == 0]
+        if zero_scan_days:
+            flags.append({
+                "severity": "critical",
+                "code": "zero_scan_trading_days",
+                "message": f"No scans on {len(zero_scan_days)} of the last "
+                           f"{len(recent)} trading days ({calendar_source})",
+                "since": min(zero_scan_days),
+                "evidence": zero_scan_days,
+            })
+
+        streak_days = trading_days[:3]
+        if streak_days and all(
+                float((daily.get(d) or {}).get("scans") or 0) > 0
+                and float((daily.get(d) or {}).get("orders") or 0) == 0
+                for d in streak_days):
+            flags.append({
+                "severity": "warning",
+                "code": "no_orders_streak",
+                "message": "Scans ran but zero orders placed for the last "
+                           f"{len(streak_days)} trading days",
+                "since": min(streak_days),
+                "evidence": streak_days,
+            })
+
+        # Gate 100%-block streaks: any stage fully blocking for the last 3
+        # trading days that passed >0 candidates over the trailing 30d.
+        try:
+            gate_rows = self._run_query(f"""
+                WITH daily AS (
+                    SELECT DATE(timestamp, 'America/New_York') AS date, stage,
+                           COUNTIF(result = 'pass') AS passed,
+                           COUNTIF(result = 'fail') AS blocked
+                    FROM `{self.dataset}.scans`
+                    WHERE DATE(timestamp, 'America/New_York')
+                          >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+                      AND stage IS NOT NULL
+                    GROUP BY date, stage
+                )
+                SELECT stage,
+                       SUM(passed) AS passed_30d,
+                       COUNTIF(passed = 0 AND blocked > 0
+                               AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 5 DAY))
+                         AS full_block_days_recent
+                FROM daily
+                GROUP BY stage
+                HAVING passed_30d > 0 AND full_block_days_recent >= 3
+            """)
+            for r in gate_rows:
+                flags.append({
+                    "severity": "warning",
+                    "code": "gate_full_block_streak",
+                    "message": f"Stage '{r['stage']}' blocked 100% of candidates on "
+                               f"{r['full_block_days_recent']} recent days despite a "
+                               "non-zero 30d pass baseline",
+                    "since": None,
+                    "evidence": {"stage": r["stage"]},
+                })
+        except Exception:
+            pass
+
+        # Ingest staleness with per-job thresholds.
+        from datetime import datetime, timezone, timedelta
+        ingest = self.get_ingest_health()
+        thresholds = {
+            "trades_from_activities": timedelta(hours=6),
+            "equity_history_from_alpaca": timedelta(hours=78),
+            "stock_history_from_alpaca": timedelta(hours=78),
+        }
+        now = datetime.now(timezone.utc)
+        for table, last in ingest.items():
+            limit = thresholds.get(table)
+            if limit is None:
+                continue
+            if last is None:
+                flags.append({"severity": "warning", "code": "ingest_never_ran",
+                              "message": f"{table}: no rows ever ingested",
+                              "since": None, "evidence": None})
+                continue
+            try:
+                # TypeError guard: a naive timestamp minus aware `now` raises
+                # TypeError, not ValueError (review A10).
+                age = now - datetime.fromisoformat(last.replace("Z", "+00:00"))
+                if age > limit:
+                    flags.append({
+                        "severity": "warning", "code": "ingest_stale",
+                        "message": f"{table}: last ingest {int(age.total_seconds() // 3600)}h ago "
+                                   f"(threshold {int(limit.total_seconds() // 3600)}h)",
+                        "since": last, "evidence": None,
+                    })
+            except (ValueError, TypeError):
+                pass
+
+        return flags
+
+    def get_optrd_events(self, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Raw OPTRD share events, oldest first (input to the FIFO lot walk).
+
+        ``symbols`` restricts the scan — callers should pass the symbols they
+        actually hold instead of scanning all history (review E1/E2).
+        """
+        where = "AND symbol IN UNNEST(@symbols)" if symbols else ""
+        query = f"""
+        SELECT symbol, transaction_time, qty, price, net_amount
+        FROM `{self.dataset}.trades_from_activities`
+        WHERE activity_type = 'OPTRD' AND symbol IS NOT NULL AND symbol != ''
+        {where}
+        ORDER BY transaction_time ASC
+        """
+        try:
+            from google.cloud.bigquery import ArrayQueryParameter
+            params = ([ArrayQueryParameter("symbols", "STRING", symbols)]
+                      if symbols else None)
+            return self._run_query(query, params=params)
+        except Exception:
+            logger.info("optrd_events query failed — returning empty list")
+            return []
+
+    def get_open_lot_bases(self, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+        """FIFO open-lot basis per symbol (display/breakeven only).
+
+        Memoized 60s — lot state changes a few times a day at most, while the
+        scorecard is fetched on every Overview load and range click.
+        """
+        key = f"open_lot_bases:{','.join(sorted(symbols)) if symbols else '*'}"
+        return self._memo(key, 60, lambda: self._open_lot_bases_uncached(symbols))
+
+    def _open_lot_bases_uncached(self, symbols: Optional[List[str]]) -> Dict[str, Dict[str, Any]]:
+        from services.lots import open_lot_basis
+        events = self.get_optrd_events(symbols=symbols)
+        by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        for ev in events:
+            by_symbol.setdefault(ev["symbol"], []).append(ev)
+        out = {}
+        for sym, evs in by_symbol.items():
+            basis = open_lot_basis(evs)
+            basis["acquired_at"] = (str(basis["acquired_at"])
+                                    if basis["acquired_at"] else None)
+            out[sym] = basis
+        return out
+
+    def get_drawdown_pauses(self, live_positions: Optional[List[Dict[str, Any]]],
+                            threshold: float,
+                            threshold_source: str) -> Dict[str, Any]:
+        """Symbols the R3 drawdown pause is (inferred to be) blocking.
+
+        Inferred from prices, not bot telemetry — labeled as such in the UI.
+        Reference price = latest OPASN put strike (what the bot compares
+        against per FC-029), shares from LIVE positions, pause window bounded
+        at the open lot's acquisition date (review F8).
+        """
+        held: Dict[str, float] = {}
+        if live_positions:
+            for p in live_positions:
+                sym = str(p.get("symbol") or "")
+                if sym and not any(c.isdigit() for c in sym):
+                    try:
+                        qty = float(p.get("qty") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if qty > 0:
+                        held[sym] = held.get(sym, 0.0) + qty
+
+        # View-vs-live share mismatches surface here too (the AMD anomaly is
+        # invisible as a pause row because live shares are 0 — the badge is
+        # the only trace; review C3).
+        mismatches: List[Dict[str, Any]] = []
+        try:
+            view_rows = self._run_query(f"""
+                SELECT underlying, current_shares
+                FROM `{self.dataset}.fc018_per_symbol_scorecard`
+                WHERE COALESCE(current_shares, 0) != 0
+            """)
+            view_by = {r["underlying"]: float(r["current_shares"] or 0) for r in view_rows}
+            if live_positions is not None:
+                for sym in set(view_by) | set(held):
+                    v = view_by.get(sym, 0.0)
+                    live_qty = held.get(sym, 0.0)
+                    if v != live_qty:
+                        mismatches.append(
+                            {"symbol": sym, "view_shares": v, "live_shares": live_qty})
+        except Exception:
+            pass
+
+        result = {"threshold": threshold, "threshold_source": threshold_source,
+                  "paused": [], "share_count_mismatches": mismatches}
+        if not held:
+            return result
+
+        from google.cloud.bigquery import ArrayQueryParameter
+        held_syms = sorted(held)
+        try:
+            strikes = {r["underlying"]: float(r["strike"])
+                       for r in self._run_query(f"""
+                SELECT underlying,
+                       ARRAY_AGG(strike_price ORDER BY transaction_time DESC LIMIT 1)[OFFSET(0)] AS strike
+                FROM `{self.dataset}.trades_from_activities`
+                WHERE activity_type = 'OPASN' AND option_type = 'put'
+                  AND underlying IN UNNEST(@symbols)
+                GROUP BY underlying
+            """, params=[ArrayQueryParameter("symbols", "STRING", held_syms)])
+                       if r.get("strike") is not None}
+        except Exception:
+            strikes = {}
+
+        lot_bases = {}
+        try:
+            lot_bases = self.get_open_lot_bases(symbols=held_syms)
+        except Exception:
+            pass
+
+        # One batched bars query for every held symbol (was one query per
+        # symbol — review E2's N+1).
+        bars_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            bar_rows = self._run_query(f"""
+                SELECT symbol, date, close
+                FROM `{self.dataset}.stock_history_from_alpaca`
+                WHERE symbol IN UNNEST(@symbols)
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) <= 90
+                ORDER BY symbol, date DESC
+            """, params=[ArrayQueryParameter("symbols", "STRING", held_syms)])
+            for r in bar_rows:
+                bars_by_symbol.setdefault(r["symbol"], []).append(r)
+        except Exception:
+            pass
+
+        for sym, qty in held.items():
+            ref = strikes.get(sym)
+            if not ref or ref <= 0:
+                continue
+            pause_floor = (1.0 - threshold) * ref
+            acquired = (lot_bases.get(sym) or {}).get("acquired_at")
+            acquired_date = str(acquired)[:10] if acquired else "1900-01-01"
+            bars = [b for b in bars_by_symbol.get(sym, [])
+                    if str(b["date"]) >= acquired_date]
+            if not bars:
+                continue
+            latest = bars[0]
+            if float(latest["close"]) >= pause_floor:
+                continue
+            days_paused = 0
+            for b in bars:
+                if float(b["close"]) < pause_floor:
+                    days_paused += 1
+                else:
+                    break
+            result["paused"].append({
+                "symbol": sym,
+                "shares": qty,
+                "assignment_strike": ref,
+                "pause_floor": round(pause_floor, 2),
+                "last_close": float(latest["close"]),
+                "last_close_date": str(latest["date"]),
+                "trading_days_paused": days_paused,
+                "pct_below_strike": round(1.0 - float(latest["close"]) / ref, 4),
+            })
+
+        return result
 
 
 # Singleton instance

@@ -7,12 +7,56 @@ will drop the `v2` prefix and retire any legacy endpoints that are no
 longer consumed.
 """
 
+import os
+
 from fastapi import APIRouter, HTTPException, Query
 from typing import List, Dict, Any, Optional
 
 from services.bigquery import get_bigquery_service
 
 router = APIRouter()
+
+
+# ----------------------------------------------------------------------
+# Live-bot proxy helpers (soft-fail: FC-031 endpoints degrade with a
+# labeled fallback instead of 5xx when the bot is unreachable). These wrap
+# the canonical handlers in routers/live.py — one copy of the response
+# normalization, plus the soft-fail behavior these endpoints need.
+# ----------------------------------------------------------------------
+
+async def _live_nlv() -> Optional[float]:
+    try:
+        from routers.live import get_account
+        account = await get_account()
+        v = account.get("portfolio_value")
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+async def _live_positions() -> Optional[List[Dict[str, Any]]]:
+    try:
+        from routers.live import get_positions
+        return await get_positions()
+    except Exception:
+        return None
+
+
+async def _bot_config() -> Dict[str, Any]:
+    try:
+        from routers.live import get_config
+        return await get_config()
+    except Exception:
+        return {}
+
+
+async def _drawdown_pause_threshold() -> tuple:
+    """Single source of truth: the bot's own /config (review F8)."""
+    cfg = await _bot_config()
+    v = cfg.get("call_drawdown_pause_threshold")
+    if v is not None:
+        return float(v), "bot /config"
+    return float(os.getenv("DRAWDOWN_PAUSE_THRESHOLD", "0.05")), "env fallback"
 
 
 # ----------------------------------------------------------------------
@@ -132,3 +176,102 @@ async def bot_health_ingest() -> Dict[str, Any]:
     """
     bq = get_bigquery_service()
     return bq.get_ingest_health()
+
+
+# ----------------------------------------------------------------------
+# FC-031 — portfolio returns, reconciliation, cycle/put stats, bot health
+# ----------------------------------------------------------------------
+
+@router.get("/portfolio/returns")
+async def portfolio_returns() -> Dict[str, Any]:
+    """XIRR / TWR / max drawdown ($ and %) from JNLC flows + equity history.
+
+    Live NLV replaces any same-date equity row; falls back to the last
+    equity row (labeled in nlv_source) when the bot proxy is unreachable.
+    """
+    bq = get_bigquery_service()
+    nlv = await _live_nlv()
+    return bq.get_portfolio_returns(current_nlv=nlv)
+
+
+@router.get("/portfolio/equity-curve")
+async def portfolio_equity_curve(
+    days: int = Query(default=3650, ge=7, le=3650),
+) -> List[Dict[str, Any]]:
+    """TWR-indexed account curve vs SPY price index (base 100)."""
+    bq = get_bigquery_service()
+    return bq.get_equity_curve_indexed(days=days)
+
+
+@router.get("/cycle-stats")
+async def cycle_stats(
+    days: int = Query(default=3650, ge=1, le=3650),
+) -> Dict[str, Any]:
+    """Closed-wheel-cycle win rate / expectancy with FC-020 exclusions
+    disclosed, open-cycle MTM shown, and an FC-029 regime split."""
+    bq = get_bigquery_service()
+    return bq.get_wheel_cycle_stats(days=days)
+
+
+@router.get("/put-stats")
+async def put_stats(
+    days: int = Query(default=3650, ge=1, le=3650),
+) -> Dict[str, Any]:
+    """Unassigned-put stats (separate from cycle stats) + held-to-expiry
+    assignment rate vs the put delta band."""
+    bq = get_bigquery_service()
+    cfg = await _bot_config()
+    return bq.get_option_trade_stats("put", days=days,
+                                     delta_band=cfg.get("put_delta_range"))
+
+
+@router.get("/call-stats")
+async def call_stats(
+    days: int = Query(default=3650, ge=1, le=3650),
+) -> Dict[str, Any]:
+    """Call-trade stats — the symmetric twin of /put-stats (Wheel Strategy
+    Symmetry Principle): held-to-expiry CALLED-AWAY rate vs the call delta
+    band, the calibration that matters most post-FC-029."""
+    bq = get_bigquery_service()
+    cfg = await _bot_config()
+    return bq.get_option_trade_stats("call", days=days,
+                                     delta_band=cfg.get("call_delta_range"))
+
+
+@router.get("/reconciliation")
+async def reconciliation() -> Dict[str, Any]:
+    """Broker-vs-ledger reconciliation identity with residual + known gaps."""
+    import asyncio
+    bq = get_bigquery_service()
+    nlv, positions = await asyncio.gather(_live_nlv(), _live_positions())
+    return bq.get_reconciliation(current_nlv=nlv, live_positions=positions)
+
+
+@router.get("/monthly-cashflow")
+async def monthly_cashflow(
+    months: int = Query(default=24, ge=1, le=120),
+) -> List[Dict[str, Any]]:
+    """Net option cash flow by month (put/call split, gross in payload)."""
+    bq = get_bigquery_service()
+    return bq.get_monthly_cashflow(months=months)
+
+
+@router.get("/bot-health/anomalies")
+async def bot_health_anomalies() -> List[Dict[str, Any]]:
+    """Anomaly flags on the SPY-bar trading calendar (independent of the
+    scheduler, so a totally dead scheduler still lights up)."""
+    bq = get_bigquery_service()
+    return bq.get_bot_anomalies()
+
+
+@router.get("/bot-health/drawdown-pauses")
+async def bot_health_drawdown_pauses() -> Dict[str, Any]:
+    """Symbols the R3 drawdown pause is inferred to be blocking (assignment-
+    strike referenced, live share counts; labeled inferred-not-telemetry)."""
+    import asyncio
+    bq = get_bigquery_service()
+    positions, (threshold, source) = await asyncio.gather(
+        _live_positions(), _drawdown_pause_threshold())
+    return bq.get_drawdown_pauses(live_positions=positions,
+                                  threshold=threshold,
+                                  threshold_source=source)

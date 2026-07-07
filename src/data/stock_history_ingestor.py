@@ -36,6 +36,15 @@ except ImportError:
 TABLE_NAME = "stock_history_from_alpaca"
 DEFAULT_BACKFILL_DAYS = 365
 
+# FC-031: always ingest benchmark bars alongside traded symbols. The
+# benchmark powers the Overview comparison curve and doubles as the
+# independent trading-day calendar for bot-health anomaly detection (a day
+# with a benchmark bar and zero scans is a missed trading day even if the
+# scheduler died completely). Same env var as the dashboard backend
+# (dashboard/backend/services/bigquery.py BENCHMARK_SYMBOL) — one setting,
+# two deployables, no drift.
+BENCHMARK_SYMBOLS = [os.getenv("BENCHMARK_SYMBOL", "SPY")]
+
 
 if _HAS_BIGQUERY:
     _SCHEMA = [
@@ -125,7 +134,7 @@ class StockHistoryIngestor:
     # ------------------------------------------------------------------
 
     def _traded_universe(self) -> List[str]:
-        """Distinct underlyings we've actually traded."""
+        """Distinct underlyings we've actually traded, plus benchmark symbols."""
         if not self._enabled:
             return []
         query = f"""
@@ -134,13 +143,16 @@ class StockHistoryIngestor:
             WHERE underlying IS NOT NULL AND underlying != ''
         """
         try:
-            return [row["underlying"] for row in self._client.query(query).result()]
+            traded = [row["underlying"] for row in self._client.query(query).result()]
         except Exception:
             logger.warning("Universe query failed",
                            event_category="error",
                            event_type="stock_history_ingest_universe_failed",
                            exc_info=True)
-            return []
+            traded = []
+        # Benchmarks ride along even when the traded query fails — the
+        # anomaly calendar must not depend on trade history being readable.
+        return sorted(set(traded) | set(BENCHMARK_SYMBOLS))
 
     def _max_date_per_symbol(self, symbols: List[str]) -> Dict[str, date]:
         """For each symbol, return the most recent date we've already ingested."""
