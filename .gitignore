@@ -46,6 +46,10 @@ backtest_results_*.json
 *.xlsx
 plots/
 
+# Backtesting local artifacts (FC-032) — generated, never committed
+cache/
+backtest_results/
+
 # Temporary files
 .DS_Store
 .AppleDouble
