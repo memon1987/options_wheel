@@ -109,7 +109,6 @@ def main():
         "utils.config",
         "api.alpaca_client",
         "strategy.wheel_engine",
-        "backtesting.backtest_engine",
         "risk.risk_manager",
     ]
     
@@ -144,7 +143,6 @@ def main():
         
         print(f"\n🚀 READY TO USE:")
         print(f"   - Live trading: python main.py --command scan")
-        print(f"   - Backtesting: python demo_backtest.py")
         print(f"   - Run tests: python -m pytest tests/ -v")
         
         return 0

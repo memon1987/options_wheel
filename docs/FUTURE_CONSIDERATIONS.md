@@ -356,7 +356,7 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ### FC-032: Backtesting engine overhaul — symbol wheel-fitness evaluation
 
-**Status:** Plan drafted
+**Status:** Executing (Phase 0 done)
 **Size estimate:** L
 **Owner:** zeshan
 **Plan file:** `docs/plans/fc-032.md`

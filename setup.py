@@ -63,7 +63,6 @@ setup(
     entry_points={
         "console_scripts": [
             "options-wheel=main:main",
-            "wheel-backtest=backtest_runner:main",
         ],
     },
     include_package_data=True,

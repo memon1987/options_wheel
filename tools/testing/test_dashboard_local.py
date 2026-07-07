@@ -61,25 +61,6 @@ def test_dashboard_functionality():
         print(f"❌ Error: {e}")
         return False
 
-def test_cloud_storage():
-    """Test cloud storage functionality."""
-    print("\n💾 Testing Cloud Storage Integration...")
-
-    try:
-        from src.backtesting.cloud_storage import CloudStorageCache
-        cache = CloudStorageCache(None)  # Pass None for config
-        stats = cache.get_cache_stats()
-        print("✅ Cloud storage integration working")
-        print(f"  • Cloud storage available: {stats.get('cloud_storage_available', False)}")
-        print(f"  • Local cache dir: {stats.get('local_cache_dir', 'Unknown')}")
-        return True
-    except ImportError as e:
-        print(f"⚠️ Cloud storage not available: {e}")
-        return False
-    except Exception as e:
-        print(f"❌ Cloud storage error: {e}")
-        return False
-
 def simulate_endpoint_responses():
     """Simulate what the actual endpoints would return."""
     print("\n🌐 Simulating Cloud Run Endpoint Responses...")
@@ -124,7 +105,6 @@ if __name__ == "__main__":
 
     # Run all tests
     dashboard_ok = test_dashboard_functionality()
-    storage_ok = test_cloud_storage()
     simulate_endpoint_responses()
 
     print("\n" + "=" * 60)
