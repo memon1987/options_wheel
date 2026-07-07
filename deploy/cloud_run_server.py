@@ -1054,7 +1054,13 @@ def get_config():
             'gap_thresholds': {
                 'quality': getattr(config, 'quality_gap_threshold', 2.0),
                 'execution': getattr(config, 'execution_gap_threshold', 1.5)
-            }
+            },
+            # FC-031: the dashboard reads these so its calibration bands and
+            # drawdown-pause card track the live strategy config instead of
+            # hardcoding parallel constants.
+            'put_delta_range': getattr(config, 'put_delta_range', [0.10, 0.20]),
+            'call_delta_range': getattr(config, 'call_delta_range', [0.15, 0.25]),
+            'call_drawdown_pause_threshold': getattr(config, 'call_drawdown_pause_threshold', 0.05),
         }
 
         return jsonify(config_data)

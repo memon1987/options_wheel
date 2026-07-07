@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import CycleStatsCard from './CycleStatsCard';
-import PutStatsCard from './PutStatsCard';
+import OptionStatsCard from './OptionStatsCard';
 import ReconciliationBanner from './ReconciliationBanner';
-import type { CycleStats, PutStats, Reconciliation } from '../../types/v2';
+import type { CycleStats, OptionTradeStats, Reconciliation } from '../../types/v2';
 
 const regime = { count: 0, win_rate: null, avg_win: null, avg_loss: null, expectancy: null, pnl_per_collateral_day: null };
 
@@ -48,35 +48,54 @@ describe('CycleStatsCard (FC-031)', () => {
   });
 });
 
-const putStats: PutStats = {
+const putStats: OptionTradeStats = {
+  option_type: 'put',
   closed_count: 52,
   win_rate: 0.92,
   net_pnl: 14200,
-  assignment_count: 11,
+  exercised_count: 11,
   expiration_count: 12,
   early_close_count: 40,
   pct_closed_early: 40 / 63,
-  assignment_rate_held_to_expiry: 11 / 23,
-  put_delta_band: [0.10, 0.20],
+  exercise_rate_held_to_expiry: 11 / 23,
+  delta_band: [0.10, 0.20],
 };
 
-describe('PutStatsCard (FC-031)', () => {
+describe('OptionStatsCard (FC-031)', () => {
   it('win rate is labeled a diagnostic, not a KPI', () => {
-    render(<PutStatsCard data={putStats} />);
+    render(<OptionStatsCard data={putStats} optionType="put" />);
     expect(screen.getByText('Win rate (diagnostic)')).toBeInTheDocument();
   });
 
   it('assignment rate is held-to-expiry (48%), not diluted by early closes (17%)', () => {
-    render(<PutStatsCard data={putStats} />);
+    render(<OptionStatsCard data={putStats} optionType="put" />);
     expect(screen.getByText(/48%/)).toBeInTheDocument();
     expect(screen.queryByText(/17%/)).toBeNull();
   });
 
   it('flags assignment rate outside the put delta band', () => {
-    render(<PutStatsCard data={putStats} />);
-    // 48% >> 20% band top → warning color class on the stat.
-    const stat = screen.getByText(/48%/);
-    expect(stat.className).toContain('text-yellow-300');
+    render(<OptionStatsCard data={putStats} optionType="put" />);
+    // 48% >> 20% band top → warning color class on the stat tile.
+    const stat = screen.getByText(/48%/).closest('div');
+    expect(stat?.className).toContain('text-yellow-300');
+  });
+
+  it('renders the symmetric call-side card with called-away framing', () => {
+    const callStats: OptionTradeStats = {
+      ...putStats,
+      option_type: 'call',
+      exercised_count: 6,
+      expiration_count: 18,
+      exercise_rate_held_to_expiry: 6 / 24,
+      delta_band: [0.15, 0.25],
+    };
+    render(<OptionStatsCard data={callStats} optionType="call" />);
+    expect(screen.getByText('Call Trades')).toBeInTheDocument();
+    const rateLabel = screen.getByText('Called-away rate (held to expiry)');
+    // 6/24 = 25%, inside the [15%, 25%] band → the value tile must NOT warn.
+    const tile = rateLabel.parentElement!;
+    expect(tile.textContent).toContain('25%');
+    expect(tile.querySelector('.text-yellow-300')).toBeNull();
   });
 });
 

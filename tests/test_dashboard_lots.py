@@ -16,8 +16,9 @@ def ev(t, qty, price):
 
 class TestOpenLots:
     def test_simple_buy_sell_leaves_nothing(self):
-        lots = open_lots([ev("2026-01-01", 100, 230.0), ev("2026-02-01", -100, 250.0)])
+        lots, unpaired = open_lots([ev("2026-01-01", 100, 230.0), ev("2026-02-01", -100, 250.0)])
         assert lots == []
+        assert unpaired == 0
 
     def test_amd_overlap_case(self):
         # FC-020's AMD anatomy: three buys, two sells → the Jan-31 lot stays open.
@@ -28,20 +29,20 @@ class TestOpenLots:
             ev("2026-01-31", 100, 245.0),
             ev("2026-04-17", -100, 252.5),
         ]
-        lots = open_lots(events)
+        lots, _ = open_lots(events)
         assert len(lots) == 1
         assert lots[0]["qty"] == 100
         assert lots[0]["price"] == 245.0  # NOT the cumulative-average ~$242.50
         assert lots[0]["buy_time"] == "2026-01-31"
 
     def test_partial_sell_splits_lot(self):
-        lots = open_lots([ev("2026-01-01", 100, 50.0), ev("2026-02-01", -40, 55.0)])
+        lots, _ = open_lots([ev("2026-01-01", 100, 50.0), ev("2026-02-01", -40, 55.0)])
         assert len(lots) == 1
         assert lots[0]["qty"] == 60
         assert lots[0]["price"] == 50.0
 
     def test_sell_spanning_two_lots(self):
-        lots = open_lots([
+        lots, _ = open_lots([
             ev("2026-01-01", 100, 50.0),
             ev("2026-01-15", 100, 60.0),
             ev("2026-02-01", -150, 65.0),
@@ -51,13 +52,14 @@ class TestOpenLots:
         assert lots[0]["price"] == 60.0
 
     def test_unpaired_sell_flagged_not_crashed(self):
-        lots = open_lots([ev("2026-01-01", -100, 50.0), ev("2026-02-01", 100, 55.0)])
+        lots, unpaired = open_lots([ev("2026-01-01", -100, 50.0), ev("2026-02-01", 100, 55.0)])
         assert len(lots) == 1
-        assert lots[0]["unpaired_sells"] == 1
+        assert unpaired == 1
 
     def test_out_of_order_events_sorted(self):
-        lots = open_lots([ev("2026-02-01", -100, 60.0), ev("2026-01-01", 100, 50.0)])
+        lots, unpaired = open_lots([ev("2026-02-01", -100, 60.0), ev("2026-01-01", 100, 50.0)])
         assert lots == []
+        assert unpaired == 0
 
 
 class TestOpenLotBasis:

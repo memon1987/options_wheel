@@ -1,20 +1,10 @@
 import type { CycleStats } from '../../types/v2';
-import { fmtCurrency, fmtPercent, pnlColor } from '../../utils/format';
+import { fmtCurrency, fmtPercent } from '../../utils/format';
+import Stat from './Stat';
 
 interface Props {
   data: CycleStats | null;
 }
-
-const Stat = ({ label, value, tone, hint }: {
-  label: string; value: string; tone?: number | null; hint?: string;
-}) => (
-  <div title={hint}>
-    <div className="text-xs uppercase tracking-wide text-gray-400">{label}</div>
-    <div className={`text-base font-semibold mt-0.5 ${tone !== undefined ? pnlColor(tone ?? null) : 'text-white'}`}>
-      {value}
-    </div>
-  </div>
-);
 
 // FC-031: closed WHEEL-CYCLE stats — deliberately separate from put-trade
 // stats (blending them re-creates the per-contract win-rate delta artifact).
@@ -22,7 +12,10 @@ const Stat = ({ label, value, tone, hint }: {
 // longest (survivorship); overlapping-lot symbols are excluded until FC-020
 // fixes their per-cycle pairing, and the exclusion is disclosed.
 export default function CycleStatsCard({ data }: Props) {
-  if (!data || (data.closed_count === 0 && data.open_count === 0)) {
+  // Defensive: `?? 0` + optional-chained regimes so a degraded backend
+  // payload renders the empty state instead of crashing the Overview page
+  // (review C2 — the backend failure path also returns the full shape now).
+  if (!data || ((data.closed_count ?? 0) === 0 && (data.open_count ?? 0) === 0)) {
     return (
       <div className="rounded-lg border border-gray-700 bg-gray-800 p-5">
         <h3 className="text-base font-semibold text-white">Wheel Cycles</h3>
@@ -39,12 +32,12 @@ export default function CycleStatsCard({ data }: Props) {
         <h3 className="text-base font-semibold text-white">Wheel Cycles (assignment → called away)</h3>
         <span className="text-xs text-gray-500">
           {data.closed_count} closed · {data.open_count} open
-          {data.excluded_overlapping_symbols.length > 0 && (
+          {(data.excluded_overlapping_symbols ?? []).length > 0 && (
             <span
               className="text-yellow-500"
-              title={`Per-cycle rows for these symbols are mis-paired until FC-020 (overlapping share lots): ${data.excluded_overlapping_symbols.join(', ')}. They are excluded from these aggregates.`}
+              title={`Per-cycle rows for these symbols are mis-paired until FC-020 (overlapping share lots): ${(data.excluded_overlapping_symbols ?? []).join(', ')}. They are excluded from these aggregates.`}
             >
-              {' '}· {data.excluded_overlapping_symbols.length} symbol(s) excluded (FC-020)
+              {' '}· {(data.excluded_overlapping_symbols ?? []).length} symbol(s) excluded (FC-020)
             </span>
           )}
         </span>
@@ -76,12 +69,12 @@ export default function CycleStatsCard({ data }: Props) {
           hint="Cycle-to-date net cash plus current market value of held shares for in-flight cycles. Shown because losing cycles stay open longest — closed-cycle stats alone overstate."
         />
       </div>
-      {post.count > 0 && (
+      {post && post.count > 0 && (
         <div className="text-xs text-gray-500 mt-3" title={`FC-029 risk re-tune deployed ${data.fc029_deploy_date} (call delta band, hard cost-basis floor, drawdown pause).`}>
           Since FC-029 ({data.fc029_deploy_date}): {post.count} cycles ·{' '}
           win rate {post.win_rate !== null ? fmtPercent(post.win_rate, 0) : '—'} ·{' '}
           expectancy {fmtCurrency(post.expectancy)} · vs pre:{' '}
-          {data.regime_pre_fc029.count} cycles, expectancy {fmtCurrency(data.regime_pre_fc029.expectancy)}
+          {data.regime_pre_fc029?.count ?? 0} cycles, expectancy {fmtCurrency(data.regime_pre_fc029?.expectancy ?? null)}
         </div>
       )}
     </div>

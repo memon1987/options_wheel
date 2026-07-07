@@ -204,16 +204,21 @@ export interface CycleStats extends RegimeStats {
   fc029_deploy_date: string;
 }
 
-export interface PutStats {
+// Per-leg trade stats — one shape for puts AND calls (Wheel Strategy
+// Symmetry Principle). "Exercised" = assignment for puts, called-away for
+// calls; the held-to-expiry exercise rate calibrates against the leg's
+// delta band (sourced from the bot's live /config when reachable).
+export interface OptionTradeStats {
+  option_type: 'put' | 'call';
   closed_count: number;
   win_rate: number | null;
   net_pnl: number | null;
-  assignment_count: number;
+  exercised_count: number;
   expiration_count: number;
   early_close_count: number;
   pct_closed_early: number | null;
-  assignment_rate_held_to_expiry: number | null;  // calibration vs |put delta|
-  put_delta_band: [number, number];
+  exercise_rate_held_to_expiry: number | null;
+  delta_band: [number, number];
 }
 
 export interface KnownGap {

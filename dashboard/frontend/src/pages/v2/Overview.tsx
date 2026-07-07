@@ -10,7 +10,7 @@ import type {
   PortfolioReturns,
   Reconciliation,
   CycleStats,
-  PutStats,
+  OptionTradeStats,
 } from '../../types/v2';
 import KPICards, { buildHeadlineKpis } from '../../components/v2/KPICards';
 import EquityCurve from '../../components/v2/EquityCurve';
@@ -19,7 +19,7 @@ import SymbolScorecard from '../../components/v2/SymbolScorecard';
 import ActionPanel from '../../components/v2/ActionPanel';
 import ReconciliationBanner from '../../components/v2/ReconciliationBanner';
 import CycleStatsCard from '../../components/v2/CycleStatsCard';
-import PutStatsCard from '../../components/v2/PutStatsCard';
+import OptionStatsCard from '../../components/v2/OptionStatsCard';
 import { fmtCurrency, fmtPercent, parseOcc } from '../../utils/format';
 
 export default function Overview() {
@@ -41,16 +41,20 @@ export default function Overview() {
   const { data: returns } = useApi<PortfolioReturns>('/api/v2/portfolio/returns');
   const { data: reconciliation } = useApi<Reconciliation>('/api/v2/reconciliation', { refreshInterval: 120_000 });
   const { data: cycleStats } = useApi<CycleStats>(`/api/v2/cycle-stats?days=${days}`);
-  const { data: putStats } = useApi<PutStats>(`/api/v2/put-stats?days=${days}`);
+  const { data: putStats } = useApi<OptionTradeStats>(`/api/v2/put-stats?days=${days}`);
+  const { data: callStats } = useApi<OptionTradeStats>(`/api/v2/call-stats?days=${days}`);
 
   const nlv = account?.portfolio_value ?? null;
   const startingCapital = baseline?.starting_capital ?? null;
-  const totalPnl = nlv !== null && startingCapital !== null ? nlv - startingCapital : null;
   const realizedCash = reconciliation?.realized_cash_pnl ?? null;
-  // Open value = everything not yet booked as cash: open premium + live
-  // market value net of the residual. Simplest consistent split: Total P&L
-  // − realized cash (+fees folded in).
-  const openValue = totalPnl !== null && realizedCash !== null ? totalPnl - realizedCash : null;
+  // Open value split comes from the reconciliation payload's OWN nlv so the
+  // realized/open components stay self-consistent — mixing the 60s-polled
+  // account NLV with the 120s-polled ledger sums made the split incoherent
+  // for up to two minutes after a fill (review AL4).
+  const openValue =
+    reconciliation?.nlv != null && realizedCash !== null
+      ? reconciliation.nlv - reconciliation.deposits - realizedCash
+      : null;
 
   // Stress + deployment stats from live positions. Underlying prices come
   // from the scorecard (latest daily-bar close) — stamped below.
@@ -73,9 +77,13 @@ export default function Overview() {
       putCollateral += notional;
       exposureBySymbol[occ.underlying] = (exposureBySymbol[occ.underlying] ?? 0) + notional;
       const cur = priceBy[occ.underlying];
-      countedPuts++;
-      if (cur !== undefined && cur < occ.strike) {
-        stress += (cur - occ.strike) * 100 * qty;
+      // Only puts we can actually price count toward the stress figure — an
+      // unpriced put must not let the green "all OTM" banner show.
+      if (cur !== undefined) {
+        countedPuts++;
+        if (cur < occ.strike) {
+          stress += (cur - occ.strike) * 100 * qty;
+        }
       }
     } else if (occ.optionType === null && !/\d/.test(p.symbol ?? '')) {
       const mv = parseFloat(String(p.market_value ?? 0));
@@ -180,9 +188,11 @@ export default function Overview() {
         <MonthlyPremiumBars data={monthly ?? []} />
       </div>
 
+      <CycleStatsCard data={cycleStats ?? null} />
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <CycleStatsCard data={cycleStats ?? null} />
-        <PutStatsCard data={putStats ?? null} />
+        <OptionStatsCard data={putStats ?? null} optionType="put" />
+        <OptionStatsCard data={callStats ?? null} optionType="call" />
       </div>
 
       <SymbolScorecard rows={scorecard ?? []} />

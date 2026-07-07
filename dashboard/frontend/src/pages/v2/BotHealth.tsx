@@ -25,7 +25,11 @@ export default function BotHealth() {
 
   const { data: ingest } = useApi<IngestHealth>('/api/v2/bot-health/ingest', { refreshInterval: 60_000 });
   const { data: filtering } = useApi<FilteringStat[]>(`/api/history/filtering?days=${funnelWindow.days}`);
-  const { data: filteringBaseline } = useApi<FilteringStat[]>('/api/history/filtering?days=30');
+  // Skip the baseline fetch when the selected window IS 30d — it would be a
+  // byte-identical query (review E5).
+  const { data: filteringBaseline } = useApi<FilteringStat[]>(
+    funnelWindow.days === 30 ? null : '/api/history/filtering?days=30');
+  const baseline = funnelWindow.days === 30 ? filtering : filteringBaseline;
   const { data: errors } = useApi<ErrorEvent[]>('/api/history/errors?days=7');
   const { data: daily } = useApi<DailySummary[]>('/api/history/daily-summary?days=30');
   const { data: anomalies } = useApi<BotAnomaly[]>('/api/v2/bot-health/anomalies', { refreshInterval: 300_000 });
@@ -94,7 +98,7 @@ export default function BotHealth() {
 
       <DecisionFunnel
         rows={filtering ?? []}
-        baselineRows={filteringBaseline ?? []}
+        baselineRows={baseline ?? []}
         windowLabel={funnelWindow.label}
       />
 

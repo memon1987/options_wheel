@@ -47,9 +47,6 @@ export default function MonthlyPremiumBars({ data }: Props) {
               tickFormatter={(n) => fmtCurrency(n, { compact: true })}
             />
             <Tooltip
-              contentStyle={{ background: '#1f2937', border: '1px solid #374151', color: '#f3f4f6' }}
-              labelFormatter={(m) => fmtMonth(m as string)}
-              formatter={(value: number, name: string) => [fmtCurrency(value), name]}
               content={({ active, payload, label }) => {
                 if (!active || !payload || payload.length === 0) return null;
                 const row = payload[0].payload as MonthlyCashflow;

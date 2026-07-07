@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 PROJECT_ID = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT", "gen-lang-client-0607444019")
 DATASET_ID = "options_wheel"
 
+# FC-031: benchmark symbol for the equity-curve overlay AND the independent
+# trading-day calendar used by anomaly detection. Must match the ingestor's
+# BENCHMARK_SYMBOLS (src/data/stock_history_ingestor.py) — both read the
+# same env var so a benchmark change is one setting, not two code edits.
+BENCHMARK_SYMBOL = os.getenv("BENCHMARK_SYMBOL", "SPY")
+
 
 class BigQueryService:
     """Service for querying BigQuery trading data."""
@@ -31,10 +37,17 @@ class BigQueryService:
         self.client = bigquery.Client(project=PROJECT_ID)
         self.dataset = f"{PROJECT_ID}.{DATASET_ID}"
 
-    def _run_query(self, query: str) -> List[Dict[str, Any]]:
-        """Execute a query and return results as list of dicts."""
+    def _run_query(self, query: str,
+                   params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
+        """Execute a query and return results as list of dicts.
+
+        ``params``: optional list of bigquery.ScalarQueryParameter /
+        ArrayQueryParameter — one place for parameterized queries instead of
+        per-call-site QueryJobConfig boilerplate (FC-031 review).
+        """
         try:
-            job = self.client.query(query)
+            job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
+            job = self.client.query(query, job_config=job_config)
             results = job.result(timeout=60)  # 60 second timeout
             return [dict(row.items()) for row in results]
         except GoogleCloudError as e:
@@ -43,6 +56,21 @@ class BigQueryService:
         except Exception as e:
             logger.error(f"Unexpected error in BigQuery query: {e}")
             raise Exception(f"Database query failed: {str(e)}")
+
+    # Tiny TTL memo for expensive, slow-moving reads (FC-031 review: the
+    # backend has no caching and Overview fires 10+ BQ jobs per load).
+    # Process-local, keyed per method — the service is a singleton.
+    _memo_store: Dict[str, Any] = {}
+
+    def _memo(self, key: str, ttl_seconds: int, fn):
+        import time
+        hit = self._memo_store.get(key)
+        now = time.monotonic()
+        if hit is not None and now - hit[0] < ttl_seconds:
+            return hit[1]
+        value = fn()
+        self._memo_store[key] = (now, value)
+        return value
 
     # ================================================================
     # FC-012: Alpaca-sourced trade queries (trades_with_outcomes view)
@@ -407,9 +435,12 @@ class BigQueryService:
             rows = self._run_query(query)
             # FC-031: attach FIFO open-lot basis (display/breakeven only — never
             # summed into P&L; acquisition cost is already expensed in the
-            # share_side_pnl cash ledger).
+            # share_side_pnl cash ledger). Restricted to symbols actually
+            # holding shares — no full-history OPTRD scan per request.
             try:
-                lot_bases = self.get_open_lot_bases()
+                holding = [r["symbol"] for r in rows
+                           if float(r.get("current_shares") or 0) != 0]
+                lot_bases = self.get_open_lot_bases(symbols=holding) if holding else {}
                 for r in rows:
                     lot = lot_bases.get(r.get("symbol"))
                     r["open_lot_shares"] = lot["shares"] if lot else 0
@@ -878,6 +909,11 @@ class BigQueryService:
         return [(r["date"], float(r["portfolio_value"]))
                 for r in rows if r.get("portfolio_value") is not None]
 
+    def _flows(self):
+        """(date, amount) tuples from JNLC — the one place the row → tuple
+        conversion convention lives (deposit positive)."""
+        return [(r["flow_date"], float(r["amount"])) for r in self.get_cash_flows()]
+
     def get_portfolio_returns(self, current_nlv: Optional[float] = None,
                               nlv_source: str = "live") -> Dict[str, Any]:
         """Account-level XIRR / TWR / drawdown from flows + equity history.
@@ -890,8 +926,7 @@ class BigQueryService:
         from datetime import date as _date
         from services import returns as R
 
-        flows_rows = self.get_cash_flows()
-        flows = [(r["flow_date"], float(r["amount"])) for r in flows_rows]
+        flows = self._flows()
         equity = self._equity_points()
 
         today = _date.today()
@@ -937,14 +972,13 @@ class BigQueryService:
         """
         from services import returns as R
 
-        flows_rows = self.get_cash_flows()
-        flows = [(r["flow_date"], float(r["amount"])) for r in flows_rows]
+        flows = self._flows()
         equity = self._equity_points(days=days)
         wheel_series = R.twr_series(equity, flows)
         wheel = {d.isoformat() if hasattr(d, "isoformat") else str(d): round(v, 4)
                  for d, v in wheel_series}
 
-        spy_rows = self.get_stock_history("SPY", days=days)
+        spy_rows = self.get_stock_history(BENCHMARK_SYMBOL, days=days)
         window_start = equity[0][0] if equity else None
         spy_rows = [r for r in spy_rows if window_start is None or r["date"] >= window_start]
         spy = {}
@@ -958,7 +992,12 @@ class BigQueryService:
         return [{"date": d, "wheel": wheel.get(d), "benchmark": spy.get(d)} for d in dates]
 
     def get_monthly_cashflow(self, months: int = 24) -> List[Dict[str, Any]]:
-        """Net option cash flow by month from the FC-031 view."""
+        """Net option cash flow by month from the FC-031 view. Memoized 300s
+        — monthly aggregates move at ingest cadence, not page-load cadence."""
+        return self._memo(f"monthly_cashflow:{months}", 300,
+                          lambda: self._monthly_cashflow_uncached(months))
+
+    def _monthly_cashflow_uncached(self, months: int) -> List[Dict[str, Any]]:
         try:
             query = f"""
             SELECT month, net_option_cashflow, put_net_cashflow, call_net_cashflow,
@@ -1000,6 +1039,23 @@ class BigQueryService:
           survivorship is visible (losing cycles stay open longest).
         - FC-029 before/after regime split on the cycle's put date.
         """
+        def _empty(excluded_syms):
+            # Full CycleStats shape — a truncated failure payload crashes the
+            # frontend card (review C2: regime_post_fc029 dereference).
+            zero = {"count": 0, "win_rate": None, "avg_win": None,
+                    "avg_loss": None, "expectancy": None,
+                    "pnl_per_collateral_day": None}
+            return {
+                **zero,
+                "closed_count": 0,
+                "open_count": 0,
+                "open_mtm_to_date": 0.0,
+                "excluded_overlapping_symbols": excluded_syms,
+                "regime_pre_fc029": zero,
+                "regime_post_fc029": zero,
+                "fc029_deploy_date": self.FC029_DEPLOY_DATE,
+            }
+
         excluded = self._overlapping_lot_symbols()
         excl_list = ", ".join(f"'{s}'" for s in excluded) or "''"
         try:
@@ -1029,7 +1085,7 @@ class BigQueryService:
             """)
         except Exception:
             logger.info("wheel_cycle_stats queries failed")
-            return {"closed_count": 0, "excluded_overlapping_symbols": excluded}
+            return _empty(excluded)
 
         def _stats(rows):
             pnls = [float(r["cycle_pnl"]) for r in rows]
@@ -1079,57 +1135,78 @@ class BigQueryService:
             "fc029_deploy_date": self.FC029_DEPLOY_DATE,
         }
 
-    def get_put_trade_stats(self, days: int = 3650) -> Dict[str, Any]:
-        """Unassigned-put trade stats, reported SEPARATELY from cycle stats.
+    # Static fallbacks for the delta bands; the router passes the live values
+    # from the bot's /config when reachable (Wheel Strategy Symmetry
+    # Principle + review AL1 — one source of truth for strategy parameters).
+    DEFAULT_PUT_DELTA_BAND = [0.10, 0.20]
+    DEFAULT_CALL_DELTA_BAND = [0.15, 0.25]   # FC-029 R1
 
-        Blending puts into one "campaign win rate" re-imports the banned
+    def get_option_trade_stats(self, option_type: str, days: int = 3650,
+                               delta_band: Optional[List[float]] = None) -> Dict[str, Any]:
+        """Per-leg trade stats, reported SEPARATELY from cycle stats — for
+        BOTH puts and calls (Wheel Strategy Symmetry Principle).
+
+        Blending legs into one "campaign win rate" re-imports the banned
         per-contract delta artifact (review F4). The calibration stat is
-        held-to-expiry only: assignments / (assignments + expirations) —
-        early closes never faced the expiry lottery (review F5).
+        held-to-expiry only — early closes never faced the expiry lottery
+        (review F5): puts calibrate assignment rate vs |put delta|, calls
+        calibrate called-away rate vs |call delta|.
         """
+        exercised_outcome = "assignment" if option_type == "put" else "called_away"
+        band = delta_band or (self.DEFAULT_PUT_DELTA_BAND if option_type == "put"
+                              else self.DEFAULT_CALL_DELTA_BAND)
+        empty = {
+            "option_type": option_type,
+            "closed_count": 0, "win_rate": None, "net_pnl": None,
+            "exercised_count": 0, "expiration_count": 0, "early_close_count": 0,
+            "pct_closed_early": None, "exercise_rate_held_to_expiry": None,
+            "delta_band": band,
+        }
         try:
+            from google.cloud.bigquery import ScalarQueryParameter
             rows = self._run_query(f"""
                 SELECT
                     outcome,
                     COUNT(*) AS n,
                     COUNTIF(COALESCE(realized_pnl, 0) > 0) AS wins,
-                    SUM(COALESCE(realized_pnl, 0)) AS pnl,
-                    COUNTIF(DATE(transaction_time, 'America/New_York')
-                            >= '{self.FC029_DEPLOY_DATE}') AS n_post_fc029
+                    SUM(COALESCE(realized_pnl, 0)) AS pnl
                 FROM `{self.dataset}.trades_with_outcomes`
-                WHERE option_type = 'put'
+                WHERE option_type = @option_type
                   AND outcome != 'open'
                   AND DATE(transaction_time, 'America/New_York')
-                      >= DATE_SUB(CURRENT_DATE(), INTERVAL {int(days)} DAY)
+                      >= DATE_SUB(CURRENT_DATE(), INTERVAL @days DAY)
                 GROUP BY outcome
-            """)
+            """, params=[
+                ScalarQueryParameter("option_type", "STRING", option_type),
+                ScalarQueryParameter("days", "INT64", days),
+            ])
         except Exception:
-            logger.info("put_trade_stats query failed")
-            return {"closed_count": 0}
+            logger.info(f"option_trade_stats query failed for {option_type}")
+            return empty
 
         by = {r["outcome"]: r for r in rows}
-        n_assign = int(by.get("assignment", {}).get("n", 0) or 0)
+        n_exercised = int(by.get(exercised_outcome, {}).get("n", 0) or 0)
         n_expire = int(by.get("expiration", {}).get("n", 0) or 0)
         n_early = int(by.get("early_close", {}).get("n", 0) or 0)
-        closed_unassigned = [by[o] for o in ("expiration", "early_close") if o in by]
-        n_closed = sum(int(r["n"]) for r in closed_unassigned)
-        wins = sum(int(r["wins"]) for r in closed_unassigned)
-        pnl = sum(float(r["pnl"] or 0) for r in closed_unassigned)
-        held_to_expiry = n_assign + n_expire
+        closed_unexercised = [by[o] for o in ("expiration", "early_close") if o in by]
+        n_closed = sum(int(r["n"]) for r in closed_unexercised)
+        wins = sum(int(r["wins"]) for r in closed_unexercised)
+        pnl = sum(float(r["pnl"] or 0) for r in closed_unexercised)
+        held_to_expiry = n_exercised + n_expire
 
         return {
+            "option_type": option_type,
             "closed_count": n_closed,
             "win_rate": (wins / n_closed) if n_closed else None,
             "net_pnl": pnl,
-            "assignment_count": n_assign,
+            "exercised_count": n_exercised,
             "expiration_count": n_expire,
             "early_close_count": n_early,
-            "pct_closed_early": (n_early / (n_early + held_to_expiry))
-                                if (n_early + held_to_expiry) else None,
-            # Calibration vs |put delta| (0.10–0.20 band): held-to-expiry only.
-            "assignment_rate_held_to_expiry": (n_assign / held_to_expiry)
-                                              if held_to_expiry else None,
-            "put_delta_band": [0.10, 0.20],
+            "pct_closed_early": ((n_early / (n_early + held_to_expiry))
+                                 if (n_early + held_to_expiry) else None),
+            "exercise_rate_held_to_expiry": ((n_exercised / held_to_expiry)
+                                             if held_to_expiry else None),
+            "delta_band": band,
         }
 
     def get_reconciliation(self, current_nlv: Optional[float],
@@ -1145,17 +1222,21 @@ class BigQueryService:
         deposits = float(baseline.get("starting_capital") or 0)
         fees = self.get_fees_total()
 
+        # One query for both the ledger sums and the per-symbol share counts
+        # (was two round-trips against the same view — review E3).
+        view_rows: List[Dict[str, Any]] = []
         try:
-            rows = self._run_query(f"""
-                SELECT
-                    SUM(COALESCE(total_realized_pnl, 0)) AS realized_cash,
-                    SUM(COALESCE(open_option_premium, 0)) AS open_premium
+            view_rows = self._run_query(f"""
+                SELECT underlying,
+                       COALESCE(current_shares, 0) AS current_shares,
+                       COALESCE(total_realized_pnl, 0) AS total_realized_pnl,
+                       COALESCE(open_option_premium, 0) AS open_option_premium
                 FROM `{self.dataset}.fc018_per_symbol_scorecard`
             """)
-            realized_cash = float(rows[0]["realized_cash"] or 0) if rows else 0.0
-            open_premium = float(rows[0]["open_premium"] or 0) if rows else 0.0
         except Exception:
-            realized_cash, open_premium = 0.0, 0.0
+            pass
+        realized_cash = sum(float(r["total_realized_pnl"]) for r in view_rows)
+        open_premium = sum(float(r["open_option_premium"]) for r in view_rows)
 
         live_mv = None
         live_shares_by_symbol: Dict[str, float] = {}
@@ -1178,23 +1259,15 @@ class BigQueryService:
 
         # View-vs-live share count mismatches (the AMD anomaly surface).
         mismatches: List[Dict[str, Any]] = []
-        try:
-            view_rows = self._run_query(f"""
-                SELECT underlying, current_shares
-                FROM `{self.dataset}.fc018_per_symbol_scorecard`
-                WHERE COALESCE(current_shares, 0) != 0
-            """)
-            if live_positions is not None:
-                view_by = {r["underlying"]: float(r["current_shares"] or 0)
-                           for r in view_rows}
-                for sym in set(view_by) | set(live_shares_by_symbol):
-                    v = view_by.get(sym, 0.0)
-                    l = live_shares_by_symbol.get(sym, 0.0)
-                    if v != l:
-                        mismatches.append(
-                            {"symbol": sym, "view_shares": v, "live_shares": l})
-        except Exception:
-            pass
+        if live_positions is not None:
+            view_by = {r["underlying"]: float(r["current_shares"])
+                       for r in view_rows if float(r["current_shares"]) != 0}
+            for sym in set(view_by) | set(live_shares_by_symbol):
+                v = view_by.get(sym, 0.0)
+                live_qty = live_shares_by_symbol.get(sym, 0.0)
+                if v != live_qty:
+                    mismatches.append(
+                        {"symbol": sym, "view_shares": v, "live_shares": live_qty})
 
         residual = None
         status = "unknown"
@@ -1219,8 +1292,8 @@ class BigQueryService:
             "fees": fees,
             "live_market_value": live_mv,
             "residual": residual,
-            "residual_net_of_known_gaps": (residual - known_total)
-                                          if residual is not None else None,
+            "residual_net_of_known_gaps": ((residual - known_total)
+                                           if residual is not None else None),
             "known_gaps": self.KNOWN_RECONCILIATION_GAPS,
             "share_count_mismatches": mismatches,
             "status": status,
@@ -1229,23 +1302,28 @@ class BigQueryService:
     def get_bot_anomalies(self) -> List[Dict[str, Any]]:
         """Bot-health anomaly flags on an INDEPENDENT trading calendar.
 
-        The calendar comes from SPY bars (stock_history_from_alpaca), not
-        from the scheduler's own events — a totally dead scheduler must
-        still light up "zero scans on a trading day" (review F7).
+        The calendar comes from benchmark bars (stock_history_from_alpaca),
+        not from the scheduler's own events — a totally dead scheduler must
+        still light up "zero scans on a trading day" (review F7). Memoized
+        300s: the inputs (daily bars, daily rollups) change once a day.
         """
+        return self._memo("bot_anomalies", 300, self._bot_anomalies_uncached)
+
+    def _bot_anomalies_uncached(self) -> List[Dict[str, Any]]:
         flags: List[Dict[str, Any]] = []
 
-        # Trading days (SPY bars), most recent first. Bars land at 17:00 ET,
-        # so "today" is naturally excluded until after the close — no
-        # intraday false positives.
+        # Trading days (benchmark bars), most recent first. Bars land at
+        # 17:00 ET, so "today" is naturally excluded until after the close —
+        # no intraday false positives.
         try:
+            from google.cloud.bigquery import ScalarQueryParameter
             cal_rows = self._run_query(f"""
                 SELECT date FROM `{self.dataset}.stock_history_from_alpaca`
-                WHERE symbol = 'SPY'
+                WHERE symbol = @benchmark
                 ORDER BY date DESC LIMIT 10
-            """)
+            """, params=[ScalarQueryParameter("benchmark", "STRING", BENCHMARK_SYMBOL)])
             trading_days = [str(r["date"]) for r in cal_rows]
-            calendar_source = "SPY bars"
+            calendar_source = f"{BENCHMARK_SYMBOL} bars"
         except Exception:
             trading_days = []
             calendar_source = "unavailable"
@@ -1258,7 +1336,8 @@ class BigQueryService:
                     ORDER BY date DESC LIMIT 10
                 """)
                 trading_days = [str(r["date"]) for r in cal_rows]
-                calendar_source = "self-derived (SPY bars unavailable — blind to total outage)"
+                calendar_source = (f"self-derived ({BENCHMARK_SYMBOL} bars unavailable "
+                                   "— blind to total outage)")
             except Exception:
                 pass
 
@@ -1359,6 +1438,8 @@ class BigQueryService:
                               "since": None, "evidence": None})
                 continue
             try:
+                # TypeError guard: a naive timestamp minus aware `now` raises
+                # TypeError, not ValueError (review A10).
                 age = now - datetime.fromisoformat(last.replace("Z", "+00:00"))
                 if age > limit:
                     flags.append({
@@ -1367,14 +1448,18 @@ class BigQueryService:
                                    f"(threshold {int(limit.total_seconds() // 3600)}h)",
                         "since": last, "evidence": None,
                     })
-            except ValueError:
+            except (ValueError, TypeError):
                 pass
 
         return flags
 
-    def get_optrd_events(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Raw OPTRD share events, oldest first (input to the FIFO lot walk)."""
-        where = "AND symbol = @symbol" if symbol else ""
+    def get_optrd_events(self, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Raw OPTRD share events, oldest first (input to the FIFO lot walk).
+
+        ``symbols`` restricts the scan — callers should pass the symbols they
+        actually hold instead of scanning all history (review E1/E2).
+        """
+        where = "AND symbol IN UNNEST(@symbols)" if symbols else ""
         query = f"""
         SELECT symbol, transaction_time, qty, price, net_amount
         FROM `{self.dataset}.trades_from_activities`
@@ -1383,19 +1468,26 @@ class BigQueryService:
         ORDER BY transaction_time ASC
         """
         try:
-            from google.cloud.bigquery import ScalarQueryParameter, QueryJobConfig
-            job_config = QueryJobConfig(query_parameters=(
-                [ScalarQueryParameter("symbol", "STRING", symbol)] if symbol else []))
-            results = self.client.query(query, job_config=job_config).result(timeout=60)
-            return [dict(row.items()) for row in results]
+            from google.cloud.bigquery import ArrayQueryParameter
+            params = ([ArrayQueryParameter("symbols", "STRING", symbols)]
+                      if symbols else None)
+            return self._run_query(query, params=params)
         except Exception:
             logger.info("optrd_events query failed — returning empty list")
             return []
 
-    def get_open_lot_bases(self) -> Dict[str, Dict[str, Any]]:
-        """FIFO open-lot basis per symbol (display/breakeven only)."""
+    def get_open_lot_bases(self, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+        """FIFO open-lot basis per symbol (display/breakeven only).
+
+        Memoized 60s — lot state changes a few times a day at most, while the
+        scorecard is fetched on every Overview load and range click.
+        """
+        key = f"open_lot_bases:{','.join(sorted(symbols)) if symbols else '*'}"
+        return self._memo(key, 60, lambda: self._open_lot_bases_uncached(symbols))
+
+    def _open_lot_bases_uncached(self, symbols: Optional[List[str]]) -> Dict[str, Dict[str, Any]]:
         from services.lots import open_lot_basis
-        events = self.get_optrd_events()
+        events = self.get_optrd_events(symbols=symbols)
         by_symbol: Dict[str, List[Dict[str, Any]]] = {}
         for ev in events:
             by_symbol.setdefault(ev["symbol"], []).append(ev)
@@ -1429,12 +1521,34 @@ class BigQueryService:
                     if qty > 0:
                         held[sym] = held.get(sym, 0.0) + qty
 
+        # View-vs-live share mismatches surface here too (the AMD anomaly is
+        # invisible as a pause row because live shares are 0 — the badge is
+        # the only trace; review C3).
+        mismatches: List[Dict[str, Any]] = []
+        try:
+            view_rows = self._run_query(f"""
+                SELECT underlying, current_shares
+                FROM `{self.dataset}.fc018_per_symbol_scorecard`
+                WHERE COALESCE(current_shares, 0) != 0
+            """)
+            view_by = {r["underlying"]: float(r["current_shares"] or 0) for r in view_rows}
+            if live_positions is not None:
+                for sym in set(view_by) | set(held):
+                    v = view_by.get(sym, 0.0)
+                    live_qty = held.get(sym, 0.0)
+                    if v != live_qty:
+                        mismatches.append(
+                            {"symbol": sym, "view_shares": v, "live_shares": live_qty})
+        except Exception:
+            pass
+
         result = {"threshold": threshold, "threshold_source": threshold_source,
-                  "paused": [], "share_count_mismatches": []}
+                  "paused": [], "share_count_mismatches": mismatches}
         if not held:
             return result
 
-        syms = ", ".join(f"'{s}'" for s in held)
+        from google.cloud.bigquery import ArrayQueryParameter
+        held_syms = sorted(held)
         try:
             strikes = {r["underlying"]: float(r["strike"])
                        for r in self._run_query(f"""
@@ -1442,15 +1556,32 @@ class BigQueryService:
                        ARRAY_AGG(strike_price ORDER BY transaction_time DESC LIMIT 1)[OFFSET(0)] AS strike
                 FROM `{self.dataset}.trades_from_activities`
                 WHERE activity_type = 'OPASN' AND option_type = 'put'
-                  AND underlying IN ({syms})
+                  AND underlying IN UNNEST(@symbols)
                 GROUP BY underlying
-            """) if r.get("strike") is not None}
+            """, params=[ArrayQueryParameter("symbols", "STRING", held_syms)])
+                       if r.get("strike") is not None}
         except Exception:
             strikes = {}
 
         lot_bases = {}
         try:
-            lot_bases = {s: b for s, b in self.get_open_lot_bases().items() if s in held}
+            lot_bases = self.get_open_lot_bases(symbols=held_syms)
+        except Exception:
+            pass
+
+        # One batched bars query for every held symbol (was one query per
+        # symbol — review E2's N+1).
+        bars_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            bar_rows = self._run_query(f"""
+                SELECT symbol, date, close
+                FROM `{self.dataset}.stock_history_from_alpaca`
+                WHERE symbol IN UNNEST(@symbols)
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) <= 90
+                ORDER BY symbol, date DESC
+            """, params=[ArrayQueryParameter("symbols", "STRING", held_syms)])
+            for r in bar_rows:
+                bars_by_symbol.setdefault(r["symbol"], []).append(r)
         except Exception:
             pass
 
@@ -1461,14 +1592,8 @@ class BigQueryService:
             pause_floor = (1.0 - threshold) * ref
             acquired = (lot_bases.get(sym) or {}).get("acquired_at")
             acquired_date = str(acquired)[:10] if acquired else "1900-01-01"
-            try:
-                bars = self._run_query(f"""
-                    SELECT date, close FROM `{self.dataset}.stock_history_from_alpaca`
-                    WHERE symbol = '{sym}' AND date >= '{acquired_date}'
-                    ORDER BY date DESC LIMIT 90
-                """)
-            except Exception:
-                bars = []
+            bars = [b for b in bars_by_symbol.get(sym, [])
+                    if str(b["date"]) >= acquired_date]
             if not bars:
                 continue
             latest = bars[0]

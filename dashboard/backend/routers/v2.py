@@ -19,13 +19,15 @@ router = APIRouter()
 
 # ----------------------------------------------------------------------
 # Live-bot proxy helpers (soft-fail: FC-031 endpoints degrade with a
-# labeled fallback instead of 5xx when the bot is unreachable)
+# labeled fallback instead of 5xx when the bot is unreachable). These wrap
+# the canonical handlers in routers/live.py — one copy of the response
+# normalization, plus the soft-fail behavior these endpoints need.
 # ----------------------------------------------------------------------
 
 async def _live_nlv() -> Optional[float]:
     try:
-        from routers.live import proxy_request
-        account = await proxy_request("/account")
+        from routers.live import get_account
+        account = await get_account()
         v = account.get("portfolio_value")
         return float(v) if v is not None else None
     except Exception:
@@ -34,25 +36,26 @@ async def _live_nlv() -> Optional[float]:
 
 async def _live_positions() -> Optional[List[Dict[str, Any]]]:
     try:
-        from routers.live import proxy_request
-        response = await proxy_request("/positions")
-        if isinstance(response, dict) and "positions" in response:
-            return response["positions"]
-        return response if isinstance(response, list) else None
+        from routers.live import get_positions
+        return await get_positions()
     except Exception:
         return None
 
 
+async def _bot_config() -> Dict[str, Any]:
+    try:
+        from routers.live import get_config
+        return await get_config()
+    except Exception:
+        return {}
+
+
 async def _drawdown_pause_threshold() -> tuple:
     """Single source of truth: the bot's own /config (review F8)."""
-    try:
-        from routers.live import proxy_request
-        cfg = await proxy_request("/config")
-        v = cfg.get("call_drawdown_pause_threshold")
-        if v is not None:
-            return float(v), "bot /config"
-    except Exception:
-        pass
+    cfg = await _bot_config()
+    v = cfg.get("call_drawdown_pause_threshold")
+    if v is not None:
+        return float(v), "bot /config"
     return float(os.getenv("DRAWDOWN_PAUSE_THRESHOLD", "0.05")), "env fallback"
 
 
@@ -215,17 +218,32 @@ async def put_stats(
     days: int = Query(default=3650, ge=1, le=3650),
 ) -> Dict[str, Any]:
     """Unassigned-put stats (separate from cycle stats) + held-to-expiry
-    assignment rate."""
+    assignment rate vs the put delta band."""
     bq = get_bigquery_service()
-    return bq.get_put_trade_stats(days=days)
+    cfg = await _bot_config()
+    return bq.get_option_trade_stats("put", days=days,
+                                     delta_band=cfg.get("put_delta_range"))
+
+
+@router.get("/call-stats")
+async def call_stats(
+    days: int = Query(default=3650, ge=1, le=3650),
+) -> Dict[str, Any]:
+    """Call-trade stats — the symmetric twin of /put-stats (Wheel Strategy
+    Symmetry Principle): held-to-expiry CALLED-AWAY rate vs the call delta
+    band, the calibration that matters most post-FC-029."""
+    bq = get_bigquery_service()
+    cfg = await _bot_config()
+    return bq.get_option_trade_stats("call", days=days,
+                                     delta_band=cfg.get("call_delta_range"))
 
 
 @router.get("/reconciliation")
 async def reconciliation() -> Dict[str, Any]:
     """Broker-vs-ledger reconciliation identity with residual + known gaps."""
+    import asyncio
     bq = get_bigquery_service()
-    nlv = await _live_nlv()
-    positions = await _live_positions()
+    nlv, positions = await asyncio.gather(_live_nlv(), _live_positions())
     return bq.get_reconciliation(current_nlv=nlv, live_positions=positions)
 
 
@@ -250,9 +268,10 @@ async def bot_health_anomalies() -> List[Dict[str, Any]]:
 async def bot_health_drawdown_pauses() -> Dict[str, Any]:
     """Symbols the R3 drawdown pause is inferred to be blocking (assignment-
     strike referenced, live share counts; labeled inferred-not-telemetry)."""
+    import asyncio
     bq = get_bigquery_service()
-    positions = await _live_positions()
-    threshold, source = await _drawdown_pause_threshold()
+    positions, (threshold, source) = await asyncio.gather(
+        _live_positions(), _drawdown_pause_threshold())
     return bq.get_drawdown_pauses(live_positions=positions,
                                   threshold=threshold,
                                   threshold_source=source)

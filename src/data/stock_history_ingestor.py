@@ -36,11 +36,14 @@ except ImportError:
 TABLE_NAME = "stock_history_from_alpaca"
 DEFAULT_BACKFILL_DAYS = 365
 
-# FC-031: always ingest benchmark bars alongside traded symbols. SPY powers
-# the Overview benchmark curve and doubles as the independent trading-day
-# calendar for bot-health anomaly detection (a day with a SPY bar and zero
-# scans is a missed trading day even if the scheduler died completely).
-BENCHMARK_SYMBOLS = ["SPY"]
+# FC-031: always ingest benchmark bars alongside traded symbols. The
+# benchmark powers the Overview comparison curve and doubles as the
+# independent trading-day calendar for bot-health anomaly detection (a day
+# with a benchmark bar and zero scans is a missed trading day even if the
+# scheduler died completely). Same env var as the dashboard backend
+# (dashboard/backend/services/bigquery.py BENCHMARK_SYMBOL) — one setting,
+# two deployables, no drift.
+BENCHMARK_SYMBOLS = [os.getenv("BENCHMARK_SYMBOL", "SPY")]
 
 
 if _HAS_BIGQUERY:
