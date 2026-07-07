@@ -3,9 +3,10 @@ import { render, screen } from '@testing-library/react';
 import VsBuyAndHoldCard from './VsBuyAndHoldCard';
 import type { VsBuyAndHold } from '../../types/v2';
 
-// Reflects the FC-023 fix: the Wheel total comes from `total_realized_pnl`
-// (option leg + share leg, FC-019), not the pre-FC-023 buggy
-// `realized_pnl + total_premium` which double-counted gross premium.
+// FC-031: the Wheel column is `wheel_mtm_pnl` — net cash P&L plus full
+// market value of held shares. The convention (adversarial review F1): share
+// acquisition cost is already expensed in the cash ledger, so the add-back
+// is market value, never (price − basis) × shares.
 
 const unhData: VsBuyAndHold = {
   underlying: 'UNH',
@@ -18,41 +19,67 @@ const unhData: VsBuyAndHold = {
   current_shares: 0,
   current_acb_per_share: null,
   price_at_start: 350.12,
+  price_at_start_date: '2025-10-06',
   price_now: 353.45,
+  price_now_date: '2026-07-03',
   hypothetical_shares: 99.25,
   bh_dollar_pnl: 997.76,
+  wheel_mtm_pnl: 2584, // no shares held → MTM = cash
   wheel_minus_bh: 1586.24,
 };
 
-describe('VsBuyAndHoldCard', () => {
-  it('renders Wheel total from total_realized_pnl, not realized_pnl + total_premium', () => {
+describe('VsBuyAndHoldCard (FC-031)', () => {
+  it('fully-cycled symbol: Wheel (MTM) equals net cash P&L', () => {
     render(<VsBuyAndHoldCard data={unhData} />);
-    // The pre-FC-023 buggy total would be 4334 + 5888 = 10,222 — must NOT be present.
-    expect(screen.queryByText(/\$10,222/)).toBeNull();
-    // Canonical total: 2,584 (option 4,334 + share −1,750).
+    expect(screen.getByText('Wheel (MTM)')).toBeInTheDocument();
     expect(screen.getByText('$2,584.00')).toBeInTheDocument();
+    // Pre-FC-023 buggy total (realized + gross premium) must not appear.
+    expect(screen.queryByText(/\$10,222/)).toBeNull();
   });
 
-  it('shows option + share breakdown in the Wheel subtitle', () => {
-    render(<VsBuyAndHoldCard data={unhData} />);
-    // Subtitle is "option $4,334 + share -$1,750" (rounded display).
-    const subtitle = screen.getByText(/option .* \+ share /);
-    expect(subtitle.textContent).toContain('option');
-    expect(subtitle.textContent).toContain('share');
-    // The pre-FC-023 wording must be gone.
-    expect(subtitle.textContent).not.toContain('prem');
-    expect(subtitle.textContent).not.toContain('realized');
+  it('symbol holding shares: Wheel column is the MTM field with the marks caveat', () => {
+    const holding: VsBuyAndHold = {
+      ...unhData,
+      underlying: 'AMD',
+      total_realized_pnl: -17319,
+      current_shares: 100,
+      price_now: 252.5,
+      wheel_mtm_pnl: -17319 + 100 * 252.5, // cash + full share MV = 7,931
+      wheel_minus_bh: 0,
+    };
+    render(<VsBuyAndHoldCard data={holding} />);
+    expect(screen.getByText('$7,931.00')).toBeInTheDocument();
+    expect(screen.getByText(/excl\. open option marks/)).toBeInTheDocument();
+    // The F1 double-count value must NOT appear anywhere.
+    expect(screen.queryByText(/-\$16,319/)).toBeNull();
   });
 
-  it('renders the wheel_minus_bh delta unmodified', () => {
-    render(<VsBuyAndHoldCard data={unhData} />);
-    // Delta column shows the corrected wheel_minus_bh from the view.
-    expect(screen.getByText('$1,586.24')).toBeInTheDocument();
+  it('renders the wheel_minus_bh delta from the view, not recomputed', () => {
+    const divergentDelta: VsBuyAndHold = {
+      ...unhData,
+      wheel_mtm_pnl: 5000,
+      bh_dollar_pnl: 1000,
+      wheel_minus_bh: 12345, // intentionally not 4000 — view is authoritative
+    };
+    render(<VsBuyAndHoldCard data={divergentDelta} />);
+    expect(screen.getByText('$12,345.00')).toBeInTheDocument();
+    expect(screen.queryByText('$4,000.00')).toBeNull();
   });
 
-  it('flags buy-and-hold as price-only', () => {
+  it('flags buy-and-hold as price-only and perfect-foresight', () => {
     render(<VsBuyAndHoldCard data={unhData} />);
     expect(screen.getByText(/price only/)).toBeInTheDocument();
+    expect(screen.getByText(/perfect-foresight/)).toBeInTheDocument();
+  });
+
+  it('flags a late B&H baseline (bar history starts after first trade)', () => {
+    const late: VsBuyAndHold = {
+      ...unhData,
+      first_trade_date: '2025-10-06',
+      price_at_start_date: '2025-11-15',
+    };
+    render(<VsBuyAndHoldCard data={late} />);
+    expect(screen.getByText(/baseline uses the 2025-11-15 close/)).toBeInTheDocument();
   });
 
   it('shows graceful empty state when data is null', () => {
@@ -60,33 +87,11 @@ describe('VsBuyAndHoldCard', () => {
     expect(screen.getByText('No comparison available.')).toBeInTheDocument();
   });
 
-  it('Wheel total is total_realized_pnl, not recomputed from option+share legs', () => {
-    // Construct a fixture where total_realized_pnl deliberately diverges
-    // from realized_pnl + share_side_pnl. The view is the authoritative
-    // source — frontend must read total_realized_pnl directly, not derive it.
-    const divergent: VsBuyAndHold = {
-      ...unhData,
-      realized_pnl: 1000,
-      share_side_pnl: 500,
-      total_realized_pnl: 9999, // intentionally not 1500
-    };
-    render(<VsBuyAndHoldCard data={divergent} />);
-    expect(screen.getByText('$9,999.00')).toBeInTheDocument();
-    expect(screen.queryByText('$1,500.00')).toBeNull();
-  });
-
-  it('Δ vs B&H comes from wheel_minus_bh field, not recomputed from total − bh', () => {
-    // Set wheel_minus_bh to a value that does NOT equal
-    // total_realized_pnl − bh_dollar_pnl. The view is the source of truth
-    // for the delta; the frontend must not re-derive it.
-    const divergentDelta: VsBuyAndHold = {
-      ...unhData,
-      total_realized_pnl: 5000,
-      bh_dollar_pnl: 1000,
-      wheel_minus_bh: 12345, // intentionally not 4000
-    };
-    render(<VsBuyAndHoldCard data={divergentDelta} />);
-    expect(screen.getByText('$12,345.00')).toBeInTheDocument();
-    expect(screen.queryByText('$4,000.00')).toBeNull();
+  it('zero price_at_start renders the backfill message via null-check, not truthiness', () => {
+    const zeroStart: VsBuyAndHold = { ...unhData, price_at_start: 0, bh_dollar_pnl: null, wheel_minus_bh: null };
+    render(<VsBuyAndHoldCard data={zeroStart} />);
+    // price_at_start = 0 is "present but degenerate" — bh_dollar_pnl null is
+    // what gates readiness now.
+    expect(screen.getByText(/backfill not yet complete/)).toBeInTheDocument();
   });
 });

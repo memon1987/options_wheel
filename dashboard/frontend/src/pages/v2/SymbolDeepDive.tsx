@@ -43,12 +43,16 @@ export default function SymbolDeepDive() {
 
   const skip = !symbol;
 
-  const { data: acb } = useApi<AcbTimelineRow[]>(skip ? null : `/api/v2/symbol/${symbol}/acb-timeline?days=730`);
-  const { data: decision } = useApi<DecisionQualityRow[]>(skip ? null : `/api/v2/symbol/${symbol}/decision-quality?days=365`);
+  // FC-031: one window for every widget on the page — mixed 365/730 windows
+  // made the header summary and the widgets below it cover different periods.
+  const WINDOW_DAYS = 730;
+
+  const { data: acb } = useApi<AcbTimelineRow[]>(skip ? null : `/api/v2/symbol/${symbol}/acb-timeline?days=${WINDOW_DAYS}`);
+  const { data: decision } = useApi<DecisionQualityRow[]>(skip ? null : `/api/v2/symbol/${symbol}/decision-quality?days=${WINDOW_DAYS}`);
   const { data: vsBh } = useApi<VsBuyAndHold>(skip ? null : `/api/v2/symbol/${symbol}/vs-buy-and-hold`);
-  const { data: cycles } = useApi<CycleRow[]>(skip ? null : `/api/v2/symbol/${symbol}/cycles?days=730`);
-  const { data: phase } = useApi<PhaseTiming>(skip ? null : `/api/v2/symbol/${symbol}/phase-timing?days=730`);
-  const { data: scorecard } = useApi<ScorecardRow[]>('/api/v2/scorecard?days=365');
+  const { data: cycles } = useApi<CycleRow[]>(skip ? null : `/api/v2/symbol/${symbol}/cycles?days=${WINDOW_DAYS}`);
+  const { data: phase } = useApi<PhaseTiming>(skip ? null : `/api/v2/symbol/${symbol}/phase-timing?days=${WINDOW_DAYS}`);
+  const { data: scorecard } = useApi<ScorecardRow[]>(`/api/v2/scorecard?days=${WINDOW_DAYS}`);
   const { data: account } = useApi<{ paper_trading?: boolean }>('/api/live/account', { refreshInterval: 60_000 });
   const isPaperTrading = account?.paper_trading ?? true;
 

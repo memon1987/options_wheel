@@ -37,7 +37,10 @@ except ImportError:
     bigquery = None  # type: ignore
 
 
-ACTIVITY_TYPES = "FILL,OPASN,OPEXP,OPTRD,JNLC"
+# FC-031 added FEE: regulatory/options fees, JNLC-shaped (no symbol/qty,
+# net_amount negative). ~$24 lifetime on paper but a first-class
+# reconciliation component so nothing breaks at live go-live.
+ACTIVITY_TYPES = "FILL,OPASN,OPEXP,OPTRD,JNLC,FEE"
 TABLE_NAME = "trades_from_activities"
 
 
@@ -169,7 +172,7 @@ class ActivitiesIngestor:
             SELECT
               MAX(CASE WHEN activity_type = 'FILL' THEN DATE(transaction_time, 'America/New_York') END) AS max_fill_date,
               MAX(CASE WHEN activity_type IN ('OPASN','OPEXP') THEN activity_date END) AS max_opevent_date,
-              MAX(CASE WHEN activity_type IN ('OPTRD','JNLC') THEN activity_date END) AS max_cash_date
+              MAX(CASE WHEN activity_type IN ('OPTRD','JNLC','FEE') THEN activity_date END) AS max_cash_date
             FROM `{self._project_id}.{self._dataset_id}.{TABLE_NAME}`
         """
         try:

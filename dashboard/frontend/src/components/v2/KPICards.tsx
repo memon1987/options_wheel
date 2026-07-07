@@ -38,87 +38,91 @@ export default function KPICards({ kpis }: Props) {
 }
 
 // Helpers used by Overview to build the KPI list from raw API data.
+// FC-031: Total P&L keeps the tile (the bank-statement number); XIRR/TWR are
+// sub-lines with the single-deposit caveat spelled out; max drawdown replaces
+// the retired CAGR tile; Days Running counts from the first DEPOSIT.
 export const buildHeadlineKpis = (args: {
   nlv: number | null;
   cash: number | null;
   buyingPower: number | null;
   startingCapital: number | null;    // sum of net deposits (JNLC) since account inception
-  grossPremium: number | null;       // sum of every option premium collected
-  netRealizedPnl: number | null;     // gross − roll buybacks
-  boughtBack: number | null;         // gross − net (paid out to roll)
-  daysRunning: number | null;
+  realizedCashPnl: number | null;    // reconciliation: closed net cash P&L
+  openValue: number | null;          // reconciliation: open premium + live MV − share cash… (see Overview)
+  xirr: number | null;
+  twrCumulative: number | null;
+  singleDeposit: boolean;
+  maxDrawdown: number | null;        // fraction ≤ 0
+  maxDrawdownDollars: number | null;
+  currentDrawdown: number | null;
+  daysRunning: number | null;        // since first deposit
+  nlvSource: string | null;
 }): KPI[] => {
   const {
-    nlv,
-    cash,
-    buyingPower,
-    startingCapital,
-    grossPremium,
-    netRealizedPnl,
-    boughtBack,
-    daysRunning,
+    nlv, cash, buyingPower, startingCapital,
+    realizedCashPnl, openValue,
+    xirr, twrCumulative, singleDeposit,
+    maxDrawdown, maxDrawdownDollars, currentDrawdown,
+    daysRunning, nlvSource,
   } = args;
 
-  // Bulletproof total return: NLV − sum of net deposits since inception.
-  // This is the bank-statement number — what your account actually grew by —
-  // and avoids the accounting noise of trying to reconcile realized P&L with
-  // share-side cash flow (OPTRD events, capital gains across overlapping lots).
-  const totalReturn =
-    nlv !== null && startingCapital !== null
-      ? nlv - startingCapital
-      : null;
-  const totalReturnPct =
+  // Total P&L: NLV − net deposits. The bank-statement number — what the
+  // account actually grew by, marked to market by the broker.
+  const totalPnl =
+    nlv !== null && startingCapital !== null ? nlv - startingCapital : null;
+  const totalPnlPct =
     nlv !== null && startingCapital !== null && startingCapital > 0
       ? (nlv - startingCapital) / startingCapital
       : null;
 
-  // Annualized return — for an account with a single deposit, this is the
-  // CAGR-like expression (NLV/deposit)^(365/days) − 1. With multiple
-  // deposits/withdrawals a true XIRR is needed; FC-019's BASELINE_DEPOSITS
-  // sum doesn't carry timing data per-deposit, so this is single-deposit
-  // approximate. Suppress display below 30 days running (extrapolation
-  // from <30d of data is misleading per the wheel-research consensus).
-  const annualizedReturn =
-    nlv !== null && startingCapital !== null && startingCapital > 0
-      && daysRunning !== null && daysRunning >= 30
-      ? Math.pow(nlv / startingCapital, 365 / daysRunning) - 1
-      : null;
+  const xirrLabel = singleDeposit ? 'annualized (single deposit)' : 'XIRR (money-weighted)';
 
   return [
     {
       label: 'Net Liquidation Value',
       value: fmtCurrencyDetail(nlv),
       sub: cash !== null ? `Cash ${fmtCurrency(cash)} · BP ${fmtCurrency(buyingPower)}` : undefined,
+      hint: nlvSource ? `NLV source: ${nlvSource}` : undefined,
     },
     {
-      label: 'Total Return',
-      value: fmtCurrencyDetail(totalReturn),
-      sub:
-        annualizedReturn !== null
-          ? `${fmtPercent(totalReturnPct ?? 0)} since inception · ${fmtPercent(annualizedReturn)} annualized`
-          : startingCapital !== null
-            ? `${fmtPercent(totalReturnPct ?? 0)} since inception · started ${fmtCurrency(startingCapital)}`
-            : undefined,
+      label: 'Total P&L',
+      value: fmtCurrencyDetail(totalPnl),
+      sub: (() => {
+        const parts: string[] = [];
+        if (totalPnlPct !== null) parts.push(`${fmtPercent(totalPnlPct)} on deposits`);
+        if (realizedCashPnl !== null && openValue !== null) {
+          parts.push(`${fmtCurrency(realizedCashPnl)} realized cash · ${fmtCurrency(openValue)} open value`);
+        }
+        return parts.join(' · ') || undefined;
+      })(),
       tone: 'pnl',
-      rawPnl: totalReturn,
-      hint: 'Current NLV minus net deposits since inception. The bank-statement number — what your account actually grew by, free of accounting noise from realized vs unrealized vs share-side cash flow. Annualized = (NLV/deposits)^(365/days) − 1, suppressed under 30 days.',
+      rawPnl: totalPnl,
+      hint: 'NLV minus net deposits since inception — the bank-statement number. The split shows closed net-cash P&L (options + share cash) vs the value currently sitting in open positions. Convention: share acquisition cost is expensed in cash P&L, so open value is full market value, never (price − basis) × shares.',
     },
     {
-      label: 'Net Realized P&L',
-      value: fmtCurrencyDetail(netRealizedPnl),
-      sub:
-        boughtBack !== null && boughtBack > 0 && grossPremium !== null
-          ? `Gross ${fmtCurrency(grossPremium)} − ${fmtCurrency(boughtBack)} bought back`
-          : 'Premium kept across all closed positions',
+      label: 'Max Drawdown',
+      value: maxDrawdown !== null ? fmtPercent(maxDrawdown) : '—',
+      sub: (() => {
+        const parts: string[] = [];
+        if (maxDrawdownDollars !== null) parts.push(`${fmtCurrency(maxDrawdownDollars)}`);
+        if (currentDrawdown !== null) parts.push(`now ${fmtPercent(currentDrawdown)} from peak`);
+        return parts.join(' · ') || undefined;
+      })(),
       tone: 'pnl',
-      rawPnl: netRealizedPnl,
-      hint: 'Sum of realized P&L across every closed option. Equals gross premium kept on assigned/expired/called-away positions, plus (premium − buyback) for early-closed positions. This is "actual cash earned from options."',
+      rawPnl: maxDrawdown,
+      hint: 'Largest peak-to-trough decline of the flow-adjusted equity curve (a deposit can neither mask nor create a drawdown). Close-to-close daily data — intraday drawdowns can be deeper.',
     },
     {
-      label: 'Days Running',
-      value: daysRunning !== null ? `${daysRunning}d` : '—',
-      sub: daysRunning !== null && daysRunning > 0 ? `since first trade` : undefined,
-      hint: 'Days since the first trade in this account.',
+      label: 'Return',
+      value: xirr !== null ? fmtPercent(xirr) : '—',
+      sub: (() => {
+        const parts: string[] = [xirrLabel];
+        if (twrCumulative !== null) parts.push(`TWR ${fmtPercent(twrCumulative)} cumulative`);
+        if (daysRunning !== null) parts.push(`${daysRunning}d since first deposit`);
+        return parts.join(' · ');
+      })(),
+      hint: singleDeposit
+        ? 'With a single deposit ever, XIRR is algebraically the annualized return since inception — nothing is money-weighted until a second cash flow exists. Extrapolated from a short track record; treat with the same skepticism as any annualized figure under 12 months.'
+        : 'XIRR: the money-weighted annual rate your actual dollars earned, including deposit timing. TWR: time-weighted return, the number to compare against benchmarks.',
     },
   ];
 };

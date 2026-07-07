@@ -208,6 +208,23 @@ class TestNormalize:
         # transaction_time falls back to created_at
         assert row["transaction_time"] == "2025-10-06T13:00:00.000000Z"
 
+    def test_fee_event(self):
+        """FC-031: FEE activities normalize through the JNLC-shaped path."""
+        row = ActivitiesIngestor._normalize({
+            "id": "20260103000000000::fee-ora",
+            "activity_type": "FEE",
+            "date": "2026-01-03",
+            "net_amount": "-0.52",
+            "description": "REG fee",
+        })
+        assert row is not None
+        assert row["activity_type"] == "FEE"
+        assert row["net_amount"] == -0.52
+        assert row["symbol"] == ""
+        assert row["option_type"] is None
+        # transaction_time synthesized from date
+        assert row["transaction_time"] == "2026-01-03T00:00:00Z"
+
     def test_synthesizes_timestamp_from_date_only(self):
         """An activity with only `date` (no transaction_time, no created_at)
         should synthesize a midnight UTC timestamp rather than be dropped.

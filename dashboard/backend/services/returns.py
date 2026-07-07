@@ -157,6 +157,38 @@ def max_drawdown(
     }
 
 
+def dollar_drawdown(
+    equity_points: List[EquityPoint], flows: List[Flow]
+) -> Dict[str, Optional[object]]:
+    """Max peak-to-trough drawdown in DOLLARS on flow-adjusted equity.
+
+    Flow-adjusted equity = raw equity − cumulative external flows, so a
+    deposit neither erases a drawdown nor manufactures one. Complements the
+    percentage drawdown from `max_drawdown` (a PM wants both).
+    """
+    pts = sorted((d, v) for d, v in equity_points if v is not None)
+    if len(pts) < 2:
+        return {"max_dd_dollars": None, "current_dd_dollars": None}
+    fl = sorted(_flows_by_date(flows).items())
+    out: List[Tuple[date, float]] = []
+    cum = 0.0
+    i = 0
+    for d, v in pts:
+        while i < len(fl) and fl[i][0] <= d:
+            cum += fl[i][1]
+            i += 1
+        out.append((d, v - cum))
+    peak = out[0][1]
+    max_dd = 0.0
+    for _, v in out:
+        peak = max(peak, v)
+        max_dd = min(max_dd, v - peak)
+    return {
+        "max_dd_dollars": max_dd if max_dd < 0 else 0.0,
+        "current_dd_dollars": out[-1][1] - peak,
+    }
+
+
 def indexed_curve(
     equity_points: List[EquityPoint], flows: List[Flow]
 ) -> List[Dict[str, object]]:

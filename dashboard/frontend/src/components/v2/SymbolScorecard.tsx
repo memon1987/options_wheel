@@ -16,6 +16,7 @@ type SortKey =
   | 'realized_pnl'
   | 'share_side_pnl'
   | 'total_realized_pnl'
+  | 'wheel_mtm_pnl'
   | 'wheel_minus_bh';
 
 interface SortState {
@@ -24,7 +25,7 @@ interface SortState {
 }
 
 export default function SymbolScorecard({ rows }: Props) {
-  const [sort, setSort] = useState<SortState>({ key: 'total_premium', dir: 'desc' });
+  const [sort, setSort] = useState<SortState>({ key: 'wheel_mtm_pnl', dir: 'desc' });
 
   const sorted = useMemo(() => {
     const out = [...rows];
@@ -91,10 +92,11 @@ export default function SymbolScorecard({ rows }: Props) {
               <SortHeader k="total_premium" label="Gross Prem" align="right" />
               <SortHeader k="realized_pnl" label="Option P&L" align="right" />
               <SortHeader k="share_side_pnl" label="Share P&L" align="right" />
-              <SortHeader k="total_realized_pnl" label="Total P&L" align="right" />
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-400 text-right" title="Adjusted cost basis per share — only meaningful when shares are held">ACB</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-400 text-right" title="Most recent close price for the underlying (from daily bars)">Price</th>
-              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-400 text-right" title="Unrealized P&L on currently-held shares: (price − ACB) × shares">Unreal</th>
+              <SortHeader k="total_realized_pnl" label="Cash P&L" align="right" />
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-400 text-right" title="Cost of the currently-open share lot (FIFO over OPTRD events). Display only — this cost is already expensed inside Cash P&L.">Basis/sh</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-400 text-right" title="Effective breakeven per share: (share cost − net premiums) / shares. A covered-call strike decision input — never summed into P&L.">Breakeven/sh</th>
+              <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-gray-400 text-right" title="Most recent daily-bar close for the underlying — can lag live prices">Price</th>
+              <SortHeader k="wheel_mtm_pnl" label="MTM P&L" align="right" />
               <SortHeader k="wheel_minus_bh" label="vs B&H" align="right" />
             </tr>
           </thead>
@@ -132,34 +134,40 @@ export default function SymbolScorecard({ rows }: Props) {
                       ? <span title="Sum of OPTRD net cash flow on share movements (assignments and called-aways) for this symbol">{fmtCurrency(r.share_side_pnl)}</span>
                       : <span className="text-gray-500">—</span>}
                   </td>
-                  <td className={cls('px-3 py-2 text-sm text-right font-semibold', pnlColor(r.total_realized_pnl))}>
-                    <span title="Option-side realized P&L plus stock-side realized P&L from share movements. This number plus unrealized on open positions = your account growth.">
+                  <td className={cls('px-3 py-2 text-sm text-right', pnlColor(r.total_realized_pnl))}>
+                    <span title="Net CASH P&L: option premiums net of buybacks + all OPTRD share cash (including the acquisition cost of shares still held). See MTM P&L for the marked-to-market total.">
                       {fmtCurrency(r.total_realized_pnl)}
                     </span>
                   </td>
                   <td className="px-3 py-2 text-sm text-right text-gray-200">
+                    {r.open_lot_basis_per_share !== null && (r.open_lot_shares ?? 0) > 0
+                      ? <span title={`FIFO open-lot cost. Acquired ${r.open_lot_acquired_at?.slice(0, 10) ?? '—'}`}>{`$${r.open_lot_basis_per_share.toFixed(2)}`}</span>
+                      : <span className="text-gray-500">—</span>}
+                  </td>
+                  <td className="px-3 py-2 text-sm text-right text-gray-200">
                     {r.current_shares !== null && r.current_shares > 0 && r.current_acb_per_share !== null
-                      ? `$${r.current_acb_per_share.toFixed(2)}`
+                      ? <span title={r.price_now !== null ? `Distance to breakeven: ${(((r.price_now - r.current_acb_per_share) / r.current_acb_per_share) * 100).toFixed(1)}%` : undefined}>
+                          {`$${r.current_acb_per_share.toFixed(2)}`}
+                        </span>
                       : <span className="text-gray-500">—</span>}
                   </td>
                   <td className="px-3 py-2 text-sm text-right text-gray-200">
                     {r.price_now !== null
-                      ? `$${r.price_now.toFixed(2)}`
+                      ? <span title={r.price_now_date ? `Close of ${r.price_now_date}` : undefined}>{`$${r.price_now.toFixed(2)}`}</span>
                       : <span className="text-gray-500">—</span>}
                   </td>
-                  <td className={cls(
-                    'px-3 py-2 text-sm text-right',
-                    r.current_shares && r.current_shares > 0 && r.price_now !== null && r.current_acb_per_share !== null
-                      ? pnlColor((r.price_now - r.current_acb_per_share) * r.current_shares)
-                      : 'text-gray-500'
-                  )}>
-                    {r.current_shares && r.current_shares > 0 && r.price_now !== null && r.current_acb_per_share !== null
-                      ? fmtCurrency((r.price_now - r.current_acb_per_share) * r.current_shares)
-                      : '—'}
+                  <td className={cls('px-3 py-2 text-sm text-right font-semibold', pnlColor(r.wheel_mtm_pnl ?? r.total_realized_pnl))}>
+                    {r.wheel_mtm_pnl !== null ? (
+                      <span title="Marked-to-market P&L: net cash P&L + full market value of held shares (their cost is already expensed in cash P&L — using (price − basis) × shares here would double-count). Open option marks excluded.">
+                        {fmtCurrency(r.wheel_mtm_pnl)}
+                      </span>
+                    ) : (
+                      <span title="No price data yet for held shares — showing net cash P&L">{fmtCurrency(r.total_realized_pnl)}</span>
+                    )}
                   </td>
                   <td className={cls('px-3 py-2 text-sm text-right', pnlColor(r.wheel_minus_bh))}>
                     {r.wheel_minus_bh !== null ? (
-                      <span title="Wheel total return minus synthetic buy-and-hold of same dollar amount">
+                      <span title="Wheel MTM P&L minus synthetic buy-and-hold of the first put's collateral, both marked to the same close. B&H is a perfect-foresight reference — every symbol assumes its full collateral deployed for the whole period.">
                         {fmtCurrency(r.wheel_minus_bh)}
                       </span>
                     ) : (
@@ -174,13 +182,27 @@ export default function SymbolScorecard({ rows }: Props) {
       </div>
       <div className="px-5 py-2 border-t border-gray-700 text-xs text-gray-500 flex justify-between gap-4 flex-wrap">
         <span>
-          {fmtPercent(sorted.filter((r) => r.wheel_minus_bh !== null && r.wheel_minus_bh > 0).length / Math.max(sorted.length, 1))} of symbols beat buy-and-hold this period.
+          {(() => {
+            // FC-031: denominator counts only symbols WITH a comparison —
+            // null rows (missing bars) used to deflate the beat rate.
+            const comparable = sorted.filter((r) => r.wheel_minus_bh !== null);
+            if (comparable.length === 0) return 'No buy-and-hold comparisons available yet.';
+            const beat = comparable.filter((r) => (r.wheel_minus_bh ?? 0) > 0).length;
+            const dateStamp = sorted.find((r) => r.price_now_date)?.price_now_date;
+            return (
+              <>
+                {fmtPercent(beat / comparable.length)} of {comparable.length} comparable symbols beat buy-and-hold.
+                {dateStamp && <span className="ml-2">Prices as of {dateStamp}.</span>}
+              </>
+            );
+          })()}
         </span>
         <span className="text-right">
-          <span title="Sum of every option premium collected when sold (gross of buybacks)">Gross Prem</span> ·{' '}
+          <span title="Sum of every option premium collected when sold (gross of buybacks) — revenue, not profit">Gross Prem</span> ·{' '}
           <span title="Option-side realized P&L net of roll buybacks">Option P&L</span> ·{' '}
-          <span title="Stock-side cash flow from OPTRD (assignment / called-away) — captures real lot economics">Share P&L</span> ·{' '}
-          <span title="Option P&L + Share P&L. Sum of this column across symbols ≈ headline Total Return (minus unrealized + fees)">Total P&L</span>
+          <span title="Stock-side cash flow from OPTRD (assignment / called-away) — includes acquisition cost of shares still held">Share P&L</span> ·{' '}
+          <span title="Net cash P&L = Option + Share cash. Σ Cash P&L + open premium + fees + live market value ≈ NLV − deposits (see reconciliation line)">Cash P&L</span> ·{' '}
+          <span title="Cash P&L + market value of held shares — the marked-to-market total">MTM P&L</span>
         </span>
       </div>
     </div>

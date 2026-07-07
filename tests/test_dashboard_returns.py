@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dashboard" / "back
 
 from services.returns import (  # noqa: E402
     annualize,
+    dollar_drawdown,
     indexed_curve,
     max_drawdown,
     twr,
@@ -145,6 +146,34 @@ class TestMaxDrawdown:
 
     def test_insufficient_data(self):
         assert max_drawdown([], [])["max_dd"] is None
+
+
+class TestDollarDrawdown:
+    def test_simple_dollar_dd(self):
+        pts = [
+            (date(2025, 1, 1), 100_000.0),
+            (date(2025, 2, 1), 120_000.0),
+            (date(2025, 3, 1), 111_000.0),
+        ]
+        dd = dollar_drawdown(pts, [])
+        assert dd["max_dd_dollars"] == pytest.approx(-9_000.0)
+        assert dd["current_dd_dollars"] == pytest.approx(-9_000.0)
+
+    def test_deposit_does_not_erase_dollar_dd(self):
+        # 120k → 110k organic loss, then a 30k deposit → raw equity 140k
+        # looks like a new high, but flow-adjusted the account is still
+        # $10k below its peak.
+        pts = [
+            (date(2025, 1, 1), 120_000.0),
+            (date(2025, 2, 1), 110_000.0),
+            (date(2025, 3, 1), 140_000.0),
+        ]
+        dd = dollar_drawdown(pts, [(date(2025, 3, 1), 30_000.0)])
+        assert dd["max_dd_dollars"] == pytest.approx(-10_000.0)
+        assert dd["current_dd_dollars"] == pytest.approx(-10_000.0)
+
+    def test_insufficient(self):
+        assert dollar_drawdown([], [])["max_dd_dollars"] is None
 
 
 class TestIndexedCurve:

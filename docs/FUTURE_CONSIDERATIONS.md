@@ -313,7 +313,7 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ### FC-030: Drawdown-pause observability — daily metric for paused symbols
 
-**Status:** Consideration
+**Status:** Consideration — dashboard half absorbed by FC-031 (Bot Health drawdown-pause card: paused symbols, days paused, assignment-strike referenced). Remaining scope: operator alerting/escalation.
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
@@ -331,7 +331,7 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ### FC-031: Dashboard metrics overhaul — vetted portfolio metrics + bot execution health
 
-**Status:** Plan published
+**Status:** Executing
 **Size estimate:** L
 **Owner:** Claude
 **Plan file:** `docs/plans/fc-031.md`

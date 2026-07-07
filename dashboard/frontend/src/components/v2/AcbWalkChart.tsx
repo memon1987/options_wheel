@@ -114,9 +114,8 @@ export default function AcbWalkChart({ data }: Props) {
               dataKey="acb"
               stroke="#fbbf24"
               strokeWidth={2}
-              connectNulls
               dot={false}
-              name="ACB / share"
+              name="Effective breakeven / share"
             />
             <Line
               yAxisId="prem"
