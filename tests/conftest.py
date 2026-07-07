@@ -9,6 +9,21 @@ from typing import Dict, Any, List
 import yaml
 
 from src.utils.config import Config
+from src.utils import clock as _time_seam
+
+
+# ==================== Global isolation ====================
+
+@pytest.fixture(autouse=True)
+def _reset_time_seam():
+    """Ensure the backtest time-seam is never left frozen between tests.
+
+    The FC-032 simulator freezes src.utils.clock.now() to simulated time; a test
+    that leaked a freeze would silently shift time-dependent live-code tests.
+    """
+    _time_seam.set_now(None)
+    yield
+    _time_seam.set_now(None)
 
 
 # ==================== Configuration Fixtures ====================
