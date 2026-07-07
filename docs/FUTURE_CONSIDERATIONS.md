@@ -329,21 +329,6 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-031: Dashboard metrics overhaul — vetted portfolio metrics + bot execution health
-
-**Status:** Executing
-**Size estimate:** L
-**Owner:** Claude
-**Plan file:** `docs/plans/fc-031.md`
-
-**Problem / opportunity:** A full audit of the dashboard (`docs/investigations/dashboard-metrics-audit-2026-07-07.md`) found several misleading or incorrectly calculated metrics: the vs-buy-and-hold comparison marks B&H to market but counts the wheel realized-only and ignores capital efficiency / varying hold times; the scorecard's Unrealized column double-counts premium by using ACB instead of raw share basis (there is no raw cost basis shown for long positions at all); the annualized-return tile is a single-deposit CAGR whose window shifts with the range picker; monthly premium bars show gross premium as if it were income; `win_rate`/`return_30d` are dead fields hardcoded to None. Bot health has data (stages 1–9 in `scans`) but no decision funnel, no anomaly flags, no run-reliability SLO, no drawdown-pause visibility (FC-030), and no automated reconciliation check.
-
-**Open questions:** see plan file.
-
-**Links:** audit doc above; FC-018/019/020/023/024/026/027 (prior dashboard accounting work); FC-030 (absorbed into this FC's Bot Health scope); `docs/investigations/strategy-review-2026-05-07.md` §1.2.3 + Open Question 2 (capital-efficiency-adjusted benchmark).
-
----
-
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
@@ -468,3 +453,9 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - PR: https://github.com/memon1987/options_wheel/pull/19 (merged 2026-05-05)
 - Commit: `78acf92` (preceded by `4862159` — interim env-var-baseline fix that this PR replaces with the real JNLC sum)
 - Notes: Per-symbol scorecard now reconciles to actual account growth (sum of Total P&L = $21,808 vs account growth $20,080, with the ~$1,600 unexplained gap concentrated entirely on AMD's Alpaca-side data anomaly). New scorecard columns: Option P&L (renamed from Net P&L), Share P&L (FC-019), Total P&L (sum). `wheel_cycles_from_activities.capital_gain` now uses real OPTRD cash flow within the cycle window. `BASELINE_DEPOSITS` env var becomes a fallback only — primary source is `SUM(net_amount) WHERE activity_type='JNLC'`. Per-cycle pairing for overlapping share lots is filed as **FC-020** for follow-up.
+
+### FC-031: Dashboard metrics overhaul — vetted portfolio metrics + bot execution health
+- Plan: `docs/plans/fc-031.md`
+- Investigations: `docs/investigations/dashboard-metrics-audit-2026-07-07.md` (per-metric methodology audit), `docs/investigations/fc-031-adversarial-review-2026-07-07.md` (adversarial PM review of the plan — 7 blockers incorporated pre-implementation)
+- Merge: direct merge commit `1e8f622` to main (2026-07-07) — no PR: GitHub App not connected for the org this session; branch `claude/dashboard-metrics-review-k1ze5g`, commits `5fa2e48` (plan+audit), `7b5a718` (implementation), `14f299d` (adversarial code-review fixes)
+- Notes: One accounting convention everywhere (net cash P&L + market value of holdings — the PM review caught that the draft's `(price − basis) × shares` add-back would have double-subtracted held-share cost, ~$24k error on AMD). Headline KPIs: Total P&L (realized cash / open value split), max drawdown (% + flow-adjusted $), XIRR labeled "annualized (single deposit)". TWR-indexed equity curve vs SPY; vs-B&H made symmetric (wheel MTM); FIFO open-lot basis + breakeven columns; cycle table RoC + $/day/$1k; separate put/call trade stats with held-to-expiry exercise-rate calibration vs live config delta bands (Symmetry Principle); net option cash flow bars. Bot Health: decision funnel, anomaly flags on the SPY-bar calendar, run reliability, drawdown-pause card (absorbs FC-030's dashboard half), falsifiable reconciliation banner (residual vs known gaps, share-count mismatch tracking). Removed: dead `win_rate`/`return_30d`, option-leg-only `/api/metrics/pnl-by-symbol`, fake freshness stamp, CAGR tile. Post-implementation 8-angle code review found + fixed 3 defects (cycle-stats fallback crash, unpopulated mismatch badge, /config not exposing threshold/bands) before merge. Tests 293 pytest + 72 vitest. **Post-merge manual steps pending:** re-apply `fc018_views.sql` + `fc031_views.sql` via bq, `POST /ingest-stock-history?backfill_days=400` (SPY), `POST /ingest-activities?after=2025-10-01` (FEE).
