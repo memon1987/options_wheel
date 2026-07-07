@@ -329,6 +329,21 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
+### FC-031: Dashboard metrics overhaul — vetted portfolio metrics + bot execution health
+
+**Status:** Plan published
+**Size estimate:** L
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-031.md`
+
+**Problem / opportunity:** A full audit of the dashboard (`docs/investigations/dashboard-metrics-audit-2026-07-07.md`) found several misleading or incorrectly calculated metrics: the vs-buy-and-hold comparison marks B&H to market but counts the wheel realized-only and ignores capital efficiency / varying hold times; the scorecard's Unrealized column double-counts premium by using ACB instead of raw share basis (there is no raw cost basis shown for long positions at all); the annualized-return tile is a single-deposit CAGR whose window shifts with the range picker; monthly premium bars show gross premium as if it were income; `win_rate`/`return_30d` are dead fields hardcoded to None. Bot health has data (stages 1–9 in `scans`) but no decision funnel, no anomaly flags, no run-reliability SLO, no drawdown-pause visibility (FC-030), and no automated reconciliation check.
+
+**Open questions:** see plan file.
+
+**Links:** audit doc above; FC-018/019/020/023/024/026/027 (prior dashboard accounting work); FC-030 (absorbed into this FC's Bot Health scope); `docs/investigations/strategy-review-2026-05-07.md` §1.2.3 + Open Question 2 (capital-efficiency-adjusted benchmark).
+
+---
+
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
 **Status:** Consideration
