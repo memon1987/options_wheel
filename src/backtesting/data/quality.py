@@ -134,13 +134,17 @@ def evaluate_coverage(
     """
     stock_bars = provider.get_stock_bars(symbol, start, end)
     trading_days = [b.bar_date for b in stock_bars]
+    closes = {b.bar_date: b.close for b in stock_bars}
     sampled = trading_days[::sample_every_trading_days]
 
     lo, hi = put_delta_band
     per_day: List[DayCoverage] = []
 
     for as_of in sampled:
-        snap = builder.build(symbol, as_of, max_dte)
+        # Hand the builder the close we already fetched. Otherwise it re-queries
+        # the underlying once per decision day — a request we cannot spare on a
+        # 200 req/min tier.
+        snap = builder.build(symbol, as_of, max_dte, underlying_price=closes.get(as_of))
         if snap is None:
             per_day.append(DayCoverage(as_of, False, 0, 0, 0, False))
             continue

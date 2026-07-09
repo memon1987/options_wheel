@@ -297,6 +297,35 @@ class TestCoverage:
         assert report.verdict() in {"good", "marginal", "poor"}
         assert "usable_fraction" in report.summary()
 
+    def test_does_not_refetch_the_underlying_per_decision_day(self):
+        """Coverage already holds the window's closes; the builder must reuse them.
+
+        A per-day underlying refetch is one wasted request per decision day, on a
+        200 req/min tier that already bounds the run's wall time.
+        """
+        p = MockProvider()
+        base = date(2025, 1, 6)
+        days = [base + timedelta(days=i) for i in range(10)]
+        for d in days:
+            p.stock[d] = 100.0
+
+        calls = {"n": 0}
+        original = p.get_stock_bars
+
+        def counting_get_stock_bars(symbol, start, end):
+            calls["n"] += 1
+            return original(symbol, start, end)
+
+        p.get_stock_bars = counting_get_stock_bars
+
+        b = ChainBuilder(p, risk_free_rate=0.04)
+        evaluate_coverage(p, b, "XYZ", days[0], days[-1], max_dte=7, sample_every_trading_days=1)
+
+        assert calls["n"] == 1, (
+            f"expected a single windowed stock-bars fetch, got {calls['n']} "
+            "(the builder is refetching the underlying per decision day)"
+        )
+
     def test_zero_decision_days_is_no_data_not_poor(self):
         """A symbol with no bars must not read as 'poor' coverage.
 
