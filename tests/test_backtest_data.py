@@ -326,6 +326,78 @@ class TestCoverage:
             "(the builder is refetching the underlying per decision day)"
         )
 
+    def _coverage(self, spot: float, strike: float, premium: float):
+        """Coverage over 10 days whose only put is (strike, premium) at 7 DTE.
+
+        The (spot, strike, premium) triples used below were solved against
+        greeks.implied_vol/bs_delta so the contract lands inside the 0.10-0.20
+        delta band — delta is derived from the premium, so the two cannot be
+        chosen independently.
+        """
+        p = MockProvider()
+        base = date(2025, 1, 6)
+        days = [base + timedelta(days=i) for i in range(10)]
+        for d in days:
+            p.stock[d] = spot
+            exp = d + timedelta(days=7)
+            p.add_contract(
+                OptionContract(_occ("XYZ", exp, "put", int(strike)), "XYZ", exp, strike, "put"),
+                close=premium,
+                traded_on=[d],
+            )
+        b = ChainBuilder(p, risk_free_rate=0.04)
+        return evaluate_coverage(
+            p, b, "XYZ", days[0], days[-1], max_dte=7,
+            min_put_premium=0.50, sample_every_trading_days=1,
+        )
+
+    def test_premium_shortfall_is_not_a_data_problem(self):
+        """A priced in-band put that underpays the floor must not read as missing data.
+
+        This is the distinction the vendor decision rests on: ThetaData supplies
+        quotes, not premium. If the chain has the contract and it simply pays
+        too little, buying data changes nothing.
+        """
+        # |delta| = 0.144, premium $0.30 -> in band, under the $0.50 floor.
+        report = self._coverage(spot=100.0, strike=96.0, premium=0.30)
+
+        # The data was there every single day...
+        assert report.days_with_bar == report.decision_days
+        assert report.days_with_in_band_put == report.decision_days
+        assert report.in_band_fraction == 1.0
+        # ...but no day was usable, and the reason is premium, not data.
+        assert report.days_with_usable_put == 0
+        assert report.premium_shortfall_days == report.decision_days
+        assert report.limiting_factor() == "premium"
+        # And the richest in-band premium is recorded even though it lost.
+        assert report.per_day[0].best_in_band_premium == pytest.approx(0.30)
+        assert report.per_day[0].best_put_premium is None
+
+    def test_data_gap_is_reported_as_data_limited(self):
+        """No priced put in the band at all => a vendor genuinely could help."""
+        p = MockProvider()
+        base = date(2025, 1, 6)
+        days = [base + timedelta(days=i) for i in range(10)]
+        for d in days:
+            p.stock[d] = 100.0  # underlying only; no option contracts anywhere
+        b = ChainBuilder(p, risk_free_rate=0.04)
+        report = evaluate_coverage(
+            p, b, "XYZ", days[0], days[-1], max_dte=7, sample_every_trading_days=1
+        )
+        assert report.decision_days == 10
+        assert report.days_with_in_band_put == 0
+        assert report.premium_shortfall_days == 0
+        assert report.limiting_factor() == "data"
+
+    def test_limiting_factor_none_when_fully_usable(self):
+        # |delta| = 0.167, premium $0.80 -> in band, clears the $0.50 floor.
+        report = self._coverage(spot=200.0, strike=192.0, premium=0.80)
+        assert report.days_with_usable_put == report.decision_days
+        assert report.usable_fraction == 1.0
+        assert report.verdict() == "good"
+        assert report.premium_shortfall_days == 0
+        assert report.limiting_factor() == "none"
+
     def test_zero_decision_days_is_no_data_not_poor(self):
         """A symbol with no bars must not read as 'poor' coverage.
 

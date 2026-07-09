@@ -40,6 +40,10 @@ class DayCoverage:
     usable_put_candidate: bool  # in band AND premium >= floor
     best_put_premium: Optional[float] = None
     best_put_delta: Optional[float] = None
+    # Richest in-band put *ignoring* the premium floor. When this is populated
+    # but usable_put_candidate is False, the data was there and the strategy's
+    # floor is what rejected the day — a fact about the symbol, not the vendor.
+    best_in_band_premium: Optional[float] = None
 
 
 @dataclass
@@ -57,6 +61,9 @@ class CoverageReport:
     put_delta_band: Tuple[float, float]
     min_put_premium: float
     max_dte: int
+    # Days where a priced put existed in the delta band, whether or not it
+    # cleared the premium floor. This is the true *data* coverage number.
+    days_with_in_band_put: int = 0
     per_day: List[DayCoverage] = field(default_factory=list)
 
     @property
@@ -70,6 +77,34 @@ class CoverageReport:
         if not self.days_with_any_contract:
             return 0.0
         return self.days_with_bar / self.days_with_any_contract
+
+    @property
+    def in_band_fraction(self) -> float:
+        """Fraction of decision days with a *priced* put in the delta band.
+
+        This — not ``usable_fraction`` — is what a data vendor could improve.
+        """
+        return self.days_with_in_band_put / self.decision_days if self.decision_days else 0.0
+
+    @property
+    def premium_shortfall_days(self) -> int:
+        """Days with an in-band put that simply did not pay the premium floor."""
+        return max(0, self.days_with_in_band_put - self.days_with_usable_put)
+
+    def limiting_factor(self) -> str:
+        """What actually costs this symbol its unusable days.
+
+        The distinction is the whole point of the gate. 'data' means the chain
+        had no priced put at our deltas — a vendor with real quotes would help.
+        'premium' means the put was right there and paid less than the floor —
+        no vendor changes that; the symbol is simply not paying for the risk.
+        """
+        if self.decision_days == 0:
+            return "unknown"
+        unusable = self.decision_days - self.days_with_usable_put
+        if unusable == 0:
+            return "none"
+        return "premium" if self.premium_shortfall_days > unusable / 2 else "data"
 
     def verdict(self, *, good_threshold: float = 0.90, marginal_threshold: float = 0.70) -> str:
         """Coverage verdict driving the data-source decision.
@@ -94,6 +129,9 @@ class CoverageReport:
         d.pop("per_day", None)
         d["usable_fraction"] = round(self.usable_fraction, 4)
         d["bar_fraction"] = round(self.bar_fraction, 4)
+        d["in_band_fraction"] = round(self.in_band_fraction, 4)
+        d["premium_shortfall_days"] = self.premium_shortfall_days
+        d["limiting_factor"] = self.limiting_factor()
         d["verdict"] = self.verdict()
         d["start"] = self.start.isoformat()
         d["end"] = self.end.isoformat()
@@ -162,6 +200,7 @@ def evaluate_coverage(
         ]
         usable = [qt for qt in in_band if qt.mark >= min_put_premium]
         best = max(usable, key=lambda x: x.mark) if usable else None
+        best_in_band = max(in_band, key=lambda x: x.mark) if in_band else None
 
         per_day.append(
             DayCoverage(
@@ -173,6 +212,7 @@ def evaluate_coverage(
                 usable_put_candidate=bool(usable),
                 best_put_premium=best.mark if best else None,
                 best_put_delta=best.delta if best else None,
+                best_in_band_premium=best_in_band.mark if best_in_band else None,
             )
         )
 
@@ -188,5 +228,6 @@ def evaluate_coverage(
         put_delta_band=put_delta_band,
         min_put_premium=min_put_premium,
         max_dte=max_dte,
+        days_with_in_band_put=sum(1 for d in per_day if d.puts_in_delta_band > 0),
         per_day=per_day,
     )

@@ -87,7 +87,10 @@ def main() -> int:
         f"(sample every {args.sample} trading days, max_dte={max_dte}, "
         f"put delta {put_band}, min premium ${min_prem})\n"
     )
-    header = f"{'symbol':<8}{'days':>6}{'w/underlying':>14}{'w/contracts':>13}{'w/bar':>8}{'usable':>8}{'usable%':>9}  verdict"
+    header = (
+        f"{'symbol':<8}{'days':>6}{'w/bar':>8}{'in-band':>9}{'inband%':>9}"
+        f"{'usable':>8}{'usable%':>9}  {'verdict':<9} limited-by"
+    )
     print(header)
     print("-" * len(header))
 
@@ -112,10 +115,10 @@ def main() -> int:
         s = report.summary()
         summaries.append(s)
         print(
-            f"{symbol:<8}{report.decision_days:>6}{report.days_with_underlying:>14}"
-            f"{report.days_with_any_contract:>13}{report.days_with_bar:>8}"
+            f"{symbol:<8}{report.decision_days:>6}{report.days_with_bar:>8}"
+            f"{report.days_with_in_band_put:>9}{report.in_band_fraction * 100:>8.1f}%"
             f"{report.days_with_usable_put:>8}{report.usable_fraction * 100:>8.1f}%"
-            f"  {report.verdict()}"
+            f"  {report.verdict():<9} {report.limiting_factor()}"
         )
 
     # A gate that reports success on zero data is worse than no gate: it is the
@@ -142,10 +145,26 @@ def main() -> int:
         f"\nVerdict tally: {good} good, {marginal} marginal, {poor} poor "
         f"of {len(summaries) - len(no_data)} measured symbols."
     )
+
+    # The vendor decision turns on WHY days are unusable, not how many. A paid
+    # provider supplies quotes and greeks; it cannot make a 15-delta weekly pay
+    # a premium it never paid. Only 'data'-limited symbols are an argument to buy.
+    measured = [s for s in summaries if s["verdict"] != "no-data"]
+    data_limited = [s["symbol"] for s in measured if s["limiting_factor"] == "data"]
+    premium_limited = [s["symbol"] for s in measured if s["limiting_factor"] == "premium"]
     print(
-        "Gate: if most target symbols are 'good', proceed on free Alpaca data; "
-        "if 'poor' dominates at our low-delta strikes, wire a paid provider "
-        "(ThetaData/ORATS) behind OptionsDataProvider before Phase 3 depends on it."
+        f"Limited by DATA (a vendor would help): {len(data_limited)} "
+        f"{sorted(data_limited) if data_limited else ''}"
+    )
+    print(
+        f"Limited by PREMIUM (no vendor helps; the symbol underpays our floor): "
+        f"{len(premium_limited)} {sorted(premium_limited) if premium_limited else ''}"
+    )
+    print(
+        "\nGate: buy ThetaData/ORATS only if symbols are DATA-limited — i.e. the "
+        "chain lacks a priced put at our deltas. PREMIUM-limited symbols are a "
+        "finding about the symbol (it does not pay our floor), and are exactly "
+        "what the fitness report exists to surface; they are not a data problem."
     )
 
     if no_data:
