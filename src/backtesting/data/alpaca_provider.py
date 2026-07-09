@@ -13,9 +13,14 @@ Sources, all confirmed against alpaca-py and Alpaca's docs (July 2026):
     feed parameter — historical option bars are OPRA-sourced and free on the
     Basic plan). Bars are trade aggregates, so illiquid contracts have gaps.
 
-  * Stock bars: ``get_stock_bars`` daily. Feed defaults to IEX (free); the live
-    ingestor uses SIP where subscribed. The provider exposes ``stock_feed`` so a
-    caller with a subscription can request SIP.
+  * Stock bars: ``get_stock_bars`` daily. With no feed parameter the SDK defaults
+    to SIP, which the Basic plan serves only on a 15-minute delay. The provider
+    exposes ``stock_feed`` so a caller may force 'iex'.
+
+Both data endpoints gate *recent* data behind entitlements we do not hold: SIP
+stock bars ("subscription does not permit querying recent SIP data") and
+real-time OPRA option bars ("OPRA agreement is not signed"). Requests are
+therefore clamped to a delayed cutoff, mirroring the live client's buffer.
 
 There is deliberately NO historical-quote path: Alpaca has none, so bid/ask is
 modeled downstream (see spread_model.py), never fetched.
@@ -46,6 +51,36 @@ logger = structlog.get_logger(__name__)
 # earlier windows return empty and should be reported as "no coverage", not
 # silently treated as a data gap.
 ALPACA_OPTIONS_HISTORY_START = date(2024, 2, 1)
+
+# Free-tier data is delayed 15 minutes; a request whose end timestamp reaches
+# into that window is rejected outright (403) rather than truncated. The live
+# client uses the same 20-minute buffer (src/api/alpaca_client.py).
+REALTIME_DELAY_MINUTES = 20
+
+# NOTE: the two helpers below deliberately read the real wall clock, never
+# src.utils.clock.now(). They answer "what is Alpaca entitled to serve at this
+# instant", which is independent of the simulated time a replay has frozen. Were
+# they to honor the freeze, a backtest of June 2024 would treat every later bar
+# as unsettled and fetch nothing.
+
+
+def _delayed_end(end: date) -> datetime:
+    """Clamp a request's end timestamp out of the real-time window."""
+    return min(
+        datetime.combine(end, time.max),
+        datetime.now() - timedelta(minutes=REALTIME_DELAY_MINUTES),
+    )
+
+
+def _is_settled(bar_date: date) -> bool:
+    """Whether a daily bar is a completed session.
+
+    Today's daily bar is still forming while the market is open, so its close is
+    not the close. The backtest consumes settled sessions only; admitting a
+    partial bar would feed the simulator a price that never existed at any
+    decision point. Dropping it costs at most the current day.
+    """
+    return bar_date < date.today()
 
 
 class AlpacaDataProvider(OptionsDataProvider):
@@ -141,8 +176,15 @@ class AlpacaDataProvider(OptionsDataProvider):
 
         Alpaca caps symbols-per-request; we chunk to stay well under limits.
         Contracts with no trades in the window simply won't appear in the result.
+        Real-time OPRA bars are not entitled, so ``end`` is clamped to the
+        delayed cutoff and the current session's partial bar is dropped.
         """
         if not symbols:
+            return {}
+
+        end_dt = _delayed_end(end)
+        start_dt = datetime.combine(start, time.min)
+        if end_dt <= start_dt:
             return {}
 
         result: Dict[str, List[OptionBar]] = {}
@@ -152,8 +194,8 @@ class AlpacaDataProvider(OptionsDataProvider):
             req = OptionBarsRequest(
                 symbol_or_symbols=chunk,
                 timeframe=TimeFrame.Day,
-                start=datetime.combine(start, time.min),
-                end=datetime.combine(end, time.max),
+                start=start_dt,
+                end=end_dt,
             )
             bars = self._option_data.get_option_bars(req)
             for sym, sym_bars in (bars.data or {}).items():
@@ -170,21 +212,32 @@ class AlpacaDataProvider(OptionsDataProvider):
                         vwap=float(getattr(b, "vwap", 0.0) or 0.0),
                     )
                     for b in sym_bars
+                    if _is_settled(b.timestamp.date())
                 ]
                 out.sort(key=lambda x: x.bar_date)
-                result[sym] = out
+                if out:
+                    result[sym] = out
         return result
 
     # ------------------------------------------------------------------ #
     # Stock bars
     # ------------------------------------------------------------------ #
     def get_stock_bars(self, symbol: str, start: date, end: date) -> List[StockBar]:
-        """Daily underlying bars over [start, end] inclusive, ascending."""
+        """Daily underlying bars over [start, end] inclusive, ascending.
+
+        Recent SIP data is not entitled on the Basic plan, so ``end`` is clamped
+        to the delayed cutoff and the current session's partial bar is dropped.
+        """
+        end_dt = _delayed_end(end)
+        start_dt = datetime.combine(start, time.min)
+        if end_dt <= start_dt:
+            return []
+
         kwargs = dict(
             symbol_or_symbols=symbol,
             timeframe=TimeFrame.Day,
-            start=datetime.combine(start, time.min),
-            end=datetime.combine(end, time.max),
+            start=start_dt,
+            end=end_dt,
         )
         if self._stock_feed:
             kwargs["feed"] = self._stock_feed
@@ -202,6 +255,7 @@ class AlpacaDataProvider(OptionsDataProvider):
                 volume=int(b.volume),
             )
             for b in sym_bars
+            if _is_settled(b.timestamp.date())
         ]
         out.sort(key=lambda x: x.bar_date)
         return out

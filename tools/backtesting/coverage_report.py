@@ -81,6 +81,7 @@ def main() -> int:
     builder = ChainBuilder(provider)
 
     summaries = []
+    errors: list = []
     print(
         f"\nData coverage {start.isoformat()} -> {args.end.isoformat()} "
         f"(sample every {args.sample} trading days, max_dte={max_dte}, "
@@ -105,6 +106,7 @@ def main() -> int:
             )
         except Exception as e:  # noqa: BLE001 - operator tool, surface and continue
             print(f"{symbol:<8}ERROR: {e}")
+            errors.append({"symbol": symbol, "error": str(e)})
             continue
 
         s = report.summary()
@@ -116,26 +118,48 @@ def main() -> int:
             f"  {report.verdict()}"
         )
 
+    # A gate that reports success on zero data is worse than no gate: it is the
+    # exact failure the old engine shipped for a year. Refuse to write an
+    # artifact that a reader would mistake for a clean run.
+    if not summaries:
+        print(
+            f"\nFATAL: no symbol produced a coverage report ({len(errors)} errored). "
+            "No gate decision is possible; not writing an output file."
+        )
+        return 1
+
     if args.out:
         with open(args.out, "w") as f:
             json.dump(summaries, f, indent=2)
         print(f"\nWrote {len(summaries)} symbol summaries to {args.out}")
 
     # Aggregate guidance.
-    if summaries:
-        good = sum(1 for s in summaries if s["verdict"] == "good")
-        marginal = sum(1 for s in summaries if s["verdict"] == "marginal")
-        poor = sum(1 for s in summaries if s["verdict"] == "poor")
+    good = sum(1 for s in summaries if s["verdict"] == "good")
+    marginal = sum(1 for s in summaries if s["verdict"] == "marginal")
+    poor = sum(1 for s in summaries if s["verdict"] == "poor")
+    no_data = [s["symbol"] for s in summaries if s["verdict"] == "no-data"]
+    print(
+        f"\nVerdict tally: {good} good, {marginal} marginal, {poor} poor "
+        f"of {len(summaries) - len(no_data)} measured symbols."
+    )
+    print(
+        "Gate: if most target symbols are 'good', proceed on free Alpaca data; "
+        "if 'poor' dominates at our low-delta strikes, wire a paid provider "
+        "(ThetaData/ORATS) behind OptionsDataProvider before Phase 3 depends on it."
+    )
+
+    if no_data:
         print(
-            f"\nVerdict tally: {good} good, {marginal} marginal, {poor} poor "
-            f"of {len(summaries)} symbols."
+            f"\nWARNING: {len(no_data)} symbol(s) yielded ZERO decision days and "
+            f"were not measured at all: {', '.join(no_data)}. This is not a "
+            "coverage verdict — investigate the data path before reading the gate."
         )
+    if errors:
         print(
-            "Gate: if most target symbols are 'good', proceed on free Alpaca data; "
-            "if 'poor' dominates at our low-delta strikes, wire a paid provider "
-            "(ThetaData/ORATS) behind OptionsDataProvider before Phase 3 depends on it."
+            f"\nWARNING: {len(errors)} of {len(symbols)} symbols failed and are "
+            f"absent from the tally: {', '.join(e['symbol'] for e in errors)}"
         )
-    return 0
+    return 1 if (errors or no_data) else 0
 
 
 if __name__ == "__main__":

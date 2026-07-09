@@ -8,7 +8,7 @@ an in-memory mock provider.
 from __future__ import annotations
 
 import math
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Dict, List
 
 import pytest
@@ -296,3 +296,74 @@ class TestCoverage:
         assert report.usable_fraction >= 0.0
         assert report.verdict() in {"good", "marginal", "poor"}
         assert "usable_fraction" in report.summary()
+
+    def test_zero_decision_days_is_no_data_not_poor(self):
+        """A symbol with no bars must not read as 'poor' coverage.
+
+        'poor' is the verdict that argues for paying a data vendor; an empty API
+        response or a bad ticker is not evidence about coverage at all.
+        """
+        p = MockProvider()  # no stock bars at all
+        b = ChainBuilder(p, risk_free_rate=0.04)
+        report = evaluate_coverage(
+            p, b, "NOSUCH", date(2025, 1, 6), date(2025, 1, 16), max_dte=7
+        )
+        assert report.decision_days == 0
+        assert report.usable_fraction == 0.0
+        assert report.verdict() == "no-data"
+        assert report.summary()["verdict"] == "no-data"
+
+
+# --------------------------------------------------------------------------- #
+# Alpaca provider: real-time entitlement clamp
+# --------------------------------------------------------------------------- #
+class TestRealtimeClamp:
+    """Alpaca 403s any request reaching into the undelayed window.
+
+    Regression guard for the Phase 1 gate failing on all 14 symbols with
+    "subscription does not permit querying recent SIP data" (stocks) and
+    "OPRA agreement is not signed" (options) whenever --end was today.
+    """
+
+    def test_delayed_end_clamps_today_out_of_realtime_window(self):
+        from src.backtesting.data.alpaca_provider import (
+            REALTIME_DELAY_MINUTES,
+            _delayed_end,
+        )
+
+        delay = timedelta(minutes=REALTIME_DELAY_MINUTES)
+        before = datetime.now()
+        got = _delayed_end(date.today())
+        after = datetime.now()
+        # Bracket the call rather than comparing to a single sampled clock read,
+        # which races the microseconds elapsed inside _delayed_end.
+        assert before - delay <= got <= after - delay
+
+    def test_delayed_end_leaves_past_windows_untouched(self):
+        from src.backtesting.data.alpaca_provider import _delayed_end
+
+        past = date.today() - timedelta(days=30)
+        assert _delayed_end(past) == datetime.combine(past, time.max)
+
+    def test_current_session_bar_is_not_settled(self):
+        from src.backtesting.data.alpaca_provider import _is_settled
+
+        assert not _is_settled(date.today())
+        assert _is_settled(date.today() - timedelta(days=1))
+
+    def test_settlement_ignores_a_frozen_simulated_clock(self):
+        """Entitlement is a wall-clock question, not a simulated-time one.
+
+        If _is_settled honored the freeze, replaying June 2024 would classify
+        every subsequent bar as unsettled and the provider would fetch nothing.
+        """
+        from src.backtesting.data.alpaca_provider import _delayed_end, _is_settled
+        from src.utils import clock
+
+        past = datetime(2024, 6, 3, 16, 0)
+        with clock.frozen(past):
+            assert clock.now() == past  # the freeze is genuinely in effect
+            # A bar well after the frozen instant is still a settled session.
+            assert _is_settled(date.today() - timedelta(days=1))
+            # And the request cutoff still tracks real time, not 2024.
+            assert _delayed_end(date.today()).year == date.today().year

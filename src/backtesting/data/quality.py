@@ -72,7 +72,15 @@ class CoverageReport:
         return self.days_with_bar / self.days_with_any_contract
 
     def verdict(self, *, good_threshold: float = 0.90, marginal_threshold: float = 0.70) -> str:
-        """Coverage verdict driving the data-source decision."""
+        """Coverage verdict driving the data-source decision.
+
+        ``no-data`` is distinct from ``poor``: measuring zero decision days (bad
+        ticker, empty API response) is not evidence of bad coverage, and must
+        never be read as one — "poor" is the verdict that argues for paying a
+        vendor. Absence of measurement is not measurement of absence.
+        """
+        if self.decision_days == 0:
+            return "no-data"
         f = self.usable_fraction
         if f >= good_threshold:
             return "good"
