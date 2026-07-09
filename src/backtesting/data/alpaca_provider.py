@@ -28,6 +28,7 @@ modeled downstream (see spread_model.py), never fetched.
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional
 
@@ -56,6 +57,24 @@ ALPACA_OPTIONS_HISTORY_START = date(2024, 2, 1)
 # into that window is rejected outright (403) rather than truncated. The live
 # client uses the same 20-minute buffer (src/api/alpaca_client.py).
 REALTIME_DELAY_MINUTES = 20
+
+# A standard OCC symbol: 1-5 char alpha root, YYMMDD, C/P, 8-digit strike. This
+# mirrors the pattern Alpaca's market-data API enforces — it rejects anything
+# else outright ('invalid symbol: "1AAPL240429P00170000" does not match ...'),
+# and one such symbol 400s the whole bars request it rides in.
+#
+# The contracts endpoint nonetheless returns them. They are adjusted contracts:
+# after a corporate action OCC re-roots the series, and the deliverable is no
+# longer 100 shares of the underlying. Excluding them is therefore correct on
+# the merits and not merely a workaround — the wheel cannot sell a put whose
+# assignment delivers something other than 100 shares.
+_STANDARD_OCC = re.compile(r"^[A-Z]{1,5}\d{6}[CP]\d{8}$")
+
+
+def is_standard_occ(symbol: str) -> bool:
+    """Whether ``symbol`` is a standard-deliverable OCC contract."""
+    return bool(_STANDARD_OCC.match(symbol))
+
 
 # NOTE: the two helpers below deliberately read the real wall clock, never
 # src.utils.clock.now(). They answer "what is Alpaca entitled to serve at this
@@ -147,6 +166,7 @@ class AlpacaDataProvider(OptionsDataProvider):
         exp_gte = as_of
         exp_lte = as_of + timedelta(days=max_dte)
         contracts: Dict[str, OptionContract] = {}
+        n_adjusted = 0
 
         for status in (AssetStatus.ACTIVE, AssetStatus.INACTIVE):
             page_token: Optional[str] = None
@@ -163,6 +183,9 @@ class AlpacaDataProvider(OptionsDataProvider):
                 for c in resp.option_contracts or []:
                     if c.symbol in contracts:
                         continue
+                    if not is_standard_occ(c.symbol):
+                        n_adjusted += 1
+                        continue
                     contracts[c.symbol] = OptionContract(
                         symbol=c.symbol,
                         underlying=underlying,
@@ -174,6 +197,17 @@ class AlpacaDataProvider(OptionsDataProvider):
                 page_token = getattr(resp, "next_page_token", None)
                 if not page_token:
                     break
+
+        if n_adjusted:
+            logger.info(
+                "Excluded adjusted (non-standard-deliverable) contracts",
+                event_category="backtest_data",
+                event_type="adjusted_contracts_excluded",
+                symbol=underlying,
+                as_of=as_of.isoformat(),
+                excluded=n_adjusted,
+                kept=len(contracts),
+            )
 
         universe = list(contracts.values())
         self._universe_cache[cache_key] = universe
@@ -192,6 +226,12 @@ class AlpacaDataProvider(OptionsDataProvider):
         Real-time OPRA bars are not entitled, so ``end`` is clamped to the
         delayed cutoff and the current session's partial bar is dropped.
         """
+        if not symbols:
+            return {}
+
+        # A single non-standard symbol rejects the entire chunk it rides in, so
+        # screen them here too rather than trusting every caller.
+        symbols = [s for s in symbols if is_standard_occ(s)]
         if not symbols:
             return {}
 

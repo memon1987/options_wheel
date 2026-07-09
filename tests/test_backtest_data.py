@@ -380,6 +380,73 @@ class TestRealtimeClamp:
         assert not _is_settled(date.today())
         assert _is_settled(date.today() - timedelta(days=1))
 
+    def test_adjusted_contracts_are_not_standard_occ(self):
+        """Real symbols Alpaca's contracts endpoint returned and its bars endpoint rejected."""
+        from src.backtesting.data.alpaca_provider import is_standard_occ
+
+        assert is_standard_occ("AAPL240429P00170000")
+        assert is_standard_occ("NVDA260601C00152500")
+        assert is_standard_occ("F240419P00012000")
+        # Adjusted / non-standard deliverable — must never enter a wheel backtest.
+        assert not is_standard_occ("1AAPL240429P00170000")
+        assert not is_standard_occ("1MSFT240621C00241000")
+        assert not is_standard_occ("")
+        assert not is_standard_occ("AAPL240429X00170000")  # bad option type
+
+    def test_universe_excludes_adjusted_contracts(self):
+        from alpaca.trading.enums import ContractType
+
+        from src.backtesting.data.alpaca_provider import AlpacaDataProvider
+
+        provider = AlpacaDataProvider(api_key="k", secret_key="s", paper=True)
+
+        class _C:
+            def __init__(self, symbol):
+                self.symbol = symbol
+                self.expiration_date = date(2024, 4, 29)
+                self.strike_price = 170.0
+                self.type = ContractType.PUT
+
+        class _Resp:
+            next_page_token = None
+            option_contracts = [
+                _C("AAPL240429P00170000"),
+                _C("1AAPL240429P00170000"),  # adjusted
+            ]
+
+        provider._trading.get_option_contracts = lambda req: _Resp()
+
+        universe = provider.get_contract_universe("AAPL", date(2024, 4, 24), 7)
+        symbols = [c.symbol for c in universe]
+        assert symbols == ["AAPL240429P00170000"]
+
+    def test_option_bars_screens_nonstandard_symbols(self):
+        """One bad symbol 400s the whole chunk; the provider must not send it."""
+        from src.backtesting.data.alpaca_provider import AlpacaDataProvider
+
+        provider = AlpacaDataProvider(api_key="k", secret_key="s", paper=True)
+        seen = {}
+
+        class _Bars:
+            data = {}
+
+        def _stub(req):
+            seen["symbols"] = list(req.symbol_or_symbols)
+            return _Bars()
+
+        provider._option_data.get_option_bars = _stub
+
+        past = date.today() - timedelta(days=30)
+        provider.get_option_bars(
+            ["AAPL240429P00170000", "1AAPL240429P00170000"], past, past
+        )
+        assert seen["symbols"] == ["AAPL240429P00170000"]
+
+        # All-nonstandard input must short-circuit without an API call at all.
+        seen.clear()
+        out = provider.get_option_bars(["1AAPL240429P00170000"], past, past)
+        assert out == {} and "symbols" not in seen
+
     def test_contract_universe_is_memoized_per_process(self):
         """The chain builder and the coverage report ask for the same universe.
 
