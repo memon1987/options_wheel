@@ -351,6 +351,45 @@ class TestRealtimeClamp:
         assert not _is_settled(date.today())
         assert _is_settled(date.today() - timedelta(days=1))
 
+    def test_contract_universe_is_memoized_per_process(self):
+        """The chain builder and the coverage report ask for the same universe.
+
+        Contract discovery paginates two statuses, so an unmemoized second call
+        doubles the request count of every run against a 200 req/min limit.
+        """
+        from src.backtesting.data.alpaca_provider import AlpacaDataProvider
+
+        provider = AlpacaDataProvider(api_key="k", secret_key="s", paper=True)
+
+        calls = []
+
+        class _StubResp:
+            option_contracts = []
+            next_page_token = None
+
+        def _stub_get_option_contracts(req):
+            calls.append(req)
+            return _StubResp()
+
+        provider._trading.get_option_contracts = _stub_get_option_contracts
+
+        as_of = date(2025, 3, 4)
+        first = provider.get_contract_universe("XYZ", as_of, 7)
+        n_after_first = len(calls)
+        second = provider.get_contract_universe("XYZ", as_of, 7)
+
+        assert n_after_first > 0
+        assert len(calls) == n_after_first, "second identical call must hit the memo"
+        assert first == second
+
+        # A different key still goes to the API.
+        provider.get_contract_universe("XYZ", as_of, 14)
+        assert len(calls) > n_after_first
+
+        # Callers must not be able to corrupt the memo by mutating the result.
+        first.append("junk")
+        assert provider.get_contract_universe("XYZ", as_of, 7) == second
+
     def test_settlement_ignores_a_frozen_simulated_clock(self):
         """Entitlement is a wall-clock question, not a simulated-time one.
 

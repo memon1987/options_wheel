@@ -107,6 +107,12 @@ class AlpacaDataProvider(OptionsDataProvider):
         self._option_data = OptionHistoricalDataClient(api_key=api_key, secret_key=secret_key)
         self._stock_data = StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
         self._stock_feed = stock_feed
+        # Contract discovery is the most expensive call we make: it paginates
+        # over two statuses. Callers legitimately ask for the same (symbol,
+        # as_of, max_dte) more than once per decision day — the chain builder
+        # needs the contracts, the coverage report needs the count. For a past
+        # date the answer is immutable, so memoize it per process.
+        self._universe_cache: Dict[tuple, List[OptionContract]] = {}
 
     @classmethod
     def from_config(cls, config, *, stock_feed: Optional[str] = None) -> "AlpacaDataProvider":
@@ -133,6 +139,11 @@ class AlpacaDataProvider(OptionsDataProvider):
         are listed well before ``as_of``, so the expiration-window filter is the
         practical point-in-time gate.
         """
+        cache_key = (underlying, as_of, max_dte)
+        cached = self._universe_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
         exp_gte = as_of
         exp_lte = as_of + timedelta(days=max_dte)
         contracts: Dict[str, OptionContract] = {}
@@ -164,7 +175,9 @@ class AlpacaDataProvider(OptionsDataProvider):
                 if not page_token:
                     break
 
-        return list(contracts.values())
+        universe = list(contracts.values())
+        self._universe_cache[cache_key] = universe
+        return list(universe)
 
     # ------------------------------------------------------------------ #
     # Option bars
