@@ -8,6 +8,7 @@ import numpy as np
 import structlog
 
 from .alpaca_client import AlpacaClient
+from ..utils import clock
 from ..utils.config import Config
 
 logger = structlog.get_logger(__name__)
@@ -200,7 +201,7 @@ class MarketDataManager:
             puts = []
             calls = []
             
-            now = datetime.now()
+            now = clock.now()
             
             for option in options_chain:
                 # Calculate days to expiration

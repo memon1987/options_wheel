@@ -1,9 +1,9 @@
 """Risk management system for options wheel strategy."""
 
 from typing import Dict, List, Any, Optional, Tuple
-from datetime import datetime
 import structlog
 
+from ..utils import clock
 from ..utils.config import Config
 
 logger = structlog.get_logger(__name__)
@@ -320,7 +320,7 @@ class RiskManager:
                 'unrealized_pl_percent': unrealized_pl_percent,
                 'underlying_exposures': underlying_exposure,
                 'risk_warnings': warnings,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': clock.now().isoformat()
             }
             
         except Exception as e:

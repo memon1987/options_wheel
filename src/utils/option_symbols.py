@@ -19,6 +19,8 @@ import calendar
 import re
 import structlog
 
+from . import clock
+
 logger = structlog.get_logger(__name__)
 
 
@@ -312,7 +314,7 @@ def parse_option_symbol(option_symbol: str, underlying_hint: Optional[str] = Non
             result['expiration_date'] = f"{year:04d}-{month:02d}-{day:02d}"
 
             exp_date = datetime(year, month, day, tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
+            now = clock.now_utc()
             result['dte'] = max(0, (exp_date.date() - now.date()).days)
 
     except Exception as e:

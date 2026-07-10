@@ -5,6 +5,7 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime
 import structlog
 
+from ..utils import clock
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
@@ -176,7 +177,7 @@ class CallSeller:
                 'stock_cost_basis': stock_cost_basis * position_details['shares_covered'],
                 'current_stock_price': position_details['current_stock_price'],
                 'total_return_if_called': position_details['total_return_if_called'],
-                'timestamp': datetime.now().isoformat()
+                'timestamp': clock.now().isoformat()
             }
             
             logger.info("Covered call opportunity identified",
@@ -337,7 +338,7 @@ class CallSeller:
                     'contracts': contracts,
                     'limit_price': limit_price,
                     'strategy': 'sell_call',
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': clock.now().isoformat()
                 }
 
                 # Enhanced logging for BigQuery analytics
@@ -369,11 +370,11 @@ class CallSeller:
                             premium=premium,
                             strike=opportunity.get('strike_price', 0),
                             contracts=contracts,
-                            sell_date=datetime.now().strftime('%Y-%m-%d'),
+                            sell_date=clock.now().strftime('%Y-%m-%d'),
                         )
 
                 # Track entry time for hold period (min_hold_hours)
-                self._entry_times[option_symbol] = datetime.now()
+                self._entry_times[option_symbol] = clock.now()
 
                 return result
             else:
@@ -402,7 +403,7 @@ class CallSeller:
                     'message': error_msg,
                     'symbol': option_symbol,
                     'strategy': 'sell_call',
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': clock.now().isoformat()
                 }
 
         except Exception as e:
@@ -423,7 +424,7 @@ class CallSeller:
                 'message': str(e),
                 'symbol': opportunity.get('option_symbol', ''),
                 'strategy': 'sell_call',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': clock.now().isoformat()
             }
     
     def _resolve_cost_basis_floor(
@@ -580,7 +581,7 @@ class CallSeller:
             day = int(date_str[4:6])
 
             exp_date = datetime(year, month, day, tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
+            now = clock.now_utc()
 
             dte = (exp_date.date() - now.date()).days
 
@@ -630,7 +631,7 @@ class CallSeller:
                 month = int(date_str[2:4])
                 day = int(date_str[4:6])
                 exp_date = datetime(year, month, day, tzinfo=timezone.utc)
-                now = datetime.now(timezone.utc)
+                now = clock.now_utc()
                 dte = max(0, (exp_date.date() - now.date()).days)
 
                 # Parse strike price
@@ -656,7 +657,7 @@ class CallSeller:
                 month = int(date_str[2:4])
                 day = int(date_str[4:6])
                 exp_date = datetime(year, month, day, tzinfo=timezone.utc)
-                now = datetime.now(timezone.utc)
+                now = clock.now_utc()
                 dte = max(0, (exp_date.date() - now.date()).days)
             else:
                 dte = 7  # Default fallback
@@ -752,7 +753,7 @@ class CallSeller:
                 # Hold period check: skip profit-target if position too new
                 entry_time = self._entry_times.get(option_symbol)
                 if entry_time:
-                    hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+                    hours_held = (clock.now() - entry_time).total_seconds() / 3600
                     if hours_held < self.config.profit_taking_min_hold_hours:
                         return False
 
@@ -851,7 +852,7 @@ class CallSeller:
             symbol = assignment_info['symbol']
             shares_assigned = assignment_info.get('shares', 0)
             strike_price = assignment_info.get('strike_price', 0)
-            assignment_date = assignment_info.get('date', datetime.now())
+            assignment_date = assignment_info.get('date', clock.now())
 
             logger.info("Handling call assignment",
                        event_category="trade",
