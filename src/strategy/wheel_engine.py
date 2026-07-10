@@ -28,7 +28,8 @@ class WheelEngine:
     """Main engine for executing options wheel strategy."""
 
     def __init__(self, config: Config, alpaca_client: Optional[AlpacaClient] = None,
-                 wheel_state: Optional[WheelStateManager] = None):
+                 wheel_state: Optional[WheelStateManager] = None,
+                 allow_bigquery_cost_basis: bool = True):
         """Initialize the wheel strategy engine.
 
         Args:
@@ -40,6 +41,9 @@ class WheelEngine:
             wheel_state: State manager. Defaults to the configured GCS bucket
                 (or in-memory when unset). A backtest injects a bucket-less
                 instance so a replay can never touch production state.
+            allow_bigquery_cost_basis: forwarded to CallSeller. A backtest passes
+                False so the cost-basis floor cannot fall back to querying
+                production trade history mid-replay.
         """
         self.config = config
         self.alpaca = alpaca_client if alpaca_client is not None else AlpacaClient(config)
@@ -52,7 +56,8 @@ class WheelEngine:
             state_bucket = getattr(config, 'state_storage_bucket', None) or os.getenv('STATE_STORAGE_BUCKET')
             self.wheel_state = WheelStateManager(storage_bucket=state_bucket)
         self.call_seller = CallSeller(self.alpaca, self.market_data, config,
-                                      wheel_state_manager=self.wheel_state)
+                                      wheel_state_manager=self.wheel_state,
+                                      allow_bigquery_cost_basis=allow_bigquery_cost_basis)
 
         # Track pending orders within current execution cycle to prevent duplicates
         self._pending_underlyings = set()

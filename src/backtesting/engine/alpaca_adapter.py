@@ -26,7 +26,7 @@ than production and silently inflate the opportunity set.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -44,6 +44,10 @@ logger = structlog.get_logger(__name__)
 class UnsupportedBacktestCall(RuntimeError):
     """Live code reached for something the adapter does not simulate."""
 
+
+# Alpaca stamps daily stock bars at 04:00 UTC; GapDetector's index comparison is
+# sensitive to this, so the adapter reproduces it rather than inventing a stamp.
+_BAR_STAMP = time(4, 0)
 
 # Ledger kinds that Alpaca reports as account activities, and their activity_type.
 _LEDGER_TO_ACTIVITY = {
@@ -214,12 +218,24 @@ class BacktestAlpacaClient:
         }
 
     def get_stock_bars(self, symbol: str, days: int = 30) -> pd.DataFrame:
-        """Daily OHLCV up to and including the simulated date. Never beyond it."""
+        """Daily OHLCV up to and including the simulated date. Never beyond it.
+
+        The index must be tz-aware UTC, exactly like the live client's
+        (``datetime64[ns, UTC]``, bars stamped 04:00 UTC). GapDetector localizes
+        `now` to UTC and does ``df[df.index < current_time]``; a naive index
+        raises "Invalid comparison between dtype=datetime64[ns] and datetime",
+        which GapDetector swallows into "no previous close" and blocks every
+        trade. Mirroring live's stamp also reproduces live's semantics: today's
+        bar sorts before the decision timestamp and is therefore included.
+        """
         bars = [b for b in self._stock_bars.get(symbol, []) if b.bar_date <= self.today]
         bars = bars[-days:] if days else bars
         if not bars:
             return pd.DataFrame()
-        df = pd.DataFrame(
+        index = pd.DatetimeIndex(
+            [datetime.combine(b.bar_date, _BAR_STAMP) for b in bars], name="timestamp"
+        ).tz_localize("UTC")
+        return pd.DataFrame(
             {
                 "open": [b.open for b in bars],
                 "high": [b.high for b in bars],
@@ -227,9 +243,8 @@ class BacktestAlpacaClient:
                 "close": [b.close for b in bars],
                 "volume": [b.volume for b in bars],
             },
-            index=pd.DatetimeIndex([b.bar_date for b in bars], name="timestamp"),
+            index=index,
         )
-        return df
 
     def get_options_chain(self, underlying_symbol: str) -> List[Dict[str, Any]]:
         snap = self._snapshot(underlying_symbol)

@@ -18,7 +18,8 @@ class CallSeller:
     """Handles covered call selling for the wheel strategy."""
     
     def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager,
-                 config: Config, wheel_state_manager=None):
+                 config: Config, wheel_state_manager=None,
+                 allow_bigquery_cost_basis: bool = True):
         """Initialize call seller.
 
         Args:
@@ -26,11 +27,18 @@ class CallSeller:
             market_data: Market data manager
             config: Configuration instance
             wheel_state_manager: Optional WheelStateManager for tracking active call details
+            allow_bigquery_cost_basis: whether the cost-basis floor may fall back
+                to a BigQuery OPASN lookup. A backtest passes False: the
+                wheel-state path (first in the resolution chain) always holds the
+                simulated assignment strike, and this fallback would otherwise
+                query *production* trade history — against CURRENT_TIMESTAMP() —
+                mixing real assignments into a simulated run.
         """
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
         self.wheel_state = wheel_state_manager
+        self.allow_bigquery_cost_basis = allow_bigquery_cost_basis
         self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
         # FC-029: cache the BigQuery client (constructed lazily on first cost-basis
         # lookup) so cold-start cycles don't pay the Client() construction cost
@@ -509,6 +517,16 @@ class CallSeller:
         unavailable, or any error. Logged at WARNING when the lookup fails so
         missed floors are observable.
         """
+        if not self.allow_bigquery_cost_basis:
+            # Backtest mode. Returning 0.0 is the same "no floor from this
+            # source" signal the fallback already emits on miss, so the caller's
+            # resolution chain is unchanged.
+            logger.debug("BigQuery cost-basis fallback disabled",
+                         event_category="data",
+                         event_type="cost_basis_bq_disabled",
+                         symbol=symbol)
+            return 0.0
+
         try:
             from google.cloud import bigquery
             if self._bq_client is None:
