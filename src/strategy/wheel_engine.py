@@ -27,19 +27,30 @@ logger = structlog.get_logger(__name__)
 class WheelEngine:
     """Main engine for executing options wheel strategy."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, alpaca_client: Optional[AlpacaClient] = None,
+                 wheel_state: Optional[WheelStateManager] = None):
         """Initialize the wheel strategy engine.
 
         Args:
             config: Configuration instance
+            alpaca_client: Broker/data client. Defaults to the real AlpacaClient.
+                A backtest injects an adapter here; because every downstream
+                component already takes the client by constructor injection,
+                this single seam redirects the whole graph.
+            wheel_state: State manager. Defaults to the configured GCS bucket
+                (or in-memory when unset). A backtest injects a bucket-less
+                instance so a replay can never touch production state.
         """
         self.config = config
-        self.alpaca = AlpacaClient(config)
+        self.alpaca = alpaca_client if alpaca_client is not None else AlpacaClient(config)
         self.market_data = MarketDataManager(self.alpaca, config)
         self.gap_detector = GapDetector(config, self.alpaca)
         self.put_seller = PutSeller(self.alpaca, self.market_data, config)
-        state_bucket = getattr(config, 'state_storage_bucket', None) or os.getenv('STATE_STORAGE_BUCKET')
-        self.wheel_state = WheelStateManager(storage_bucket=state_bucket)
+        if wheel_state is not None:
+            self.wheel_state = wheel_state
+        else:
+            state_bucket = getattr(config, 'state_storage_bucket', None) or os.getenv('STATE_STORAGE_BUCKET')
+            self.wheel_state = WheelStateManager(storage_bucket=state_bucket)
         self.call_seller = CallSeller(self.alpaca, self.market_data, config,
                                       wheel_state_manager=self.wheel_state)
 
