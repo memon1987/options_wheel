@@ -218,10 +218,19 @@ def render_screen_summary(result: ScreenResult) -> str:
     if result.demote_candidates:
         a("## Demotion candidates")
         a("")
-        a("These scored **unfit**. This is a recommendation for a human to weigh, "
-          "not an action — and it should be weighed against the known biases in "
-          "the per-symbol reports (dividends and early assignment are unmodeled, "
-          "and both flatter the wheel).")
+        a("These scored **unfit**. A recommendation for a human to weigh, not "
+          "an action.")
+        a("")
+        a("> **Weigh it against the engine's biases, which do not all point the "
+          "same way.** Unmodeled dividends *flatter* the wheel on the "
+          "buy-and-hold comparison, but *penalise* it on the absolute gates "
+          "(`lost money`, `below the risk-free rate`) that actually produce a "
+          "demotion — the wheel forgoes real dividends whenever it holds "
+          "assigned shares. On a 5–7% yielder that alone can push it under the "
+          "floor, so **on income names this list is biased toward demoting**. "
+          "Unmodeled early assignment is optimistic in the other direction. "
+          "Do not demote a dividend payer on this engine until dividends are "
+          "modeled.")
         a("")
         for symbol in result.demote_candidates:
             r = next(x for x in result.results if x.symbol == symbol)

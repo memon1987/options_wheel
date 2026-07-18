@@ -275,11 +275,24 @@ class FitnessReport:
             # being recommended for demotion because its cycle happened to
             # straddle the window edge. INSUFFICIENT keeps it out of the
             # demotion list while still refusing to call it fit.
-            reasons.append(
-                "INSUFFICIENT: no wheel cycle completed inside the window — "
-                "not enough evidence to judge this symbol (lengthen the window "
-                "or check whether it can trade at all)"
-            )
+            # These share a label but imply opposite actions: a symbol that
+            # never opened a position is a config/data question (can it trade
+            # at all?), while one that was deployed almost every day is a
+            # window-length question (it just didn't round-trip in time).
+            if self.days_in_position == 0:
+                reasons.append(
+                    "INSUFFICIENT: never opened a position in the window — "
+                    "this is a question about whether the strategy CAN trade "
+                    "this symbol (premium floor, delta band, gap filter), not "
+                    "about how it performed"
+                )
+            else:
+                reasons.append(
+                    f"INSUFFICIENT: deployed on {self.days_in_position} of "
+                    f"{self.decision_days} decision days but no cycle closed "
+                    f"inside the window — lengthen the window to judge it; the "
+                    f"return below excludes the open position's outcome"
+                )
             return reasons
 
         # Check activity before performance: a return earned on 3% of the days

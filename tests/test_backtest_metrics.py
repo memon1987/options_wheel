@@ -304,7 +304,29 @@ class TestFitness:
         r = compute_fitness("XYZ", _states(days, [100_000, 100_000]), [], 100_000.0)
         assert r.verdict() == "insufficient"
         assert r.verdict() != "unfit"
-        assert any("not enough evidence" in x for x in r.verdict_reasons())
+        # Zero days deployed: a question about whether it CAN trade.
+        assert any("never opened a position" in x for x in r.verdict_reasons())
+
+    def test_traded_but_unclosed_cycle_reads_differently_from_never_traded(self):
+        """98%-deployed-and-profitable and 0%-never-traded imply opposite actions.
+
+        Both lack a closed cycle, but one asks "lengthen the window" and the
+        other asks "can this symbol trade at all?".
+        """
+        days = [D(2025, 1, 6) + __import__("datetime").timedelta(days=i)
+                for i in range(10)]
+        states = [
+            DailyState(day=d, equity=101_000.0, cash=92_000.0,
+                       reserved_collateral=9_000.0, open_options=1, shares_held={})
+            for d in days
+        ]
+        r = compute_fitness("XYZ", states, [], 100_000.0,
+                            data_quality={"decision_days": len(days)})
+        assert r.verdict() == "insufficient"
+        assert r.days_in_position == len(days)
+        reasons = r.verdict_reasons()
+        assert any("no cycle closed" in x for x in reasons)
+        assert not any("never opened a position" in x for x in reasons)
 
     def test_verdict_blocks_on_a_loss(self):
         r = self._report(equities=(100_000, 99_000, 98_000))
