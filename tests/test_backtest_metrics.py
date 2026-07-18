@@ -246,6 +246,47 @@ class TestFitness:
         assert r.option_pnl_share < 0.25
         assert any("mostly a long-stock position" in x for x in r.verdict_reasons())
 
+    def test_days_underwater_counts_only_days_held_below_basis(self):
+        days = [D(2025, 1, 6), D(2025, 1, 7), D(2025, 1, 8), D(2025, 1, 9)]
+        ledger = [
+            _ev(days[0], "sell_put_open", symbol="P1", contracts=1,
+                cash_delta=100.0, detail={"collateral": 9000.0}),
+            _ev(days[0], "put_assignment", symbol="P1", contracts=1,
+                shares=100, price=90.0, cash_delta=-9000.0),
+            _ev(days[3], "call_assignment", symbol="C1", contracts=1,
+                shares=100, price=95.0, cash_delta=9500.0),
+        ]
+        held = {d: {"XYZ": 100} for d in days[:3]}
+        held[days[3]] = {"XYZ": 0}
+        states = _states(days, [100_000] * 4, shares=held)
+        # Below the $90 basis on the 7th and 8th only.
+        prices = {days[0]: 92.0, days[1]: 85.0, days[2]: 88.0, days[3]: 95.0}
+        r = compute_fitness("XYZ", states, build_cycles(ledger), 100_000.0,
+                            benchmark_prices=prices)
+        assert r.days_underwater == 2
+
+    def test_days_underwater_does_not_double_count_across_symbols(self):
+        """Regression: keying by day alone let one symbol's basis clobber another's."""
+        days = [D(2025, 1, 6), D(2025, 1, 7)]
+        ledger = [
+            _ev(days[0], "sell_put_open", "AAA", "A1", contracts=1,
+                cash_delta=10.0, detail={"collateral": 9000.0}),
+            _ev(days[0], "put_assignment", "AAA", "A1", contracts=1,
+                shares=100, price=90.0, cash_delta=-9000.0),
+            _ev(days[0], "sell_put_open", "BBB", "B1", contracts=1,
+                cash_delta=10.0, detail={"collateral": 5000.0}),
+            _ev(days[0], "put_assignment", "BBB", "B1", contracts=1,
+                shares=100, price=50.0, cash_delta=-5000.0),
+        ]
+        held = {d: {"AAA": 100, "BBB": 100} for d in days}
+        states = _states(days, [100_000, 100_000], shares=held)
+        prices = {days[0]: 40.0, days[1]: 40.0}  # below BOTH bases
+        r = compute_fitness("AAA", states, build_cycles(ledger), 100_000.0,
+                            benchmark_prices=prices)
+        # Two underlyings underwater on two days = 4 (symbol, day) pairs,
+        # not 2 collapsed by date.
+        assert r.days_underwater == 4
+
     def test_win_rate_needs_closed_cycles(self):
         days = [D(2025, 1, 6), D(2025, 1, 8)]
         r = compute_fitness("XYZ", _states(days, [100_000, 100_000]), [], 100_000.0)

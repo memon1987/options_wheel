@@ -295,22 +295,25 @@ def _days_underwater(
     """
     if not prices:
         return 0
-    basis_by_day: Dict[date, float] = {}
+    # Keyed by (underlying, day), not day: a multi-symbol run holding two
+    # assigned names on the same date would otherwise have one basis silently
+    # overwrite the other. `prices` is single-symbol today, so only days where
+    # that symbol is held can count.
+    underwater_days = set()
     for cycle in cycles:
         if cycle.cost_basis is None:
             continue
         stop = cycle.end or daily[-1].day
         for state in daily:
-            if cycle.start <= state.day <= stop and state.shares_held.get(
-                cycle.underlying, 0
-            ) > 0:
-                basis_by_day[state.day] = cycle.cost_basis
+            if not (cycle.start <= state.day <= stop):
+                continue
+            if state.shares_held.get(cycle.underlying, 0) <= 0:
+                continue
+            price = prices.get(state.day)
+            if price is not None and price < cycle.cost_basis:
+                underwater_days.add((cycle.underlying, state.day))
 
-    return sum(
-        1
-        for day, basis in basis_by_day.items()
-        if day in prices and prices[day] < basis
-    )
+    return len(underwater_days)
 
 
 def _buy_and_hold(
