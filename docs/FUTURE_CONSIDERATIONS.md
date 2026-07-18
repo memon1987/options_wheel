@@ -441,6 +441,30 @@ The module `alpaca` is **never imported** in that file — only `QueryOrderStatu
 
 ---
 
+### FC-036: Stage-4 execution gap check is dead in production
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not needed (single-file fix) — but it changes runtime behavior, so branch + PR
+
+**Problem / opportunity:** Found by the FC-032 backtest, which reproduced it faithfully — the replay is behaving correctly; **production is not**.
+
+`GapDetector._get_previous_close` (`src/risk/gap_detector.py`) does `df[df.index < current_time]` and takes `.iloc[-1]`. Alpaca stamps daily stock bars at **04:00 UTC**, which is before any of our decision times (9:35am ET = 13:35 UTC). So today's own bar satisfies the filter and "previous close" returns **today's close**.
+
+Verified against the live client on 2026-07-17: at a simulated 9:35am ET decision, `_get_previous_close` returned **202.81** while the latest bar in the frame was also **202.81** (dated the same day).
+
+**Consequence:** the Stage-4 execution gap check computes a gap of exactly 0.0% every single time and can never block a trade. The `execution_gap_threshold` config knob has no effect. Note this is *not* true of the Stage-2 gap-risk analysis, which computes `current_gap` correctly — so of our two gap controls, one works and one is inert, and nothing surfaces the disagreement.
+
+**Open questions:**
+- Fix by excluding the current session's bar (`df.index.date < current_time.date()`), or by requesting bars with an explicit end of yesterday?
+- Enabling a gate that has never fired changes live behavior. How much would it have blocked historically? The FC-032 engine can now answer this directly — run it with the gate fixed and compare.
+- Does the same 04:00-stamp assumption leak into any other windowed statistic?
+
+**Links:** FC-032 (`docs/plans/fc-032.md`), found during its two-reviewer pass; `docs/investigations/fc-032-parity-check.md`.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
