@@ -201,6 +201,79 @@ class TestFitness:
         assert r.option_pnl > 0 and r.stock_pnl < 0
         assert r.option_pnl_share is None
 
+    def test_open_assigned_position_counts_in_attribution(self):
+        """Regression: NVDA finished holding shares assigned at 177.50 whose
+
+        ~$2,000 gain was inside final_equity but absent from attribution, so the
+        report totalled $1,009 against a headline of $3,018 and claimed "100%
+        from the option leg" for a result that was two-thirds long stock.
+        """
+        days = [D(2025, 1, 6), D(2025, 1, 7)]
+        ledger = [
+            _ev(days[0], "sell_put_open", symbol="P1", contracts=1,
+                cash_delta=1000.0, detail={"collateral": 17750.0}),
+            _ev(days[0], "put_assignment", symbol="P1", contracts=1,
+                shares=100, price=177.50, cash_delta=-17750.0),
+        ]
+        held = {days[0]: {"XYZ": 100}, days[1]: {"XYZ": 100}}
+        # Final close 197.50 -> 100 shares * $20 = $2,000 unrealized.
+        prices = {days[0]: 177.50, days[1]: 197.50}
+        states = _states(days, [100_000.0, 103_000.0], shares=held)
+        r = compute_fitness("XYZ", states, build_cycles(ledger), 100_000.0,
+                            benchmark_prices=prices)
+
+        assert r.unrealized_stock_pnl == pytest.approx(2000.0)
+        assert r.total_stock_pnl == pytest.approx(2000.0)
+        assert r.attribution_total == pytest.approx(3000.0)
+        # And the share is now honest: option leg is the minority.
+        # Was 100% before the fix; now honestly a minority of the result.
+        assert r.option_pnl_share == pytest.approx(1000.0 / 3000.0)
+
+    def test_attribution_reconciles_with_the_equity_change(self):
+        days = [D(2025, 1, 6), D(2025, 1, 7)]
+        ledger = [
+            _ev(days[0], "sell_put_open", symbol="P1", contracts=1,
+                cash_delta=1000.0, detail={"collateral": 17750.0}),
+            _ev(days[0], "put_assignment", symbol="P1", contracts=1,
+                shares=100, price=177.50, cash_delta=-17750.0),
+        ]
+        held = {d: {"XYZ": 100} for d in days}
+        prices = {days[0]: 177.50, days[1]: 197.50}
+        # Equity moved exactly premium + unrealized.
+        states = _states(days, [100_000.0, 103_000.0], shares=held)
+        r = compute_fitness("XYZ", states, build_cycles(ledger), 100_000.0,
+                            benchmark_prices=prices)
+        assert r.reconciliation_gap == pytest.approx(0.0, abs=0.01)
+
+    def test_report_flags_a_reconciliation_gap_instead_of_hiding_it(self):
+        days = [D(2025, 1, 6), D(2025, 1, 7)]
+        ledger = [
+            _ev(days[0], "sell_put_open", symbol="P1", contracts=1,
+                cash_delta=1000.0, detail={"collateral": 9000.0}),
+            _ev(days[1], "expire_worthless", symbol="P1", contracts=1),
+        ]
+        # Equity claims +5,000 while only 1,000 is attributable.
+        r = compute_fitness("XYZ", _states(days, [100_000.0, 105_000.0]),
+                            build_cycles(ledger), 100_000.0)
+        assert r.reconciliation_gap == pytest.approx(-4000.0)
+        md = render_markdown(r)
+        assert "Attribution does not reconcile" in md
+
+    def test_assignment_rate_includes_an_open_assigned_cycle(self):
+        """0% assignment next to 'days holding shares below basis' is nonsense."""
+        days = [D(2025, 1, 6), D(2025, 1, 7)]
+        ledger = [
+            _ev(days[0], "sell_put_open", symbol="P1", contracts=1,
+                cash_delta=100.0, detail={"collateral": 9000.0}),
+            _ev(days[0], "put_assignment", symbol="P1", contracts=1,
+                shares=100, price=90.0, cash_delta=-9000.0),
+        ]
+        held = {d: {"XYZ": 100} for d in days}
+        r = compute_fitness("XYZ", _states(days, [100_000, 100_100], shares=held),
+                            build_cycles(ledger), 100_000.0)
+        assert r.closed_cycles == []
+        assert r.assignment_rate == 1.0
+
     def test_beats_buy_and_hold_is_measured_not_assumed(self):
         prices = {D(2025, 1, 6): 100.0, D(2025, 1, 7): 100.0, D(2025, 1, 8): 90.0}
         r = self._report(benchmark_prices=prices)
@@ -372,7 +445,8 @@ class TestReport:
 
     def test_markdown_shows_both_legs_and_the_benchmark(self):
         md = render_markdown(self._report())
-        assert "Option premium" in md and "Stock (realized)" in md
+        assert "Option premium" in md
+        assert "Stock — realized" in md and "Stock — unrealized" in md
         assert "Buy & hold" in md
         assert "Attribution" in md
 

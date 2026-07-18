@@ -97,11 +97,21 @@ def render_markdown(report: FitnessReport) -> str:
     a("")
     a("| leg | P&L |")
     a("|---|---:|")
-    a(f"| Option premium (net of buybacks) | ${report.option_pnl:+,.2f} |")
-    a(f"| Stock (realized) | ${report.stock_pnl:+,.2f} |")
+    a(f"| Option premium (net of buybacks and fees) | ${report.option_pnl:+,.2f} |")
+    a(f"| Stock — realized (called away) | ${report.stock_pnl:+,.2f} |")
+    a(f"| Stock — unrealized (still held) | ${report.unrealized_stock_pnl:+,.2f} |")
     a(f"| Dividends | ${report.dividends:+,.2f} |")
-    a(f"| Fees | ${-report.fees:,.2f} |")
-    a(f"| **Total** | **${report.total_pnl:+,.2f}** |")
+    a(f"| **Total** | **${report.attribution_total:+,.2f}** |")
+    a("")
+    a(f"_Memo: ${report.fees:,.2f} of fees is already deducted inside the option "
+      f"row. Equity change over the window was ${report.total_pnl:+,.2f}._")
+    if abs(report.reconciliation_gap) > 0.01:
+        a("")
+        a(f"> **Attribution does not reconcile** — the rows above sum to "
+          f"${report.attribution_total:+,.2f} but equity moved "
+          f"${report.total_pnl:+,.2f}, a gap of "
+          f"${report.reconciliation_gap:+,.2f}. Some cash flow is unaccounted "
+          f"for, so treat the split below as unreliable.")
     a("")
     share = report.option_pnl_share
     if share is None:
@@ -210,9 +220,13 @@ def render_json(report: FitnessReport, *, sensitivity: Optional[dict] = None) ->
         "annualized_return": report.annualized_return,
         "attribution": {
             "option_pnl": report.option_pnl,
-            "stock_pnl": report.stock_pnl,
+            "stock_pnl_realized": report.stock_pnl,
+            "stock_pnl_unrealized": report.unrealized_stock_pnl,
+            "stock_pnl_total": report.total_stock_pnl,
             "dividends": report.dividends,
-            "fees": report.fees,
+            "fees_memo": report.fees,
+            "attribution_total": report.attribution_total,
+            "reconciliation_gap": report.reconciliation_gap,
             "option_pnl_share": report.option_pnl_share,
         },
         "cycles": {

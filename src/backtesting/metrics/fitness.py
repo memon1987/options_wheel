@@ -67,10 +67,11 @@ class FitnessReport:
     final_equity: float
 
     # Attribution — never collapsed into one number.
-    option_pnl: float = 0.0
-    stock_pnl: float = 0.0
+    option_pnl: float = 0.0  # premium net of buybacks AND fees (fees are inside)
+    stock_pnl: float = 0.0  # realized: called away or otherwise disposed
+    unrealized_stock_pnl: float = 0.0  # open assigned shares, marked to the last close
     dividends: float = 0.0
-    fees: float = 0.0
+    fees: float = 0.0  # memo only; already deducted inside option_pnl
 
     # Cycle statistics.
     cycles: List[WheelCycle] = field(default_factory=list)
@@ -115,6 +116,33 @@ class FitnessReport:
         return self.total_return * (365.0 / self.days)
 
     @property
+    def total_stock_pnl(self) -> float:
+        """Realized plus unrealized. Both are the stock leg.
+
+        Counting only realized P&L understates the stock leg badly whenever a
+        cycle is still open: an NVDA replay finished holding shares assigned at
+        177.50 that had appreciated ~$2,000, which showed up in equity (and so
+        in the headline return) but nowhere in attribution — the report claimed
+        "100% from the option leg" for a result that was two-thirds long stock.
+        """
+        return self.stock_pnl + self.unrealized_stock_pnl
+
+    @property
+    def attribution_total(self) -> float:
+        """What the attribution rows sum to. Must equal ``total_pnl``."""
+        return self.option_pnl + self.total_stock_pnl + self.dividends
+
+    @property
+    def reconciliation_gap(self) -> float:
+        """Attribution minus the actual equity change.
+
+        Non-zero means a cash flow escaped the attribution table, which would
+        make every share below a lie. Surfaced in the report rather than
+        silently absorbed.
+        """
+        return self.attribution_total - self.total_pnl
+
+    @property
     def option_pnl_share(self) -> Optional[float]:
         """Fraction of gross P&L from the option leg.
 
@@ -122,8 +150,9 @@ class FitnessReport:
         then (e.g. premium +$500 against stock -$5,000 is not "10% from options"),
         and reporting a number anyway is how attribution gets misread.
         """
-        gross = self.option_pnl + self.stock_pnl
-        if gross == 0 or (self.option_pnl < 0) != (self.stock_pnl < 0):
+        stock = self.total_stock_pnl
+        gross = self.option_pnl + stock
+        if gross == 0 or (self.option_pnl < 0) != (stock < 0):
             return None
         return self.option_pnl / gross
 
@@ -144,10 +173,15 @@ class FitnessReport:
 
     @property
     def assignment_rate(self) -> Optional[float]:
-        closed = self.closed_cycles
-        if not closed:
+        """Share of ALL cycles that took assignment, open ones included.
+
+        Counting closed cycles only reported "0% assignment" for a run that
+        finished holding assigned shares — irreconcilable, next to it, with
+        "12 days holding shares below cost basis".
+        """
+        if not self.cycles:
             return None
-        return sum(1 for c in closed if c.assigned) / len(closed)
+        return sum(1 for c in self.cycles if c.assigned) / len(self.cycles)
 
     @property
     def utilization(self) -> float:
@@ -272,6 +306,7 @@ def compute_fitness(
     report.days_in_position = sum(
         1 for d in daily if d.open_options > 0 or any(v > 0 for v in d.shares_held.values())
     )
+    report.unrealized_stock_pnl = _unrealized_stock_pnl(daily, cycles, benchmark_prices or {})
 
     equity = [d.equity for d in daily]
     report.max_drawdown = _max_drawdown(equity)
@@ -359,6 +394,36 @@ def _days_underwater(
                 underwater_days.add((cycle.underlying, state.day))
 
     return len(underwater_days)
+
+
+def _unrealized_stock_pnl(
+    daily: Sequence[DailyState],
+    cycles: Sequence[WheelCycle],
+    prices: Dict[date, float],
+) -> float:
+    """Mark still-held assigned shares to the final close.
+
+    A cycle open at the end of the window holds real shares whose gain or loss
+    is already inside ``final_equity``. Leaving it out of attribution makes the
+    rows disagree with the headline return — and understates the stock leg
+    exactly when it matters most.
+    """
+    if not prices or not daily:
+        return 0.0
+    final_day = daily[-1].day
+    final_prices = prices
+    total = 0.0
+    for cycle in cycles:
+        if not cycle.is_open or cycle.cost_basis is None:
+            continue
+        shares = daily[-1].shares_held.get(cycle.underlying, 0)
+        if shares <= 0:
+            continue
+        price = final_prices.get(final_day)
+        if price is None:
+            continue
+        total += (price - cycle.cost_basis) * shares
+    return total
 
 
 def _buy_and_hold(
