@@ -696,6 +696,50 @@ class WheelEngine:
                                 symbol=symbol,
                                 error=str(e))
 
+    @staticmethod
+    def _normalize_sdk_order(order: Any) -> Optional[Dict[str, Any]]:
+        """Normalize a raw Alpaca SDK ``Order`` into the AlpacaClient dict shape.
+
+        `AlpacaClient.get_orders()` returns dicts, but the closed-orders fetch
+        in `poll_order_statuses` goes through the trading client directly and
+        gets SDK models back. This maps one onto the other so both sources can
+        share a single processing loop.
+
+        Returns None if the object cannot be read, so one malformed order
+        cannot abort the whole poll.
+        """
+        try:
+            def _val(attr):
+                # Enum -> its .value; coerce to str so the caller can .lower()
+                # it without a None check.
+                v = getattr(order, attr, None)
+                v = getattr(v, 'value', v)
+                return '' if v is None else str(v)
+
+            qty = int(float(getattr(order, 'qty', 0) or 0))
+            filled_qty = int(float(getattr(order, 'filled_qty', 0) or 0))
+            filled_avg_price = getattr(order, 'filled_avg_price', None)
+            return {
+                'order_id': str(getattr(order, 'id', '') or ''),
+                'symbol': getattr(order, 'symbol', '') or '',
+                'qty': qty,
+                'filled_qty': filled_qty,
+                'remaining_qty': qty - filled_qty,
+                'is_partial_fill': 0 < filled_qty < qty,
+                'side': _val('side'),
+                'status': _val('status'),
+                'order_type': _val('order_type'),
+                'submitted_at': getattr(order, 'submitted_at', None),
+                'filled_at': getattr(order, 'filled_at', None),
+                'filled_avg_price': (float(filled_avg_price)
+                                     if filled_avg_price is not None else None),
+            }
+        except Exception as exc:  # noqa: BLE001 - one bad order must not abort the poll
+            logger.warning("Could not normalize closed order",
+                          event_category="error", event_type="order_normalize_failed",
+                          error=str(exc))
+            return None
+
     def poll_order_statuses(self) -> Dict[str, Any]:
         """Poll recent orders and log status updates for filled/expired orders.
 
@@ -712,16 +756,27 @@ class WheelEngine:
                        event_category="system",
                        event_type="order_poll_started")
 
-            # Get all orders (Alpaca returns recent orders by default)
+            # `get_orders()` sends no status filter, and Alpaca's REST default
+            # for `status` is "open" — so this returns ONLY open orders, which
+            # are by definition never in a final state. On its own it can never
+            # log anything; the closed-orders fetch below is what makes this
+            # job do work at all.
             all_orders = self.alpaca.get_orders()
 
             # Also check closed/filled orders
             try:
                 # Use the trading client directly to get closed orders
                 from alpaca.trading.enums import QueryOrderStatus
+                from alpaca.trading.requests import GetOrdersRequest
+                # Bound to the 7-day window this method's docstring has always
+                # claimed but never implemented. Without it the fetch reaches
+                # back over the whole account history, and since this job has
+                # no persistence it re-logs every order it can still see on
+                # every poll.
                 closed_orders = self.alpaca.trading_client.get_orders(
-                    filter=alpaca.trading.requests.GetOrdersRequest(
+                    filter=GetOrdersRequest(
                         status=QueryOrderStatus.CLOSED,
+                        after=clock.now() - timedelta(days=7),
                         limit=100
                     )
                 )
@@ -740,8 +795,24 @@ class WheelEngine:
                 'errors': 0
             }
 
-            # Process orders from get_orders
+            # `closed_orders` comes off the raw trading client as SDK Order
+            # objects, while `all_orders` is already normalized to dicts by the
+            # AlpacaClient wrapper. Normalize and merge, keyed by order_id so a
+            # single order is logged at most once per poll. Closed orders are
+            # applied last: if an order appears in both (it closed between the
+            # two calls) the final state is the one worth logging.
+            orders_by_id = {}
             for order in all_orders:
+                oid = str(order.get('order_id', ''))
+                if oid:
+                    orders_by_id[oid] = order
+            for raw in closed_orders:
+                normalized = self._normalize_sdk_order(raw)
+                if normalized and normalized['order_id']:
+                    orders_by_id[normalized['order_id']] = normalized
+
+            # Process open + closed orders
+            for order in orders_by_id.values():
                 try:
                     stats['orders_checked'] += 1
                     order_id = str(order.get('order_id', ''))
@@ -777,7 +848,7 @@ class WheelEngine:
                                 symbol=order.get('symbol'),
                                 status=order.get('status'),
                                 side=order.get('side'),
-                                filled_price=float(order.get('filled_avg_price', 0)),
+                                filled_price=float(order.get('filled_avg_price') or 0),
                                 filled_qty=int(order.get('filled_qty', 0)),
                                 filled_at=str(order.get('filled_at', '')),
                             )
@@ -808,7 +879,7 @@ class WheelEngine:
                                 symbol=order.get('symbol'),
                                 status=order.get('status'),
                                 side=order.get('side'),
-                                filled_price=float(order.get('filled_avg_price', 0)),
+                                filled_price=float(order.get('filled_avg_price') or 0),
                                 filled_qty=int(order.get('filled_qty', 0)),
                                 filled_at=str(order.get('filled_at', '')),
                             )
@@ -839,7 +910,7 @@ class WheelEngine:
                                 symbol=order.get('symbol'),
                                 status=order.get('status'),
                                 side=order.get('side'),
-                                filled_price=float(order.get('filled_avg_price', 0)),
+                                filled_price=float(order.get('filled_avg_price') or 0),
                                 filled_qty=int(order.get('filled_qty', 0)),
                                 filled_at=str(order.get('filled_at', '')),
                             )

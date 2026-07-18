@@ -300,3 +300,173 @@ class TestWheelEngine:
         assert action['action_type'] == 'close_position'
         assert action['reason'] == 'profit_target'
         assert action['unrealized_pl'] == 150.0
+
+# --------------------------------------------------------------------------- #
+# FC-035: poll_order_statuses closed-orders path
+#
+# This path raised `NameError: name 'alpaca' is not defined` on every
+# invocation (the module was never imported), and the surrounding
+# `except Exception` swallowed it — so it had never executed in production.
+# Even once the import was fixed, `closed_orders` was assigned and never
+# read. These tests exercise the path end to end so neither defect can
+# return silently.
+# --------------------------------------------------------------------------- #
+class _FakeEnum:
+    """Stands in for an SDK enum whose value is read via `.value`."""
+
+    def __init__(self, value):
+        self.value = value
+
+
+class _FakeSDKOrder:
+    """Mimics an alpaca-py `Order` model as returned by the trading client."""
+
+    def __init__(self, order_id, symbol, status, qty=1, filled_qty=1,
+                 filled_avg_price="2.50", side="sell"):
+        self.id = order_id
+        self.symbol = symbol
+        self.status = _FakeEnum(status)
+        self.side = _FakeEnum(side)
+        self.order_type = _FakeEnum("limit")
+        self.qty = qty
+        self.filled_qty = filled_qty
+        self.filled_avg_price = filled_avg_price
+        self.submitted_at = datetime(2026, 7, 17, 10, 0, 0)
+        self.filled_at = datetime(2026, 7, 17, 10, 0, 5)
+
+
+class TestPollOrderStatusesClosedOrders:
+    """The closed-orders path must actually run and actually be consumed."""
+
+    def setup_method(self):
+        mock_config = Mock(spec=Config)
+        mock_config.max_total_positions = 10
+        mock_config.stock_symbols = ['AAPL']
+
+        with patch('src.strategy.wheel_engine.AlpacaClient') as mock_alpaca_cls, \
+             patch('src.strategy.wheel_engine.MarketDataManager'), \
+             patch('src.strategy.wheel_engine.PutSeller'), \
+             patch('src.strategy.wheel_engine.CallSeller'):
+            self.mock_alpaca = Mock()
+            mock_alpaca_cls.return_value = self.mock_alpaca
+            self.engine = WheelEngine(mock_config)
+
+        # `get_orders()` sends no status filter and Alpaca defaults to "open",
+        # so the wrapper yields only non-final orders. Empty is the realistic
+        # case: without the closed-orders fetch there is nothing to log.
+        self.mock_alpaca.get_orders.return_value = []
+
+    def _run(self, closed_orders):
+        self.mock_alpaca.trading_client.get_orders.return_value = closed_orders
+        with patch('src.strategy.wheel_engine.log_order_status_update') as log_status, \
+             patch('src.strategy.wheel_engine.get_analytics_writer'):
+            stats = self.engine.poll_order_statuses()
+        return stats, log_status
+
+    def test_closed_orders_are_fetched_and_logged(self):
+        """Regression: the NameError made this path a permanent no-op.
+
+        With the bug present, `closed_orders` is [] and nothing is ever
+        logged, so every assertion below fails.
+        """
+        stats, log_status = self._run([
+            _FakeSDKOrder("ord-1", "AAPL260717P00150000", "filled"),
+            _FakeSDKOrder("ord-2", "AAPL260717P00140000", "expired"),
+        ])
+
+        assert stats['orders_checked'] == 2
+        assert stats['filled_logged'] == 1
+        assert stats['expired_logged'] == 1
+        assert stats['errors'] == 0
+
+        event_types = [c.kwargs['event_type'] for c in log_status.call_args_list]
+        assert event_types == ['order_filled', 'order_expired']
+
+    def test_closed_orders_request_uses_closed_status_filter(self):
+        """The fetch must ask for CLOSED orders, not re-request open ones."""
+        from alpaca.trading.enums import QueryOrderStatus
+
+        self._run([])
+
+        _, kwargs = self.mock_alpaca.trading_client.get_orders.call_args
+        assert kwargs['filter'].status == QueryOrderStatus.CLOSED
+
+    def test_closed_orders_request_is_bounded_to_seven_days(self):
+        """The job has no persistence, so an unbounded window re-logs history.
+
+        The docstring has always promised a 7-day lookback; assert the request
+        actually carries it.
+        """
+        from src.utils import clock
+
+        self._run([])
+
+        _, kwargs = self.mock_alpaca.trading_client.get_orders.call_args
+        after = kwargs['filter'].after
+        assert after is not None, "closed-orders fetch is unbounded"
+        assert (clock.now() - after).days == 7
+
+    def test_expired_order_with_no_fill_price_still_logs(self):
+        """Expired orders carry filled_avg_price=None (15% of live closed orders).
+
+        `float(None)` would raise and silently drop the analytics write.
+        """
+        stats, log_status = self._run([
+            _FakeSDKOrder("ord-3", "AAPL260717P00140000", "expired",
+                          filled_qty=0, filled_avg_price=None),
+        ])
+        assert stats['expired_logged'] == 1
+        assert stats['errors'] == 0
+        assert log_status.call_args.kwargs['event_type'] == 'order_expired'
+
+    def test_no_exception_is_swallowed_on_the_closed_path(self):
+        """The bug hid behind `except Exception` -> closed_orders_failed.
+
+        If any NameError-style defect returns, the fetch raises, the handler
+        sets closed_orders = [] and nothing is logged.
+        """
+        stats, log_status = self._run([
+            _FakeSDKOrder("ord-1", "AAPL260717P00150000", "filled"),
+        ])
+        assert log_status.call_count == 1, (
+            "closed-orders fetch was swallowed by the except handler"
+        )
+        assert stats['filled_logged'] == 1
+
+    def test_order_in_both_sources_is_logged_once_with_final_state(self):
+        """Dedupe by order_id; the closed (final) state wins."""
+        self.mock_alpaca.get_orders.return_value = [{
+            'order_id': 'ord-1', 'symbol': 'AAPL260717P00150000',
+            'status': 'new', 'filled_qty': 0, 'filled_avg_price': None,
+        }]
+        stats, log_status = self._run([
+            _FakeSDKOrder("ord-1", "AAPL260717P00150000", "filled"),
+        ])
+
+        assert stats['orders_checked'] == 1
+        assert log_status.call_count == 1
+        assert log_status.call_args.kwargs['event_type'] == 'order_filled'
+
+    def test_sdk_order_is_normalized_to_wrapper_shape(self):
+        """Normalized closed orders must match AlpacaClient.get_orders()."""
+        row = WheelEngine._normalize_sdk_order(
+            _FakeSDKOrder("ord-9", "AAPL260717P00150000", "filled",
+                          qty=2, filled_qty=1, filled_avg_price="3.25")
+        )
+        assert row['order_id'] == 'ord-9'
+        assert row['status'] == 'filled'
+        assert row['side'] == 'sell'
+        assert row['qty'] == 2
+        assert row['filled_qty'] == 1
+        assert row['remaining_qty'] == 1
+        assert row['is_partial_fill'] is True
+        assert row['filled_avg_price'] == 3.25
+
+    def test_malformed_order_does_not_abort_the_poll(self):
+        """One unreadable order must not take the whole job down."""
+        stats, log_status = self._run([
+            object(),  # no attributes at all
+            _FakeSDKOrder("ord-2", "AAPL260717P00140000", "filled"),
+        ])
+        assert stats['filled_logged'] == 1
+        assert log_status.call_count == 1
