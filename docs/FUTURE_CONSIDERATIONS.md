@@ -204,14 +204,12 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 
 **Problem / opportunity:** `RiskManager.validate_new_position()` (risk_manager.py:23) is defined but **never invoked**. It contains portfolio-level checks — max total positions, max positions per stock, max exposure per ticker, min cash reserve, portfolio allocation — that today are partially duplicated in `wheel_engine._can_open_new_positions` and partially absent. Only `validate_roll()` is wired (from `CallRoller`). Either consolidate the put/call seller paths through `validate_new_position` (and dedupe the engine-level checks) or formally retire the method and document where each portfolio-level check actually lives.
 
-> **Verified 2026-07-18** (covered-call starvation investigation + adversarial review): `validate_new_position` has **zero call sites anywhere in the codebase**, and the actual production execution path (`/scan` → GCS opportunity blob → `/run` → `ExecutionEngine.rank_opportunities/select_batch/execute_batch`) never constructs a RiskManager at all. Answering the open question below: **`max_exposure_per_ticker` and `min_cash_reserve` are checked nowhere in production.** Also note the method contains a latent substring bug (`underlying_symbol in p['symbol']` at risk_manager.py:57 — counts the stock position itself, and `F` would match `PFE`); if consolidation is chosen, that must be fixed first. FC-038 adds selection-level budget checks in the execution engine, which shrinks what consolidation here would need to cover.
-
 **Open questions:**
 - Consolidate (route puts/calls through `validate_new_position`) or retire (delete the method, ensure engine-level checks cover everything)?
 - If consolidating, do the engine-level early checks stay as a fast-fail before scanning, with the seller-level call as the authoritative gate?
-- Are `max_exposure_per_ticker` and `min_cash_reserve` actually checked anywhere today, or are they silently disabled? *(Answered 2026-07-18: no — see above.)*
+- Are `max_exposure_per_ticker` and `min_cash_reserve` actually checked anywhere today, or are they silently disabled?
 
-**Links:** FC-013 Phase-1 audit, FC-038 (execution-selection rewrite), `risk_manager.py:23-120`, `wheel_engine.py:220-249`, `docs/investigations/covered-call-starvation-2026-07-18.md`.
+**Links:** FC-013 Phase-1 audit, `risk_manager.py:23-120`, `wheel_engine.py:220-249`.
 
 ---
 
@@ -225,11 +223,11 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 **Problem / opportunity:** Both `PutSeller._entry_times` (put_seller.py:30) and `CallSeller._entry_times` (call_seller.py:32) are local in-memory dicts that do not survive Cloud Run cold starts. The `profit_taking_min_hold_hours` gate inside `should_close_*_early()` silently fails open when the dict is empty (no `entry_time` → loop falls through). This is the same class of bug as FC-009 (the `_closed_today` cold-start dedup issue). Persist `_entry_times` to GCS alongside the existing wheel state so the hold-period gate enforces correctly across cold starts and parallel cycles.
 
 **Open questions:**
-- Persist to GCS (existing `WheelStateManager` GCS layer) or query Alpaca for fill timestamps? *(2026-07-18 data point: `STATE_STORAGE_BUCKET` is not set on the Cloud Run service, so the "existing GCS layer" has never persisted anything in production — no state blob exists in any bucket. FC-039's roller repair chose the query-Alpaca route (stateless, broker is source of truth) for the same class of problem; strongly consider the same here.)*
+- Persist to GCS (existing `WheelStateManager` GCS layer) or query Alpaca for fill timestamps?
 - Should this share infrastructure with FC-009's `_closed_today` fix or stay independent?
 - What's the migration path for currently-held positions whose entry times are unknown?
 
-**Links:** FC-009, FC-039 (stateless-from-Alpaca precedent), `put_seller.py:30,378,544`, `call_seller.py:32,300,557`.
+**Links:** FC-009, `put_seller.py:30,378,544`, `call_seller.py:32,300,557`.
 
 ---
 
@@ -348,7 +346,7 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 **Problem / opportunity:** Some high-volume symbols (e.g., GOOGL, AMZN, SPY, QQQ) now have options expiring every trading day, not just Fridays. The current system assumes Friday-only expirations in multiple places:
 
-1. **FC-006 rolling engine** — hardcoded Friday guard (`weekday()==4`) in both the `/roll` endpoint and Cloud Scheduler (`30 15 * * 5`). Positions expiring on a Wednesday won't be evaluated for rolling. *(2026-07-18: FC-039's roller repair moves roll-eligibility checks into the daily monitor cycle, which delivers this item; the DTE-band and target-DTE questions below remain this FC's scope.)*
+1. **FC-006 rolling engine** — hardcoded Friday guard (`weekday()==4`) in both the `/roll` endpoint and Cloud Scheduler (`30 15 * * 5`). Positions expiring on a Wednesday won't be evaluated for rolling.
 2. **DTE bands** — the 7→0 bands assume a Monday-sell, Friday-expire cadence. A position sold Monday with a Wednesday expiry has DTE=2 at open, hitting different (later) bands than intended.
 3. **`call_target_dte: 7` / `put_target_dte: 7`** — assumes next-Friday expiry. With daily expirations available, shorter DTE targets (2-3 days) become viable, potentially improving theta capture per calendar day.
 4. **Strike selection** — `find_suitable_calls/puts` filters by `dte <= target_dte` which works, but may miss better opportunities at non-Friday expirations.
@@ -479,66 +477,83 @@ Note this is *not* true of the Stage-2 gap-risk analysis (`_detect_current_gap`,
 
 ---
 
-### FC-038: Covered calls charged phantom cash collateral in execution selection — call starvation
-
-**Status:** Plan published
-**Size estimate:** M (production trading logic → two-reviewer, high-stakes calibration)
-**Owner:** Claude / zeshan
-**Plan file:** `docs/plans/fc-038.md`
-
-**Problem / opportunity:** The production `/run` pipeline treats covered calls as if they required full cash collateral, in **two** places: `put_seller._calculate_position_size` (invoked for *all* opportunity types by `ExecutionEngine.rank_opportunities`) silently drops any call whose `strike × 100` exceeds buying power, and `select_batch` charges `strike × 100` phantom collateral against the BP budget for calls that survive. Covered calls need zero cash — the shares are the cover. Empirical blast radius (verified 2026-07-18, adversarial-reviewed): AAPL's 100 shares sat uncovered 7/15–7/18 while its calls were the **top-scored opportunities in every scan** (~$75–$190/day of scanned premium foregone); the Friday 7/17 14:15 run was reproduced exactly (BP $67,142.50 → GOOGL call charged $37k phantom → all three AAPL calls dropped); ~50–90 opportunities/day convert to only 1–3 trades. A second wasted-slot bug compounds it: share-committed underlyings (GOOGL post-sale) keep winning selection, charge phantom BP, then fail `execute_batch`'s available-shares check — every cycle. Selection drops are entirely unlogged, which is why this was invisible for months.
-
-**Fix direction (per plan):** two-pool budgeting — calls consume a per-underlying available-shares budget (owned − committed, computed at selection time); puts consume the cash/BP budget; calls stop competing with puts entirely. Shares-based call sizing replaces the put-sizing BP gate. Every ranking/selection drop gets a logged reason.
-
-**Open questions:** see plan file.
-
-**Links:** `docs/plans/fc-038.md`, `docs/investigations/covered-call-starvation-2026-07-18.md` (investigation + adversarial review), FC-014 (RiskManager dead code — separate consolidation question), FC-039 (roller repair, sibling finding), `src/strategy/execution_engine.py:140-251,305-360`, `src/strategy/put_seller.py:154`.
-
----
-
-### FC-039: Call roller has never executed a roll — quote-key bug, Friday/DTE eligibility gap, state amnesia
+### FC-039: Wheel state persistence has never worked in production
 
 **Status:** Consideration
 **Size estimate:** M
 **Owner:** unassigned
-**Plan file:** not yet
+**Plan file:** not yet — changes runtime behavior of the live wheel, so a plan is required
 
-**Problem / opportunity:** The FC-006 roller has **never placed a single order** in its production life (verified two ways 2026-07-18: every `roll_cycle_completed` log in retention shows `rolls_executed=0`, and full Alpaca order history — 459 orders — contains no option order in any Friday roll window). Four stacked causes:
+**Problem / opportunity:** `WheelStateManager` has been running with `storage_bucket=None` since inception. Its GCS save/load are therefore unconditional no-ops (`src/strategy/wheel_state_manager.py:60-62, 84-86`), and wheel state is in-memory per Cloud Run instance — lost on every scale-to-zero.
 
-1. **Quote-key mismatch (fatal, silent):** `call_roller.py:102` reads `quote.get('last_price')/quote.get('ask_price')` but `AlpacaClient.get_stock_quote` returns keys `bid`/`ask` → price always 0 → unlogged `return None` *before* any gate can log a skip reason. (`get_stock_quote` also raises on failure rather than returning falsy, so the `if not quote` branch is miswired too.)
-2. **Eligibility gap:** monitor profit-taking churn keeps Friday-evaluated calls at DTE 5–7 (all 5 observed Fridays), and 52% of call sales expire mid-week where a Friday-only `max_current_dte: 1` check can never see them. (Note: 48% of call expiries *are* Fridays — a Friday-expiry ITM call at 15:30 would be eligible; churn, not the calendar, is the main idler.)
-3. **State amnesia:** `STATE_STORAGE_BUCKET` is unset on Cloud Run → wheel state is per-request in-memory → `original_premium` resolves 0 → `debit_pct_of_premium=999` → any debit roll rejected; `roll_count` never increments (2-roll cap dead). Setting the bucket alone is **insufficient**: `/run` constructs `CallSeller` without a wheel_state (`cloud_run_server.py:381`), so `set_active_call_details` never fires regardless.
-4. **Zero observability:** the fatal path is an unlogged early return.
+Verified four independent ways on 2026-07-18:
 
-**Fix direction (adversarial-reviewed):** fix quote keys (bid/ask mid); make the roller **stateless** — read original premium from Alpaca order history (`filled_avg_price` of the opening STO) instead of doubling down on in-memory state production has proven it never persists; move eligibility checks (DTE ≤ 1 + ITM ratio) into the daily monitor cycle, sequenced *before* profit-taking (near-disjoint states: profit-taking fires on OTM winners, rolling on ITM losers); retain a ~15:30 ET expiry-day check since the last monitor runs 14:55 ET; log every skip with a reason.
+1. `src/strategy/wheel_engine.py:40` resolves the bucket as `getattr(config, 'state_storage_bucket', None) or os.getenv('STATE_STORAGE_BUCKET')`.
+2. `Config` has **no** `state_storage_bucket` property — `grep` over all of `src/utils/config.py` returns nothing, so the `getattr` yields `None`.
+3. `STATE_STORAGE_BUCKET` is **not set** on the live Cloud Run service. `gcloud run services describe options-wheel-strategy` shows the env is exactly `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `FINNHUB_API_KEY`, `ALPACA_PAPER_TRADING`, `GCP_PROJECT`. `cloudbuild.yaml:75` sets only the last two, and `--set-env-vars` is replace-semantics, so any hand-added value is wiped on the next deploy.
+4. **No `wheel_state/current_state.json` object exists in any bucket in the project** — checked all three (`...-options-data`, `..._cloudbuild`, `options-wheel-opportunities`).
+
+**Consequence — this silently disabled a control we believe is running.** Source #1 of the FC-029 R2 cost-basis chain is `wheel_state.symbol_states[symbol]['stock_cost_basis']` (`src/strategy/call_seller.py:429-441`), documented as *canonical*. It never resolves. The chain has been running on source #2 (BigQuery OPASN lookup) and source #3 (Alpaca `cost_basis`, empirically broken for assigned positions — that finding is what motivated FC-029 R2 in the first place). The cost-basis floor is therefore weaker in production than the FC-029 plan claims, on exactly the path FC-029 was written to harden.
+
+Same family as FC-035 (`poll_order_statuses` latent `NameError`) and FC-015 (`_entry_times` is in-process, so the 4h min-hold gate is dead): code that has never executed in production while appearing healthy.
 
 **Open questions:**
-- Keep the Friday 15:30 Cloud Scheduler job as the expiry-day late check (generalized to all expiry days), or add a new daily 15:30 job?
-- With FC-038 fixed, daily re-selling keeps most calls short-dated and OTM — the roller becomes a tail-risk (deep-ITM) device. Is `itm_trigger_ratio: 0.98` still the right trigger, and is the 25%-of-premium debit tolerance meaningful once premium comes from real fills?
-- Does roll_count need persistence at all, or can it too be derived from Alpaca order history (count of BTC+STO pairs on the same underlying's calls within the holding window)?
+- Enable persistence, or accept in-memory state and delete the dead code? `reconcile_positions` rebuilds state from Alpaca each cycle, so persistence may be genuinely unnecessary — in which case the fix is removing the illusion, not the bucket.
+- If we enable it: this is a **behavior change**, not a config fix. Cost-basis floors would begin resolving from source #1 and change which strikes are sellable. Needs its own canary and rollback.
+- Add `state_storage_bucket` to `Config`, or set `STATE_STORAGE_BUCKET` in `cloudbuild.yaml`? The former is testable; the latter is one line.
+- Should there be a startup assertion that any configured-but-unresolvable persistence target is fatal rather than silently no-op? This bug class keeps recurring.
 
-**Links:** FC-006 (original build), FC-011 item 1 (delivered by this), FC-015 (same stateless-vs-GCS question), FC-033 (escalation interaction), `docs/investigations/covered-call-starvation-2026-07-18.md`, `src/strategy/call_roller.py:102-104,148,487,506-508`, `src/api/alpaca_client.py:317-324`.
+**Links:** found during the FC-038 two-reviewer plan pass — `docs/investigations/fc-038-plan-review-2026-07-18.md` (BLOCKER B2). Related: FC-029 (R2 cost-basis chain), FC-035, FC-015.
 
 ---
 
-### FC-040: Trade journal mislabels every covered call as a put + BQ log sink dead since 2025-11-22
+### FC-040: Unit tests make live BigQuery calls against production data — ALREADY FIXED, entry withdrawn
+
+**Status:** Withdrawn 2026-07-18 — the bug was real but had already been fixed on `main` before this entry was filed.
+
+**What happened.** This entry was filed on 2026-07-18 during the FC-038 review, claiming the bug existed on `main`. It did not. `tests/conftest.py` on `main` already carries an autouse `_no_production_bigquery` fixture that stubs `CallSeller._lookup_last_opasn_put_strike`, with a `@pytest.mark.real_bq_lookup` escape hatch for the one test that genuinely exercises the fallback.
+
+That fixture's own docstring documents the identical finding — same mechanism, same AAPL `$305` value, same drawdown-pause symptom — so the diagnosis here was a rediscovery, not a new bug.
+
+**Why the false positive.** The verification was run in the FC-038 worktree, which is based on `main` from before PR #35 merged and therefore predates the fixture. The lesson is procedural and worth keeping: **verify a claimed `main` bug against `main`, not against a feature branch's base.** Every other finding in that review pass was re-checked against `main` afterward; FC-039 and FC-041 survived, this one did not.
+
+**Links:** `tests/conftest.py` (`_no_production_bigquery`); `docs/investigations/fc-038-plan-review-2026-07-18.md`.
+
+---
+
+### FC-041: Naked-call share guard misparses OCC symbols and can fail open
 
 **Status:** Consideration
-**Size estimate:** M
+**Size estimate:** S
 **Owner:** unassigned
-**Plan file:** not yet
+**Plan file:** not needed (single-file fix), but it changes runtime behavior of a risk control, so branch + PR
 
-**Problem / opportunity:** Two observability defects that actively misled the 2026-07-17/18 investigations:
+**Problem / opportunity:** `ExecutionEngine`'s committed-share accounting (`src/strategy/execution_engine.py:333` (on `main`)) identifies short calls with a hand-rolled parser:
 
-1. **Journal mislabeling:** `trade_journal.py:148,161` defaults `option_type→'put'` and `strategy→'sell_put'`; scanner-produced call opportunities carry `type: 'call'` but neither of those keys, so **all 29 covered-call rows in `options_wheel.trades` are labeled as puts** (verified by OCC-symbol regex vs label). Fix by deriving `option_type`/`strategy` from the OCC symbol inside `record_trade` (authoritative; retro-fixes any future forgetful producer), plus a prefix-disciplined backfill UPDATE for the 29 rows per the synthetic/corrective-write rules.
-2. **Dead log sink:** the `options-wheel-logs` sink stopped exporting 2025-11-22 (newest dated table `run_googleapis_com_stderr_20251122`; partitioned table empty). `errors_all` view errors outright on the known repeated-field schema conflict (`jsonPayload.symbols`). Any BQ-based analysis of bot decisions silently sees nothing after November; investigations must use `gcloud logging read` (30-day retention) instead. Restoring the sink into the same dataset without a schema strategy (exclusion/transform of array fields, or a fresh dataset) will die the same way — the restore must address that, and the session-2026-04-07 "never string-ify arrays" rule applies.
+```python
+for ch in opt_sym:
+    if ch.isdigit(): break
+    opt_underlying += ch
+if opt_underlying == underlying and 'C' in opt_sym:
+    committed_shares += abs(int(float(pos.get('qty', 0)))) * 100
+```
+
+Two defects:
+
+1. **`'C' in opt_sym` is a substring test over the whole OCC symbol, including the ticker.** `CRWD250718P00150000` contains a `C`, so a short *put* on any C-containing ticker is counted as committing 100 shares to calls — over-blocking legitimate call sales. The current wheel universe (AAPL, MSFT, GOOGL, AMZN, NVDA, AMD, QQQ, SPY, IWM, UNH, F, PFE, KMI, VZ) contains no `C` ticker, so the wheel is safe **by luck, not by design**. Adding CSCO, CVX, KO-adjacent names, or C itself would trigger it.
+2. **The digit-break underlying parser breaks on class shares.** `BRK.B` has position symbol `BRK.B` but OCC symbol `BRKB250718C...`, which parses to `BRKB` ≠ `BRK.B`. No match → `committed_shares = 0` → `available_shares = owned` → **the guard fails open and the bot writes calls against already-committed shares. That is a naked call.**
+
+`src/utils/option_symbols.py` already exists and should be used instead; the option type is at a fixed offset in the OCC layout, not a substring.
+
+**Consequence.** Defect (1) is currently latent and costs premium when triggered. Defect (2) is a genuine naked-call path — an uncovered short call has unbounded upside risk. Both become materially more likely under FC-038, which introduces a covered-call account with **no configured symbol universe by design**, where the operator buys arbitrary tickers through the Alpaca UI. FC-038's Phase 2 explicitly relies on this guard as the primitive for committed-share accounting.
 
 **Open questions:**
-- Backfill scope: just the 29 strategy/option_type labels, or also normalize `expiration`/`dte` (currently null on many rows)?
-- Sink restore: new dataset vs field-exclusion filter vs log-to-BQ via scheduled `gcloud logging read` ingestion?
-- Should dashboard queries that read `options_wheel.trades` labels be audited for damage from the mislabeled rows?
+- Replace the parser with `src/utils/option_symbols.py`, or is that module's coverage incomplete for class-share tickers too? Check before assuming.
+- Add a hard pre-submit assertion that `short_calls × 100 ≤ shares_owned` per underlying, independent of the parser, so a parsing bug cannot produce a naked call?
+- Are there other places that infer option type or underlying by substring? Sweep for `'C' in` / `'P' in` over option symbols.
+- Regression tests must include a short put on a C-containing ticker and a `BRK.B`-style class-share position.
 
-**Links:** `docs/investigations/covered-call-starvation-2026-07-18.md`, FC-038 (discovered during), `src/data/trade_journal.py:148,161`, session memory 2026-04-07 (BQ array-schema conflict).
+**Links:** found during the FC-038 two-reviewer plan pass — `docs/investigations/fc-038-plan-review-2026-07-18.md` (HIGH H1); flagged independently by both reviewers. Related: FC-038 (Phase 2 depends on this guard).
 
 ---
 
@@ -651,5 +666,8 @@ _Move entries here once a plan has been published, executed, and merged. Include
 ### FC-030: Drawdown-pause alerting — operator notification for extended pauses
 - Plan: `docs/plans/fc-030.md`
 - Runbook: `deploy/monitoring/drawdown_pause_alert.md`
-- PRs: [#38](https://github.com/memon1987/options_wheel/pull/38) (endpoint + tests), [#40](https://github.com/memon1987/options_wheel/pull/40) (CI fix), [#41](https://github.com/memon1987/options_wheel/pull/41) (alert-filter fix + closeout) — merged 2026-07-18
-- Notes: Builds the project's **first notification channel** (email), shared by two alerts. **Build-failure alerting was prioritized ahead of the pause alert** — FC-031 had sat undeployed 11 days behind an unnoticed red build, and two more builds failed during this session, both correctly matching the new policy. The pause alert (`POST /api/v2/bot-health/pause-alert-check`, daily 17:45 ET via Cloud Scheduler) fires at ≥7 trading days paused, env-overridable; it is a strict consumer of FC-031's `get_drawdown_pauses`, and a live-proxy outage now logs `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED` rather than reading as "all clear". **The mandatory fire drill caught a fatal defect**: the policy's `severity>=WARNING` clause matched 0 entries because Cloud Run captures stderr as plain text with empty severity — the alert would have been silent forever, discoverable only as a missing notification. Pure logic lives in `services/pause_alert.py` (the bot CI image has no FastAPI); a module-level `pytest.importorskip` was rejected after verifying it silently skips the pure tests too. Escalation remains **FC-033**, deliberately gated on pause-duration data this alert now collects. **Operator action outstanding:** confirm the email lands (Cloud Monitoring channels may need one-time verification).
+- PRs: [#38](https://github.com/memon1987/options_wheel/pull/38) (endpoint + tests), [#40](https://github.com/memon1987/options_wheel/pull/40) (CI fix — FastAPI-free service module), [#41](https://github.com/memon1987/options_wheel/pull/41) + [#42](https://github.com/memon1987/options_wheel/pull/42) (alert-filter fix + closeout, **duplicate fixes — see note**)
+- Date: 2026-07-18
+- Notes: Scope was alerting only — the observability half shipped in FC-031. `POST /api/v2/bot-health/pause-alert-check` runs weekdays 17:45 ET and logs a single `DRAWDOWN_PAUSE_ALERT` line when any symbol is paused >= 7 trading days (threshold declared in `cloudbuild.yaml`); a Cloud Monitoring log-based policy emails the operator via the project's **first notification channel**. Built as a strict consumer of FC-031's `get_drawdown_pauses` — one implementation of pause state, not two. Degraded paths are loud: a live-positions outage logs `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED` rather than reporting "nothing paused". **Cloud Build failure alerting shipped on the same channel** and was prioritized ahead of the pause alert — FC-031 had sat undeployed 11 days behind an unnoticed red build; the new alert then caught three real failures the same session. **The mandatory fire drill caught a fatal defect:** the policy's `severity>=WARNING` clause matched zero entries, because Cloud Run only assigns severity to structured JSON logs while Python's `logging.warning()` writes plain text — the alert would have been silent forever, discoverable only as a missing notification. Pure logic lives in `services/pause_alert.py` (the bot CI image has no FastAPI); a module-level `pytest.importorskip` was rejected after verifying it silently skips the pure tests too.
+- Note on duplicate PRs: two parallel sessions independently found and fixed the same severity-filter defect (#41 and #42). The same collision duplicated this file's entire Completed section, repaired in `fix/dedupe-fc-ledger`. No code conflict resulted; the fixes were equivalent.
+- **Operator action outstanding:** confirm the alert email lands (Cloud Monitoring channels may need one-time verification).

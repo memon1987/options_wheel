@@ -16,6 +16,44 @@ Published plans for changes to this codebase. **No medium or large change should
 - File name: `docs/plans/fc-NNN.md` matching the FC entry number (e.g., `fc-006.md` for FC-006)
 - This ensures direct traceability between FC entries and their published plans.
 
+## Allocating an FC number — read this first
+
+**Always allocate against `origin/main`, never against your branch's copy of
+`docs/FUTURE_CONSIDERATIONS.md`.**
+
+```sh
+git fetch origin main
+git show origin/main:docs/FUTURE_CONSIDERATIONS.md \
+  | grep -oE '^### FC-[0-9]+' | sort -u -t- -k2 -n | tail -1
+```
+
+Take the next number after that, and note that concurrent sessions or long-lived
+branches may have unmerged claims — grep other active branches too if you are
+working alongside someone:
+
+```sh
+for b in $(git branch -r --format='%(refname:short)' | grep -v HEAD); do
+  git show "$b:docs/FUTURE_CONSIDERATIONS.md" 2>/dev/null \
+    | grep -oE '^### FC-[0-9]+' | sed "s|^|$b |"
+done | sort -u -k2 -t- | tail -20
+```
+
+**Why this exists.** On 2026-07-18 four FC-number collisions occurred in a single
+day — FC-032 twice, FC-037 once, and a three-way clash on FC-038/039/040 between
+two concurrent sessions — every one of them caused by reading a branch-local
+`FUTURE_CONSIDERATIONS.md` that was behind `main`. Two plan files named
+`fc-038.md` describing unrelated projects existed simultaneously on different
+branches.
+
+**Resolution rule when a collision does happen:** whatever is already on `main`
+keeps its number; unmerged branches renumber. If two unmerged branches clash,
+first to merge takes the number. Record the renumber in the plan file header so
+older commit-message prefixes remain traceable.
+
+**Concurrent sessions must use separate git worktrees.** Two sessions in one
+working directory have already caused one session to commit another's
+in-progress edits.
+
 ## Plan template
 
 Copy `_template.md` in this directory to start a new plan.
