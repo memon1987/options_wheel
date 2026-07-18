@@ -863,16 +863,15 @@ class BigQueryService:
     # broker-vs-ledger discrepancy we have investigated and accepted.
     # NEVER add an entry without an investigation doc — this list exists to
     # keep the banner honest, not to silence it.
-    KNOWN_RECONCILIATION_GAPS = [
-        {
-            "symbol": "AMD",
-            "amount": -1594.0,
-            "as_of": "2026-05-05",
-            "reason": "Alpaca paper-engine anomaly: OPTRDs net +100 shares but "
-                      "positions API reports 0 (FC-019 execution notes; "
-                      "docs/investigations/amd-reconciliation.md)",
-        },
-    ]
+    # Currently empty. Retired entries (kept here for the audit trail):
+    # - AMD −$1,594 (as_of 2026-05-05, FC-019: paper-engine OPTRDs netted
+    #   +100 shares vs positions API 0). RESOLVED by 2026-07-18 — AMD's
+    #   OPTRD ledger nets to 0 shares, share_count_mismatches is empty, and
+    #   the raw residual reconciles within threshold WITHOUT the allowance;
+    #   the stale entry itself was tripping the warn banner (exactly the
+    #   rot mode review F6 predicted). If a residual reappears, re-add a
+    #   dated entry backed by an investigation doc.
+    KNOWN_RECONCILIATION_GAPS = []
 
     def get_cash_flows(self) -> List[Dict[str, Any]]:
         """Dated external cash flows (JNLC): deposits positive."""
