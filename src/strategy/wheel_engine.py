@@ -29,7 +29,8 @@ class WheelEngine:
 
     def __init__(self, config: Config, alpaca_client: Optional[AlpacaClient] = None,
                  wheel_state: Optional[WheelStateManager] = None,
-                 allow_bigquery_cost_basis: bool = True):
+                 allow_bigquery_cost_basis: bool = True,
+                 earnings_calendar: Optional[Any] = None):
         """Initialize the wheel strategy engine.
 
         Args:
@@ -44,6 +45,11 @@ class WheelEngine:
             allow_bigquery_cost_basis: forwarded to CallSeller. A backtest passes
                 False so the cost-basis floor cannot fall back to querying
                 production trade history mid-replay.
+            earnings_calendar: earnings service used by the rolling cycle.
+                Defaults to constructing the live Finnhub-backed service. A
+                backtest injects a point-in-time calendar, because Finnhub can
+                only answer "when is the *next* earnings date" — meaningless
+                when replaying 2024.
         """
         self.config = config
         self.alpaca = alpaca_client if alpaca_client is not None else AlpacaClient(config)
@@ -58,6 +64,8 @@ class WheelEngine:
         self.call_seller = CallSeller(self.alpaca, self.market_data, config,
                                       wheel_state_manager=self.wheel_state,
                                       allow_bigquery_cost_basis=allow_bigquery_cost_basis)
+
+        self._injected_earnings_calendar = earnings_calendar
 
         # Track pending orders within current execution cycle to prevent duplicates
         self._pending_underlyings = set()
@@ -1371,8 +1379,8 @@ class WheelEngine:
 
         # Initialize rolling components
         risk_manager = RiskManager(self.config)
-        earnings_calendar = None
-        if self.config.earnings_enabled:
+        earnings_calendar = self._injected_earnings_calendar
+        if earnings_calendar is None and self.config.earnings_enabled:
             earnings_calendar = EarningsCalendarService(self.config)
 
         roller = CallRoller(

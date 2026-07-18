@@ -4,6 +4,7 @@ Each simulated trading day:
 
     freeze the clock  ->  wheel_engine.run_strategy_cycle()   (find opportunities)
                       ->  ExecutionEngine: filter -> rank -> select -> execute
+                      ->  Friday only: wheel_engine.run_rolling_cycle()
                       ->  settle expirations against today's close
                       ->  record equity
 
@@ -30,7 +31,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import structlog
 
@@ -44,6 +45,7 @@ from ..data.provider import OptionsDataProvider, StockBar
 from .alpaca_adapter import BacktestAlpacaClient
 from .broker import BacktestBroker
 from .clock import SimClock
+from .historical_earnings import HistoricalEarningsCalendar
 from .no_op_analytics import NoOpAnalyticsWriter, NoOpTradeJournal
 
 logger = structlog.get_logger(__name__)
@@ -109,6 +111,8 @@ class Simulator:
         fill_haircut: float = 0.25,
         fees_per_contract: float = 0.04,
         warmup_calendar_days: int = 60,
+        earnings_calendar: Optional[object] = None,
+        roll_weekday: int = 4,
     ) -> None:
         self.config = restrict_symbols(config, symbols)
         self.provider = provider
@@ -127,6 +131,16 @@ class Simulator:
         # day already has the lookback live would have had. 60 calendar days
         # comfortably covers the 30-session requirement.
         self.warmup_calendar_days = warmup_calendar_days
+        # Live earnings gating asks Finnhub for the *next* earnings date, which
+        # cannot be answered about a past decision. Default to the committed
+        # point-in-time table; passing None skips the gate entirely, which makes
+        # rolls more permissive than live (an optimistic bias), so that is
+        # strictly opt-in and never the default.
+        if earnings_calendar is None:
+            earnings_calendar = HistoricalEarningsCalendar.from_table()
+        self.earnings_calendar = earnings_calendar
+        # Production runs the roll cycle on Fridays (weekday 4).
+        self.roll_weekday = roll_weekday
 
     # ------------------------------------------------------------------ #
     # Data loading
@@ -193,6 +207,7 @@ class Simulator:
             alpaca_client=client,
             wheel_state=WheelStateManager(storage_bucket=None),
             allow_bigquery_cost_basis=False,
+            earnings_calendar=self.earnings_calendar,
         )
         # run_strategy_cycle() only *finds* opportunities — production executes
         # them in a second phase (cloud_run_server's /execute -> ExecutionEngine).
@@ -219,6 +234,11 @@ class Simulator:
                 try:
                     cycle = engine.run_strategy_cycle()
                     self._execute_opportunities(engine, exec_engine, cycle, client)
+                    # Production runs the roll cycle Friday afternoon, after the
+                    # normal cycle. CallRoller executes its own BTC/STO legs, so
+                    # unlike the scan it needs no separate execution phase.
+                    if day.weekday() == self.roll_weekday:
+                        engine.run_rolling_cycle()
                 except Exception:
                     logger.exception(
                         "Strategy cycle raised during replay",

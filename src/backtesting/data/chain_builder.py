@@ -28,6 +28,20 @@ from .spread_model import SpreadModel
 
 logger = structlog.get_logger(__name__)
 
+# The universe is fetched one calendar day wider than the strategy's DTE window.
+#
+# Live computes ``dte = (expiration - now).days`` (market_data.py) where the
+# expiration is midnight and ``now`` is intraday, so the timedelta FLOORS: a
+# contract 8 calendar days out reads as DTE 7 and passes a ``dte <= 7`` filter.
+# 50 of 241 real put fills (21%) were exactly those contracts.
+#
+# Filtering the universe by calendar days would hide them from the chain
+# entirely, making the replay structurally blind to a fifth of the trades live
+# actually made. So the data layer supplies everything live could see and the
+# strategy's own filter — flooring included — decides what qualifies. One day is
+# the exact buffer: a 9-calendar-day contract floors to DTE 8 and live rejects it.
+UNIVERSE_DTE_BUFFER = 1
+
 
 @dataclass(frozen=True)
 class ChainQuote:
@@ -102,7 +116,8 @@ class ChainBuilder:
         Args:
             underlying: ticker.
             as_of: decision date.
-            max_dte: only include contracts expiring within this many days.
+            max_dte: the strategy's DTE window. The universe is fetched one day
+                wider — see ``UNIVERSE_DTE_BUFFER``.
             underlying_price: the underlying's ``as_of`` close; fetched from the
                 provider if not supplied (the simulator supplies it to avoid a
                 redundant fetch).
@@ -116,7 +131,9 @@ class ChainBuilder:
         if underlying_price is None or underlying_price <= 0:
             return None
 
-        contracts = self._provider.get_contract_universe(underlying, as_of, max_dte)
+        contracts = self._provider.get_contract_universe(
+            underlying, as_of, max_dte + UNIVERSE_DTE_BUFFER
+        )
         if not contracts:
             return ChainSnapshot(underlying, as_of, underlying_price)
 

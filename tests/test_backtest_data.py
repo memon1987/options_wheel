@@ -203,6 +203,50 @@ class TestChainBuilder:
         symbols = {q.symbol for q in snap.puts}
         assert sym not in symbols  # no bar on as_of -> excluded
 
+    def test_universe_includes_the_extra_day_live_dte_flooring_reaches(self):
+        """Live floors DTE, so an 8-calendar-day contract is a valid DTE-7 candidate.
+
+        market_data does ``dte = (expiration_midnight - now_intraday).days``, which
+        floors. Filtering the chain by calendar days would hide those contracts,
+        and 21% of real put fills were exactly them.
+        """
+        p = MockProvider()
+        as_of = date(2025, 1, 6)
+        p.stock[as_of] = 100.0
+        eight_days_out = as_of + timedelta(days=8)
+        sym = _occ("XYZ", eight_days_out, "put", 93)
+        p.add_contract(
+            OptionContract(sym, "XYZ", eight_days_out, 93.0, "put"),
+            close=0.80,
+            traded_on=[as_of],
+        )
+
+        b = ChainBuilder(p, risk_free_rate=0.04)
+        snap = b.build("XYZ", as_of, 7)  # strategy window is 7
+        assert snap is not None
+        assert [q.symbol for q in snap.puts] == [sym], (
+            "the 8-calendar-day contract must be in the chain; live can select it"
+        )
+
+        # And live's own filter, with its flooring, accepts it as DTE 7.
+        from datetime import datetime as _dt
+        floored = (_dt.combine(eight_days_out, time.min)
+                   - _dt.combine(as_of, time(16, 0))).days
+        assert floored == 7
+
+    def test_universe_buffer_is_exactly_one_day(self):
+        """A 9-calendar-day contract floors to DTE 8 and live rejects it."""
+        from datetime import datetime as _dt
+
+        from src.backtesting.data.chain_builder import UNIVERSE_DTE_BUFFER
+
+        assert UNIVERSE_DTE_BUFFER == 1
+        as_of = date(2025, 1, 6)
+        nine_days_out = as_of + timedelta(days=9)
+        floored = (_dt.combine(nine_days_out, time.min)
+                   - _dt.combine(as_of, time(16, 0))).days
+        assert floored == 8, "a 9-day contract must floor to 8 and be filtered out by live"
+
     def test_expired_contract_excluded(self):
         """A contract expiring before as_of is outside the window."""
         p, as_of, exp = self._provider_with_chain()
