@@ -73,4 +73,4 @@ from).
 - Deployment permissions (`roles/run.admin`, `roles/cloudbuild.builds.editor`,
   `roles/cloudscheduler.admin`, `roles/iam.serviceAccountUser`) are deliberately
   not in the default list above; add them when we want sandboxes to deploy the
-  covered-call service (FC-032 Phase 3) rather than just prepare it.
+  covered-call service (FC-037 Phase 3) rather than just prepare it.
