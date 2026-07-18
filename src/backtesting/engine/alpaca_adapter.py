@@ -45,8 +45,13 @@ class UnsupportedBacktestCall(RuntimeError):
     """Live code reached for something the adapter does not simulate."""
 
 
-# Alpaca stamps daily stock bars at 04:00 UTC; GapDetector's index comparison is
-# sensitive to this, so the adapter reproduces it rather than inventing a stamp.
+# Alpaca stamps daily stock bars at MIDNIGHT ET — 04:00 UTC under EDT, 05:00 UTC
+# under EST. GapDetector's index comparison is sensitive to the stamp, so the
+# adapter reproduces it rather than inventing one. A fixed 04:00 is an hour off
+# for winter dates, which is harmless here because every stamp (04:00 or 05:00)
+# sorts before the 16:00 decision timestamp — the comparison outcome is
+# identical either way. Kept fixed for determinism; revisit only if some caller
+# ever depends on the exact hour.
 _BAR_STAMP = time(4, 0)
 
 # Ledger kinds that Alpaca reports as account activities, and their activity_type.
