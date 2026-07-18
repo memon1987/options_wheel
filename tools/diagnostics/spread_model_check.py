@@ -21,9 +21,11 @@ the market is genuinely open. Use that flag whenever the output is going to be
 quoted as an intraday measurement — an after-hours sample labelled "intraday"
 is the exact failure this tool exists to prevent.
 
-``--calibrate`` fits a SpreadModel from the collected sample and prints the
-parameters together with their provenance (n, date, session, symbols) so the
-committed constants can never be separated from the measurement behind them.
+``--calibrate`` fits a SpreadModel and prints the parameters together with
+their provenance (n, date, session, symbols) AND their fit diagnostics, then
+states a VERDICT on whether they may be committed. Provenance alone is not
+validity: an RTH sample can still produce a fit that is clamped, extrapolated,
+or explains almost none of the variance. Both gates must pass.
 
 Usage:
     python tools/diagnostics/spread_model_check.py
@@ -174,20 +176,53 @@ def main() -> int:
                             " NOT a valid intraday measurement."))
 
     calibrated = None
+    calib_diag = None
     if args.calibrate:
-        calibrated = SpreadModel.calibrate(rows)
-        print(f"\n{'='*60}\nCALIBRATED PARAMS\n{'='*60}")
-        print(f"  base_frac     {calibrated.base_frac:.4f}  (default {SpreadModel().base_frac})")
+        calibrated, calib_diag = SpreadModel.calibrate(rows, return_diagnostics=True)
+        defaults = SpreadModel()
+        print(f"\n{'='*60}\nCALIBRATION\n{'='*60}")
+        print(f"  base_frac     {calibrated.base_frac:.4f}  (default {defaults.base_frac})")
         print(f"  otm_widening  {calibrated.otm_widening:.4f}  "
-              f"(default {SpreadModel().otm_widening})")
+              f"(default {defaults.otm_widening})")
+        print("  fit quality:")
+        print(f"    samples in / used   {calib_diag['n_input']} / {calib_diag['n_used']}")
+        print(f"    excluded cheap      {calib_diag['n_excluded_cheap']} "
+              f"(mark < ${defaults.cheap_threshold:.2f}; cheap_widening is applied "
+              f"at eval, so fitting them double-counts it)")
+        print(f"    excluded floor      {calib_diag['n_excluded_floor']} "
+              f"(half-spread at the ${defaults.abs_floor:.2f} floor; a constant, "
+              f"not a fraction of mark)")
+        if calib_diag["r_squared"] is not None:
+            print(f"    R^2                 {calib_diag['r_squared']:.3f}")
+        if calib_diag["moneyness_min"] is not None:
+            print(f"    moneyness span      {calib_diag['moneyness_min']:.4f}"
+                  f" .. {calib_diag['moneyness_max']:.4f}")
+        print(f"    clamp applied       {calib_diag['clamp_hit']}")
         print("  provenance:")
-        print(f"    n        {len(rows)}")
         print(f"    date     {now:%Y-%m-%d %H:%M} local")
-        print(f"    session  {'RTH' if rth else 'OUT-OF-HOURS (NOT usable for calibration)'}")
+        print(f"    session  {'RTH' if rth else 'OUT-OF-HOURS'}")
         print(f"    symbols  {', '.join(sorted({r['symbol'] for r in rows}))}")
+
+        # Per-symbol fits. A pooled fit is weighted by how many strikes each
+        # underlying happens to list, not by trading importance — one liquid
+        # ETF with a dense ladder can dominate and drag base_frac toward its
+        # penny-wide regime, making the backtest optimistic on every other name.
+        print("  per-symbol (pooling hides this dispersion):")
+        for sym in sorted({r["symbol"] for r in rows}):
+            sym_rows = [r for r in rows if r["symbol"] == sym]
+            sym_fit, sym_diag = SpreadModel.calibrate(sym_rows, return_diagnostics=True)
+            flag = "OK " if sym_diag["usable"] else "BAD"
+            print(f"    [{flag}] {sym:<6} n={len(sym_rows):<4} used={sym_diag['n_used']:<4}"
+                  f" base_frac={sym_fit.base_frac:.4f}"
+                  f" otm_widening={sym_fit.otm_widening:.4f}")
+
+        verdict = "USABLE" if (calib_diag["usable"] and rth) else "NOT USABLE"
+        print(f"\n  VERDICT: {verdict} — {calib_diag['reason']}")
         if not rth:
-            print("\n  These params are NOT fit to commit: the sample is out-of-hours.",
-                  file=sys.stderr)
+            print("  Additionally the sample is out-of-hours, which alone "
+                  "disqualifies it for calibration.")
+        if verdict != "USABLE":
+            print("  DO NOT COMMIT these parameters.")
 
     if args.out:
         with open(args.out, "w") as fh:
@@ -200,9 +235,15 @@ def main() -> int:
                 "during_regular_hours": bool(rth),
                 "session": session_desc,
                 "symbols": sorted({r["symbol"] for r in rows}),
+                # `usable` gates the whole block: a consumer reading
+                # calibrated.base_frac must not get a number that came from a
+                # clamped, defaulted, or out-of-hours fit.
                 "calibrated": ({
                     "base_frac": calibrated.base_frac,
                     "otm_widening": calibrated.otm_widening,
+                    "usable": bool(calib_diag["usable"] and rth),
+                    "reason": calib_diag["reason"],
+                    "diagnostics": calib_diag,
                 } if calibrated else None),
                 "rows": rows,
             }, fh, indent=1)
