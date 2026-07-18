@@ -311,15 +311,32 @@ class TestSimulatorEarlyAssignment:
         assert sim._early_assignments == 0
         assert self.OCC in b.options
 
-    def test_no_ex_date_tomorrow_means_no_assignment(self):
+    def test_no_ex_date_ahead_means_no_assignment(self):
         sim = self._sim()
         b = self._broker_holding_a_covered_call()
         sim._assign_calls_before_ex_dividend(
             b, self._chains(mark=2.05, spot=30.0), {"KMI": 30.0},
-            self.EVE, date(2025, 1, 31),  # not an ex-date
+            date(2025, 2, 3), date(2025, 2, 4),  # the ex-date is long past
         )
         assert sim._early_assignments == 0
         assert self.OCC in b.options
+
+    def test_an_ex_date_between_two_sessions_still_triggers(self):
+        """The last session before the ex-date is the last chance to act.
+
+        If the ex-date falls on a day with no session (or no bar for this
+        symbol), the decision still has to be taken on the prior session —
+        otherwise the wheel keeps shares a real account would have lost AND
+        collects the dividend, which is the optimistic bias twice over.
+        """
+        sim = self._sim()
+        b = self._broker_holding_a_covered_call()
+        sim._assign_calls_before_ex_dividend(
+            b, self._chains(mark=2.05, spot=30.0), {"KMI": 30.0},
+            self.EVE, date(2025, 1, 31),  # spans the Jan 30 ex-date
+        )
+        assert sim._early_assignments == 1
+        assert self.OCC not in b.options
 
     def test_an_unpriced_itm_call_is_left_alone_but_counted(self):
         """No mark means no extrinsic; assigning on silence would fabricate a trade."""
@@ -367,10 +384,10 @@ class TestSimulatorDividendCredit:
         b = BacktestBroker(starting_cash=10_000.0)
         b._add_stock("KMI", 200, 27.0, date(2025, 1, 17))
 
-        sim._credit_dividends(b, date(2025, 1, 29))
+        sim._credit_dividends(b, date(2025, 1, 29), date(2025, 1, 28))
         assert not [e for e in b.ledger if e.kind == "dividend"]
 
-        sim._credit_dividends(b, date(2025, 1, 30))
+        sim._credit_dividends(b, date(2025, 1, 30), date(2025, 1, 29))
         events = [e for e in b.ledger if e.kind == "dividend"]
         assert len(events) == 1
         assert events[0].cash_delta == pytest.approx(57.5)  # 200 * 0.2875
@@ -382,5 +399,42 @@ class TestSimulatorDividendCredit:
         sim.symbols = ["KMI"]
         sim.dividends = _schedule(KMI=[(date(2025, 1, 30), 0.2875)])
         b = BacktestBroker(starting_cash=10_000.0)
-        sim._credit_dividends(b, date(2025, 1, 30))
+        sim._credit_dividends(b, date(2025, 1, 30), date(2025, 1, 29))
         assert b.cash == pytest.approx(10_000.0)
+
+    def test_an_ex_date_on_a_missing_session_is_still_credited(self):
+        """The wheel must collect every dividend the benchmark collects.
+
+        ``days`` only contains sessions this symbol has a bar for. An ex-date
+        landing on a session it did not trade is absent from that list, and an
+        exact-date match would drop it from the wheel while the benchmark's
+        total_between still counted it — putting the two legs back on different
+        dividend streams, which is exactly the asymmetry this track removes.
+        """
+        from src.backtesting.engine.simulator import Simulator
+
+        sim = Simulator.__new__(Simulator)
+        sim.symbols = ["KMI"]
+        sim.dividends = _schedule(KMI=[(date(2025, 1, 30), 0.2875)])
+        b = BacktestBroker(starting_cash=10_000.0)
+        b._add_stock("KMI", 100, 27.0, date(2025, 1, 17))
+
+        # Jan 30 is not a session here: the loop steps Jan 29 -> Jan 31.
+        sim._credit_dividends(b, date(2025, 1, 31), date(2025, 1, 29))
+        events = [e for e in b.ledger if e.kind == "dividend"]
+        assert len(events) == 1
+        assert events[0].cash_delta == pytest.approx(28.75)
+
+    def test_a_dividend_is_never_credited_twice(self):
+        """Consecutive intervals must not overlap at the boundary."""
+        from src.backtesting.engine.simulator import Simulator
+
+        sim = Simulator.__new__(Simulator)
+        sim.symbols = ["KMI"]
+        sim.dividends = _schedule(KMI=[(date(2025, 1, 30), 0.2875)])
+        b = BacktestBroker(starting_cash=10_000.0)
+        b._add_stock("KMI", 100, 27.0, date(2025, 1, 17))
+
+        sim._credit_dividends(b, date(2025, 1, 30), date(2025, 1, 29))
+        sim._credit_dividends(b, date(2025, 1, 31), date(2025, 1, 30))
+        assert len([e for e in b.ledger if e.kind == "dividend"]) == 1

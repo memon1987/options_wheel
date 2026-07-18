@@ -358,7 +358,7 @@ class Simulator:
                 # record). Crediting after settlement instead would pay a
                 # dividend on shares a put assignment delivered on the ex-date
                 # itself, which the real holder does not receive.
-                self._credit_dividends(broker, day)
+                self._credit_dividends(broker, day, days[i - 1] if i else None)
 
                 try:
                     # Pre-trade housekeeping, exactly as production does before
@@ -432,14 +432,31 @@ class Simulator:
     # ------------------------------------------------------------------ #
     # Dividends
     # ------------------------------------------------------------------ #
-    def _credit_dividends(self, broker: BacktestBroker, day: date) -> None:
-        """Credit any dividend going ex today, on shares held at yesterday's close.
+    def _credit_dividends(
+        self, broker: BacktestBroker, day: date, previous_day: Optional[date]
+    ) -> None:
+        """Credit dividends going ex in ``(previous_day, day]``, on shares held.
+
+        The interval rather than an exact date match on ``day`` is deliberate,
+        and it is what keeps the two legs on the same footing. ``days`` is the
+        set of sessions for which this symbol has a bar; an ex-date landing on a
+        session the symbol did not trade is absent from it. Matching exactly
+        would drop that dividend from the wheel while the benchmark — which sums
+        over the whole window via ``total_between`` — still collects it. The two
+        would then be measured against different dividend streams, which is the
+        precise failure this track exists to remove.
+
+        Crediting it on the next session the wheel can be observed on is also
+        correct on the ownership test: the holder held through the prior close.
 
         ``credit_dividend`` is a no-op when no shares are held, so this is safe
-        to call unconditionally on every symbol every day.
+        to call unconditionally on every symbol every day. On the first day
+        ``previous_day`` is None and the interval collapses to ``day`` alone —
+        immaterial, since the broker starts flat.
         """
+        lower = previous_day if previous_day is not None else day - timedelta(days=1)
         for symbol in self.symbols:
-            per_share = self.dividends.amount_on(symbol, day)
+            per_share = self.dividends.total_between(symbol, lower, day)
             if per_share <= 0:
                 continue
             amount = broker.credit_dividend(symbol, per_share, day)
@@ -472,7 +489,10 @@ class Simulator:
         assumed.
         """
         for symbol in self.symbols:
-            dividend = self.dividends.amount_on(symbol, next_day)
+            # Anything going ex before the next session the wheel could act on —
+            # same interval convention as _credit_dividends, so a dividend that
+            # is credited is also one that can trigger assignment.
+            dividend = self.dividends.total_between(symbol, day, next_day)
             if dividend <= 0:
                 continue
             spot = closes.get(symbol)
