@@ -1,479 +1,347 @@
-"""Tests for backtesting engine."""
+"""Unit tests for the FC-032 simulation kernel: broker accounting/assignment
+rules and the simulation clock time-seam.
+
+(The old file of this name — which tested the never-working legacy engine — was
+removed in Phase 0. This is the rebuilt kernel's suite.)
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, time
 
 import pytest
-from unittest.mock import Mock, patch
-from datetime import datetime, timedelta
-import pandas as pd
-import numpy as np
 
-from src.backtesting.backtest_engine import BacktestEngine, BacktestConfig
-from src.backtesting.portfolio import BacktestPortfolio
-from src.utils.config import Config
+from src.backtesting.engine.broker import BacktestBroker
+from src.backtesting.engine.clock import SimClock
+from src.utils import clock as time_seam
 
 
-class TestBacktestEngine:
-    """Test backtesting engine functionality."""
-    
-    def setup_method(self):
-        """Set up test fixtures."""
-        # Mock configuration
-        self.mock_config = Mock(spec=Config)
-        self.mock_config.put_target_dte = 7
-        self.mock_config.call_target_dte = 7
-        self.mock_config.put_delta_range = [0.10, 0.20]
-        self.mock_config.call_delta_range = [0.10, 0.20]
-        self.mock_config.min_put_premium = 0.50
-        self.mock_config.min_call_premium = 0.30
-        self.mock_config.max_position_size = 0.10
-        self.mock_config.min_cash_reserve = 0.20
-        self.mock_config.max_total_positions = 10
-        self.mock_config.profit_target_percent = 0.50
-        self.mock_config.use_call_stop_loss = True
-        self.mock_config.call_stop_loss_percent = 0.50
-        self.mock_config.stop_loss_multiplier = 1.5
-        # New profit taking settings (dynamic DTE-based)
-        self.mock_config.use_dynamic_profit_target = False  # Use static for test predictability
-        self.mock_config.profit_taking_static_target = 0.50
-        self.mock_config.profit_taking_min_target = 0.30
-        self.mock_config.profit_taking_max_target = 0.80
-        self.mock_config.profit_taking_default_long_dte = 0.50
-        self.mock_config.profit_taking_dte_bands = []
-        self.mock_config._config = {
-            'strategy': {
-                'put_target_dte': 7,
-                'call_target_dte': 7,
-                'put_delta_range': [0.10, 0.20],
-                'call_delta_range': [0.10, 0.20]
-            }
-        }
-        
-        # Backtest configuration
-        self.backtest_config = BacktestConfig(
-            start_date=datetime(2023, 1, 1),
-            end_date=datetime(2023, 1, 31),
-            initial_capital=100000.0,
-            symbols=['AAPL', 'MSFT'],
-            commission_per_contract=1.00,
-            slippage_bps=5
-        )
-        
-        # Sample stock data
-        dates = pd.date_range('2023-01-01', '2023-01-31', freq='D')
-        self.sample_stock_data = {
-            'AAPL': pd.DataFrame({
-                'open': np.random.uniform(150, 160, len(dates)),
-                'high': np.random.uniform(160, 170, len(dates)),
-                'low': np.random.uniform(140, 150, len(dates)),
-                'close': np.random.uniform(150, 160, len(dates)),
-                'volume': np.random.uniform(50000000, 100000000, len(dates)),
-                'returns': np.random.normal(0, 0.02, len(dates)),
-                'volatility': np.random.uniform(0.20, 0.30, len(dates))
-            }, index=dates),
-            'MSFT': pd.DataFrame({
-                'open': np.random.uniform(250, 260, len(dates)),
-                'high': np.random.uniform(260, 270, len(dates)),
-                'low': np.random.uniform(240, 250, len(dates)),
-                'close': np.random.uniform(250, 260, len(dates)),
-                'volume': np.random.uniform(30000000, 60000000, len(dates)),
-                'returns': np.random.normal(0, 0.02, len(dates)),
-                'volatility': np.random.uniform(0.20, 0.30, len(dates))
-            }, index=dates)
-        }
-    
-    def test_backtest_engine_initialization(self):
-        """Test backtest engine initialization."""
-        with patch('src.backtesting.backtest_engine.HistoricalDataManager'):
-            engine = BacktestEngine(self.mock_config, self.backtest_config)
-            
-            assert engine.config == self.mock_config
-            assert engine.backtest_config == self.backtest_config
-            assert engine.portfolio.initial_cash == 100000.0
-            assert engine.portfolio.cash == 100000.0
-    
-    def test_config_override(self):
-        """Test configuration parameter override."""
-        backtest_config = BacktestConfig(
-            start_date=datetime(2023, 1, 1),
-            end_date=datetime(2023, 1, 31),
-            put_target_dte=14,  # Override
-            put_delta_range=[0.15, 0.25]  # Override
-        )
-        
-        with patch('src.backtesting.backtest_engine.HistoricalDataManager'):
-            engine = BacktestEngine(self.mock_config, backtest_config)
-            engine._override_config()
-            
-            assert self.mock_config._config['strategy']['put_target_dte'] == 14
-            assert self.mock_config._config['strategy']['put_delta_range'] == [0.15, 0.25]
-    
-    @patch('src.backtesting.backtest_engine.HistoricalDataManager')
-    def test_load_historical_data(self, mock_data_manager):
-        """Test historical data loading."""
-        # Mock data manager
-        mock_data_manager_instance = Mock()
-        mock_data_manager.return_value = mock_data_manager_instance
-        
-        # Mock get_stock_data to return our sample data
-        def mock_get_stock_data(symbol, start, end):
-            return self.sample_stock_data.get(symbol, pd.DataFrame())
-        
-        mock_data_manager_instance.get_stock_data = mock_get_stock_data
-        
-        engine = BacktestEngine(self.mock_config, self.backtest_config)
-        engine._load_historical_data()
-        
-        assert 'AAPL' in engine.stock_data
-        assert 'MSFT' in engine.stock_data
-        assert len(engine.stock_data['AAPL']) > 0
-    
-    @patch('src.backtesting.backtest_engine.HistoricalDataManager')
-    def test_portfolio_value_update(self, mock_data_manager):
-        """Test portfolio value updates."""
-        mock_data_manager_instance = Mock()
-        mock_data_manager.return_value = mock_data_manager_instance
-        mock_data_manager_instance.get_stock_data = lambda *args: pd.DataFrame()
-        
-        engine = BacktestEngine(self.mock_config, self.backtest_config)
-        engine.stock_data = self.sample_stock_data
-        
-        # Add a stock position
-        stock_position = {
-            'symbol': 'AAPL',
-            'quantity': 100,
-            'entry_price': 150.0,
-            'current_price': 150.0,
-            'market_value': 15000.0
-        }
-        engine.portfolio.stock_positions.append(stock_position)
-        
-        # Update values for a specific date
-        test_date = datetime(2023, 1, 15)
-        engine._update_portfolio_values(test_date)
-        
-        # Check that current_price was updated
-        updated_position = engine.portfolio.stock_positions[0]
-        assert updated_position['current_price'] != 150.0  # Should be updated
-        assert updated_position['market_value'] == updated_position['current_price'] * 100
-    
-    @patch('src.backtesting.backtest_engine.HistoricalDataManager')
-    def test_option_value_estimation(self, mock_data_manager):
-        """Test option value estimation."""
-        mock_data_manager_instance = Mock()
-        mock_data_manager.return_value = mock_data_manager_instance
-        mock_data_manager_instance.calculate_option_greeks = Mock(return_value={
-            'delta': -0.15,
-            'gamma': 0.01,
-            'theta': -0.05,
-            'vega': 0.20
-        })
-        
-        engine = BacktestEngine(self.mock_config, self.backtest_config)
-        engine.stock_data = self.sample_stock_data
-        
-        # Create option position
-        option_position = {
-            'underlying': 'AAPL',
-            'strike': 145.0,
-            'expiration': datetime(2023, 1, 20),
-            'type': 'PUT'
-        }
-        
-        test_date = datetime(2023, 1, 15)
-        estimated_value = engine._get_historical_option_value(option_position, test_date)
-
-        assert isinstance(estimated_value, float)
-        assert estimated_value >= 0  # Option value should be non-negative
-    
-    @patch('src.backtesting.backtest_engine.HistoricalDataManager')
-    def test_trading_day_check(self, mock_data_manager):
-        """Test trading day identification."""
-        mock_data_manager.return_value = Mock()
-        
-        engine = BacktestEngine(self.mock_config, self.backtest_config)
-        
-        # Test weekdays (should be trading days)
-        monday = datetime(2023, 1, 2)  # Monday
-        tuesday = datetime(2023, 1, 3)  # Tuesday
-        
-        assert engine._is_trading_day(monday) == True
-        assert engine._is_trading_day(tuesday) == True
-        
-        # Test weekends (should not be trading days)
-        saturday = datetime(2023, 1, 7)  # Saturday
-        sunday = datetime(2023, 1, 8)    # Sunday
-        
-        assert engine._is_trading_day(saturday) == False
-        assert engine._is_trading_day(sunday) == False
-    
-    @patch('src.backtesting.backtest_engine.HistoricalDataManager')
-    def test_put_assignment_handling(self, mock_data_manager):
-        """Test put assignment logic."""
-        mock_data_manager.return_value = Mock()
-        
-        engine = BacktestEngine(self.mock_config, self.backtest_config)
-        engine.stock_data = self.sample_stock_data
-        
-        # Create put position that should be assigned (ITM)
-        put_position = {
-            'underlying': 'AAPL',
-            'strike': 160.0,  # Strike above current price
-            'expiration': datetime(2023, 1, 15),
-            'type': 'PUT',
-            'quantity': -1  # Short position
-        }
-        
-        initial_cash = engine.portfolio.cash
-        initial_stock_positions = len(engine.portfolio.stock_positions)
-        
-        # Handle assignment
-        engine._handle_put_assignment(put_position, datetime(2023, 1, 15))
-        
-        # Check results
-        assert engine.portfolio.cash < initial_cash  # Cash should decrease
-        assert len(engine.portfolio.stock_positions) == initial_stock_positions + 1  # Stock position added
-        assert len(engine.trade_history) > 0  # Trade recorded
-    
-    @patch('src.backtesting.backtest_engine.HistoricalDataManager')
-    def test_call_assignment_handling(self, mock_data_manager):
-        """Test call assignment logic."""
-        mock_data_manager.return_value = Mock()
-        
-        engine = BacktestEngine(self.mock_config, self.backtest_config)
-        engine.stock_data = self.sample_stock_data
-        
-        # Add stock position first
-        stock_position = {
-            'symbol': 'AAPL',
-            'quantity': 100,
-            'entry_price': 150.0,
-            'current_price': 155.0,
-            'market_value': 15500.0
-        }
-        engine.portfolio.stock_positions.append(stock_position)
-        
-        # Create call position that should be assigned (ITM)
-        call_position = {
-            'underlying': 'AAPL',
-            'strike': 150.0,  # Strike below current price
-            'expiration': datetime(2023, 1, 15),
-            'type': 'CALL',
-            'quantity': -1  # Short position
-        }
-        
-        initial_cash = engine.portfolio.cash
-        initial_stock_positions = len(engine.portfolio.stock_positions)
-        
-        # Handle assignment
-        engine._handle_call_assignment(call_position, datetime(2023, 1, 15))
-        
-        # Check results
-        assert engine.portfolio.cash > initial_cash  # Cash should increase
-        assert len(engine.portfolio.stock_positions) == initial_stock_positions - 1  # Stock position removed
-        assert len(engine.trade_history) > 0  # Trade recorded
-    
-    @patch('src.backtesting.backtest_engine.HistoricalDataManager')
-    def test_suitable_put_finding(self, mock_data_manager):
-        """Test finding suitable put options."""
-        mock_data_manager_instance = Mock()
-        mock_data_manager.return_value = mock_data_manager_instance
-        mock_data_manager_instance.calculate_option_greeks = Mock(return_value={
-            'delta': -0.15,  # Within range
-            'gamma': 0.01,
-            'theta': -0.05,
-            'vega': 0.20
-        })
-        
-        engine = BacktestEngine(self.mock_config, self.backtest_config)
-        engine.stock_data = self.sample_stock_data
-        
-        # Find suitable put
-        put_opportunity = engine._find_suitable_put('AAPL', 155.0, datetime(2023, 1, 15))
-        
-        if put_opportunity:  # Might be None if criteria not met
-            assert put_opportunity['type'] == 'PUT'
-            assert put_opportunity['underlying'] == 'AAPL'
-            assert put_opportunity['strike'] < 155.0  # Should be OTM
-            assert put_opportunity['premium'] >= self.mock_config.min_put_premium
-    
-    @patch('src.backtesting.backtest_engine.HistoricalDataManager')
-    def test_suitable_call_finding(self, mock_data_manager):
-        """Test finding suitable call options."""
-        mock_data_manager_instance = Mock()
-        mock_data_manager.return_value = mock_data_manager_instance
-        mock_data_manager_instance.calculate_option_greeks = Mock(return_value={
-            'delta': 0.15,  # Within range
-            'gamma': 0.01,
-            'theta': -0.05,
-            'vega': 0.20
-        })
-        
-        engine = BacktestEngine(self.mock_config, self.backtest_config)
-        engine.stock_data = self.sample_stock_data
-        
-        # Find suitable call
-        call_opportunity = engine._find_suitable_call('AAPL', 155.0, datetime(2023, 1, 15))
-        
-        if call_opportunity:  # Might be None if criteria not met
-            assert call_opportunity['type'] == 'CALL'
-            assert call_opportunity['underlying'] == 'AAPL'
-            assert call_opportunity['strike'] > 155.0  # Should be OTM
-            assert call_opportunity['premium'] >= self.mock_config.min_call_premium
-    
-    @patch('src.backtesting.backtest_engine.HistoricalDataManager')
-    def test_position_closure_logic(self, mock_data_manager):
-        """Test position closure logic."""
-        mock_data_manager.return_value = Mock()
-        
-        engine = BacktestEngine(self.mock_config, self.backtest_config)
-        
-        # Create profitable position (should close)
-        profitable_position = {
-            'type': 'PUT',
-            'quantity': -1,
-            'entry_price': 2.00,
-            'current_price': 0.80,  # 60% profit
-            'underlying': 'AAPL'
-        }
-        
-        should_close = engine._should_close_position(profitable_position, datetime(2023, 1, 15))
-        assert should_close == True  # Should close due to profit target
-        
-        # Create losing call position (should close if stop loss enabled)
-        losing_position = {
-            'type': 'CALL',
-            'quantity': -1,
-            'entry_price': 1.00,
-            'current_price': 2.00,  # 100% loss
-            'underlying': 'AAPL'
-        }
-        
-        should_close_loss = engine._should_close_position(losing_position, datetime(2023, 1, 15))
-        assert should_close_loss == True  # Should close due to stop loss
-    
-    def test_backtest_config_validation(self):
-        """Test backtest configuration validation."""
-        # Test valid config
-        config = BacktestConfig(
-            start_date=datetime(2023, 1, 1),
-            end_date=datetime(2023, 12, 31),
-            initial_capital=100000.0
-        )
-        assert config.start_date < config.end_date
-        assert config.initial_capital > 0
-        
-        # Test default values
-        assert config.commission_per_contract == 1.00
-        assert config.slippage_bps == 5
-        assert len(config.symbols) > 0
+D0 = date(2025, 1, 6)
+EXP = date(2025, 1, 10)
 
 
-class TestBacktestPortfolio:
-    """Test backtesting portfolio functionality."""
-    
-    def setup_method(self):
-        """Set up test fixtures."""
-        self.portfolio = BacktestPortfolio(100000.0)
-    
-    def test_portfolio_initialization(self):
-        """Test portfolio initialization."""
-        assert self.portfolio.initial_cash == 100000.0
-        assert self.portfolio.cash == 100000.0
-        assert len(self.portfolio.stock_positions) == 0
-        assert len(self.portfolio.option_positions) == 0
-    
-    def test_stock_position_management(self):
-        """Test stock position addition and removal."""
-        # Add stock position
-        stock_pos = {
-            'symbol': 'AAPL',
-            'quantity': 100,
-            'entry_price': 150.0,
-            'current_price': 155.0,
-            'market_value': 15500.0,
-            'cost_basis': 15000.0
-        }
-        
-        self.portfolio.add_stock_position(stock_pos)
-        assert len(self.portfolio.stock_positions) == 1
-        assert self.portfolio.stock_value == 15500.0
-        
-        # Remove partial position
-        success = self.portfolio.remove_stock_position('AAPL', 50)
-        assert success == True
-        assert self.portfolio.stock_positions[0]['quantity'] == 50
-        
-        # Remove remaining position
-        success = self.portfolio.remove_stock_position('AAPL', 50)
-        assert success == True
-        assert len(self.portfolio.stock_positions) == 0
-    
-    def test_option_position_management(self):
-        """Test option position addition and removal."""
-        # Add option position
-        option_pos = {
-            'symbol': 'AAPL_PUT_150_20230120',
-            'underlying': 'AAPL',
-            'type': 'PUT',
-            'strike': 150.0,
-            'quantity': -1,
-            'entry_price': 2.00,
-            'current_price': 1.50,
-            'market_value': -150.0
-        }
-        
-        self.portfolio.add_option_position(option_pos)
-        assert len(self.portfolio.option_positions) == 1
-        assert self.portfolio.option_value == -150.0
-        
-        # Remove position
-        success = self.portfolio.remove_option_position('AAPL_PUT_150_20230120')
-        assert success == True
-        assert len(self.portfolio.option_positions) == 0
-    
-    def test_portfolio_value_calculation(self):
-        """Test total portfolio value calculation."""
-        # Add positions
-        stock_pos = {
-            'symbol': 'AAPL',
-            'quantity': 100,
-            'market_value': 15500.0
-        }
-        option_pos = {
-            'symbol': 'AAPL_PUT',
-            'market_value': -150.0
-        }
-        
-        self.portfolio.add_stock_position(stock_pos)
-        self.portfolio.add_option_position(option_pos)
-        
-        # Update cash
-        self.portfolio.cash = 85000.0
-        
-        total_value = self.portfolio.total_value
-        expected_value = 85000.0 + 15500.0 + (-150.0)  # Cash + Stock + Option
-        
-        assert total_value == expected_value
-    
-    def test_portfolio_summary(self):
-        """Test portfolio summary generation."""
-        summary = self.portfolio.get_portfolio_summary()
-        
-        assert 'cash' in summary
-        assert 'total_value' in summary
-        assert 'total_return' in summary
-        assert summary['total_return'] == 0.0  # No change initially
-    
-    def test_risk_metrics(self):
-        """Test risk metrics calculation."""
-        # Add a large position to test concentration
-        large_pos = {
-            'symbol': 'AAPL',
-            'market_value': 50000.0  # 50% of portfolio
-        }
-        self.portfolio.add_stock_position(large_pos)
-        
-        risk_metrics = self.portfolio.get_risk_metrics()
-        
-        assert 'concentration_risk' in risk_metrics
-        assert 'cash_percentage' in risk_metrics
-        assert risk_metrics['concentration_risk'] > 0.3  # Should show high concentration
+def _broker(cash=100_000.0, **kw):
+    return BacktestBroker(cash, **kw)
+
+
+# --------------------------------------------------------------------------- #
+# Fill pricing
+# --------------------------------------------------------------------------- #
+class TestFills:
+    def test_sell_fill_interpolates_toward_bid(self):
+        b = _broker(fill_haircut=0.25)
+        # mark 1.00, bid 0.80 -> 1.00 - 0.25*0.20 = 0.95
+        assert b.sell_fill(1.00, 0.80) == pytest.approx(0.95)
+
+    def test_buy_fill_interpolates_toward_ask(self):
+        b = _broker(fill_haircut=0.25)
+        # mark 1.00, ask 1.20 -> 1.00 + 0.25*0.20 = 1.05
+        assert b.buy_fill(1.00, 1.20) == pytest.approx(1.05)
+
+    def test_haircut_zero_is_mid(self):
+        b = _broker(fill_haircut=0.0)
+        assert b.sell_fill(1.0, 0.8) == 1.0
+        assert b.buy_fill(1.0, 1.2) == 1.0
+
+    def test_haircut_one_is_far_quote(self):
+        b = _broker(fill_haircut=1.0)
+        assert b.sell_fill(1.0, 0.8) == pytest.approx(0.8)
+        assert b.buy_fill(1.0, 1.2) == pytest.approx(1.2)
+
+
+# --------------------------------------------------------------------------- #
+# Cash-secured put lifecycle
+# --------------------------------------------------------------------------- #
+class TestPutLifecycle:
+    def test_sell_put_reserves_collateral_and_credits_premium(self):
+        b = _broker(100_000.0, fees_per_contract=0.04, fill_haircut=0.0)
+        fill = b.sell_put_to_open("XYZ_P90", "XYZ", 90.0, EXP, 1, mark=1.00, bid=0.90, opened=D0)
+        assert fill == 1.00
+        # cash += 100*1.00 - 0.04 = +99.96 ; collateral reserved = 9000
+        assert b.cash == pytest.approx(100_000 + 99.96)
+        assert b.reserved_collateral == pytest.approx(9000.0)
+        assert b.available_cash == pytest.approx(100_000 + 99.96 - 9000)
+
+    def test_sell_put_rejected_when_collateral_exceeds_available(self):
+        b = _broker(5_000.0)
+        # 90 strike -> 9000 collateral > 5000 available
+        assert b.sell_put_to_open("XYZ_P90", "XYZ", 90.0, EXP, 1, 1.0, 0.9, D0) is None
+        assert not b.options
+        assert b.cash == 5_000.0
+
+    def test_put_expires_worthless_keeps_premium_releases_collateral(self):
+        b = _broker(100_000.0, fill_haircut=0.0)
+        b.sell_put_to_open("XYZ_P90", "XYZ", 90.0, EXP, 1, 1.0, 0.9, D0)
+        cash_after_open = b.cash
+        b.settle_expirations(EXP, {"XYZ": 95.0})  # close above strike -> OTM
+        assert not b.options  # position gone
+        assert b.reserved_collateral == 0.0
+        assert b.cash == cash_after_open  # premium kept, no assignment cash move
+        assert b.shares("XYZ") == 0
+
+    def test_put_assigned_buys_shares_at_strike(self):
+        b = _broker(100_000.0, fill_haircut=0.0)
+        b.sell_put_to_open("XYZ_P90", "XYZ", 90.0, EXP, 1, 1.0, 0.9, D0)
+        cash_after_open = b.cash
+        b.settle_expirations(EXP, {"XYZ": 85.0})  # below strike -> assigned
+        assert not b.options
+        assert b.shares("XYZ") == 100
+        assert b.average_cost_basis("XYZ") == pytest.approx(90.0)
+        assert b.cash == pytest.approx(cash_after_open - 9000.0)  # bought 100 @ 90
+        assert b.reserved_collateral == 0.0
+
+    def test_itm_threshold_penny(self):
+        # Exactly 1 cent ITM -> assigned; 0.9 cent ITM -> worthless.
+        b = _broker(100_000.0, fill_haircut=0.0)
+        b.sell_put_to_open("A", "A", 90.0, EXP, 1, 1.0, 0.9, D0)
+        b.settle_expirations(EXP, {"A": 89.99})  # 0.01 ITM
+        assert b.shares("A") == 100
+
+        b2 = _broker(100_000.0, fill_haircut=0.0)
+        b2.sell_put_to_open("A", "A", 90.0, EXP, 1, 1.0, 0.9, D0)
+        b2.settle_expirations(EXP, {"A": 89.991})  # 0.009 ITM -> not assigned
+        assert b2.shares("A") == 0
+
+
+# --------------------------------------------------------------------------- #
+# Covered call lifecycle
+# --------------------------------------------------------------------------- #
+class TestCallLifecycle:
+    def _with_shares(self, strike_basis=90.0):
+        b = _broker(100_000.0, fill_haircut=0.0)
+        b.sell_put_to_open("P", "XYZ", strike_basis, EXP, 1, 1.0, 0.9, D0)
+        b.settle_expirations(EXP, {"XYZ": strike_basis - 5})  # assign -> 100 shares
+        return b
+
+    def test_sell_call_requires_shares(self):
+        b = _broker(100_000.0)
+        assert b.sell_call_to_open("C", "XYZ", 100.0, EXP, 1, 0.5, 0.4, D0) is None
+
+    def test_covered_call_expires_worthless_keeps_shares(self):
+        b = self._with_shares()
+        exp2 = date(2025, 1, 17)
+        b.sell_call_to_open("C", "XYZ", 100.0, exp2, 1, 0.5, 0.4, date(2025, 1, 13))
+        cash_after = b.cash
+        b.settle_expirations(exp2, {"XYZ": 95.0})  # below call strike -> OTM
+        assert b.shares("XYZ") == 100
+        assert not b.options
+        assert b.cash == cash_after
+
+    def test_covered_call_assigned_sells_shares_at_strike(self):
+        b = self._with_shares()
+        exp2 = date(2025, 1, 17)
+        b.sell_call_to_open("C", "XYZ", 100.0, exp2, 1, 0.5, 0.4, date(2025, 1, 13))
+        cash_after = b.cash
+        b.settle_expirations(exp2, {"XYZ": 105.0})  # above strike -> called away
+        assert b.shares("XYZ") == 0
+        assert not b.options
+        assert b.cash == pytest.approx(cash_after + 10_000.0)  # sold 100 @ 100
+
+    def test_early_assignment(self):
+        b = self._with_shares()
+        exp2 = date(2025, 1, 17)
+        b.sell_call_to_open("C", "XYZ", 100.0, exp2, 1, 0.5, 0.4, date(2025, 1, 13))
+        cash_after = b.cash
+        assert b.assign_call_early("C", date(2025, 1, 15), reason="ex_dividend")
+        assert b.shares("XYZ") == 0
+        assert b.cash == pytest.approx(cash_after + 10_000.0)
+
+
+# --------------------------------------------------------------------------- #
+# Buy-to-close, dividends, equity
+# --------------------------------------------------------------------------- #
+class TestCloseDividendEquity:
+    def test_buy_to_close_releases_collateral(self):
+        b = _broker(100_000.0, fees_per_contract=0.0, fill_haircut=0.0)
+        b.sell_put_to_open("P", "XYZ", 90.0, EXP, 1, 1.00, 0.90, D0)
+        assert b.reserved_collateral == 9000.0
+        b.buy_to_close("P", 1, mark=0.30, ask=0.35, close_date=date(2025, 1, 8))
+        assert not b.options
+        assert b.reserved_collateral == 0.0
+        # net premium: +100 (open) -30 (close) = +70
+        assert b.cash == pytest.approx(100_000 + 70.0)
+
+    def test_partial_close_releases_proportional_collateral(self):
+        b = _broker(100_000.0, fees_per_contract=0.0, fill_haircut=0.0)
+        b.sell_put_to_open("P", "XYZ", 90.0, EXP, 2, 1.00, 0.90, D0)
+        assert b.reserved_collateral == 18_000.0
+        b.buy_to_close("P", 1, 0.30, 0.35, date(2025, 1, 8))
+        assert b.options["P"].contracts == 1
+        assert b.reserved_collateral == pytest.approx(9000.0)
+
+    def test_dividend_credit(self):
+        b = _broker(100_000.0, fill_haircut=0.0)
+        b.sell_put_to_open("P", "XYZ", 90.0, EXP, 1, 1.0, 0.9, D0)
+        b.settle_expirations(EXP, {"XYZ": 85.0})  # 100 shares
+        cash = b.cash
+        credited = b.credit_dividend("XYZ", 0.50, date(2025, 1, 15))
+        assert credited == pytest.approx(50.0)
+        assert b.cash == pytest.approx(cash + 50.0)
+
+    def test_equity_marks_shares_and_short_options(self):
+        b = _broker(100_000.0, fees_per_contract=0.0, fill_haircut=0.0)
+        b.sell_put_to_open("P", "XYZ", 90.0, EXP, 1, 1.0, 0.9, D0)  # cash +100
+        # equity with the short put marked at 0.60: cash - 0.60*100
+        eq = b.equity({"XYZ": 88.0}, {"P": 0.60})
+        assert eq == pytest.approx(100_100 - 60.0)
+
+
+# --------------------------------------------------------------------------- #
+# Simulation clock / time seam
+# --------------------------------------------------------------------------- #
+class TestSimClock:
+    def test_steps_freeze_and_clear_now(self):
+        days = [date(2025, 1, 6), date(2025, 1, 7), date(2025, 1, 8)]
+        clock = SimClock(days, decision_time=time(16, 0))
+        seen = []
+        assert not time_seam.is_frozen()
+        for d in clock.steps():
+            assert time_seam.is_frozen()
+            assert time_seam.now() == datetime.combine(d, time(16, 0))
+            seen.append(d)
+        assert seen == days
+        assert not time_seam.is_frozen()  # cleared after iteration
+        assert clock.current_date == days[-1] or clock.current_date is None
+
+    def test_seam_default_is_wall_clock(self):
+        time_seam.set_now(None)
+        assert not time_seam.is_frozen()
+        # now() returns a real datetime close to wall clock
+        assert isinstance(time_seam.now(), datetime)
+
+    def test_frozen_context_restores(self):
+        time_seam.set_now(None)
+        with time_seam.frozen(datetime(2024, 6, 1, 10, 0)):
+            assert time_seam.now() == datetime(2024, 6, 1, 10, 0)
+        assert not time_seam.is_frozen()
+
+
+class TestBuyToCloseCashCheck:
+    """A cash-secured account cannot take a margin loan to close a losing call.
+
+    Regression for an adversarial-review finding: buy_to_close performed no cash
+    check, so an expensive buyback drove cash to -$4,727. That matters most in
+    exactly the case rolling exists for — a deep-ITM covered call, when cash is
+    tight because it went into the assigned shares. Live: order rejected, shares
+    called away. Sim (before this): roll succeeds, escaping the loss.
+    """
+
+    def _covered(self, cash):
+        from datetime import date as _d
+
+        from src.backtesting.engine.broker import BacktestBroker
+        b = BacktestBroker(starting_cash=cash)
+        b._add_stock("XYZ", 100, 10.0, _d(2025, 1, 6))
+        b.sell_call_to_open("C1", "XYZ", 12.0, _d(2025, 1, 17), 1, 1.00, 0.90, _d(2025, 1, 6))
+        return b
+
+    def test_expensive_buyback_is_rejected_and_cash_stays_positive(self):
+        from datetime import date as _d
+
+        b = self._covered(1200.0)
+        assert b.buy_to_close("C1", 1, 60.0, 61.0, _d(2025, 1, 10)) is None
+        assert b.cash > 0
+        assert "C1" in b.options, "rejected close must leave the position open"
+
+    def test_affordable_buyback_still_works(self):
+        from datetime import date as _d
+
+        b = self._covered(50_000.0)
+        assert b.buy_to_close("C1", 1, 0.50, 0.55, _d(2025, 1, 10)) is not None
+        assert "C1" not in b.options
+
+    def test_csp_buyback_may_use_its_own_released_collateral(self):
+        """The reserve backing the very put being closed is not a blocker."""
+        from datetime import date as _d
+
+        from src.backtesting.engine.broker import BacktestBroker
+        b = BacktestBroker(starting_cash=9_100.0)
+        b.sell_put_to_open("P1", "XYZ", 90.0, _d(2025, 1, 17), 1, 1.00, 0.90, _d(2025, 1, 6))
+        assert b.available_cash < 500  # nearly all cash is reserved
+        assert b.buy_to_close("P1", 1, 0.40, 0.45, _d(2025, 1, 10)) is not None
+
+
+class TestSplitGuard:
+    """Raw bars are right for point-in-time chains but cannot span a split."""
+
+    def _bars(self, closes):
+        from datetime import date as _d, timedelta as _td
+
+        from src.backtesting.data.provider import StockBar
+        start = _d(2024, 6, 3)
+        return [
+            StockBar(symbol="NVDA", bar_date=start + _td(days=i), open=c, high=c,
+                     low=c, close=c, volume=1)
+            for i, c in enumerate(closes)
+        ]
+
+    def test_detects_a_ten_for_one_split(self):
+        from src.backtesting.data.alpaca_provider import detect_split
+
+        # NVDA's real 2024-06-10 split: 1208.88 -> 121.79
+        got = detect_split(self._bars([1150.0, 1164.37, 1208.88, 121.79, 120.91]))
+        assert got is not None
+        _, ratio = got
+        assert ratio == pytest.approx(0.101, abs=0.002)
+
+    def test_ordinary_volatility_is_not_flagged(self):
+        from src.backtesting.data.alpaca_provider import detect_split
+
+        # A brutal but real -25% earnings gap must not be mistaken for a split.
+        assert detect_split(self._bars([100.0, 75.0, 78.0, 70.0, 95.0])) is None
+
+
+class TestCoverAccounting:
+    """A covered call must be covered by shares nothing else has claimed.
+
+    Regression for an adversarial-review finding: the cover check counted TOTAL
+    shares, so two calls could be written against the same 100 shares. On
+    settlement the broker credited proceeds for 200 shares while holding 100 and
+    only logged a warning — $10,595 of phantom cash in the demonstrated case.
+    """
+
+    def _long_100(self, cash=100_000.0):
+        from datetime import date as _d
+
+        from src.backtesting.engine.broker import BacktestBroker
+        b = BacktestBroker(starting_cash=cash)
+        b._add_stock("XYZ", 100, 100.0, _d(2025, 1, 6))
+        return b
+
+    def test_second_call_against_the_same_shares_is_rejected(self):
+        from datetime import date as _d
+
+        b = self._long_100()
+        assert b.sell_call_to_open("C1", "XYZ", 105.0, _d(2025, 1, 17), 1,
+                                   1.0, 0.9, _d(2025, 1, 6)) is not None
+        assert b.sell_call_to_open("C2", "XYZ", 106.0, _d(2025, 1, 17), 1,
+                                   1.0, 0.9, _d(2025, 1, 6)) is None
+        assert b.pledged_shares("XYZ") == 100
+        assert b.uncovered_shares("XYZ") == 0
+
+    def test_settlement_cannot_mint_cash(self):
+        from datetime import date as _d
+
+        b = self._long_100()
+        b.sell_call_to_open("C1", "XYZ", 105.0, _d(2025, 1, 17), 1,
+                            1.0, 0.9, _d(2025, 1, 6))
+        b.settle_expirations(_d(2025, 1, 17), {"XYZ": 120.0})
+        # 100k cash + 10,500 called away @105 + 97.46 premium net of $0.04 fees.
+        assert b.cash == pytest.approx(110_597.46, abs=0.01)
+        assert b.shares("XYZ") == 0
+
+    def test_disposing_more_shares_than_held_raises(self):
+        """Silently inventing shares is how a ledger mints money."""
+        b = self._long_100()
+        with pytest.raises(ValueError, match="more than held"):
+            b._remove_shares_fifo("XYZ", 200)
+
+    def test_a_second_call_is_allowed_once_shares_support_it(self):
+        from datetime import date as _d
+
+        b = self._long_100()
+        b._add_stock("XYZ", 100, 100.0, _d(2025, 1, 6))  # now 200 shares
+        assert b.sell_call_to_open("C1", "XYZ", 105.0, _d(2025, 1, 17), 1,
+                                   1.0, 0.9, _d(2025, 1, 6)) is not None
+        assert b.sell_call_to_open("C2", "XYZ", 106.0, _d(2025, 1, 17), 1,
+                                   1.0, 0.9, _d(2025, 1, 6)) is not None

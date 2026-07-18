@@ -19,11 +19,24 @@ def main():
     parser = argparse.ArgumentParser(description='Options Wheel Strategy')
     parser.add_argument('--config', default='config/settings.yaml', help='Configuration file path')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
-    parser.add_argument('--command', required=True, 
-                       choices=['run', 'scan', 'status', 'report'], 
+    parser.add_argument('--command', required=True,
+                       choices=['run', 'scan', 'status', 'report', 'backtest'],
                        help='Command to execute')
     parser.add_argument('--dry-run', action='store_true', help='Run without executing trades')
-    
+
+    # backtest (FC-032 evaluate mode)
+    parser.add_argument('--symbol', help='backtest: symbol to evaluate')
+    parser.add_argument('--start', help='backtest: window start, YYYY-MM-DD')
+    parser.add_argument('--end', help='backtest: window end, YYYY-MM-DD (default: today)')
+    parser.add_argument('--starting-cash', type=float, default=100_000.0,
+                        help='backtest: starting capital (default 100000)')
+    parser.add_argument('--fill-haircut', type=float, default=0.25,
+                        help='backtest: 0=mid, 1=bid (default 0.25)')
+    parser.add_argument('--no-sensitivity', action='store_true',
+                        help='backtest: skip the bid-fill sensitivity replay')
+    parser.add_argument('--out', help='backtest: write the markdown report here')
+    parser.add_argument('--json-out', help='backtest: write the JSON report here')
+
     args = parser.parse_args()
     
     try:
@@ -41,6 +54,14 @@ def main():
                    config_file=args.config,
                    dry_run=args.dry_run)
         
+        # Backtesting builds its own data stack and must not touch the live
+        # trading client, so it dispatches before those are constructed.
+        if args.command == 'backtest':
+            run_backtest(args, config, logger)
+            logger.info("Command completed successfully",
+                        event_category="system", event_type="command_completed")
+            return
+
         # Initialize components
         alpaca_client = AlpacaClient(config)
         market_data = MarketDataManager(alpaca_client, config)
@@ -292,6 +313,82 @@ def generate_report(tracker: PortfolioTracker, logger):
     except Exception as e:
         logger.error("Report generation failed", event_category="error", event_type="report_failed", error=str(e))
         print(f"\nReport generation failed: {str(e)}")
+
+
+def run_backtest(args, config: Config, logger):
+    """Evaluate one symbol's wheel fitness over a historical window (FC-032)."""
+    from datetime import date, datetime
+
+    from src.backtesting.evaluate import evaluate_symbol
+    from src.backtesting.reporting.report import render_json, render_markdown
+
+    if not args.symbol or not args.start:
+        raise SystemExit("backtest requires --symbol and --start (YYYY-MM-DD)")
+
+    start = datetime.strptime(args.start, '%Y-%m-%d').date()
+    end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
+    if end <= start:
+        raise SystemExit(f"--end ({end}) must be after --start ({start})")
+
+    symbol = args.symbol.upper()
+    print(f"\nReplaying {symbol} {start} -> {end} "
+          f"(${args.starting_cash:,.0f}, fill haircut {args.fill_haircut})...\n")
+
+    report, sensitivity = evaluate_symbol(
+        symbol, start, end,
+        config=config,
+        starting_cash=args.starting_cash,
+        fill_haircut=args.fill_haircut,
+        run_sensitivity=not args.no_sensitivity,
+    )
+
+    markdown = render_markdown(report)
+    if sensitivity:
+        markdown += _sensitivity_section(sensitivity)
+    print(markdown)
+
+    if args.out:
+        with open(args.out, 'w') as fh:
+            fh.write(markdown)
+        print(f"\nMarkdown report -> {args.out}")
+    if args.json_out:
+        with open(args.json_out, 'w') as fh:
+            fh.write(render_json(report, sensitivity=sensitivity))
+        print(f"JSON report -> {args.json_out}")
+
+    logger.info("Backtest completed",
+                event_category="backtest", event_type="backtest_completed",
+                symbol=symbol, verdict=report.verdict(),
+                total_return=report.total_return)
+
+
+def _sensitivity_section(s: dict) -> str:
+    """Mid-vs-bid fill comparison, appended to the markdown report."""
+    lines = [
+        "",
+        "## Fill sensitivity (mid vs bid)",
+        "",
+        "| fill assumption | total return | verdict |",
+        "|---|---:|---|",
+        f"| mid − {s['mid_haircut']:.2f}×half-spread (headline) | "
+        f"{s['mid_return']:+.2%} | {s['mid_verdict']} |",
+        f"| at the bid (worst case) | {s['bid_return']:+.2%} | {s['bid_verdict']} |",
+        "",
+    ]
+    if s["verdict_flips"]:
+        lines += [
+            f"> **The verdict flips on the fill assumption** "
+            f"({s['mid_verdict']} → {s['bid_verdict']}). Treat this symbol as "
+            f"unproven: the result depends on getting better than bid fills.",
+            "",
+        ]
+    else:
+        lines += [
+            f"Verdict holds at both ends ({s['bid_return'] - s['mid_return']:+.2%} "
+            f"at the bid), so it does not rest on the fill assumption.",
+            "",
+        ]
+    return "\n".join(lines)
 
 
 if __name__ == '__main__':

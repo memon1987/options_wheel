@@ -613,6 +613,7 @@ class TestCallSellerCostBasisFloorFC029:
         assert result is None
         self.mock_market_data.find_suitable_calls.assert_not_called()
 
+    @pytest.mark.real_bq_lookup
     def test_lookup_last_opasn_put_strike_handles_bq_failure(self):
         """``_lookup_last_opasn_put_strike`` must return 0 on any BQ exception.
 

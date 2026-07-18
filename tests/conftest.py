@@ -9,6 +9,55 @@ from typing import Dict, Any, List
 import yaml
 
 from src.utils.config import Config
+from src.utils import clock as _time_seam
+
+
+# ==================== Global isolation ====================
+
+@pytest.fixture(autouse=True)
+def _reset_time_seam():
+    """Ensure the backtest time-seam is never left frozen between tests.
+
+    The FC-032 simulator freezes src.utils.clock.now() to simulated time; a test
+    that leaked a freeze would silently shift time-dependent live-code tests.
+    """
+    _time_seam.set_now(None)
+    yield
+    _time_seam.set_now(None)
+
+
+@pytest.fixture(autouse=True)
+def _no_production_bigquery(monkeypatch, request):
+    """No test may query production BigQuery, whatever credentials are present.
+
+    CallSeller's cost-basis floor falls back to a BigQuery OPASN lookup
+    (`_lookup_last_opasn_put_strike`), which builds its own client from ambient
+    env/ADC. Three tests in test_call_seller.py were passing only because
+    BigQuery auth happened to be broken on the machine: once `gcloud auth login`
+    succeeded, the lookup started returning a *real* AAPL assignment strike
+    ($305) in place of the fixture's $160 cost basis, and the drawdown pause
+    then suppressed the covered call under test.
+
+    A unit test whose result depends on ambient cloud credentials is not a unit
+    test, so the fallback is stubbed out globally here. Tests that want to
+    exercise it should inject their own value explicitly.
+    """
+    # A test that is specifically exercising the BigQuery fallback opts out with
+    # @pytest.mark.real_bq_lookup. Without this escape hatch the blanket stub
+    # made test_lookup_last_opasn_put_strike_handles_bq_failure vacuous — it
+    # asserted the stub's return value, and the try/except it exists to cover
+    # (the only thing keeping the bot alive when BQ is down) had zero coverage.
+    if request.node.get_closest_marker("real_bq_lookup"):
+        yield
+        return
+
+    from src.strategy.call_seller import CallSeller
+
+    monkeypatch.setattr(
+        CallSeller, "_lookup_last_opasn_put_strike",
+        lambda self, symbol, lookback_days=90: 0.0,
+    )
+    yield
 
 
 # ==================== Configuration Fixtures ====================

@@ -364,7 +364,7 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ### FC-032: Backtesting engine overhaul — symbol wheel-fitness evaluation
 
-**Status:** Executing (Phases 0–2 done; Phase 1 coverage gate run 2026-07-09 → stay on free Alpaca data; Phase 3 in progress)
+**Status:** Phases 0–4 **Done** (PR #35, merged 2026-07-18) — evaluate mode ships; **Phase 5 (screen mode) still open**, tracked in the plan's Rollout section
 **Size estimate:** L
 **Owner:** zeshan
 **Plan file:** `docs/plans/fc-032.md`
@@ -381,7 +381,7 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-033: Synthetic pre-2024 premium extension for backtests
+### FC-037: Synthetic pre-2024 premium extension for backtests
 
 **Status:** Consideration — explicitly deferred out of FC-032 v1
 **Size estimate:** M
@@ -458,11 +458,15 @@ The module `alpaca` is **never imported** in that file — only `QueryOrderStatu
 
 **Problem / opportunity:** Found by the FC-032 backtest, which reproduced it faithfully — the replay is behaving correctly; **production is not**.
 
-`GapDetector._get_previous_close` (`src/risk/gap_detector.py`) does `df[df.index < current_time]` and takes `.iloc[-1]`. Alpaca stamps daily stock bars at **04:00 UTC**, which is before any of our decision times (9:35am ET = 13:35 UTC). So today's own bar satisfies the filter and "previous close" returns **today's close**.
+`GapDetector._get_previous_close` (`src/risk/gap_detector.py`) does `df[df.index < current_time]` and takes `.iloc[-1]`. Alpaca stamps daily stock bars at **midnight ET** (04:00 UTC under EDT, 05:00 under EST), far before any of our decision times (9:35am ET = 13:35 UTC). So today's own bar satisfies the filter and "previous close" returns **today's close**.
 
 Verified against the live client on 2026-07-17: at a simulated 9:35am ET decision, `_get_previous_close` returned **202.81** while the latest bar in the frame was also **202.81** (dated the same day).
 
-**Consequence:** the Stage-4 execution gap check computes a gap of exactly 0.0% every single time and can never block a trade. The `execution_gap_threshold` config knob has no effect. Note this is *not* true of the Stage-2 gap-risk analysis, which computes `current_gap` correctly — so of our two gap controls, one works and one is inert, and nothing surfaces the disagreement.
+**Consequence — note the precise failure, it is not "the gap reads zero".** Alpaca returns a *partial* bar for the current session, and `can_execute_trade` compares a real-time IEX quote against it, so what the gate actually measures is the **~20-minute pre-market drift** (the partial bar's last print ~9:15 ET vs the 9:35 quote), not the overnight gap. Observed drifts ran −0.967% to +1.212% — **nonzero**, so anyone spot-checking `gap_percent` in the logs would wrongly conclude the gate is working.
+
+Today's bar was returned in **10/10 live trials** across NVDA and AAPL. The real overnight gaps on five sampled NVDA days were −2.295%, −1.096%, +0.076%, +2.295%, −1.147%; against `execution_gap_threshold = 1.5`, **3 of 5 should have blocked execution and none did.** The gate can also fire *spuriously* on a violent 9:15→9:35 move unrelated to any overnight gap.
+
+Note this is *not* true of the Stage-2 gap-risk analysis (`_detect_current_gap`, gap_detector.py:214), which compares `df_dates < target_date` — a **date** comparison rather than a timestamp one. That is the fix pattern, and it means one of our two gap controls works while the other does not, with nothing surfacing the disagreement.
 
 **Open questions:**
 - Fix by excluding the current session's bar (`df.index.date < current_time.date()`), or by requesting bars with an explicit end of yesterday?
@@ -623,7 +627,7 @@ _Move entries here once a plan has been published, executed, and merged. Include
 
 ---
 
-### FC-033: Synthetic pre-2024 premium extension for backtests
+### FC-037: Synthetic pre-2024 premium extension for backtests
 
 **Status:** Consideration — explicitly deferred out of FC-032 v1
 **Size estimate:** M
@@ -700,11 +704,15 @@ The module `alpaca` is **never imported** in that file — only `QueryOrderStatu
 
 **Problem / opportunity:** Found by the FC-032 backtest, which reproduced it faithfully — the replay is behaving correctly; **production is not**.
 
-`GapDetector._get_previous_close` (`src/risk/gap_detector.py`) does `df[df.index < current_time]` and takes `.iloc[-1]`. Alpaca stamps daily stock bars at **04:00 UTC**, which is before any of our decision times (9:35am ET = 13:35 UTC). So today's own bar satisfies the filter and "previous close" returns **today's close**.
+`GapDetector._get_previous_close` (`src/risk/gap_detector.py`) does `df[df.index < current_time]` and takes `.iloc[-1]`. Alpaca stamps daily stock bars at **midnight ET** (04:00 UTC under EDT, 05:00 under EST), far before any of our decision times (9:35am ET = 13:35 UTC). So today's own bar satisfies the filter and "previous close" returns **today's close**.
 
 Verified against the live client on 2026-07-17: at a simulated 9:35am ET decision, `_get_previous_close` returned **202.81** while the latest bar in the frame was also **202.81** (dated the same day).
 
-**Consequence:** the Stage-4 execution gap check computes a gap of exactly 0.0% every single time and can never block a trade. The `execution_gap_threshold` config knob has no effect. Note this is *not* true of the Stage-2 gap-risk analysis, which computes `current_gap` correctly — so of our two gap controls, one works and one is inert, and nothing surfaces the disagreement.
+**Consequence — note the precise failure, it is not "the gap reads zero".** Alpaca returns a *partial* bar for the current session, and `can_execute_trade` compares a real-time IEX quote against it, so what the gate actually measures is the **~20-minute pre-market drift** (the partial bar's last print ~9:15 ET vs the 9:35 quote), not the overnight gap. Observed drifts ran −0.967% to +1.212% — **nonzero**, so anyone spot-checking `gap_percent` in the logs would wrongly conclude the gate is working.
+
+Today's bar was returned in **10/10 live trials** across NVDA and AAPL. The real overnight gaps on five sampled NVDA days were −2.295%, −1.096%, +0.076%, +2.295%, −1.147%; against `execution_gap_threshold = 1.5`, **3 of 5 should have blocked execution and none did.** The gate can also fire *spuriously* on a violent 9:15→9:35 move unrelated to any overnight gap.
+
+Note this is *not* true of the Stage-2 gap-risk analysis (`_detect_current_gap`, gap_detector.py:214), which compares `df_dates < target_date` — a **date** comparison rather than a timestamp one. That is the fix pattern, and it means one of our two gap controls works while the other does not, with nothing surfacing the disagreement.
 
 **Open questions:**
 - Fix by excluding the current session's bar (`df.index.date < current_time.date()`), or by requesting bars with an explicit end of yesterday?
