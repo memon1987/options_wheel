@@ -125,6 +125,10 @@ def render_markdown(report: FitnessReport) -> str:
       f"({len(report.cycles) - len(closed)} still open at window end)")
     a(f"- Puts sold: {report.puts_sold} · calls sold: {report.calls_sold} · "
       f"rolls: {report.rolls}")
+    if report.decision_days:
+        a(f"- Capital deployed on **{report.days_in_position} of "
+          f"{report.decision_days}** decision days (**{report.utilization:.0%}** "
+          f"utilization)")
     if report.win_rate is not None:
         a(f"- Win rate: **{report.win_rate:.0%}** "
           f"(expected to be high at 0.10-0.20 delta — read with the worst cycle below)")
@@ -226,6 +230,11 @@ def render_json(report: FitnessReport, *, sensitivity: Optional[dict] = None) ->
             "sharpe": report.sharpe,
             "sortino": report.sortino,
             "days_underwater": report.days_underwater,
+        },
+        "activity": {
+            "decision_days": report.decision_days,
+            "days_in_position": report.days_in_position,
+            "utilization": report.utilization,
         },
         "benchmark": (
             {

@@ -287,6 +287,63 @@ class TestFitness:
         # not 2 collapsed by date.
         assert r.days_underwater == 4
 
+    def test_untradeable_symbol_is_unfit_not_marginal(self):
+        """KMI's real shape: one 8-day cycle in 273 days, +138% annualized on it.
+
+        Scoring that as 'marginal' would flatter a symbol the strategy simply
+        cannot trade. Low utilization must block the verdict outright.
+        """
+        # 20 decision days, in a position for 2 of them (10%) — KMI's real
+        # shape was 8 of 273 (3%).
+        days = [D(2025, 1, 6) + __import__("datetime").timedelta(days=i) for i in range(20)]
+        ledger = [
+            _ev(days[0], "sell_put_open", symbol="P1", contracts=1,
+                cash_delta=64.0, detail={"collateral": 2700.0}),
+            _ev(days[2], "expire_worthless", symbol="P1", contracts=1),
+        ]
+        states = [
+            DailyState(day=d, equity=100_064.0, cash=100_064.0,
+                       reserved_collateral=0.0,
+                       open_options=(1 if i < 2 else 0), shares_held={})
+            for i, d in enumerate(days)
+        ]
+        r = compute_fitness("KMI", states, build_cycles(ledger), 100_000.0,
+                            data_quality={"decision_days": len(days)})
+        assert r.days_in_position == 2
+        assert r.utilization == pytest.approx(0.10)
+        assert r.verdict() == "unfit"
+        assert any("cannot consistently trade this symbol" in x
+                   for x in r.verdict_reasons())
+
+    def test_a_continuously_traded_symbol_passes_the_activity_gate(self):
+        days = [D(2025, 1, i) for i in (6, 7, 8, 9)]
+        ledger = [
+            _ev(days[0], "sell_put_open", symbol="P1", contracts=1,
+                cash_delta=1000.0, detail={"collateral": 9000.0}),
+            _ev(days[3], "expire_worthless", symbol="P1", contracts=1),
+        ]
+        states = [
+            DailyState(day=d, equity=100_000.0 + 250 * i, cash=0.0,
+                       reserved_collateral=9000.0, open_options=1, shares_held={})
+            for i, d in enumerate(days)
+        ]
+        prices = {d: 100.0 for d in days}
+        r = compute_fitness("XYZ", states, build_cycles(ledger), 100_000.0,
+                            benchmark_prices=prices,
+                            data_quality={"decision_days": len(days)})
+        assert r.utilization == 1.0
+        assert not any("cannot consistently trade" in x for x in r.verdict_reasons())
+
+    def test_max_drawdown_never_renders_as_negative_zero(self):
+        days = [D(2025, 1, 6), D(2025, 1, 7)]
+        ledger = [_ev(days[0], "sell_put_open", symbol="P1", contracts=1,
+                      cash_delta=1.0, detail={"collateral": 1.0}),
+                  _ev(days[1], "expire_worthless", symbol="P1", contracts=1)]
+        r = compute_fitness("XYZ", _states(days, [100.0, 100.0]),
+                            build_cycles(ledger), 100.0)
+        assert r.max_drawdown == 0.0
+        assert f"{r.max_drawdown:.2%}" == "0.00%"
+
     def test_win_rate_needs_closed_cycles(self):
         days = [D(2025, 1, 6), D(2025, 1, 8)]
         r = compute_fitness("XYZ", _states(days, [100_000, 100_000]), [], 100_000.0)

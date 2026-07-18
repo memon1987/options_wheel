@@ -29,6 +29,12 @@ from .cycles import WheelCycle
 
 TRADING_DAYS_PER_YEAR = 252
 
+# Below this fraction of decision days with capital deployed, a symbol is judged
+# untradeable rather than scored. The wheel sells ~7 DTE, so a symbol it can
+# actually trade sits in a position most of the time; 25% is well under a
+# continuously-wheeled name and well above a symbol that traded once or twice.
+MIN_UTILIZATION = 0.25
+
 
 @dataclass
 class BuyAndHold:
@@ -78,6 +84,10 @@ class FitnessReport:
     days_underwater: int = 0
     sharpe: float = 0.0
     sortino: float = 0.0
+
+    # Activity. A symbol the strategy cannot actually trade produces a tiny,
+    # flattering return on a handful of days; utilization is what exposes that.
+    days_in_position: int = 0
 
     benchmark: Optional[BuyAndHold] = None
     data_quality: Dict = field(default_factory=dict)
@@ -140,6 +150,24 @@ class FitnessReport:
         return sum(1 for c in closed if c.assigned) / len(closed)
 
     @property
+    def utilization(self) -> float:
+        """Fraction of decision days with capital actually deployed.
+
+        The wheel only earns while it holds something. A symbol whose premiums
+        rarely clear the strategy's floor shows a *good-looking* return on the
+        few days it traded and nothing the rest of the time — KMI managed one
+        8-day cycle in 273 days, +138% annualized on that cycle, +0.06% overall.
+        Utilization is what makes that visible instead of flattering.
+        """
+        if not self.decision_days:
+            return 0.0
+        return self.days_in_position / self.decision_days
+
+    @property
+    def decision_days(self) -> int:
+        return int(self.data_quality.get("decision_days") or 0)
+
+    @property
     def worst_cycle(self) -> Optional[WheelCycle]:
         closed = self.closed_cycles
         return min(closed, key=lambda c: c.total_pnl) if closed else None
@@ -166,6 +194,17 @@ class FitnessReport:
         if not self.closed_cycles:
             reasons.append("BLOCK: no completed wheel cycle in the window")
             return reasons
+
+        # Check activity before performance: a return earned on 3% of the days
+        # is not a verdict about the strategy, it is a verdict about whether the
+        # strategy can trade this symbol at all.
+        if self.decision_days and self.utilization < MIN_UTILIZATION:
+            reasons.append(
+                f"BLOCK: capital deployed on only {self.days_in_position} of "
+                f"{self.decision_days} decision days ({self.utilization:.0%}) — "
+                f"the strategy cannot consistently trade this symbol, so the "
+                f"return below is not a meaningful sample"
+            )
 
         if self.total_pnl <= 0:
             reasons.append(f"BLOCK: strategy lost money ({self.total_return:+.2%})")
@@ -230,6 +269,10 @@ def compute_fitness(
         report.calls_sold += cycle.calls_sold
         report.assignments += 1 if cycle.assigned else 0
 
+    report.days_in_position = sum(
+        1 for d in daily if d.open_options > 0 or any(v > 0 for v in d.shares_held.values())
+    )
+
     equity = [d.equity for d in daily]
     report.max_drawdown = _max_drawdown(equity)
     report.sharpe, report.sortino = _risk_ratios(equity)
@@ -251,7 +294,9 @@ def _max_drawdown(equity: Sequence[float]) -> float:
         peak = max(peak, value)
         if peak > 0:
             worst = min(worst, (value - peak) / peak)
-    return worst
+    # Collapse -0.0 (and sub-basis-point noise) to 0.0 so reports don't print
+    # "-0.00%", which reads as a real but tiny loss rather than none at all.
+    return 0.0 if worst > -1e-9 else worst
 
 
 def _risk_ratios(equity: Sequence[float]) -> tuple:
