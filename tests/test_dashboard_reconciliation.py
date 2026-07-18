@@ -68,9 +68,19 @@ class TestIdentity:
         svc = _service(rows())
         rec = svc.get_reconciliation(NLV, LIVE)
         assert rec["residual"] == pytest.approx(0.0, abs=1e-6)
-        # AMD's known gap is in the payload, so net-of-known-gaps is +1594,
-        # above the $500 floor — with the documented gap absent from live
-        # mismatches, status must be WARN (stale allowance), not ok.
+        # No known gaps on file (AMD's retired 2026-07-18) → clean books = ok.
+        assert rec["status"] == "ok"
+
+    def test_stale_known_gap_trips_warn(self):
+        # Regression cover for the stale-allowance detector: a documented gap
+        # whose symbol no longer mismatches must WARN (the allowance is rot,
+        # not slack) — this is what surfaced AMD's resolution in production.
+        svc = _service(rows())
+        svc.KNOWN_RECONCILIATION_GAPS = [
+            {"symbol": "AMD", "amount": -1594.0, "as_of": "2026-05-05",
+             "reason": "test fixture"}]
+        rec = svc.get_reconciliation(NLV, LIVE)
+        assert rec["residual"] == pytest.approx(0.0, abs=1e-6)
         assert rec["status"] == "warn"
 
     def test_missing_share_cash_breaks_identity(self):
