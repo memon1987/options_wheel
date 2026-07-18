@@ -1,0 +1,24 @@
+{
+  "displayName": "Drawdown pause extended — options-wheel",
+  "documentation": {
+    "content": "One or more held symbols have been in FC-029 R3 drawdown pause for >= the alert threshold (default 7 trading days). The bot is not writing covered calls on them, so that capital is idle.\n\nPrecedent: AMZN's 62-day implicit pause (Feb-Apr 2026) cost an estimated $1,500-3,000 in foregone premium.\n\nThe alert message lists each symbol with days paused and depth below the assignment strike. Full detail on the Bot Health page's drawdown-pause card.\n\nThis filter also matches DRAWDOWN_PAUSE_ALERT_CHECK_FAILED - the daily check could not evaluate pause state (live-positions proxy down). Treat that as 'unknown', not 'all clear'.\n\nRunbook: deploy/monitoring/drawdown_pause_alert.md",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "Symbol paused beyond threshold",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"options-wheel-dashboard\" AND severity>=WARNING AND textPayload:\"DRAWDOWN_PAUSE_ALERT\""
+      }
+    }
+  ],
+  "alertStrategy": {
+    "notificationRateLimit": {"period": "86400s"},
+    "autoClose": "172800s"
+  },
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ]
+}

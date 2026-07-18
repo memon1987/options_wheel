@@ -7,6 +7,7 @@ will drop the `v2` prefix and retire any legacy endpoints that are no
 longer consumed.
 """
 
+import logging
 import os
 
 from fastapi import APIRouter, HTTPException, Query
@@ -15,6 +16,7 @@ from typing import List, Dict, Any, Optional
 from services.bigquery import get_bigquery_service
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
@@ -264,14 +266,98 @@ async def bot_health_anomalies() -> List[Dict[str, Any]]:
     return bq.get_bot_anomalies()
 
 
-@router.get("/bot-health/drawdown-pauses")
-async def bot_health_drawdown_pauses() -> Dict[str, Any]:
-    """Symbols the R3 drawdown pause is inferred to be blocking (assignment-
-    strike referenced, live share counts; labeled inferred-not-telemetry)."""
+async def _evaluate_drawdown_pauses() -> Dict[str, Any]:
+    """Shared pause evaluation — one computation, two consumers (the Bot
+    Health card and the FC-030 alert check)."""
     import asyncio
     bq = get_bigquery_service()
     positions, (threshold, source) = await asyncio.gather(
         _live_positions(), _drawdown_pause_threshold())
-    return bq.get_drawdown_pauses(live_positions=positions,
-                                  threshold=threshold,
-                                  threshold_source=source)
+    result = bq.get_drawdown_pauses(live_positions=positions,
+                                    threshold=threshold,
+                                    threshold_source=source)
+    # Distinguish "no symbol is paused" from "we could not tell" — the
+    # alert path must not read a proxy outage as all-clear.
+    result["positions_available"] = positions is not None
+    return result
+
+
+@router.get("/bot-health/drawdown-pauses")
+async def bot_health_drawdown_pauses() -> Dict[str, Any]:
+    """Symbols the R3 drawdown pause is inferred to be blocking (assignment-
+    strike referenced, live share counts; labeled inferred-not-telemetry)."""
+    return await _evaluate_drawdown_pauses()
+
+
+def select_alertable_pauses(pauses: List[Dict[str, Any]],
+                            threshold_days: int) -> List[Dict[str, Any]]:
+    """Pauses at or beyond the alert threshold, longest-paused first.
+
+    Pure function so the threshold boundary is unit-testable without any
+    BigQuery or live-proxy involvement (FC-030).
+    """
+    qualifying = [p for p in pauses
+                  if (p.get("trading_days_paused") or 0) >= threshold_days]
+    return sorted(qualifying,
+                  key=lambda p: p.get("trading_days_paused") or 0,
+                  reverse=True)
+
+
+def format_pause_alert(symbols: List[Dict[str, Any]], threshold_days: int) -> str:
+    """One-line digest for the alert log. Single line => single email.
+
+    The marker DRAWDOWN_PAUSE_ALERT is what the Cloud Monitoring
+    log-based policy matches on; do not rename it without updating
+    deploy/monitoring/drawdown_pause_alert.md.
+    """
+    parts = [
+        f"{p['symbol']} {p.get('trading_days_paused')}d "
+        f"({(p.get('pct_below_strike') or 0) * 100:.1f}% below "
+        f"${p.get('assignment_strike')})"
+        for p in symbols
+    ]
+    return (f"DRAWDOWN_PAUSE_ALERT {len(symbols)} symbol(s) paused "
+            f">={threshold_days} trading days: " + "; ".join(parts))
+
+
+@router.post("/bot-health/pause-alert-check")
+async def pause_alert_check() -> Dict[str, Any]:
+    """FC-030: evaluate drawdown pauses and log an alert if any are extended.
+
+    Triggered daily post-close by Cloud Scheduler. Emits ONE structured
+    WARNING line carrying the marker `DRAWDOWN_PAUSE_ALERT` when any symbol
+    has been paused >= PAUSE_ALERT_THRESHOLD_DAYS trading days; a Cloud
+    Monitoring log-based policy turns that into an operator email.
+
+    Returns the evaluation either way so the check is manually invokable.
+    """
+    try:
+        threshold_days = int(os.getenv("PAUSE_ALERT_THRESHOLD_DAYS", "7"))
+    except (TypeError, ValueError):
+        threshold_days = 7
+
+    try:
+        result = await _evaluate_drawdown_pauses()
+    except Exception as exc:  # noqa: BLE001 - must never raise past the scheduler
+        # A silent evaluator is the FC-006 failure mode. Log loudly.
+        logger.warning("DRAWDOWN_PAUSE_ALERT_CHECK_FAILED evaluation raised: %s", exc)
+        return {"status": "degraded", "reason": str(exc),
+                "threshold_days": threshold_days}
+
+    if not result.get("positions_available"):
+        logger.warning("DRAWDOWN_PAUSE_ALERT_CHECK_FAILED live positions "
+                       "unavailable; pause state could not be evaluated")
+        return {"status": "degraded", "reason": "live positions unavailable",
+                "threshold_days": threshold_days}
+
+    alertable = select_alertable_pauses(result.get("paused", []), threshold_days)
+    if alertable:
+        logger.warning(format_pause_alert(alertable, threshold_days))
+
+    return {
+        "status": "ok",
+        "threshold_days": threshold_days,
+        "alerted": bool(alertable),
+        "alert_symbols": alertable,
+        "paused_total": len(result.get("paused", [])),
+    }
