@@ -127,14 +127,35 @@ mypy src/                        # Type checking
 ## Data Analysis Policy
 
 **IMPORTANT: Cloud-First Data Analysis**
-- For ALL data analysis requests, ONLY use data stored on Google Cloud Platform
-- DO NOT analyze local files, local backtest results, or local cache data
-- Primary data sources for analysis:
+- For ALL analysis of *what the bot actually did*, use data on Google Cloud Platform — not local files or caches.
+- Primary sources:
+  - BigQuery `options_wheel.trades_from_activities` — real fills, the source of truth for realized behavior
+  - BigQuery `options_wheel.backtest_runs` — screening results (see `docs/bigquery/backtest_runs.md`)
   - Google Cloud Storage: `gs://gen-lang-client-0607444019-options-data/`
-  - Cloud Run API endpoints: Dashboard and backtest history endpoints
-  - Cloud-based backtesting results and performance metrics
-- If cloud data is not available, request user to trigger cloud-based backtesting first
-- This ensures analysis reflects production-ready, persistent, and centralized data
+  - Cloud Run dashboard endpoints
+- This ensures analysis reflects production-ready, persistent, centralized data.
+
+**Backtests are the exception, and the distinction matters.** The old
+`/backtest`, `/backtest/results`, `/backtest/history` and `/cache/*` endpoints
+were **deleted in FC-032** — the engine behind them had never produced a single
+trade and one component emitted fabricated numbers. Do not reference them.
+
+The rebuilt engine (FC-032) runs **locally by design**: it replays live strategy
+code over historical Alpaca data and needs no cloud round-trip.
+
+```bash
+python main.py --command backtest --symbol NVDA --start 2025-10-01 --end 2026-07-01
+python main.py --command screen            # whole universe -> options_wheel.backtest_runs
+```
+
+Screening results *are* persisted to BigQuery and are cloud-first like everything
+else. A local `--command backtest` run is a simulation, never evidence of what
+the bot did — for that, always go to `trades_from_activities`.
+
+**Read backtest output with its stated biases.** Every report carries a
+known-bias footer. Two of them favour the wheel over its own benchmark
+(dividends and early assignment are unmodeled), so `excess_return` is optimistic
+on dividend payers. Never quote a backtest number without them.
 
 ## Dashboard & Backend Cascading Impact Analysis
 

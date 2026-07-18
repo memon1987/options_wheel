@@ -1072,6 +1072,87 @@ def get_config():
                     error=str(e))
         return jsonify({'error': f"Config retrieval failed: {str(e)}"}), 500
 
+@app.route('/backtest/screen', methods=['POST'])
+@require_api_key
+def backtest_screen():
+    """Screen the whole universe for wheel fitness (FC-032 Phase 5).
+
+    Triggered monthly by Cloud Scheduler. Writes one row per symbol to
+    options_wheel.backtest_runs and returns the tally plus demotion candidates.
+
+    Demotion is a RECOMMENDATION. This endpoint never changes the trading
+    universe — the plan requires two observed cycles before any automation, and
+    the engine's known biases (dividends and early assignment unmodeled, both
+    flattering the wheel; a single vol regime) are why.
+
+    Long-running: a full 14-symbol screen replays a year per symbol. Give the
+    Cloud Run job a generous timeout and do not point a short-timeout scheduler
+    at it without checking.
+    """
+    logger.info("Endpoint called",
+                event_category="system",
+                event_type="backtest_screen_endpoint",
+                endpoint="/backtest/screen")
+
+    try:
+        from datetime import date as _date, datetime as _datetime
+
+        from src.backtesting.screen import run_screen
+
+        config = Config()
+
+        def _parse(param):
+            raw = request.args.get(param)
+            return _datetime.strptime(raw, "%Y-%m-%d").date() if raw else None
+
+        symbols_arg = request.args.get('symbols')
+        symbols = [s.strip().upper() for s in symbols_arg.split(',')] if symbols_arg else None
+        # Sensitivity doubles the runtime; allow a scheduler to skip it.
+        run_sensitivity = request.args.get('sensitivity', 'true').lower() != 'false'
+
+        result = run_screen(
+            config=config,
+            symbols=symbols,
+            start=_parse('start'),
+            end=_parse('end') or _date.today(),
+            persist=request.args.get('persist', 'true').lower() != 'false',
+            run_sensitivity=run_sensitivity,
+        )
+
+        payload = {
+            'status': 'ok',
+            'run_id': result.run_id,
+            'window': {'start': result.start.isoformat(), 'end': result.end.isoformat()},
+            'symbols_screened': len(result.results),
+            'tally': result.tally(),
+            'demote_candidates': result.demote_candidates,
+            'failures': result.failures,
+            'persisted': result.persisted,
+            'note': 'demote_candidates is a recommendation for human review; '
+                    'no trading universe change has been made',
+            'timestamp': datetime.now().isoformat(),
+        }
+
+        # A screen that half-ran, or never reached BigQuery, is not a usable
+        # record — surface it as a failure so the scheduler reports it rather
+        # than logging a green run over a partial table.
+        if result.failures or not result.persisted:
+            payload['status'] = 'partial'
+            return jsonify(payload), 500
+        return jsonify(payload), 200
+
+    except Exception as e:
+        logger.error("Backtest screen failed",
+                     event_category="error",
+                     event_type="backtest_screen_failed",
+                     error=str(e))
+        return jsonify({
+            'status': 'failed',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat(),
+        }), 500
+
+
 @app.route('/ingest-activities', methods=['POST'])
 @require_api_key
 def ingest_activities():

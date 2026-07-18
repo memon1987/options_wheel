@@ -20,7 +20,7 @@ def main():
     parser.add_argument('--config', default='config/settings.yaml', help='Configuration file path')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     parser.add_argument('--command', required=True,
-                       choices=['run', 'scan', 'status', 'report', 'backtest'],
+                       choices=['run', 'scan', 'status', 'report', 'backtest', 'screen'],
                        help='Command to execute')
     parser.add_argument('--dry-run', action='store_true', help='Run without executing trades')
 
@@ -34,7 +34,9 @@ def main():
                         help='backtest: 0=mid, 1=bid (default 0.25)')
     parser.add_argument('--no-sensitivity', action='store_true',
                         help='backtest: skip the bid-fill sensitivity replay')
-    parser.add_argument('--out', help='backtest: write the markdown report here')
+    parser.add_argument('--no-persist', action='store_true',
+                        help='screen: do not write results to BigQuery')
+    parser.add_argument('--out', help='backtest/screen: write the markdown report here')
     parser.add_argument('--json-out', help='backtest: write the JSON report here')
 
     args = parser.parse_args()
@@ -60,6 +62,14 @@ def main():
             run_backtest(args, config, logger)
             logger.info("Command completed successfully",
                         event_category="system", event_type="command_completed")
+            return
+
+        if args.command == 'screen':
+            rc = run_screen_cmd(args, config, logger)
+            logger.info("Command completed",
+                        event_category="system", event_type="command_completed")
+            if rc:
+                sys.exit(rc)
             return
 
         # Initialize components
@@ -360,6 +370,43 @@ def run_backtest(args, config: Config, logger):
                 event_category="backtest", event_type="backtest_completed",
                 symbol=symbol, verdict=report.verdict(),
                 total_return=report.total_return)
+
+
+def run_screen_cmd(args, config: Config, logger) -> int:
+    """Screen the whole universe (FC-032 Phase 5). Returns a process exit code."""
+    from datetime import date, datetime
+
+    from src.backtesting.screen import run_screen, render_screen_summary
+
+    start = datetime.strptime(args.start, '%Y-%m-%d').date() if args.start else None
+    end = datetime.strptime(args.end, '%Y-%m-%d').date() if args.end else date.today()
+    symbols = [args.symbol.upper()] if args.symbol else None
+
+    result = run_screen(
+        config=config, symbols=symbols, start=start, end=end,
+        starting_cash=args.starting_cash,
+        persist=not args.no_persist,
+        run_sensitivity=not args.no_sensitivity,
+    )
+
+    summary = render_screen_summary(result)
+    print(summary)
+    if args.out:
+        with open(args.out, 'w') as fh:
+            fh.write(summary)
+        print(f"\nSummary -> {args.out}")
+
+    # Exit non-zero when the run is not trustworthy as a record: a symbol that
+    # never got a verdict, or results that never reached BigQuery. A screen that
+    # silently half-ran reads as a complete one.
+    if result.failures:
+        print(f"\nWARNING: {len(result.failures)} symbol(s) produced no verdict: "
+              f"{', '.join(result.failures)}")
+        return 1
+    if not args.no_persist and not result.persisted:
+        print("\nWARNING: results were NOT persisted to BigQuery.")
+        return 1
+    return 0
 
 
 def _sensitivity_section(s: dict) -> str:

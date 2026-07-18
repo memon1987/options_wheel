@@ -204,12 +204,14 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 
 **Problem / opportunity:** `RiskManager.validate_new_position()` (risk_manager.py:23) is defined but **never invoked**. It contains portfolio-level checks — max total positions, max positions per stock, max exposure per ticker, min cash reserve, portfolio allocation — that today are partially duplicated in `wheel_engine._can_open_new_positions` and partially absent. Only `validate_roll()` is wired (from `CallRoller`). Either consolidate the put/call seller paths through `validate_new_position` (and dedupe the engine-level checks) or formally retire the method and document where each portfolio-level check actually lives.
 
+> **Verified 2026-07-18** (covered-call starvation investigation + adversarial review): `validate_new_position` has **zero call sites anywhere in the codebase**, and the actual production execution path (`/scan` → GCS opportunity blob → `/run` → `ExecutionEngine.rank_opportunities/select_batch/execute_batch`) never constructs a RiskManager at all. Answering the open question below: **`max_exposure_per_ticker` and `min_cash_reserve` are checked nowhere in production.** Also note the method contains a latent substring bug (`underlying_symbol in p['symbol']` at risk_manager.py:57 — counts the stock position itself, and `F` would match `PFE`); if consolidation is chosen, that must be fixed first. FC-038 adds selection-level budget checks in the execution engine, which shrinks what consolidation here would need to cover.
+
 **Open questions:**
 - Consolidate (route puts/calls through `validate_new_position`) or retire (delete the method, ensure engine-level checks cover everything)?
 - If consolidating, do the engine-level early checks stay as a fast-fail before scanning, with the seller-level call as the authoritative gate?
-- Are `max_exposure_per_ticker` and `min_cash_reserve` actually checked anywhere today, or are they silently disabled?
+- Are `max_exposure_per_ticker` and `min_cash_reserve` actually checked anywhere today, or are they silently disabled? *(Answered 2026-07-18: no — see above.)*
 
-**Links:** FC-013 Phase-1 audit, `risk_manager.py:23-120`, `wheel_engine.py:220-249`.
+**Links:** FC-013 Phase-1 audit, FC-038 (execution-selection rewrite), `risk_manager.py:23-120`, `wheel_engine.py:220-249`, `docs/investigations/covered-call-starvation-2026-07-18.md`.
 
 ---
 
@@ -223,11 +225,11 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 **Problem / opportunity:** Both `PutSeller._entry_times` (put_seller.py:30) and `CallSeller._entry_times` (call_seller.py:32) are local in-memory dicts that do not survive Cloud Run cold starts. The `profit_taking_min_hold_hours` gate inside `should_close_*_early()` silently fails open when the dict is empty (no `entry_time` → loop falls through). This is the same class of bug as FC-009 (the `_closed_today` cold-start dedup issue). Persist `_entry_times` to GCS alongside the existing wheel state so the hold-period gate enforces correctly across cold starts and parallel cycles.
 
 **Open questions:**
-- Persist to GCS (existing `WheelStateManager` GCS layer) or query Alpaca for fill timestamps?
+- Persist to GCS (existing `WheelStateManager` GCS layer) or query Alpaca for fill timestamps? *(2026-07-18 data point: `STATE_STORAGE_BUCKET` is not set on the Cloud Run service, so the "existing GCS layer" has never persisted anything in production — no state blob exists in any bucket. FC-039's roller repair chose the query-Alpaca route (stateless, broker is source of truth) for the same class of problem; strongly consider the same here.)*
 - Should this share infrastructure with FC-009's `_closed_today` fix or stay independent?
 - What's the migration path for currently-held positions whose entry times are unknown?
 
-**Links:** FC-009, `put_seller.py:30,378,544`, `call_seller.py:32,300,557`.
+**Links:** FC-009, FC-039 (stateless-from-Alpaca precedent), `put_seller.py:30,378,544`, `call_seller.py:32,300,557`.
 
 ---
 
@@ -346,7 +348,7 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 **Problem / opportunity:** Some high-volume symbols (e.g., GOOGL, AMZN, SPY, QQQ) now have options expiring every trading day, not just Fridays. The current system assumes Friday-only expirations in multiple places:
 
-1. **FC-006 rolling engine** — hardcoded Friday guard (`weekday()==4`) in both the `/roll` endpoint and Cloud Scheduler (`30 15 * * 5`). Positions expiring on a Wednesday won't be evaluated for rolling.
+1. **FC-006 rolling engine** — hardcoded Friday guard (`weekday()==4`) in both the `/roll` endpoint and Cloud Scheduler (`30 15 * * 5`). Positions expiring on a Wednesday won't be evaluated for rolling. *(2026-07-18: FC-039's roller repair moves roll-eligibility checks into the daily monitor cycle, which delivers this item; the DTE-band and target-DTE questions below remain this FC's scope.)*
 2. **DTE bands** — the 7→0 bands assume a Monday-sell, Friday-expire cadence. A position sold Monday with a Wednesday expiry has DTE=2 at open, hitting different (later) bands than intended.
 3. **`call_target_dte: 7` / `put_target_dte: 7`** — assumes next-Friday expiry. With daily expirations available, shorter DTE targets (2-3 days) become viable, potentially improving theta capture per calendar day.
 4. **Strike selection** — `find_suitable_calls/puts` filters by `dte <= target_dte` which works, but may miss better opportunities at non-Friday expirations.
@@ -477,249 +479,66 @@ Note this is *not* true of the Stage-2 gap-risk analysis (`_detect_current_gap`,
 
 ---
 
-## Completed
+### FC-038: Covered calls charged phantom cash collateral in execution selection — call starvation
 
-_Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
+**Status:** Plan published
+**Size estimate:** M (production trading logic → two-reviewer, high-stakes calibration)
+**Owner:** Claude / zeshan
+**Plan file:** `docs/plans/fc-038.md`
 
-### FC-006: Covered call rolling engine (Friday EOW)
-- Plan: `docs/plans/fc-006.md`
-- PR: https://github.com/memon1987/options_wheel/pull/5 (merged 2026-04-16)
-- Commit: `08fb876`
-- Notes: Deployed with `rolling.enabled: false`. Pending paper testing on Fridays before enabling Cloud Scheduler job.
+**Problem / opportunity:** The production `/run` pipeline treats covered calls as if they required full cash collateral, in **two** places: `put_seller._calculate_position_size` (invoked for *all* opportunity types by `ExecutionEngine.rank_opportunities`) silently drops any call whose `strike × 100` exceeds buying power, and `select_batch` charges `strike × 100` phantom collateral against the BP budget for calls that survive. Covered calls need zero cash — the shares are the cover. Empirical blast radius (verified 2026-07-18, adversarial-reviewed): AAPL's 100 shares sat uncovered 7/15–7/18 while its calls were the **top-scored opportunities in every scan** (~$75–$190/day of scanned premium foregone); the Friday 7/17 14:15 run was reproduced exactly (BP $67,142.50 → GOOGL call charged $37k phantom → all three AAPL calls dropped); ~50–90 opportunities/day convert to only 1–3 trades. A second wasted-slot bug compounds it: share-committed underlyings (GOOGL post-sale) keep winning selection, charge phantom BP, then fail `execute_batch`'s available-shares check — every cycle. Selection drops are entirely unlogged, which is why this was invisible for months.
 
-### FC-007: Earnings Calendar Service (Finnhub)
-- Plan: `docs/plans/fc-007.md`
-- PR: https://github.com/memon1987/options_wheel/pull/5 (merged 2026-04-16)
-- Commit: `0ccf852`
-- Notes: Finnhub API key in Secret Manager, injected into Cloud Run. Log enrichment active; PutSeller/CallSeller integration deferred.
+**Fix direction (per plan):** two-pool budgeting — calls consume a per-underlying available-shares budget (owned − committed, computed at selection time); puts consume the cash/BP budget; calls stop competing with puts entirely. Shares-based call sizing replaces the put-sizing BP gate. Every ranking/selection drop gets a logged reason.
 
-### FC-010: Disable call stop-losses (assignment is profitable by design)
-- Plan: `docs/plans/fc-010.md`
-- PR: https://github.com/memon1987/options_wheel/pull/7 (merged 2026-04-17)
-- Commit: `737db8a`
-- Notes: Single config change (`use_call_stop_loss: false`). Deployed to Cloud Run revision `00142-vz6`.
+**Open questions:** see plan file.
 
-### FC-012: Shift dashboard logging to Alpaca queries wherever authoritative
-- Plan: `docs/plans/fc-012.md`
-- PR: https://github.com/memon1987/options_wheel/pull/8 (merged 2026-04-24)
-- Commit: `8b31a1b`
-- Notes: All phases (2.1-2.7) shipped in one PR after user dropped the parity gate. New tables: `trades_from_activities` (465 rows backfilled) and `equity_history_from_alpaca` (124 rows). New views: `trades_with_outcomes`, `wheel_cycles_from_activities`. Three Cloud Scheduler jobs ingest on a split schedule. V1 tables (trades, wheel_cycles, position_snapshots, order_statuses) left inert pending manual `bq rm` — a follow-up remote routine on 2026-05-01 opens a cleanup PR. Follow-up fix PR #9 preserves `GCP_PROJECT` env var across bot deploys.
+**Links:** `docs/plans/fc-038.md`, `docs/investigations/covered-call-starvation-2026-07-18.md` (investigation + adversarial review), FC-014 (RiskManager dead code — separate consolidation question), FC-039 (roller repair, sibling finding), `src/strategy/execution_engine.py:140-251,305-360`, `src/strategy/put_seller.py:154`.
 
-### FC-008: Stop-loss events mislabeled as profit_target_reached (superseded)
-- No dedicated PR — superseded by FC-010 + FC-012.
-- Closed: 2026-04-24
-- Notes: Two independent mechanisms neutralized this. (1) FC-010 disabled call stop-losses, so `should_close_call_early` no longer returns True for losses — the mislabeling trigger is gone. (2) FC-012 cut dashboard reads over to `trades_with_outcomes` (Alpaca-sourced), so the corrupted `event_type=early_close_executed` + `reason=profit_target_reached` rows in the v1 `trades` table no longer affect analytics. Historical rows remain dirty but unread; the v1 table itself is scheduled for drop on 2026-05-01 via the FC-012 cleanup routine. If put early-closes ever start showing the same mislabel in structlog events, re-file as a new FC focused on the put-side path only.
+---
 
-### FC-018: Wheel-centric dashboard rebuild (frontend only)
-- Plan: `docs/plans/fc-018.md`
-- PRs: #12 (skeleton), #13 (backend), #14 (pages), #15-#18 (review fixes), #22 (Trade Log), #23 (gap-closing), #24 (PR F cutover), #25 (PR G cleanup) — final merge 2026-05-05
-- Commits: `b7b9184` → `4eb74d2` (PR G)
-- Notes: 3-page dashboard (Overview / By Symbol / Bot Health) shipped via strangler migration. Canonical paths are now bare (`/overview`, `/symbol`, `/bot-health`); `/v2/*` and legacy `/positions`, `/trades`, `/performance`, `/cycles` redirect for bookmark compatibility. Legacy frontend preserved under `dashboard/frontend.archive/` with emergency-revert README — recommend deletion after ~2 weeks of bake time. Mid-execution the gross-vs-net premium audit triggered FC-019; FIFO cycle pairing for overlapping share lots was scoped out as FC-020.
-
-### FC-022: Trade Log contract IDs + ET timezone + By-Symbol summary table
-- Plan: `docs/plans/fc-022.md`
-- PR: https://github.com/memon1987/options_wheel/pull/26 (merged 2026-05-06)
-- Commit: `cd1d47d`
-- Notes: Trade Log gains OCC symbol + expiration + Alpaca order ↗ link per row. All date helpers (`fmtDate`, `fmtDateShort`, `fmtDateTime`) now ET-anchored with explicit `timeZone: 'America/New_York'` and `fmtDateTime` shows the EST/EDT marker. `/symbol` landing page replaces the pill grid with a sortable summary table (`SymbolUniverseTable`) backed by existing scorecard data. Backend `fc018_acb_timeline_per_symbol` view extended with `occ_symbol`, `order_id`, `expiration` columns. `positionState`/`stateColor` extracted from SymbolScorecard into a shared util. 4 new vitest tests assert ET-stability across system locales.
-
-### FC-021: Synthetic activity correction for Alpaca paper-engine silent settlements
-- Plan: `docs/plans/fc-021.md`
-- Commit: `133ebb0` (no PR — data-only correction)
-- Date: 2026-05-06
-- Notes: Inserted two synthetic rows into `options_wheel.trades_from_activities` (`activity_id LIKE 'synthetic-fc-021-%'`) to reconcile the dashboard for `AMD260116C00212500`'s silent 2026-01-16 paper-engine exercise. Discovered during reconciliation diving (see `docs/investigations/amd-reconciliation.md`) — Alpaca's paper engine settled the deep-ITM call without logging OPASN/OPEXP/OPTRD; daily-P&L hypothesis fit confirmed only one silent event occurred, no second discrepancy. Effect on AMD scorecard: `share_pnl` −$24,250 → −$3,000, `total_pnl` −$17,319 → +$5,309, Cycle 2 `cap_gain` −$20,500 → $0 (clean wash). Headline Total Return remains pinned to NLV − sum(deposits) so it's unaffected; per-symbol sum across symbols ($44.9k) no longer ≈ headline ($20.1k) — accepted divergence reflecting the off-book silent settlement. Audit query: `WHERE activity_id LIKE 'synthetic-%'`. Rollback: `DELETE` same predicate.
-
-### FC-023: Per-symbol Realized P&L reconciliation — single canonical number across drilldown
-- Plan: `docs/plans/fc-023.md`
-- PR: https://github.com/memon1987/options_wheel/pull/27 (merged 2026-05-07)
-- Commit: `83bbd57`
-- Notes: Top-of-page "Realized P&L" card and Wheel-vs-B&H "Wheel" total now both display canonical `total_realized_pnl` (option leg + share leg, FC-019) instead of two different disagreeing numbers. UNH pre-fix: top $4,334, wheel $10,222 (double-counted premium). UNH post-fix: both $2,584. View `fc018_vs_buy_and_hold_per_symbol.wheel_minus_bh` formula corrected from `realized_pnl + total_premium` to `total_realized_pnl`. B&H labeled "(price only)" — dividend-reinvested B&H is a deferred concern (FC-017's neighborhood).
-
-### FC-024: ACB walk view rewrite — restore missing event types and ACB computation
-- Plan: `docs/plans/fc-024.md`
-- PRs: https://github.com/memon1987/options_wheel/pull/30 (merged 2026-05-07; replaces auto-closed [#28](https://github.com/memon1987/options_wheel/pull/28) which lost its base on FC-023's merge)
-- Commit: `1a4e401`
-- Notes: `fc018_acb_timeline_per_symbol` rewritten to source from `trades_from_activities` directly via four UNION-ALL blocks (opens / closes / OPASN with QUALIFY-guarded OPTRD pairing / OPEXP). Pre-fix every symbol had `rows_w_acb=0`; post-fix all 6 event types render correctly with ACB transitions during share-holding windows. Reference-dot positioning fixed (`dotAxisFor()` helper rides ACB axis when shares held, premium axis otherwise). Incidentally fixed Phase Timing observation #4 (UNH state machine now returns 4-phase split: cash 124d / short_put 61d / long_stock 10d / covered 17d). Surfaced AMZN silent-exercise data anomaly as a side discovery, filed as FC-025.
-
-### FC-026: Decision Quality — surface Premium Received / Captured / Foregone macro stats
-- Plan: `docs/plans/fc-026.md`
-- PR: https://github.com/memon1987/options_wheel/pull/29 (merged 2026-05-07)
-- Commit: `1b5559c`
-- Notes: Capture-ratio math validated as correct against raw activities (no data fixes shipped). Three new dollar-magnitude aggregates rendered in the chart card: Received / Captured / Foregone (buybacks). UNH macros: **$5,888 / $4,334 (73.6%) / $1,554 (26.4%)** (verified 2026-05-07 against raw Alpaca activity feed). "Foregone" is qualified "(buybacks)" to disambiguate from the counterfactual reading (which would require option-chain snapshots — FC-017). Frontend-only; no view, no backend, no payload change.
-
-### FC-027: Cycle Table — separate "Total Premium" from "Cycle P&L"
-- Plan: `docs/plans/fc-027.md`
-- PR: https://github.com/memon1987/options_wheel/pull/31 (merged 2026-05-07)
-- Commit: `9928db8`
-- Notes: Surfaced mid-trace during the FC-023/024/026 manual reconcile when the user noticed the Cycle Table column labeled "Cycle P&L" actually displayed `total_premium` only (option-side net), silently excluding `capital_gain` (share-side cash flow). For UNH Cycle 1 the column read +$1,218 but the true cycle outcome was $1,218 − $1,750 = −$532. Fix: rename existing column → "Total Premium" (matches the data), add new "Cycle P&L" column = `total_premium + capital_gain`. Same class of bug as FC-023 at cycle granularity. Peer review caught one defect (Cap Gain tooltip leaked internal nomenclature `Post-FC-019`/`OPTRD` — reverted to user-readable copy) and two test-strength suggestions (cell-position assertions) — all addressed pre-merge.
-
-### FC-028: fmtDate calendar-date off-by-one (TZ shift on pure dates)
-- PR: https://github.com/memon1987/options_wheel/pull/32 (merged 2026-05-07)
-- Commit: `0c4d20d`
-- Notes: Plan-exempt (single-file utility bug fix). User caught on Trade Log: OCC `UNH260424P00302500` (Apr 24 expiry) rendered "Apr 23" in the Expiration column. Root cause: `fmtDate()` parsed pure-date strings as UTC midnight then converted to ET (UTC−4) — rolled back to prior day. Same bug affected `event_date` Date column. Fix detects `YYYY-MM-DD`-shaped inputs and renders from year/month/day directly with no TZ conversion. Full ISO 8601 timestamps still ET-anchor per FC-022. 4 new vitests pin the contract; FC-022's ISO behavior verified preserved.
-
-### FC-025: AMZN silent-exercise correction (paper-engine, Jan 16 2026)
-- Plan: `docs/plans/fc-025.md`
-- Investigation: `docs/investigations/amzn-reconciliation.md`
-- Commit: `15625ce` (no PR — data-only correction direct to `main`, mirroring FC-021)
-- Date: 2026-05-07
-- Notes: Twin of FC-021's AMD silent-exercise bug. AMZN $240 put `AMZN260116P00240000` (sold 2026-01-12 at $0.73, expired 2026-01-16 with AMZN at $239.09 = $0.91 ITM) was auto-exercised silently — no OPASN/OPTRD ingested. Confirmed by behavioral evidence (Jan 23 covered call written, Apr 22 called-away at exact $240 strike). Inserted two synthetic rows into `options_wheel.trades_from_activities` (`activity_id LIKE 'synthetic-fc-025-%'`). Effect on AMZN scorecard: `share_side_pnl` +$20,500 → **−$3,500**, `total_realized_pnl` $26,206 → **$2,279**, `cycles_completed` 1 → 2, `wheel_minus_bh` +$21,094 → **−$2,833** (sign reversal — wheel actually lagged B&H on AMZN). Audit query: `WHERE activity_id LIKE 'synthetic-%'` (returns 4 rows: 2 FC-021 + 2 FC-025). Rollback: `DELETE WHERE activity_id LIKE 'synthetic-fc-025-%'`.
-
-### FC-029: Wheel strategy Phase 1 risk re-tune (call delta + cost-basis floor + drawdown pause)
-- Plan: `docs/plans/fc-029.md`
-- Investigations: `docs/investigations/strategy-review-2026-05-07.md`, `docs/investigations/cost-basis-floor-validation-2026-05-08.md`
-- PR: https://github.com/memon1987/options_wheel/pull/34 (merged 2026-05-08)
-- Commit: `692f64e`
-- Notes: Three complementary changes addressing the 3-loss-cycle pattern (-$9k share losses) found in the senior-trader strategy review. **R1**: tightened `call_delta_range` from `[0.30, 0.70]` to `[0.15, 0.25]` (calls 2-4% further OTM, 30-70% → 15-25% assignment probability). **R2**: cost-basis floor source-order rewrite — Alpaca's `cost_basis` returns 0 for assigned paper positions (both safety guards were gated on `> 0` and silently bypassed), now `CallSeller._resolve_cost_basis_floor` reads `wheel_state.stock_cost_basis` (canonical, populated from put strike at OPASN) → BQ lookup of last 90-day OPASN-put strike (handles silent assignments + cold starts; back-fills wheel_state) → Alpaca (last-resort fallback for non-wheel positions); when ALL three fail with shares > 0 the call write is blocked with `event_type=cost_basis_floor_unresolved` (operator intervention). **R3**: drawdown pause — skip covered call writes when shares ≥ 5% below cost basis with `event_type=covered_call_drawdown_pause`. Bad/missing quote now defers (`event_type=covered_call_quote_missing`) instead of failing-open. Two-reviewer process (new ~/CLAUDE.md rule for high-stakes changes) caught 4 HIGH + 3 MEDIUM the first review missed — see PR comments. Tests 27 in `TestCallSellerCostBasisFloorFC029`; 253/253 pytest green. Follow-up FC-030 filed for drawdown-pause observability metric.
-
-### FC-019: True P&L reconciliation — JNLC + OPTRD ingest, share-side P&L
-- Plan: `docs/plans/fc-019.md` (written retroactively)
-- PR: https://github.com/memon1987/options_wheel/pull/19 (merged 2026-05-05)
-- Commit: `78acf92` (preceded by `4862159` — interim env-var-baseline fix that this PR replaces with the real JNLC sum)
-- Notes: Per-symbol scorecard now reconciles to actual account growth (sum of Total P&L = $21,808 vs account growth $20,080, with the ~$1,600 unexplained gap concentrated entirely on AMD's Alpaca-side data anomaly). New scorecard columns: Option P&L (renamed from Net P&L), Share P&L (FC-019), Total P&L (sum). `wheel_cycles_from_activities.capital_gain` now uses real OPTRD cash flow within the cycle window. `BASELINE_DEPOSITS` env var becomes a fallback only — primary source is `SUM(net_amount) WHERE activity_type='JNLC'`. Per-cycle pairing for overlapping share lots is filed as **FC-020** for follow-up.
-
-### FC-031: Dashboard metrics overhaul — vetted portfolio metrics + bot execution health
-- Plan: `docs/plans/fc-031.md`
-- Investigations: `docs/investigations/dashboard-metrics-audit-2026-07-07.md` (per-metric methodology audit), `docs/investigations/fc-031-adversarial-review-2026-07-07.md` (adversarial PM review of the plan — 7 blockers incorporated pre-implementation)
-- Merge: direct merge commit `1e8f622` to main (2026-07-07) — no PR: GitHub App not connected for the org this session; branch `claude/dashboard-metrics-review-k1ze5g`, commits `5fa2e48` (plan+audit), `7b5a718` (implementation), `14f299d` (adversarial code-review fixes)
-- Notes: One accounting convention everywhere (net cash P&L + market value of holdings — the PM review caught that the draft's `(price − basis) × shares` add-back would have double-subtracted held-share cost, ~$24k error on AMD). Headline KPIs: Total P&L (realized cash / open value split), max drawdown (% + flow-adjusted $), XIRR labeled "annualized (single deposit)". TWR-indexed equity curve vs SPY; vs-B&H made symmetric (wheel MTM); FIFO open-lot basis + breakeven columns; cycle table RoC + $/day/$1k; separate put/call trade stats with held-to-expiry exercise-rate calibration vs live config delta bands (Symmetry Principle); net option cash flow bars. Bot Health: decision funnel, anomaly flags on the SPY-bar calendar, run reliability, drawdown-pause card (absorbs FC-030's dashboard half), falsifiable reconciliation banner (residual vs known gaps, share-count mismatch tracking). Removed: dead `win_rate`/`return_30d`, option-leg-only `/api/metrics/pnl-by-symbol`, fake freshness stamp, CAGR tile. Post-implementation 8-angle code review found + fixed 3 defects (cycle-stats fallback crash, unpopulated mismatch badge, /config not exposing threshold/bands) before merge. Tests 293 pytest + 72 vitest. **Post-merge manual steps pending:** re-apply `fc018_views.sql` + `fc031_views.sql` via bq, `POST /ingest-stock-history?backfill_days=400` (SPY), `POST /ingest-activities?after=2025-10-01` (FEE).
-
-### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
+### FC-039: Call roller has never executed a roll — quote-key bug, Friday/DTE eligibility gap, state amnesia
 
 **Status:** Consideration
-**Size estimate:** L
-**Owner:** unassigned
-**Plan file:** not yet
-
-**Problem / opportunity:** Some high-volume symbols (e.g., GOOGL, AMZN, SPY, QQQ) now have options expiring every trading day, not just Fridays. The current system assumes Friday-only expirations in multiple places:
-
-1. **FC-006 rolling engine** — hardcoded Friday guard (`weekday()==4`) in both the `/roll` endpoint and Cloud Scheduler (`30 15 * * 5`). Positions expiring on a Wednesday won't be evaluated for rolling.
-2. **DTE bands** — the 7→0 bands assume a Monday-sell, Friday-expire cadence. A position sold Monday with a Wednesday expiry has DTE=2 at open, hitting different (later) bands than intended.
-3. **`call_target_dte: 7` / `put_target_dte: 7`** — assumes next-Friday expiry. With daily expirations available, shorter DTE targets (2-3 days) become viable, potentially improving theta capture per calendar day.
-4. **Strike selection** — `find_suitable_calls/puts` filters by `dte <= target_dte` which works, but may miss better opportunities at non-Friday expirations.
-
-**Open questions:**
-- Which symbols in our universe have daily expirations vs Friday-only? Need to audit Alpaca's option chain data.
-- Should the rolling engine run daily (not just Fridays) for symbols with daily expirations?
-- Do DTE bands need to be reparameterized for shorter-DTE strategies (see FC-003)?
-- Should we support mixed strategies — daily expirations for some symbols, weekly for others?
-- How does this interact with FC-003 (DTE target optimization from 7 to 2-3)?
-
-**Links:** FC-003 (DTE target optimization), FC-006 (rolling engine)
-
----
-
-### FC-032: Backtesting engine overhaul — symbol wheel-fitness evaluation
-
-**Status:** Executing (Phases 0–2 done; Phase 1 coverage gate run 2026-07-09 → stay on free Alpaca data; Phase 3 in progress)
-**Size estimate:** L
-**Owner:** zeshan
-**Plan file:** `docs/plans/fc-032.md`
-
-**Problem / opportunity:** The original backtesting engine has never produced a single trade in any saved run (all `backtest_results/` artifacts show 0 trades). Root causes: it requests Alpaca option bars with `feed='iex'` (options come from OPRA) so chains are always empty; the covered-call scan crashes on a nonexistent `portfolio.positions` attribute; `_calculate_summary_metrics` is called but never defined; and it reimplements — and diverges from — the live strategy rules instead of replaying them. Separately, `tools/backtesting/scheduled_backtest.py` emits fabricated performance numbers when its (nonexistent-module) imports fail. We want a rebuilt engine whose purpose is **symbol wheel-fitness evaluation**: given a symbol, replay our live strategy rules over a 1–2 year lookback with real historical options data and report how the full wheel (CSP → assignment → covered calls → called away) would have performed — both on-demand for candidate symbols and on a cadence to flag risky symbols for demotion.
-
-**Open questions:**
-- Data budget: free Alpaca bars (Feb 2024+, no bid/ask/greeks) vs a paid vendor (ThetaData/ORATS) — decide after the Phase 1 data-quality report?
-- Reuse live strategy components via an adapter vs standalone reimplementation with parity tests?
-- One decision point per simulated day (EOD) vs mimicking the live 9/12/3 ET schedule?
-- Is the scheduled screening/demotion job part of this FC or a follow-up?
-
-**Links:** FC-017 (chain snapshots at decision points — same storage need, forward-looking), FC-001 (symbol universe optimization — this engine answers its backtest question), `docs/plans/fc-032.md`.
-
----
-
-### FC-037: Synthetic pre-2024 premium extension for backtests
-
-**Status:** Consideration — explicitly deferred out of FC-032 v1
 **Size estimate:** M
 **Owner:** unassigned
 **Plan file:** not yet
 
-**Problem / opportunity:** Alpaca's historical options data starts 2024-02-01, so FC-032 can only backtest ~2.4 years — a single, calm vol regime. Fitness verdicts risk overfitting to it. Extending backward requires *synthesising* option premiums from underlying price history, which is dangerous: Black-Scholes with trailing realized vol badly underprices seller premiums (IV exceeds RV ~85% of days; VIX/RV ≈ 1.18; the variance risk premium concentrates at short maturities — worst exactly for our weeklies; OTM put skew adds 3–5 vol points). Naive BS-with-RV understates a 30-delta weekly put premium by ~50–60%.
+**Problem / opportunity:** The FC-006 roller has **never placed a single order** in its production life (verified two ways 2026-07-18: every `roll_cycle_completed` log in retention shows `rolls_executed=0`, and full Alpaca order history — 459 orders — contains no option order in any Friday roll window). Four stacked causes:
 
-If ever built, the recipe and its error bars are already written down in the FC-032 plan appendix: Yang-Zhang 21d realized vol × a per-symbol IV/HV factor calibrated from our real 2024+ chains, plus a skew bump; binomial with discrete dividends for ITM/dividend cases. Synthetic-regime results must be **labeled as such and never silently mixed** with real-data results.
+1. **Quote-key mismatch (fatal, silent):** `call_roller.py:102` reads `quote.get('last_price')/quote.get('ask_price')` but `AlpacaClient.get_stock_quote` returns keys `bid`/`ask` → price always 0 → unlogged `return None` *before* any gate can log a skip reason. (`get_stock_quote` also raises on failure rather than returning falsy, so the `if not quote` branch is miswired too.)
+2. **Eligibility gap:** monitor profit-taking churn keeps Friday-evaluated calls at DTE 5–7 (all 5 observed Fridays), and 52% of call sales expire mid-week where a Friday-only `max_current_dte: 1` check can never see them. (Note: 48% of call expiries *are* Fridays — a Friday-expiry ITM call at 15:30 would be eligible; churn, not the calendar, is the main idler.)
+3. **State amnesia:** `STATE_STORAGE_BUCKET` is unset on Cloud Run → wheel state is per-request in-memory → `original_premium` resolves 0 → `debit_pct_of_premium=999` → any debit roll rejected; `roll_count` never increments (2-roll cap dead). Setting the bucket alone is **insufficient**: `/run` constructs `CallSeller` without a wheel_state (`cloud_run_server.py:381`), so `set_active_call_details` never fires regardless.
+4. **Zero observability:** the fatal path is an unlogged early return.
+
+**Fix direction (adversarial-reviewed):** fix quote keys (bid/ask mid); make the roller **stateless** — read original premium from Alpaca order history (`filled_avg_price` of the opening STO) instead of doubling down on in-memory state production has proven it never persists; move eligibility checks (DTE ≤ 1 + ITM ratio) into the daily monitor cycle, sequenced *before* profit-taking (near-disjoint states: profit-taking fires on OTM winners, rolling on ITM losers); retain a ~15:30 ET expiry-day check since the last monitor runs 14:55 ET; log every skip with a reason.
 
 **Open questions:**
-- Is a wider, lower-fidelity window actually more informative than a narrow, high-fidelity one for a *fitness* verdict (which is comparative vs buy-and-hold, not absolute)?
-- Cheaper alternative: buy ThetaData/ORATS history (2012+/2007+, real quotes) — $25–99/mo or $599 one-time. That buys real data instead of modeled data for less engineering risk.
-- Would a multi-start-date ensemble on the real 2024+ window capture most of the timing-luck benefit at a fraction of the cost?
+- Keep the Friday 15:30 Cloud Scheduler job as the expiry-day late check (generalized to all expiry days), or add a new daily 15:30 job?
+- With FC-038 fixed, daily re-selling keeps most calls short-dated and OTM — the roller becomes a tail-risk (deep-ITM) device. Is `itm_trigger_ratio: 0.98` still the right trigger, and is the 25%-of-premium debit tolerance meaningful once premium comes from real fills?
+- Does roll_count need persistence at all, or can it too be derived from Alpaca order history (count of BTC+STO pairs on the same underlying's calls within the holding window)?
 
-**Links:** `docs/plans/fc-032.md` (non-goals + research appendix), FC-032.
+**Links:** FC-006 (original build), FC-011 item 1 (delivered by this), FC-015 (same stateless-vs-GCS question), FC-033 (escalation interaction), `docs/investigations/covered-call-starvation-2026-07-18.md`, `src/strategy/call_roller.py:102-104,148,487,506-508`, `src/api/alpaca_client.py:317-324`.
 
 ---
 
-### FC-034: Premium floor is not scale-free — four universe symbols can never trade
+### FC-040: Trade journal mislabels every covered call as a put + BQ log sink dead since 2025-11-22
 
 **Status:** Consideration
-**Size estimate:** M (changes live trading behavior → requires a plan file)
+**Size estimate:** M
 **Owner:** unassigned
 **Plan file:** not yet
 
-**Problem / opportunity:** `min_put_premium: 0.50` is a **fixed dollar** floor applied identically to a $12 stock and a $600 one. The FC-032 coverage gate measured every decision day from 2024-02-01 to 2026-07-09 and found **F, PFE and KMI have zero usable decision days, and VZ has two** — a 0.10–0.20 delta weekly put on a low-priced underlying is worth pennies and can never clear $0.50. Independently confirmed against production: across 588 live Alpaca `FILL` activities and `options_wheel.trades_from_activities`, the bot has **never sold a put on any of the four**. They occupy 4 of 14 universe slots, consume screening API budget, and are structurally incapable of generating a trade.
+**Problem / opportunity:** Two observability defects that actively misled the 2026-07-17/18 investigations:
 
-This is not a data problem (bar coverage was 122/122 for all 14 symbols) and not a bug — the filter is doing exactly what it says. The question is whether a dollar-denominated floor is the right *threshold shape*.
-
-**Open questions:**
-- Re-express the floor as a fraction of strike (e.g. ≥ 0.5% of strike), as annualized return on collateral, or keep a dollar floor with a per-symbol override?
-- A return-on-collateral floor is the economically meaningful one (it's what the wheel actually earns) — but it changes which contracts pass on *every* symbol, not just the cheap ones. Needs a backtest before it ships. FC-032's engine is exactly the tool; sequence this after FC-032 Phase 4.
-- Or simply demote F/PFE/KMI/VZ from the universe and leave the floor alone. Cheapest fix, but leaves the threshold mis-shaped for any future low-priced candidate.
-- Does `min_call_premium: 0.30` have the same defect on the call side? (Almost certainly — same shape, and calls are only sold post-assignment so the blast radius differs.)
-
-**Links:** `docs/investigations/fc-032-coverage-gate.md` (the measurement + production validation), FC-032, FC-001 (symbol universe optimization).
-
----
-
-### FC-035: `poll_order_statuses` closed-orders fetch has never worked (latent NameError)
-
-**Status:** Consideration
-**Size estimate:** S
-**Owner:** unassigned
-**Plan file:** not needed (single-file, isolated) — but it *does* change runtime behavior, so branch + PR
-
-**Problem / opportunity:** `src/strategy/wheel_engine.py` (~line 698, in `poll_order_statuses`) calls:
-
-```python
-closed_orders = self.alpaca.trading_client.get_orders(
-    filter=alpaca.trading.requests.GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100))
-```
-
-The module `alpaca` is **never imported** in that file — only `QueryOrderStatus`, in a local import on the line above. So this raises `NameError: name 'alpaca' is not defined` on every invocation. The surrounding `except Exception` swallows it and logs a debug line, "Could not fetch closed orders directly, using all_orders". Found by pyflakes while seaming the clock for FC-032; confirmed pre-existing (predates the FC-032 branch).
-
-**Consequence:** the closed-orders path has never once executed. Order-status polling sees only whatever `self.alpaca.get_orders()` returns (the SDK default), so `order_filled` / `order_expired` events may be under-reported. Worth checking whether the dashboard's order-status accuracy has been quietly leaning on the activities ingestor instead.
+1. **Journal mislabeling:** `trade_journal.py:148,161` defaults `option_type→'put'` and `strategy→'sell_put'`; scanner-produced call opportunities carry `type: 'call'` but neither of those keys, so **all 29 covered-call rows in `options_wheel.trades` are labeled as puts** (verified by OCC-symbol regex vs label). Fix by deriving `option_type`/`strategy` from the OCC symbol inside `record_trade` (authoritative; retro-fixes any future forgetful producer), plus a prefix-disciplined backfill UPDATE for the 29 rows per the synthetic/corrective-write rules.
+2. **Dead log sink:** the `options-wheel-logs` sink stopped exporting 2025-11-22 (newest dated table `run_googleapis_com_stderr_20251122`; partitioned table empty). `errors_all` view errors outright on the known repeated-field schema conflict (`jsonPayload.symbols`). Any BQ-based analysis of bot decisions silently sees nothing after November; investigations must use `gcloud logging read` (30-day retention) instead. Restoring the sink into the same dataset without a schema strategy (exclusion/transform of array fields, or a fresh dataset) will die the same way — the restore must address that, and the session-2026-04-07 "never string-ify arrays" rule applies.
 
 **Open questions:**
-- Fix is one import (`from alpaca.trading.requests import GetOrdersRequest`). But this *enables* a code path that has never run in production — what does it start doing, and does it double-log `order_filled` events against the activities-derived ones?
-- Does `get_orders()` (no filter) already return closed orders, making the whole block dead code worth deleting instead?
-- Add a test that would have caught this: pyflakes/flake8 `undefined name` in CI. There are other pre-existing lint findings; a clean-then-gate pass is probably warranted.
+- Backfill scope: just the 29 strategy/option_type labels, or also normalize `expiration`/`dte` (currently null on many rows)?
+- Sink restore: new dataset vs field-exclusion filter vs log-to-BQ via scheduled `gcloud logging read` ingestion?
+- Should dashboard queries that read `options_wheel.trades` labels be audited for damage from the mislabeled rows?
 
-**Links:** FC-032 (found during the Phase 3 clock seam), `src/strategy/wheel_engine.py`.
-
----
-
-### FC-036: Stage-4 execution gap check is dead in production
-
-**Status:** Consideration
-**Size estimate:** S
-**Owner:** unassigned
-**Plan file:** not needed (single-file fix) — but it changes runtime behavior, so branch + PR
-
-**Problem / opportunity:** Found by the FC-032 backtest, which reproduced it faithfully — the replay is behaving correctly; **production is not**.
-
-`GapDetector._get_previous_close` (`src/risk/gap_detector.py`) does `df[df.index < current_time]` and takes `.iloc[-1]`. Alpaca stamps daily stock bars at **midnight ET** (04:00 UTC under EDT, 05:00 under EST), far before any of our decision times (9:35am ET = 13:35 UTC). So today's own bar satisfies the filter and "previous close" returns **today's close**.
-
-Verified against the live client on 2026-07-17: at a simulated 9:35am ET decision, `_get_previous_close` returned **202.81** while the latest bar in the frame was also **202.81** (dated the same day).
-
-**Consequence — note the precise failure, it is not "the gap reads zero".** Alpaca returns a *partial* bar for the current session, and `can_execute_trade` compares a real-time IEX quote against it, so what the gate actually measures is the **~20-minute pre-market drift** (the partial bar's last print ~9:15 ET vs the 9:35 quote), not the overnight gap. Observed drifts ran −0.967% to +1.212% — **nonzero**, so anyone spot-checking `gap_percent` in the logs would wrongly conclude the gate is working.
-
-Today's bar was returned in **10/10 live trials** across NVDA and AAPL. The real overnight gaps on five sampled NVDA days were −2.295%, −1.096%, +0.076%, +2.295%, −1.147%; against `execution_gap_threshold = 1.5`, **3 of 5 should have blocked execution and none did.** The gate can also fire *spuriously* on a violent 9:15→9:35 move unrelated to any overnight gap.
-
-Note this is *not* true of the Stage-2 gap-risk analysis (`_detect_current_gap`, gap_detector.py:214), which compares `df_dates < target_date` — a **date** comparison rather than a timestamp one. That is the fix pattern, and it means one of our two gap controls works while the other does not, with nothing surfacing the disagreement.
-
-**Open questions:**
-- Fix by excluding the current session's bar (`df.index.date < current_time.date()`), or by requesting bars with an explicit end of yesterday?
-- Enabling a gate that has never fired changes live behavior. How much would it have blocked historically? The FC-032 engine can now answer this directly — run it with the gate fixed and compare.
-- Does the same 04:00-stamp assumption leak into any other windowed statistic?
-
-**Links:** FC-032 (`docs/plans/fc-032.md`), found during its two-reviewer pass; `docs/investigations/fc-032-parity-check.md`.
+**Links:** `docs/investigations/covered-call-starvation-2026-07-18.md`, FC-038 (discovered during), `src/data/trade_journal.py:148,161`, session memory 2026-04-07 (BQ array-schema conflict).
 
 ---
 
@@ -834,10 +653,3 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - Runbook: `deploy/monitoring/drawdown_pause_alert.md`
 - PRs: [#38](https://github.com/memon1987/options_wheel/pull/38) (endpoint + tests), [#40](https://github.com/memon1987/options_wheel/pull/40) (CI fix), [#41](https://github.com/memon1987/options_wheel/pull/41) (alert-filter fix + closeout) — merged 2026-07-18
 - Notes: Builds the project's **first notification channel** (email), shared by two alerts. **Build-failure alerting was prioritized ahead of the pause alert** — FC-031 had sat undeployed 11 days behind an unnoticed red build, and two more builds failed during this session, both correctly matching the new policy. The pause alert (`POST /api/v2/bot-health/pause-alert-check`, daily 17:45 ET via Cloud Scheduler) fires at ≥7 trading days paused, env-overridable; it is a strict consumer of FC-031's `get_drawdown_pauses`, and a live-proxy outage now logs `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED` rather than reading as "all clear". **The mandatory fire drill caught a fatal defect**: the policy's `severity>=WARNING` clause matched 0 entries because Cloud Run captures stderr as plain text with empty severity — the alert would have been silent forever, discoverable only as a missing notification. Pure logic lives in `services/pause_alert.py` (the bot CI image has no FastAPI); a module-level `pytest.importorskip` was rejected after verifying it silently skips the pure tests too. Escalation remains **FC-033**, deliberately gated on pause-duration data this alert now collects. **Operator action outstanding:** confirm the email lands (Cloud Monitoring channels may need one-time verification).
-
-### FC-030: Drawdown-pause alerting — operator notification for extended pauses
-- Plan: `docs/plans/fc-030.md`
-- Runbook: `deploy/monitoring/drawdown_pause_alert.md`
-- PRs: [#38](https://github.com/memon1987/options_wheel/pull/38) (implementation), [#40](https://github.com/memon1987/options_wheel/pull/40) (CI fix)
-- Date: 2026-07-18
-- Notes: Scope was alerting only — the observability half shipped in FC-031. `POST /api/v2/bot-health/pause-alert-check` runs weekdays 17:45 ET and logs a single `DRAWDOWN_PAUSE_ALERT` line when any symbol is paused >= 7 trading days (env-overridable); a Cloud Monitoring log-based policy emails the operator. Built as a strict consumer of FC-031's `get_drawdown_pauses` — one implementation of pause state, not two. Degraded paths are loud: a live-positions outage logs `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED` rather than reporting "nothing paused". **Cloud Build failure alerting shipped on the same channel** and is arguably the bigger win — FC-031 sat undeployed 11 days behind an unnoticed red build; the new alert caught the very next failure within the hour. The fire drill found two defects nothing else would have: CI lacks FastAPI (fixed by moving pure logic to `services/pause_alert.py`), and the policy filter's `severity>=WARNING` matched nothing because Cloud Run only assigns severity to structured JSON logs. **Open:** operator to confirm alert emails arrive (channels may need one-time verification); FC-033 (escalation) still deferred.
