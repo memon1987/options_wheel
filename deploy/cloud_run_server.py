@@ -1082,10 +1082,15 @@ SCREEN_SYNC_SYMBOL_LIMIT = 3
 @app.route('/backtest/screen', methods=['POST'])
 @require_api_key
 def backtest_screen():
-    """Screen the whole universe for wheel fitness (FC-032 Phase 5).
+    """Screen symbols for wheel fitness (FC-032 Phase 5).
 
-    Triggered monthly by Cloud Scheduler. Writes one row per symbol to
-    options_wheel.backtest_runs and returns the tally plus demotion candidates.
+    NOT currently on a schedule. `monthly-performance-review` is PAUSED and
+    still targets the deleted /backtest/performance-comparison; re-pointing it
+    is an outstanding deploy step, and the monthly full-universe run needs a
+    Cloud Run Job rather than this endpoint (see the symbol limit below).
+
+    Writes one row per symbol to options_wheel.backtest_runs and returns the
+    tally plus demotion candidates.
 
     Demotion is a RECOMMENDATION. This endpoint never changes the trading
     universe — the plan requires two observed cycles before any automation, and
@@ -1113,7 +1118,8 @@ def backtest_screen():
             return _datetime.strptime(raw, "%Y-%m-%d").date() if raw else None
 
         symbols_arg = request.args.get('symbols')
-        symbols = [s.strip().upper() for s in symbols_arg.split(',')] if symbols_arg else None
+        symbols = ([s.strip().upper() for s in symbols_arg.split(',') if s.strip()]
+                   if symbols_arg else None)
         # Sensitivity doubles the runtime; allow a scheduler to skip it.
         run_sensitivity = request.args.get('sensitivity', 'true').lower() != 'false'
 
@@ -1123,7 +1129,13 @@ def backtest_screen():
         # written — a partial table plus a failure status, which is the worst of
         # both. Refuse loudly and point at the right primitive instead.
         requested = symbols or config.stock_symbols
-        budget = int(request.args.get('max_symbols', SCREEN_SYNC_SYMBOL_LIMIT))
+        # Clamp, never trust. ?max_symbols=999 would otherwise disable the guard
+        # entirely, and a non-integer would raise into the 500 handler.
+        try:
+            asked = int(request.args.get('max_symbols', SCREEN_SYNC_SYMBOL_LIMIT))
+        except (TypeError, ValueError):
+            asked = SCREEN_SYNC_SYMBOL_LIMIT
+        budget = max(1, min(asked, SCREEN_SYNC_SYMBOL_LIMIT))
         if len(requested) > budget:
             return jsonify({
                 'status': 'refused',
@@ -1135,8 +1147,11 @@ def backtest_screen():
                     f'exceed this service\'s {SCREEN_REQUEST_TIMEOUT_S}s request '
                     f'timeout and the scheduler\'s attempt deadline, timing out '
                     f'mid-run after partially writing to BigQuery. Run the full '
-                    f'universe as a Cloud Run Job (see docs/bigquery/'
-                    f'backtest_runs.md), or pass ?symbols=A,B to screen a few.'
+                    f'universe as a Cloud Run Job (see the "Running a full screen" '
+                    f'section of docs/bigquery/backtest_runs.md), or pass '
+                    f'?symbols=A,B for an ad-hoc subset — which is recorded as '
+                    f'run_kind=adhoc and will NOT be read as the current state '
+                    f'of the universe.'
                 ),
                 'timestamp': datetime.now().isoformat(),
             }), 413
@@ -1164,12 +1179,19 @@ def backtest_screen():
             'timestamp': datetime.now().isoformat(),
         }
 
-        # A screen that half-ran, or never reached BigQuery, is not a usable
-        # record — surface it as a failure so the scheduler reports it rather
-        # than logging a green run over a partial table.
-        if result.failures or not result.persisted:
-            payload['status'] = 'partial'
+        # Distinguish three states that a responder must not confuse:
+        #   - nothing persisted  -> 500, there is no record of this run
+        #   - persisted, but some symbols produced no verdict -> 200 'partial',
+        #     the run IS recorded and readable; the gaps are visible in the table
+        #   - clean -> 200 'ok'
+        # Collapsing the middle case into 5xx makes "recorded and mostly fine"
+        # page identically to "no data at all".
+        if not result.persisted:
+            payload['status'] = 'not_persisted'
             return jsonify(payload), 500
+        if result.failures:
+            payload['status'] = 'partial'
+            return jsonify(payload), 200
         return jsonify(payload), 200
 
     except Exception as e:

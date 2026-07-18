@@ -63,6 +63,8 @@ class ScreenResult:
     end: date
     results: List[SymbolResult] = field(default_factory=list)
     persisted: bool = False
+    run_kind: str = "full"
+    universe_size: int = 0
 
     @property
     def demote_candidates(self) -> List[str]:
@@ -114,12 +116,28 @@ def run_screen(
 
     run_id = uuid.uuid4().hex[:16]
     cfg_hash = config_hash(config)
+    # A run covering the whole configured universe is 'full'; anything narrower
+    # is 'adhoc' and must never be mistaken for the current state of the
+    # universe by a "latest run" query.
+    run_kind = "full" if set(universe) == set(config.stock_symbols) else "adhoc"
     logger.info("Screen run starting",
                 event_category="backtest", event_type="screen_started",
                 run_id=run_id, symbols=len(universe),
                 window=f"{start}..{end}", config_hash=cfg_hash)
 
-    result = ScreenResult(run_id=run_id, start=start, end=end)
+    # Construct the writer BEFORE the loop: a missing credential or wrong
+    # project discovered after ~a minute per symbol wastes the entire run and
+    # leaves the results only in memory.
+    writer = BacktestRunWriter() if persist else None
+    if persist and not writer.enabled:
+        logger.error(
+            "BigQuery writer unavailable — screening anyway, but results will "
+            "NOT be persisted. Fix credentials/GCP_PROJECT to record this run.",
+            event_category="backtest", event_type="screen_writer_unavailable",
+        )
+
+    result = ScreenResult(run_id=run_id, start=start, end=end,
+                          run_kind=run_kind, universe_size=len(universe))
     for symbol in universe:
         try:
             report, sensitivity = evaluate_symbol(
@@ -151,10 +169,12 @@ def run_screen(
         rows = [
             build_row(run_id=run_id, symbol=r.symbol, report=r.report,
                       sensitivity=r.sensitivity, cfg_hash=cfg_hash,
-                      engine_version=ENGINE_VERSION, error=r.error)
+                      engine_version=ENGINE_VERSION, error=r.error,
+                      run_kind=run_kind, universe_size=len(universe),
+                      window_start=start, window_end=end)
             for r in result.results
         ]
-        result.persisted = BacktestRunWriter().write(rows)
+        result.persisted = writer.write(rows)
 
     logger.info("Screen run complete",
                 event_category="backtest", event_type="screen_completed",
@@ -170,7 +190,9 @@ def render_screen_summary(result: ScreenResult) -> str:
     a = out.append
     a(f"# Universe screen — {result.start} → {result.end}")
     a("")
-    a(f"Run `{result.run_id}` · {len(result.results)} symbols · "
+    scope = ("full universe" if result.run_kind == "full"
+             else "**ad-hoc subset — not a picture of the whole universe**")
+    a(f"Run `{result.run_id}` · {len(result.results)} symbols · {scope} · "
       f"persisted: {'yes' if result.persisted else '**NO**'}")
     a("")
 

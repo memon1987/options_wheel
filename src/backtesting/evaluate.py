@@ -28,6 +28,11 @@ logger = structlog.get_logger(__name__)
 # Fill haircut of 1.0 = sell at the bid: the worst case a marketable order sees.
 BID_FILL_HAIRCUT = 1.0
 
+# Headline fill assumption. Named rather than inlined so config_hash() can
+# include it: changing it changes verdicts, and a verdict must not be
+# indistinguishable from one produced under a different fill model.
+DEFAULT_FILL_HAIRCUT = 0.25
+
 
 def evaluate_symbol(
     symbol: str,
@@ -36,7 +41,7 @@ def evaluate_symbol(
     *,
     config: Optional[Config] = None,
     starting_cash: float = 100_000.0,
-    fill_haircut: float = 0.25,
+    fill_haircut: float = DEFAULT_FILL_HAIRCUT,
     run_sensitivity: bool = True,
 ) -> tuple:
     """Replay ``symbol`` and score it.

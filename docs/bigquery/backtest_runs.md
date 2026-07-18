@@ -41,8 +41,10 @@ at mid or at the bid, which means it is not a verdict.
 | `timestamp` | TIMESTAMP | Partition key |
 | `symbol` | STRING | |
 | `window_start` / `window_end` | DATE | Evaluation window |
-| `config_hash` | STRING | 16-char hash of the strategy thresholds |
+| `config_hash` | STRING | 16-char hash of the thresholds **and scoring constants** that shaped the verdict |
 | `engine_version` | STRING | |
+| `run_kind` | STRING | `full` (whole configured universe) or `adhoc` (a subset). **Always filter on this** when asking "what is the state of the universe?" — an ad-hoc probe is more recent but answers a different question |
+| `universe_size` | INTEGER | Symbols attempted in this run |
 
 ### Verdict
 | column | type | notes |
@@ -80,18 +82,52 @@ A symbol that failed still gets a row with `error` set and a NULL verdict.
 **A NULL verdict does not mean the symbol is fine — it means it was never
 checked.** Filter explicitly.
 
+## Running a full screen
+
+The `/backtest/screen` endpoint is for **ad-hoc subsets only**. It refuses more
+than 3 symbols with a 413, because Cloud Run's request timeout here is 300s and
+the scheduler's attempt deadline is 180s, while a screened symbol replays a year
+of decisions in roughly a minute — a synchronous full run would time out
+*after* partially writing.
+
+Run the full universe as a batch job instead:
+
+```bash
+# Locally (writes to options_wheel.backtest_runs):
+python main.py --command screen
+
+# As a Cloud Run Job (the intended monthly path):
+gcloud run jobs create backtest-screen \
+  --image gcr.io/gen-lang-client-0607444019/options-wheel-strategy \
+  --region us-central1 \
+  --task-timeout 3600s \
+  --set-env-vars GCP_PROJECT=gen-lang-client-0607444019 \
+  --command python --args "main.py,--command,screen"
+
+gcloud run jobs execute backtest-screen --region us-central1
+```
+
+Then point a monthly Cloud Scheduler job at the Job's `:run` endpoint rather
+than at the HTTP service. **Not yet deployed** — `monthly-performance-review` is
+currently PAUSED and still targets the deleted
+`/backtest/performance-comparison`.
+
 ## Queries
 
 Current demotion candidates from the most recent run:
 ```sql
-WITH latest AS (
+-- run_kind='full' is load-bearing: an ad-hoc subset run is more RECENT but is
+-- not a picture of the universe. Without it this silently returns the ad-hoc
+-- run's symbols and hides the full screen's demotion candidates.
+WITH latest_full AS (
   SELECT run_id FROM `options_wheel.backtest_runs`
+  WHERE run_kind = 'full'
   ORDER BY timestamp DESC LIMIT 1
 )
 SELECT symbol, verdict, total_return, annualized_return_on_collateral,
        days_in_position_fraction, ARRAY_TO_STRING(verdict_reasons, '; ') AS reasons
 FROM `options_wheel.backtest_runs`
-WHERE run_id IN (SELECT run_id FROM latest) AND demote
+WHERE run_id IN (SELECT run_id FROM latest_full) AND demote
 ORDER BY total_return;
 ```
 
@@ -100,6 +136,7 @@ Symbols that were never actually checked (do not mistake these for passes):
 SELECT symbol, error FROM `options_wheel.backtest_runs`
 WHERE verdict IS NULL
   AND run_id = (SELECT run_id FROM `options_wheel.backtest_runs`
+                WHERE run_kind = 'full'
                 ORDER BY timestamp DESC LIMIT 1);
 ```
 

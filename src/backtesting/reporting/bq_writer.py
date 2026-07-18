@@ -49,6 +49,12 @@ def _schema():
         f("window_end", "DATE"),
         f("config_hash", "STRING"),
         f("engine_version", "STRING"),
+        # Scope. Without these, "the latest run" (ORDER BY timestamp DESC) picks
+        # whichever run happened last — so a 2-symbol ad-hoc probe hides a full
+        # screen's demotion candidates and its failures. The endpoint's own 413
+        # tells operators to make exactly those ad-hoc runs.
+        f("run_kind", "STRING"),        # 'full' | 'adhoc'
+        f("universe_size", "INTEGER"),  # symbols attempted in this run
         # Verdict — what a human acts on
         f("verdict", "STRING"),
         f("demote", "BOOL"),
@@ -104,6 +110,19 @@ def config_hash(config) -> str:
         "max_gap_frequency", "execution_gap_threshold",
     ]
     payload = {k: getattr(config, k, None) for k in keys}
+
+    # The verdict is not computed from config alone: these live as module
+    # constants and a default argument, and changing any of them flips symbols.
+    # Omitting them made a threshold change byte-identical to a symbol change —
+    # the exact confusion this hash exists to prevent.
+    from ..evaluate import DEFAULT_FILL_HAIRCUT
+    from ..metrics import fitness as _fit
+    payload["_scoring"] = {
+        "min_days_in_position": _fit.MIN_DAYS_IN_POSITION,
+        "risk_free_rate": _fit.RISK_FREE_RATE,
+        "max_drawdown_warn": _fit.MAX_DRAWDOWN_WARN,
+        "fill_haircut": DEFAULT_FILL_HAIRCUT,
+    }
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -144,7 +163,22 @@ class BacktestRunWriter:
             table.time_partitioning = bigquery.TimePartitioning(
                 type_=bigquery.TimePartitioningType.DAY, field="timestamp",
             )
-            self._client.create_table(table, exists_ok=True)
+            existing = self._client.create_table(table, exists_ok=True)
+
+            # create_table(exists_ok=True) returns the EXISTING table and never
+            # reconciles its schema. Left alone, the first release that adds a
+            # field makes every row carry an unknown key — and insert_rows_json
+            # rejects the WHOLE request rather than the offending row, so a run
+            # writes ZERO rows. Reconcile additive fields explicitly.
+            have = {f.name for f in (existing.schema or [])}
+            missing = [f for f in _schema() if f.name not in have]
+            if missing:
+                existing.schema = list(existing.schema) + missing
+                self._client.update_table(existing, ["schema"])
+                logger.info("Extended backtest_runs schema",
+                            event_category="backtest",
+                            event_type="screen_schema_extended",
+                            added=[f.name for f in missing])
             self._table = table_ref
             self._enabled = True
         except Exception:
@@ -192,7 +226,9 @@ class BacktestRunWriter:
 
 def build_row(*, run_id: str, symbol: str, report, sensitivity: Optional[dict],
               cfg_hash: str, engine_version: str,
-              error: Optional[str] = None) -> Dict[str, Any]:
+              error: Optional[str] = None,
+              run_kind: str = "full", universe_size: Optional[int] = None,
+              window_start=None, window_end=None) -> Dict[str, Any]:
     """Flatten a FitnessReport into one BigQuery row.
 
     A symbol that failed still gets a row, carrying ``error`` and a null verdict.
@@ -201,9 +237,14 @@ def build_row(*, run_id: str, symbol: str, report, sensitivity: Optional[dict],
     """
     now = datetime.now(timezone.utc).isoformat()
     if report is None:
+        # A failed symbol keeps its window: a window-scoped query would
+        # otherwise drop exactly the never-checked symbols the docs say to hunt.
         return {
             "run_id": run_id, "timestamp": now, "symbol": symbol,
+            "window_start": window_start.isoformat() if window_start else None,
+            "window_end": window_end.isoformat() if window_end else None,
             "config_hash": cfg_hash, "engine_version": engine_version,
+            "run_kind": run_kind, "universe_size": universe_size,
             "verdict": None, "demote": None, "error": (error or "unknown")[:500],
         }
 
@@ -218,6 +259,8 @@ def build_row(*, run_id: str, symbol: str, report, sensitivity: Optional[dict],
         "window_end": report.end.isoformat(),
         "config_hash": cfg_hash,
         "engine_version": engine_version,
+        "run_kind": run_kind,
+        "universe_size": universe_size,
 
         "verdict": verdict,
         # Demotion is a *recommendation*; the plan keeps the decision human.

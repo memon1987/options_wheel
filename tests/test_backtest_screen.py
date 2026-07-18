@@ -229,3 +229,136 @@ class TestSyncScreenIsBounded:
         # ~1 min/symbol measured; the limit must leave headroom under 300s.
         assert mod.SCREEN_SYNC_SYMBOL_LIMIT * 60 < mod.SCREEN_REQUEST_TIMEOUT_S
         assert mod.SCREEN_SYNC_SYMBOL_LIMIT >= 1
+
+
+class TestSchemaContract:
+    """The schema and build_row must not drift apart.
+
+    insert_rows_json rejects the WHOLE request when any row carries an unknown
+    field — not just the offending row — so a single drifted key means a run
+    writes zero rows. This is the cheapest possible guard against that.
+    """
+
+    def _schema_names(self):
+        pytest.importorskip("google.cloud.bigquery")
+        from src.backtesting.reporting.bq_writer import _schema
+        return {f.name for f in _schema()}
+
+    def test_success_row_keys_all_exist_in_the_schema(self):
+        names = self._schema_names()
+        row = build_row(run_id="r", symbol="X", report=_FakeReport(),
+                        sensitivity={"bid_return": 0.01, "verdict_flips": False},
+                        cfg_hash="h", engine_version="v")
+        assert set(row) <= names, f"row keys not in schema: {set(row) - names}"
+
+    def test_failure_row_keys_all_exist_in_the_schema(self):
+        names = self._schema_names()
+        row = build_row(run_id="r", symbol="X", report=None, sensitivity=None,
+                        cfg_hash="h", engine_version="v", error="boom",
+                        window_start=date(2025, 1, 1), window_end=date(2025, 6, 30))
+        assert set(row) <= names, f"row keys not in schema: {set(row) - names}"
+
+    def test_failure_row_keeps_its_window(self):
+        """A window-scoped query would otherwise drop the never-checked symbols."""
+        row = build_row(run_id="r", symbol="X", report=None, sensitivity=None,
+                        cfg_hash="h", engine_version="v", error="boom",
+                        window_start=date(2025, 1, 1), window_end=date(2025, 6, 30))
+        assert row["window_start"] == "2025-01-01"
+        assert row["window_end"] == "2025-06-30"
+
+
+class TestRunScope:
+    """An ad-hoc subset must never be readable as the state of the universe."""
+
+    def test_full_universe_run_is_marked_full(self):
+        from unittest.mock import patch as _p
+
+        from src.utils.config import Config
+        cfg = Config()
+        with _p("src.backtesting.screen.evaluate_symbol",
+                return_value=(_FakeReport(), None)):
+            r = run_screen(config=cfg, persist=False, run_sensitivity=False,
+                           start=date(2025, 1, 1), end=date(2025, 6, 30))
+        assert r.run_kind == "full"
+        assert r.universe_size == len(cfg.stock_symbols)
+
+    def test_subset_run_is_marked_adhoc(self):
+        from unittest.mock import patch as _p
+
+        with _p("src.backtesting.screen.evaluate_symbol",
+                return_value=(_FakeReport(), None)):
+            r = run_screen(symbols=["NVDA"], persist=False, run_sensitivity=False,
+                           start=date(2025, 1, 1), end=date(2025, 6, 30))
+        assert r.run_kind == "adhoc"
+        assert r.universe_size == 1
+
+    def test_adhoc_scope_is_stated_in_the_summary(self):
+        r = ScreenResult(run_id="r", start=date(2025, 1, 1), end=date(2025, 12, 31),
+                         run_kind="adhoc", universe_size=1)
+        r.results = [SymbolResult("NVDA", _FakeReport())]
+        md = render_screen_summary(r)
+        assert "ad-hoc subset" in md
+        assert "not a picture of the whole universe" in md
+
+    def test_row_carries_the_scope(self):
+        row = build_row(run_id="r", symbol="X", report=_FakeReport(),
+                        sensitivity=None, cfg_hash="h", engine_version="v",
+                        run_kind="adhoc", universe_size=2)
+        assert row["run_kind"] == "adhoc"
+        assert row["universe_size"] == 2
+
+
+class TestConfigHashCoversScoring:
+    """A threshold change must not be indistinguishable from a symbol change."""
+
+    def test_hash_moves_when_a_scoring_constant_moves(self, monkeypatch):
+        from src.utils.config import Config
+        from src.backtesting.metrics import fitness as fit
+
+        cfg = Config()
+        before = config_hash(cfg)
+        monkeypatch.setattr(fit, "RISK_FREE_RATE", 0.045)
+        after = config_hash(cfg)
+        assert before != after, (
+            "changing the risk-free floor flips verdicts but left the hash "
+            "identical — a threshold change would read as a symbol change"
+        )
+
+    def test_hash_moves_when_the_fill_assumption_moves(self, monkeypatch):
+        from src.utils.config import Config
+        from src.backtesting import evaluate as ev
+
+        cfg = Config()
+        before = config_hash(cfg)
+        monkeypatch.setattr(ev, "DEFAULT_FILL_HAIRCUT", 0.5)
+        after = config_hash(cfg)
+        assert before != after
+
+
+class TestSyncGuardCannotBeBypassed:
+    def _client(self):
+        import importlib
+        mod = importlib.import_module("deploy.cloud_run_server")
+        mod.app.config["TESTING"] = True
+        return mod, mod.app.test_client()
+
+    def test_max_symbols_query_param_cannot_raise_the_limit(self):
+        _, client = self._client()
+        resp = client.post("/backtest/screen?symbols=A,B,C,D,E,F,G,H&max_symbols=999")
+        assert resp.status_code == 413, "caller raised the guard's own limit"
+
+    def test_garbage_max_symbols_does_not_500(self):
+        _, client = self._client()
+        resp = client.post("/backtest/screen?symbols=A,B,C,D,E,F,G,H&max_symbols=abc")
+        assert resp.status_code == 413
+
+    def test_trailing_comma_does_not_create_an_empty_symbol(self):
+        from unittest.mock import patch as _p
+
+        _, client = self._client()
+        with _p("src.backtesting.screen.evaluate_symbol",
+                return_value=(_FakeReport("NVDA"), None)):
+            resp = client.post("/backtest/screen?symbols=NVDA,&persist=false"
+                               "&sensitivity=false&start=2025-01-01&end=2025-06-30")
+        assert resp.status_code != 413
+        assert resp.get_json()["symbols_screened"] == 1
