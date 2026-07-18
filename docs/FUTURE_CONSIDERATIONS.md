@@ -314,23 +314,6 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-030: Drawdown-pause alerting — operator notification for extended pauses
-
-**Status:** Plan published
-**Size estimate:** S
-**Owner:** Claude
-**Plan file:** `docs/plans/fc-030.md`
-
-**Scope note (2026-07-18):** the *observability* half shipped inside FC-031 (Bot Health drawdown-pause card). FC-030 now covers **alerting only** — notify the operator when a pause crosses ~7 trading days, via the project's first notification channel (Cloud Monitoring log-based alert → email). The **escalation** question (permit a below-cost-basis call after an extended pause) is split out to **FC-033**: it reverses part of FC-029 R2's hard floor, so it is a strategy change needing its own plan and two-reviewer scrutiny — and it should be decided on the pause-duration data this alerting will collect.
-
-**Problem / opportunity:** Surfaced by the FC-029 second-reviewer (peer review LOW 8). The R3 drawdown pause is a passive `return None` with `event_type=covered_call_drawdown_pause` events. AMZN cycle 2's 62-day idle is the existence proof that an extended pause can silently cost meaningful opportunity (~$1,500–3,000 in foregone premium across the period). Add a daily dashboard metric / alert: number of days each symbol has been continuously paused, with a threshold (e.g., 7 days) that triggers an operator notification. Could escalate further (e.g., ≥ 14 days → allow far-OTM strike below cost basis with explicit operator approval).
-
-**Open questions:** resolved in the plan — threshold 7 trading days (env-overridable); Bot Health card is the surface (shipped, FC-031); escalation deferred to FC-033.
-
-**Links:** FC-029 (introduces the drawdown pause), FC-031 (pause card), FC-033 (escalation), `docs/investigations/strategy-review-2026-05-07.md` §R3.
-
----
-
 ### FC-033: Drawdown-pause escalation — permit a below-cost-basis call after an extended pause
 
 **Status:** Consideration
@@ -595,3 +578,9 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - Investigations: `docs/investigations/dashboard-metrics-audit-2026-07-07.md` (per-metric methodology audit), `docs/investigations/fc-031-adversarial-review-2026-07-07.md` (adversarial PM review of the plan — 7 blockers incorporated pre-implementation)
 - Merge: direct merge commit `1e8f622` to main (2026-07-07) — no PR: GitHub App not connected for the org this session; branch `claude/dashboard-metrics-review-k1ze5g`, commits `5fa2e48` (plan+audit), `7b5a718` (implementation), `14f299d` (adversarial code-review fixes)
 - Notes: One accounting convention everywhere (net cash P&L + market value of holdings — the PM review caught that the draft's `(price − basis) × shares` add-back would have double-subtracted held-share cost, ~$24k error on AMD). Headline KPIs: Total P&L (realized cash / open value split), max drawdown (% + flow-adjusted $), XIRR labeled "annualized (single deposit)". TWR-indexed equity curve vs SPY; vs-B&H made symmetric (wheel MTM); FIFO open-lot basis + breakeven columns; cycle table RoC + $/day/$1k; separate put/call trade stats with held-to-expiry exercise-rate calibration vs live config delta bands (Symmetry Principle); net option cash flow bars. Bot Health: decision funnel, anomaly flags on the SPY-bar calendar, run reliability, drawdown-pause card (absorbs FC-030's dashboard half), falsifiable reconciliation banner (residual vs known gaps, share-count mismatch tracking). Removed: dead `win_rate`/`return_30d`, option-leg-only `/api/metrics/pnl-by-symbol`, fake freshness stamp, CAGR tile. Post-implementation 8-angle code review found + fixed 3 defects (cycle-stats fallback crash, unpopulated mismatch badge, /config not exposing threshold/bands) before merge. Tests 293 pytest + 72 vitest. **Post-merge manual steps pending:** re-apply `fc018_views.sql` + `fc031_views.sql` via bq, `POST /ingest-stock-history?backfill_days=400` (SPY), `POST /ingest-activities?after=2025-10-01` (FEE).
+
+### FC-030: Drawdown-pause alerting — operator notification for extended pauses
+- Plan: `docs/plans/fc-030.md`
+- Runbook: `deploy/monitoring/drawdown_pause_alert.md`
+- PRs: [#38](https://github.com/memon1987/options_wheel/pull/38) (endpoint + tests), [#40](https://github.com/memon1987/options_wheel/pull/40) (CI fix), [#41](https://github.com/memon1987/options_wheel/pull/41) (alert-filter fix + closeout) — merged 2026-07-18
+- Notes: Builds the project's **first notification channel** (email), shared by two alerts. **Build-failure alerting was prioritized ahead of the pause alert** — FC-031 had sat undeployed 11 days behind an unnoticed red build, and two more builds failed during this session, both correctly matching the new policy. The pause alert (`POST /api/v2/bot-health/pause-alert-check`, daily 17:45 ET via Cloud Scheduler) fires at ≥7 trading days paused, env-overridable; it is a strict consumer of FC-031's `get_drawdown_pauses`, and a live-proxy outage now logs `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED` rather than reading as "all clear". **The mandatory fire drill caught a fatal defect**: the policy's `severity>=WARNING` clause matched 0 entries because Cloud Run captures stderr as plain text with empty severity — the alert would have been silent forever, discoverable only as a missing notification. Pure logic lives in `services/pause_alert.py` (the bot CI image has no FastAPI); a module-level `pytest.importorskip` was rejected after verifying it silently skips the pure tests too. Escalation remains **FC-033**, deliberately gated on pause-duration data this alert now collects. **Operator action outstanding:** confirm the email lands (Cloud Monitoring channels may need one-time verification).
