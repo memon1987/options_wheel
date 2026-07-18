@@ -124,7 +124,7 @@ class Config:
         # Alpaca validation
         alpaca = self._config.get('alpaca', {})
         if not alpaca.get('api_key_id') or alpaca.get('api_key_id', '').startswith('${'):
-            errors.append("Alpaca API key not configured (check ALPACA_API_KEY_ID env var)")
+            errors.append("Alpaca API key not configured (check ALPACA_API_KEY env var)")
         if not alpaca.get('secret_key') or alpaca.get('secret_key', '').startswith('${'):
             errors.append("Alpaca secret key not configured (check ALPACA_SECRET_KEY env var)")
 
