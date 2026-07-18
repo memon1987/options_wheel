@@ -32,11 +32,15 @@ KNOWN_BIASES = [
     ("Bid/ask is modeled, not calibrated", (
         "Alpaca sells no historical option quotes at any price, so spreads come "
         "from a parametric model running on its DEFAULT parameters — "
-        "SpreadModel.calibrate() exists but is not invoked in this path. "
-        "Measured against 452 live OTM put quotes the model is ~2.2x WIDER than "
-        "reality (median half-spread $0.064 modeled vs $0.030 real), so fills "
-        "err against the strategy. Conservative, but by accident rather than by "
-        "calibration.")),
+        "SpreadModel.calibrate() exists but is never invoked on this path. "
+        "Measured against 455 live OTM put quotes by "
+        "tools/diagnostics/spread_model_check.py (re-runnable): median real "
+        "half-spread $0.0300 vs $0.0635 modeled, i.e. the model is ~2.1x wider, "
+        "and wider on 80% of contracts — which errs against the strategy. BUT "
+        "that sample was taken OUTSIDE regular trading hours, when real spreads "
+        "are at their widest; intraday the gap narrows and the model may not be "
+        "conservative at all on the most liquid names. Treat 'conservative' as "
+        "unproven intraday rather than established.")),
     ("Greeks are computed", (
         "IV and delta are Black-Scholes inversions from the bar close, not "
         "published values. Dividend yield is treated as zero for every symbol, "

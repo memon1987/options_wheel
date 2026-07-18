@@ -366,17 +366,32 @@ class BacktestAlpacaClient:
                 if fill is None:
                     return self._order_error(
                         symbol, qty, side, "insufficient_shares",
-                        f"Need {qty * 100} shares of {underlying}, "
-                        f"hold {self._broker.shares(underlying)}.",
+                        f"Need {qty * 100} uncovered shares of {underlying}; "
+                        f"hold {self._broker.shares(underlying)}, of which "
+                        f"{self._broker.pledged_shares(underlying)} already back "
+                        f"open calls.",
                     )
         elif side == "buy":
+            # Capture the reason BEFORE attempting, so a rejection is diagnosed
+            # correctly. buy_to_close returns None for two different causes, and
+            # reporting a cash shortfall as "no position" would mislead exactly
+            # the rejection analysis this feeds.
+            position = self._broker.options.get(symbol)
             fill = self._broker.buy_to_close(
                 symbol, qty, quote.mark, quote.ask, self.today
             )
             if fill is None:
+                if position is None or qty > position.contracts:
+                    return self._order_error(
+                        symbol, qty, side, "no_position",
+                        f"No open short position in {symbol} to close "
+                        f"({qty} contracts requested).",
+                    )
+                cost = self._broker.buy_fill(quote.mark, quote.ask) * 100 * qty
                 return self._order_error(
-                    symbol, qty, side, "no_position",
-                    f"No open short position in {symbol} to close.",
+                    symbol, qty, side, "insufficient_cash",
+                    f"Buy-to-close needs ${cost:,.2f} but only "
+                    f"${self._broker.available_cash:,.2f} is available.",
                 )
         else:
             raise UnsupportedBacktestCall(f"Unsupported order side: {side!r}")

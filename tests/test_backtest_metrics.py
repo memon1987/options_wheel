@@ -12,6 +12,8 @@ from datetime import date
 
 import pytest
 
+from src.utils import clock
+
 from src.backtesting.engine.broker import LedgerEvent
 from src.backtesting.engine.simulator import DailyState
 from src.backtesting.metrics.cycles import build_cycles, count_rolls
@@ -533,3 +535,65 @@ class TestReport:
         payload = json.loads(render_json(r))
         assert payload["cycles"]["open"] == 1
         assert payload["cycles"]["table"][0]["end"] is None
+
+
+class TestRejectionTally:
+    """Regression: the tally counted EVENTS and labelled them days, printing
+    "335 days" against 206 decision days — impossible on its face. Live emits
+    two events for one logical gap rejection (the inner analyzer and the outer
+    filter), both mapped to the same bucket.
+    """
+
+    def _tally(self):
+        from src.backtesting.engine.rejections import RejectionTally
+        return RejectionTally()
+
+    def _emit(self, tally, event_type):
+        tally.processor(None, "info", {"event_type": event_type})
+
+    def test_two_events_for_one_rejection_count_as_one_day(self):
+        from datetime import datetime as _dt
+
+        t = self._tally()
+        with clock.frozen(_dt(2025, 1, 6, 16, 0)):
+            self._emit(t, "rejected_high_gap_frequency")
+            self._emit(t, "stock_filtered_by_gap_risk")
+        assert t.summary() == {"gap-risk filter (stage 2)": 1}
+
+    def test_days_never_exceed_the_days_observed(self):
+        from datetime import datetime as _dt, timedelta as _td
+
+        t = self._tally()
+        for i in range(5):
+            with clock.frozen(_dt(2025, 1, 6, 16, 0) + _td(days=i)):
+                # Both events fire every day, as they do in a real run.
+                self._emit(t, "rejected_high_gap_frequency")
+                self._emit(t, "stock_filtered_by_gap_risk")
+        assert t.summary()["gap-risk filter (stage 2)"] == 5
+        assert t.binding_constraint() == "gap-risk filter (stage 2)"
+
+    def test_distinct_reasons_are_tracked_separately(self):
+        from datetime import datetime as _dt
+
+        t = self._tally()
+        with clock.frozen(_dt(2025, 1, 6, 16, 0)):
+            self._emit(t, "stock_filtered_by_gap_risk")
+            self._emit(t, "no_suitable_puts")
+        assert set(t.summary()) == {
+            "gap-risk filter (stage 2)",
+            "no put cleared delta/DTE/premium (stage 7)",
+        }
+
+    def test_candidate_days_are_distinct_days_too(self):
+        from datetime import datetime as _dt
+
+        t = self._tally()
+        with clock.frozen(_dt(2025, 1, 6, 16, 0)):
+            self._emit(t, "stage_7_complete_found")
+            self._emit(t, "stage_7_complete_found")
+        assert t.candidate_days == 1
+
+    def test_processor_never_raises_into_the_run(self):
+        t = self._tally()
+        assert t.processor(None, "info", {}) == {}
+        assert t.processor(None, "info", {"event_type": None}) is not None

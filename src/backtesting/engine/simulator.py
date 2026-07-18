@@ -205,6 +205,23 @@ class Simulator:
             split = detect_split(bars)
             if split is not None:
                 split_date, ratio = split
+                # A split inside the WARM-UP buffer is survivable: those bars
+                # only feed GapDetector's lookback, and no equity, benchmark or
+                # settlement number is computed from them. Refusing the run
+                # would reject ~2 months of otherwise-legitimate history and
+                # tell the user to avoid a date their window already avoids.
+                if split_date < self.start:
+                    logger.warning(
+                        "Split inside the warm-up window, not the decision "
+                        "window: gap statistics over the first sessions read a "
+                        "corporate action as a price move and will be "
+                        "distorted. Decision-day results are unaffected.",
+                        event_category="backtest",
+                        event_type="split_in_warmup",
+                        symbol=symbol, split_date=split_date.isoformat(),
+                        ratio=round(ratio, 4),
+                    )
+                    continue
                 raise UnadjustedCorporateAction(
                     f"{symbol} moved {ratio:.3f}x on {split_date} — a split or "
                     f"other corporate action the engine does not model. Prices "

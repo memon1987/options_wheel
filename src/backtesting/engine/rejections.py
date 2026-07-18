@@ -20,6 +20,8 @@ from typing import Dict, Optional
 
 import structlog
 
+from ...utils import clock
+
 # Live event_type -> the human-facing reason a day produced no trade. Ordered
 # roughly by how early the stage sits in the pipeline.
 _REASONS = {
@@ -45,22 +47,29 @@ class RejectionTally:
     """
 
     def __init__(self) -> None:
-        self.counts: Counter = Counter()
-        self.candidate_days: int = 0
+        # Keyed by (day, reason) so a reason counts ONCE per day. Live emits two
+        # events for one logical gap rejection — analyze_gap_risk's inner
+        # _is_suitable_for_trading and the outer filter_symbols_by_gap_risk —
+        # and both map to the same bucket. Counting events produced "335 days"
+        # against 206 decision days: impossible on its face, and exactly the
+        # class of dishonest metric this review round existed to remove.
+        self._seen: set = set()
+        self._candidate_days: set = set()
         self._prev_config: Optional[dict] = None
 
     # ------------------------------------------------------------------ #
     def processor(self, logger, name, event_dict):
         try:
             event_type = event_dict.get("event_type", "")
+            day = clock.now().date() if clock.is_frozen() else None
             reason = _REASONS.get(event_type)
-            if reason:
-                self.counts[reason] += 1
-            # Days on which the chain *did* offer a qualifying candidate — the
-            # denominator that separates "no opportunity existed" from
-            # "an opportunity existed and something else blocked it".
-            if event_type == "stage_7_complete_found":
-                self.candidate_days += 1
+            if reason and day is not None:
+                self._seen.add((day, reason))
+            # Days on which the chain *was examined* and offered a qualifying
+            # candidate. Not a count of days a tradeable option existed: when an
+            # earlier stage blocks, stage 7 never runs.
+            if event_type == "stage_7_complete_found" and day is not None:
+                self._candidate_days.add(day)
         except Exception:  # noqa: BLE001 - diagnostics must never break a run
             pass
         return event_dict
@@ -83,11 +92,16 @@ class RejectionTally:
         return None
 
     # ------------------------------------------------------------------ #
+    @property
+    def candidate_days(self) -> int:
+        return len(self._candidate_days)
+
     def summary(self) -> Dict[str, int]:
-        """Reasons in descending order of how often they blocked a day."""
-        return dict(self.counts.most_common())
+        """Distinct DAYS blocked, per reason, descending."""
+        per_reason: Counter = Counter(reason for _day, reason in self._seen)
+        return dict(per_reason.most_common())
 
     def binding_constraint(self) -> Optional[str]:
         """The reason that blocked the most days, if any."""
-        top = self.counts.most_common(1)
+        top = Counter(r for _d, r in self._seen).most_common(1)
         return top[0][0] if top else None
