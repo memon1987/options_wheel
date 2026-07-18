@@ -48,15 +48,18 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 **Owner:** unassigned
 **Plan file:** not yet
 
-**Problem / opportunity:** 8 of 14 configured symbols have never traded (AAPL, MSFT, QQQ, SPY, F, PFE, KMI, VZ). They burn ~6k API calls/month and slow scans. Before removing them or adding replacements, we need a plan covering rollout, monitoring, and reversion.
+**Problem / opportunity:** Several configured symbols never trade — they burn ~6k API calls/month and slow scans. Before removing them or adding replacements, we need a plan covering rollout, monitoring, and reversion.
+
+> **Premise corrected 2026-07-18.** The original entry listed 8 never-traded symbols including AAPL and MSFT. **Both now trade**: AAPL 11 trades since 2026-04-28 (assigned at $305 on 6/13), MSFT 6 trades since 2026-06-16 (assigned at $382.50 on 6/23) — they were below the price filter when this entry was written and have since come into range. The actual dead weight is **6 symbols: QQQ, SPY, F, PFE, KMI, VZ** (zero trades ever). FC-032's coverage work separately found F/PFE/KMI/VZ **structurally** untradeable (0 usable days — the $0.50 premium floor, not a data gap), which is a stronger argument for removal than "hasn't traded yet". Note SPY now appears in `stock_history_from_alpaca` as the FC-031 benchmark/trading-calendar symbol — that is ingest-only and does not make it a trading candidate.
 
 **Open questions:**
-- Remove the 8 dead-weight symbols in one change or stage it?
+- Remove the 6 dead-weight symbols in one change or stage it? (F/PFE/KMI/VZ have a structural justification; QQQ/SPY are price-filter exclusions.)
 - Which replacement candidates (META, TSLA, COIN, PLTR) clear our filters in a backtest?
-- Do we raise `max_stock_price` from $400 to bring MSFT/QQQ/SPY into range, or leave them out?
+- Do we raise `max_stock_price` from $400 to bring QQQ/SPY into range? (AAPL/MSFT resolved themselves without a config change.)
 - How do we validate the change hasn't reduced premium throughput?
+- Should this merge into FC-032's wheel-fitness evaluation rather than stand alone? The backtesting overhaul is building exactly the machinery to answer "which symbols deserve capital".
 
-**Links:** `PERFORMANCE_EVAL_CATALOG.md` EVAL-010.
+**Links:** `PERFORMANCE_EVAL_CATALOG.md` EVAL-010; FC-032 (wheel-fitness evaluation — overlapping scope).
 
 ---
 
