@@ -42,6 +42,11 @@ from ...strategy.wheel_state_manager import WheelStateManager
 from ...utils.config import Config
 from ..data.chain_builder import ChainBuilder, ChainSnapshot
 from ..data.alpaca_provider import UnadjustedCorporateAction, detect_split
+from ..data.dividends import (
+    DividendSchedule,
+    load_default_schedule,
+    should_assign_early,
+)
 from ..data.provider import OptionsDataProvider, StockBar
 from .alpaca_adapter import BacktestAlpacaClient
 from .broker import BacktestBroker
@@ -51,6 +56,16 @@ from .no_op_analytics import NoOpAnalyticsWriter, NoOpTradeJournal
 from .rejections import RejectionTally
 
 logger = structlog.get_logger(__name__)
+
+
+def _find_chain_quote(snapshot: Optional[ChainSnapshot], symbol: str):
+    """The quote for one OCC symbol in a snapshot, or None if it did not trade."""
+    if snapshot is None:
+        return None
+    for quote in snapshot.all_quotes():
+        if quote.symbol == symbol:
+            return quote
+    return None
 
 
 def restrict_symbols(config: Config, symbols: Sequence[str]) -> Config:
@@ -86,6 +101,12 @@ class SimulationResult:
     broker: BacktestBroker
     rejections: Dict[str, int] = field(default_factory=dict)
     candidate_days: int = 0
+    dividends_credited: float = 0.0
+    early_assignments: int = 0
+    # ITM short calls sitting on an ex-date eve with no mark to price extrinsic
+    # from, so the early-assignment test could not be applied. The residual of
+    # C2, reported rather than assumed away.
+    unpriced_ex_div_calls: int = 0
 
     @property
     def final_equity(self) -> float:
@@ -116,6 +137,7 @@ class Simulator:
         fees_per_contract: float = 0.04,
         warmup_calendar_days: int = 60,
         earnings_calendar: Optional[object] = None,
+        dividend_schedule: Optional[DividendSchedule] = None,
         roll_weekday: int = 4,
     ) -> None:
         self.config = restrict_symbols(config, symbols)
@@ -143,6 +165,14 @@ class Simulator:
         if earnings_calendar is None:
             earnings_calendar = HistoricalEarningsCalendar.from_table()
         self.earnings_calendar = earnings_calendar
+        # Dividends are credited on ex-dates while shares are held, and drive
+        # ex-div early assignment. Defaults to the committed table; an explicit
+        # DividendSchedule.empty() restores the pre-FC-042 no-dividend model,
+        # which is what the fitness benchmark must also be told (see
+        # evaluate._score) so both legs stay on the same footing.
+        if dividend_schedule is None:
+            dividend_schedule = load_default_schedule()
+        self.dividends = dividend_schedule
         # Production runs the roll cycle on Fridays (weekday 4).
         self.roll_weekday = roll_weekday
 
@@ -311,6 +341,8 @@ class Simulator:
 
         daily: List[DailyState] = []
         sim_clock = SimClock(days)
+        self._early_assignments = 0
+        self._unpriced_ex_div_calls = 0
 
         # Swap the analytics singleton for a recorder: strategy code fetches it
         # from module scope, so there is no injection point. Restored on exit.
@@ -319,7 +351,15 @@ class Simulator:
         tally = RejectionTally()
         tally.__enter__()
         try:
-            for day in sim_clock.steps():
+            for i, day in enumerate(sim_clock.steps()):
+                # Dividends are credited at the OPEN of the ex-date, against
+                # shares held at the previous close — which is exactly the real
+                # ownership test (you must own before the ex-date to be on the
+                # record). Crediting after settlement instead would pay a
+                # dividend on shares a put assignment delivered on the ex-date
+                # itself, which the real holder does not receive.
+                self._credit_dividends(broker, day)
+
                 try:
                     # Pre-trade housekeeping, exactly as production does before
                     # every cycle (cloud_run_server /run). reconcile_positions()
@@ -355,6 +395,18 @@ class Simulator:
                 # dated to expire the same day, which then never settles at all.
                 broker.settle_expirations(day, closes_by_day[day])
 
+                # Ex-div early assignment, decided at tonight's close: a short
+                # ITM call whose remaining extrinsic value is less than
+                # tomorrow's dividend is assigned away tonight, so the shares —
+                # and tomorrow's dividend credit above — are gone. Runs after
+                # settlement so a call that already expired today is not
+                # assigned twice.
+                next_day = days[i + 1] if i + 1 < len(days) else None
+                if next_day is not None:
+                    self._assign_calls_before_ex_dividend(
+                        broker, chains, closes_by_day[day], day, next_day
+                    )
+
                 daily.append(self._snapshot_state(day, broker, client, closes_by_day[day]))
         finally:
             tally.__exit__(None, None, None)
@@ -370,7 +422,94 @@ class Simulator:
             broker=broker,
             rejections=tally.summary(),
             candidate_days=tally.candidate_days,
+            dividends_credited=sum(
+                e.cash_delta for e in broker.ledger if e.kind == "dividend"
+            ),
+            early_assignments=self._early_assignments,
+            unpriced_ex_div_calls=self._unpriced_ex_div_calls,
         )
+
+    # ------------------------------------------------------------------ #
+    # Dividends
+    # ------------------------------------------------------------------ #
+    def _credit_dividends(self, broker: BacktestBroker, day: date) -> None:
+        """Credit any dividend going ex today, on shares held at yesterday's close.
+
+        ``credit_dividend`` is a no-op when no shares are held, so this is safe
+        to call unconditionally on every symbol every day.
+        """
+        for symbol in self.symbols:
+            per_share = self.dividends.amount_on(symbol, day)
+            if per_share <= 0:
+                continue
+            amount = broker.credit_dividend(symbol, per_share, day)
+            if amount:
+                logger.debug(
+                    "Dividend credited",
+                    event_category="backtest",
+                    event_type="dividend_credited",
+                    symbol=symbol, day=day.isoformat(),
+                    per_share=per_share, amount=round(amount, 2),
+                )
+
+    def _assign_calls_before_ex_dividend(
+        self,
+        broker: BacktestBroker,
+        chains: Dict[str, Dict[date, ChainSnapshot]],
+        closes: Dict[str, float],
+        day: date,
+        next_day: date,
+    ) -> None:
+        """Assign short ITM calls whose extrinsic value is below tomorrow's dividend.
+
+        The mark comes from today's chain. When the contract did not trade today
+        there is no mark, and the position is **left alone** rather than assigned.
+        That is a real residual bias — an illiquid deep-ITM call genuinely has
+        near-zero extrinsic and would be assigned in life — but the alternative
+        is to treat "no data" as "zero extrinsic" and manufacture assignments
+        from silence, which is worse than the bias it removes. Counted in the
+        report's data-quality block so the size of it is visible rather than
+        assumed.
+        """
+        for symbol in self.symbols:
+            dividend = self.dividends.amount_on(symbol, next_day)
+            if dividend <= 0:
+                continue
+            spot = closes.get(symbol)
+            if spot is None:
+                continue
+            snapshot = chains.get(symbol, {}).get(day)
+            # Snapshot the calls first: assignment mutates broker.options.
+            calls = [
+                p for p in broker.options.values()
+                if p.underlying == symbol and p.option_type == "call"
+            ]
+            for pos in calls:
+                quote = _find_chain_quote(snapshot, pos.symbol)
+                if quote is None:
+                    if (spot - pos.strike) >= 0.01:
+                        self._unpriced_ex_div_calls += 1
+                    continue
+                if not should_assign_early(
+                    strike=pos.strike,
+                    underlying_price=spot,
+                    option_mark=quote.mark,
+                    dividend=dividend,
+                ):
+                    continue
+                if broker.assign_call_early(pos.symbol, day, reason="ex_dividend"):
+                    self._early_assignments += 1
+                    logger.info(
+                        "Short call assigned early ahead of ex-dividend",
+                        event_category="backtest",
+                        event_type="ex_dividend_early_assignment",
+                        symbol=pos.symbol, underlying=symbol,
+                        day=day.isoformat(), ex_date=next_day.isoformat(),
+                        strike=pos.strike, spot=round(spot, 2),
+                        mark=round(quote.mark, 4),
+                        extrinsic=round(max(0.0, quote.mark - (spot - pos.strike)), 4),
+                        dividend=dividend,
+                    )
 
     @staticmethod
     def _execute_opportunities(engine, exec_engine, cycle, client) -> None:

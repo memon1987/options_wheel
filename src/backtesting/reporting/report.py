@@ -45,26 +45,32 @@ KNOWN_BIASES = [
         "IV and delta are Black-Scholes inversions from the bar close, not "
         "published values. Dividend yield is treated as zero for every symbol, "
         "which is immaterial at ~7 DTE but not free.")),
-    ("Dividends are NOT modeled — and the bias runs BOTH ways", (
-        "No dividend is credited to either leg, and the direction of that bias "
-        "is not uniform; stating only one side of it is worse than stating "
-        "none. It FLATTERS the wheel on the buy-and-hold comparison (a WARN): "
-        "the benchmark holds shares every day and forgoes the entire dividend "
-        "stream, worth ~15 points on a 6.5% yielder over 2.4 years. But it "
-        "PENALISES the wheel on total return and return-on-collateral — the "
-        "absolute gates that actually produce an 'unfit' verdict — because "
-        "real dividends earned while holding assigned shares are simply "
-        "missing. On a 5-7% yielder that alone can push annualized return "
-        "under the 4% risk-free floor. So on the income names (F, PFE, KMI, "
-        "VZ) the verdict is biased TOWARD unfit even though the headline "
-        "benchmark line leans the other way. Do not judge a dividend payer on "
-        "this engine until dividends are modeled.")),
-    ("Early assignment is NOT modeled", (
-        "Short ITM calls are held to expiry. A real short call whose remaining "
-        "extrinsic value is less than an upcoming dividend is frequently "
-        "assigned the day before the ex-date, so the replay keeps shares — and "
-        "any later appreciation — that a live account would have lost. "
-        "Optimistic, and concentrated on the same dividend payers as above.")),
+    ("Dividends are modeled from a static table", (
+        "Both legs now collect dividends: the wheel is credited on each ex-date "
+        "it holds assigned shares, and the buy-and-hold benchmark collects the "
+        "whole stream over the window (FC-042 Track C). Amounts come from a "
+        "committed table built from Alpaca's corporate-actions endpoint — "
+        "as-declared rates, deliberately NOT split-adjusted, so they stay in "
+        "the same units as the unadjusted bars and as-listed strikes. What "
+        "remains is table staleness, not direction: the table is a snapshot "
+        "(see its `generated` date), so a window running past it credits "
+        "nothing after that point, and a rate revised after the fact is read at "
+        "its revised value. Re-run tools/backtesting/fetch_dividend_table.py "
+        "when extending a window forward. ETF rows (SPY/QQQ/IWM) are fund "
+        "distributions rather than declared corporate dividends — same cash "
+        "flow, lumpier composition, and year-end capital-gains distributions "
+        "are included.")),
+    ("Ex-dividend early assignment is modeled; other early assignment is not", (
+        "A short ITM call whose remaining extrinsic value is below the next "
+        "day's dividend is assigned the evening before the ex-date, which is "
+        "the dominant real-world early-assignment trigger (FC-042 Track C). "
+        "Two residuals. First, extrinsic is measured off that day's chain mark; "
+        "when the contract did not trade there is no mark and the position is "
+        "left alone rather than assigned — see `ex_div_calls_with_no_mark` in "
+        "the data-quality block above, which is the count of times that "
+        "happened, and is optimistic when non-zero. Second, early assignment "
+        "for reasons other than a dividend (deep-ITM pin risk, hard-to-borrow "
+        "recalls) is still unmodeled — rare, and also optimistic.")),
     ("One decision per day, with zero decision-to-fill latency", (
         "The live bot scans three times daily; the replay decides once at the "
         "close. Production also splits scanning from execution across separate "
@@ -147,6 +153,15 @@ def render_markdown(report: FitnessReport) -> str:
         a("")
         a(f"The wheel finished **{abs(excess):.2%} {verdict_word}** simply owning "
           f"{report.symbol} over the same window.")
+        if b.dividends:
+            a("")
+            a(f"Buy-and-hold's return includes **${b.dividends:,.0f}** of "
+              f"dividends (${b.dividends_per_share:.4f}/share over {b.shares} "
+              f"shares); its price return alone was {b.price_return:+.2%}. The "
+              f"wheel collected ${report.dividends:,.0f} on the days it actually "
+              f"held shares. Comparing a wheel with dividends against a "
+              f"benchmark without them is the single easiest way to make this "
+              f"table lie, so both carry them.")
     else:
         a("")
         a("_Buy-and-hold benchmark unavailable (no price at window edges)._")
@@ -169,7 +184,8 @@ def render_markdown(report: FitnessReport) -> str:
     a(f"| Option premium (net of buybacks and fees) | ${report.option_pnl:+,.2f} |")
     a(f"| Stock — realized (called away) | ${report.stock_pnl:+,.2f} |")
     a(f"| Stock — unrealized (still held) | ${report.unrealized_stock_pnl:+,.2f} |")
-    a(f"| Dividends _(not modeled — see biases)_ | ${report.dividends:+,.2f} |")
+    a(f"| Dividends (collected while holding assigned shares) | "
+      f"${report.dividends:+,.2f} |")
     a(f"| **Total** | **${report.attribution_total:+,.2f}** |")
     a("")
     a(f"_Memo: ${report.fees:,.2f} of fees is already deducted inside the option "
@@ -336,6 +352,9 @@ def render_json(report: FitnessReport, *, sensitivity: Optional[dict] = None) ->
                 "entry_price": report.benchmark.entry_price,
                 "exit_price": report.benchmark.exit_price,
                 "total_return": report.benchmark.total_return,
+                "price_return": report.benchmark.price_return,
+                "dividends": report.benchmark.dividends,
+                "dividends_per_share": report.benchmark.dividends_per_share,
                 "final_value": report.benchmark.final_value,
                 "excess_return": report.excess_return,
             }
