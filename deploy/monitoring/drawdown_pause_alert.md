@@ -79,10 +79,17 @@ gcloud run services update options-wheel-dashboard --region=us-central1 \
   --update-env-vars PAUSE_ALERT_THRESHOLD_DAYS=7
 ```
 
-**Match filter** — the marker string is emitted by
-`format_pause_alert()` in `dashboard/backend/routers/v2.py`. **Renaming the
-marker breaks the alert**; there is a unit test asserting it
+**Match filter** — the marker string is `ALERT_MARKER` in
+`dashboard/backend/services/pause_alert.py`. **Renaming it breaks the alert**;
+a unit test pins the literal
 (`tests/test_dashboard_pause_alert.py::test_carries_marker_and_is_single_line`).
+
+> Selection/formatting live in `services/pause_alert.py`, not the router, so
+> they are testable in the **bot CI image**, which does not install FastAPI —
+> only the dashboard image does. Endpoint tests are class-scoped-skipped there.
+> Do not use a module-level `pytest.importorskip`: it aborts collection of the
+> whole file and silently skips the pure tests too (CI goes green testing
+> nothing — this was caught during FC-030 implementation).
 
 ```
 resource.type="cloud_run_revision"

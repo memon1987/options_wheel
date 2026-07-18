@@ -5,12 +5,16 @@ Cloud Monitoring log-based policy matches on), and the degraded path — a
 live-proxy outage must NOT read as "nothing is paused".
 """
 
+import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dashboard" / "backend"))
 
-from routers.v2 import (  # noqa: E402
+from services.pause_alert import (  # noqa: E402
+    ALERT_MARKER,
     format_pause_alert,
     select_alertable_pauses,
 )
@@ -61,7 +65,8 @@ class TestFormatPauseAlert:
     def test_carries_marker_and_is_single_line(self):
         msg = format_pause_alert([pause("AMZN", 9, 0.0585, 262.5)], 7)
         # Marker is the policy's match string — renaming it breaks the alert.
-        assert msg.startswith("DRAWDOWN_PAUSE_ALERT")
+        assert msg.startswith(ALERT_MARKER)
+        assert ALERT_MARKER == "DRAWDOWN_PAUSE_ALERT", "policy filter depends on this literal"
         assert "\n" not in msg, "must be one line so it yields one email"
 
     def test_includes_symbol_days_and_depth(self):
@@ -83,6 +88,17 @@ class TestFormatPauseAlert:
         assert ">=14 trading days" in format_pause_alert([pause("AMZN", 20)], 14)
 
 
+# The endpoint tests import routers.v2, which needs FastAPI — present in
+# the dashboard image but NOT in the bot CI image where this suite runs.
+# Skip is deliberately CLASS-scoped: a module-level pytest.importorskip
+# would abort collection of the whole file and silently skip the pure
+# tests above too (verified — it skipped all 14), turning CI green while
+# testing nothing.
+_HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
+
+
+@pytest.mark.skipif(not _HAS_FASTAPI,
+                    reason="FastAPI only present in the dashboard image")
 class TestPauseAlertCheckEndpoint:
     """Endpoint behavior — especially that a degraded evaluation is never
     silently reported as 'nothing is paused'."""
