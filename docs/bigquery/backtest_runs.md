@@ -84,11 +84,16 @@ checked.** Filter explicitly.
 
 ## Running a full screen
 
-The `/backtest/screen` endpoint is for **ad-hoc subsets only**. It refuses more
-than 3 symbols with a 413, because Cloud Run's request timeout here is 300s and
-the scheduler's attempt deadline is 180s, while a screened symbol replays a year
-of decisions in roughly a minute — a synchronous full run would time out
-*after* partially writing.
+**The `/backtest/screen` endpoint is DISABLED by default** (503 unless
+`ENABLE_SCREEN_ENDPOINT=true`), and should stay that way until the Cloud Run Job
+below is deployed.
+
+Measured cost is **~25 minutes per symbol** cold — ~50 with the sensitivity pass
+— because `ChainStore` is not yet wired in and Cloud Run's filesystem is
+ephemeral regardless. Against a 300s request timeout, no synchronous request
+finishes even a single symbol. Running it there would burn Alpaca quota the live
+bot shares and time out with no record. (A timeout does not corrupt the table:
+persistence is one write after the loop, so a timeout writes zero rows.)
 
 Run the full universe as a batch job instead:
 
@@ -108,9 +113,18 @@ gcloud run jobs execute backtest-screen --region us-central1
 ```
 
 Then point a monthly Cloud Scheduler job at the Job's `:run` endpoint rather
-than at the HTTP service. **Not yet deployed** — `monthly-performance-review` is
-currently PAUSED and still targets the deleted
-`/backtest/performance-comparison`.
+than at the HTTP service.
+
+**Not yet deployed.** Four scheduler jobs are currently PAUSED because they
+target endpoints deleted in Phase 0: `monthly-performance-review`
+(`/backtest/performance-comparison`), `daily-quick-backtest` and
+`weekly-comprehensive-backtest` (`/backtest`), and `daily-cache-maintenance`
+(`/cache/cleanup`). `monthly-performance-review` is the one to re-point at the
+Job; the other three have no replacement and should be deleted.
+
+Before the first real screening run is used for a demotion decision, two gaps
+should close: wire `ChainStore` (turns hours into minutes) and model dividends
+(the bias runs **toward** demoting on income names — see below).
 
 ## Queries
 

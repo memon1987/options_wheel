@@ -1078,6 +1078,18 @@ def get_config():
 SCREEN_REQUEST_TIMEOUT_S = 300
 SCREEN_SYNC_SYMBOL_LIMIT = 3
 
+# The endpoint is DISABLED by default and must stay that way until two things
+# land: the Cloud Run Job (the only primitive that can actually finish a run)
+# and ChainStore wiring (measured ~25 min/symbol cold, ~50 with sensitivity —
+# no synchronous request can complete even ONE symbol inside the 300s timeout).
+#
+# It is not dead code: it is the reviewed, tested path that the Job will use,
+# and it is useful locally. But shipping a button that cannot work invites
+# someone to press it, burn ~25 min of the Alpaca quota the live bot shares,
+# and get a timeout with no record. Set ENABLE_SCREEN_ENDPOINT=true to opt in
+# once the Job exists.
+SCREEN_ENDPOINT_ENV = "ENABLE_SCREEN_ENDPOINT"
+
 
 @app.route('/backtest/screen', methods=['POST'])
 @require_api_key
@@ -1105,6 +1117,24 @@ def backtest_screen():
                 event_category="system",
                 event_type="backtest_screen_endpoint",
                 endpoint="/backtest/screen")
+
+    if os.environ.get(SCREEN_ENDPOINT_ENV, "false").lower() != "true":
+        return jsonify({
+            'status': 'disabled',
+            'reason': 'screen_endpoint_not_enabled',
+            'detail': (
+                'The screen endpoint is intentionally disabled. A screened '
+                'symbol takes ~25 min cold (~50 with the sensitivity pass), so '
+                f'no synchronous request completes inside this service\'s '
+                f'{SCREEN_REQUEST_TIMEOUT_S}s timeout — not even one symbol. '
+                'Running it here would burn Alpaca quota the live bot shares '
+                'and time out with no record. Use `python main.py --command '
+                'screen` locally, or the Cloud Run Job once deployed (see the '
+                '"Running a full screen" section of docs/bigquery/'
+                f'backtest_runs.md). Set {SCREEN_ENDPOINT_ENV}=true to enable.'
+            ),
+            'timestamp': datetime.now().isoformat(),
+        }), 503
 
     try:
         from datetime import date as _date, datetime as _datetime

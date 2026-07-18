@@ -187,11 +187,21 @@ class TestWindow:
 
 
 class TestSyncScreenIsBounded:
-    """A full-universe screen exceeds Cloud Run's 300s request timeout and the
+    """(Opts the gate on: these assert the 413 behavior *behind* the gate.)
+
+    A full-universe screen exceeds Cloud Run's 300s request timeout and the
     scheduler's 180s attempt deadline. Starting one synchronously would time out
     mid-run AFTER partially writing to BigQuery — a partial table reported as a
     failure. The endpoint refuses instead and points at the Cloud Run Job.
     """
+
+    def setup_method(self):
+        import os
+        os.environ["ENABLE_SCREEN_ENDPOINT"] = "true"
+
+    def teardown_method(self):
+        import os
+        os.environ.pop("ENABLE_SCREEN_ENDPOINT", None)
 
     def _client(self):
         import importlib
@@ -335,12 +345,63 @@ class TestConfigHashCoversScoring:
         assert before != after
 
 
+class TestEndpointIsGatedOff:
+    """Shipping a button that cannot work invites someone to press it.
+
+    At ~25 min/symbol cold, no synchronous request finishes inside the 300s
+    timeout — not even one symbol. Pressing it burns Alpaca quota the live bot
+    shares and returns a timeout with no record. Disabled until the Cloud Run
+    Job and ChainStore land.
+    """
+
+    def _client(self):
+        import importlib
+        mod = importlib.import_module("deploy.cloud_run_server")
+        mod.app.config["TESTING"] = True
+        return mod, mod.app.test_client()
+
+    def test_disabled_by_default(self, monkeypatch):
+        mod, client = self._client()
+        monkeypatch.delenv(mod.SCREEN_ENDPOINT_ENV, raising=False)
+        resp = client.post("/backtest/screen?symbols=NVDA")
+        assert resp.status_code == 503
+        body = resp.get_json()
+        assert body["status"] == "disabled"
+        assert "main.py --command screen" in body["detail"]
+        assert "Cloud Run Job" in body["detail"]
+
+    def test_opt_in_restores_the_normal_path(self, monkeypatch):
+        from unittest.mock import patch as _p
+
+        mod, client = self._client()
+        monkeypatch.setenv(mod.SCREEN_ENDPOINT_ENV, "true")
+        with _p("src.backtesting.screen.evaluate_symbol",
+                return_value=(_FakeReport("NVDA"), None)):
+            resp = client.post("/backtest/screen?symbols=NVDA&persist=false"
+                               "&sensitivity=false&start=2025-01-01&end=2025-06-30")
+        assert resp.status_code == 200, resp.get_json()
+
+    def test_the_413_guard_still_applies_when_enabled(self, monkeypatch):
+        mod, client = self._client()
+        monkeypatch.setenv(mod.SCREEN_ENDPOINT_ENV, "true")
+        resp = client.post("/backtest/screen?symbols=A,B,C,D,E,F,G,H")
+        assert resp.status_code == 413
+
+
 class TestSyncGuardCannotBeBypassed:
     def _client(self):
         import importlib
         mod = importlib.import_module("deploy.cloud_run_server")
         mod.app.config["TESTING"] = True
         return mod, mod.app.test_client()
+
+    def setup_method(self):
+        import os
+        os.environ["ENABLE_SCREEN_ENDPOINT"] = "true"
+
+    def teardown_method(self):
+        import os
+        os.environ.pop("ENABLE_SCREEN_ENDPOINT", None)
 
     def test_max_symbols_query_param_cannot_raise_the_limit(self):
         _, client = self._client()
