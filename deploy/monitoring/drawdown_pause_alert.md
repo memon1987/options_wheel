@@ -94,13 +94,20 @@ a unit test pins the literal
 ```
 resource.type="cloud_run_revision"
 AND resource.labels.service_name="options-wheel-dashboard"
-AND severity>=WARNING
-AND textPayload:"DRAWDOWN_PAUSE_ALERT"
+AND (textPayload:"DRAWDOWN_PAUSE_ALERT" OR jsonPayload.message:"DRAWDOWN_PAUSE_ALERT")
 ```
 
-Note the filter deliberately matches the `_CHECK_FAILED` marker too — a check
-that cannot evaluate is itself worth knowing about (a silent evaluator is the
-FC-006 failure mode).
+**Do not add a `severity>=WARNING` clause.** The first version of this policy
+had one and would never have fired: Cloud Run captures the app's stderr as
+plain text with an **empty** severity field, so `logging.warning()` does *not*
+produce a WARNING-severity log entry. Verified in the 2026-07-18 fire drill —
+the severity-constrained filter matched **0** entries while the alert line was
+sitting in Cloud Logging. This is exactly why the fire drill is mandatory.
+
+Both payload shapes are matched so structured logging can be adopted later
+without breaking the alert. The filter also matches the `_CHECK_FAILED` marker
+— a check that cannot evaluate is itself worth knowing about (a silent
+evaluator is the FC-006 failure mode).
 
 ### Create the policy
 
