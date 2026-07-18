@@ -275,3 +275,57 @@ class TestRestrictSymbols:
         narrowed = restrict_symbols(config, ["NVDA"])
         assert narrowed.stock_symbols == ["NVDA"]
         assert config.stock_symbols == original
+
+
+class TestAnalyticsIsolationIsReal:
+    """Reviewers proved these paths were untested: mutating the analytics swap
+    to a no-op left every simulator test green, meaning a replay writing
+    simulated fills into the PRODUCTION analytics singleton would not be caught.
+    """
+
+    def test_noop_writer_is_installed_for_the_whole_run(self, falling_then_flat):
+        """Assert the singleton is swapped *while the day loop runs*.
+
+        Checked from inside the loop rather than by spying on
+        get_analytics_writer: the strategy only reaches that call on certain
+        branches, so a spy can pass vacuously by never firing. What matters is
+        that any call made at any point during the run would land on the no-op.
+        """
+        days, closes, exps = falling_then_flat
+        seen = []
+
+        sim = _simulator("XYZ", closes, exps, days)
+        original = sim._execute_opportunities
+
+        def observing(engine, exec_engine, cycle, client):
+            seen.append(type(analytics_module.get_analytics_writer()).__name__)
+            return original(engine, exec_engine, cycle, client)
+
+        sim._execute_opportunities = observing
+        sim.run()
+
+        assert seen, "day loop never ran"
+        assert set(seen) == {"NoOpAnalyticsWriter"}, (
+            f"strategy code would have reached {set(seen)} — a real writer sends "
+            "simulated trades to production analytics"
+        )
+
+    def test_singleton_restored_when_the_run_raises_AFTER_the_swap(self):
+        """The old test raised ~40 lines BEFORE the swap, so the finally never ran."""
+        days = _weekdays(date(2024, 6, 3), 10)
+        closes = {d: 100.0 for d in days}
+        exps = [d for d in days if d.weekday() == 4]
+        before = analytics_module._instance
+
+        sim = _simulator("XYZ", closes, exps, days)
+        original = sim._execute_opportunities
+
+        def boom(*a, **kw):
+            raise RuntimeError("blew up inside the day loop")
+
+        sim._execute_opportunities = boom
+        with pytest.raises(RuntimeError, match="blew up inside the day loop"):
+            sim.run()
+
+        assert analytics_module._instance is before
+        assert not clock.is_frozen()

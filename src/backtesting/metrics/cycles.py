@@ -157,16 +157,29 @@ def build_cycles(ledger: Iterable[LedgerEvent]) -> List[WheelCycle]:
             open_contracts[underlying] = open_contracts.get(underlying, 0) - event.contracts
         elif kind == "put_assignment":
             cycle.assigned = True
-            cycle.shares_acquired += event.shares
-            cycle.cost_basis = event.price
+            # Share-weighted, not last-wins. Two assignments at different
+            # strikes previously kept only the last basis and applied it to
+            # every called-away share: assigned 100@100 then 100@90, called
+            # away 200@105 reported $3,000 of stock P&L against a true $2,000
+            # — a 50% overstatement of the stock leg.
+            prior_shares = cycle.shares_acquired
+            prior_basis = cycle.cost_basis or 0.0
+            cycle.shares_acquired = prior_shares + event.shares
+            cycle.cost_basis = (
+                (prior_basis * prior_shares + event.price * event.shares)
+                / cycle.shares_acquired
+            ) if cycle.shares_acquired else event.price
             open_contracts[underlying] = open_contracts.get(underlying, 0) - event.contracts
             shares[underlying] = shares.get(underlying, 0) + event.shares
         elif kind == "call_assignment":
             cycle.called_away = True
             cycle.exit_price = event.price
-            # Realized stock P&L: proceeds at strike minus what we paid.
+            # Realized stock P&L: proceeds at strike minus the weighted basis.
             if cycle.cost_basis is not None:
                 cycle.stock_pnl += (event.price - cycle.cost_basis) * event.shares
+                # Disposal consumes shares, so a later assignment re-weights
+                # against what actually remains.
+                cycle.shares_acquired = max(0, cycle.shares_acquired - event.shares)
             open_contracts[underlying] = open_contracts.get(underlying, 0) - event.contracts
             shares[underlying] = shares.get(underlying, 0) - event.shares
         elif kind == "dividend":

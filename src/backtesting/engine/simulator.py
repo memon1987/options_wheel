@@ -48,6 +48,7 @@ from .broker import BacktestBroker
 from .clock import SimClock
 from .historical_earnings import HistoricalEarningsCalendar
 from .no_op_analytics import NoOpAnalyticsWriter, NoOpTradeJournal
+from .rejections import RejectionTally
 
 logger = structlog.get_logger(__name__)
 
@@ -83,6 +84,8 @@ class SimulationResult:
     starting_cash: float
     daily: List[DailyState]
     broker: BacktestBroker
+    rejections: Dict[str, int] = field(default_factory=dict)
+    candidate_days: int = 0
 
     @property
     def final_equity(self) -> float:
@@ -247,6 +250,8 @@ class Simulator:
         # from module scope, so there is no injection point. Restored on exit.
         no_op = NoOpAnalyticsWriter()
         previous_writer = analytics_module.set_analytics_writer(no_op)
+        tally = RejectionTally()
+        tally.__enter__()
         try:
             for day in sim_clock.steps():
                 try:
@@ -286,6 +291,7 @@ class Simulator:
 
                 daily.append(self._snapshot_state(day, broker, client, closes_by_day[day]))
         finally:
+            tally.__exit__(None, None, None)
             analytics_module.set_analytics_writer(previous_writer)
 
         self._analytics = no_op
@@ -296,6 +302,8 @@ class Simulator:
             starting_cash=self.starting_cash,
             daily=daily,
             broker=broker,
+            rejections=tally.summary(),
+            candidate_days=tally.candidate_days,
         )
 
     @staticmethod

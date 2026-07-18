@@ -27,7 +27,7 @@ def _reset_time_seam():
 
 
 @pytest.fixture(autouse=True)
-def _no_production_bigquery(monkeypatch):
+def _no_production_bigquery(monkeypatch, request):
     """No test may query production BigQuery, whatever credentials are present.
 
     CallSeller's cost-basis floor falls back to a BigQuery OPASN lookup
@@ -42,6 +42,15 @@ def _no_production_bigquery(monkeypatch):
     test, so the fallback is stubbed out globally here. Tests that want to
     exercise it should inject their own value explicitly.
     """
+    # A test that is specifically exercising the BigQuery fallback opts out with
+    # @pytest.mark.real_bq_lookup. Without this escape hatch the blanket stub
+    # made test_lookup_last_opasn_put_strike_handles_bq_failure vacuous — it
+    # asserted the stub's return value, and the try/except it exists to cover
+    # (the only thing keeping the bot alive when BQ is down) had zero coverage.
+    if request.node.get_closest_marker("real_bq_lookup"):
+        yield
+        return
+
     from src.strategy.call_seller import CallSeller
 
     monkeypatch.setattr(

@@ -17,16 +17,29 @@ code paths. The freeze is process-global (a backtest runs single-threaded);
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-_frozen_now: Optional[datetime] = None
+# THREAD-LOCAL, deliberately. The freeze must never be visible to a thread that
+# did not set it: deploy/cloud_run_server.py runs Flask with threaded=True, so a
+# process-global freeze set by a backtest would corrupt every concurrent live
+# decision — DTE, min-hold windows and entry stamps would all be computed
+# against the simulated date. Today no in-process backtest entry point exists,
+# but "safe because nothing calls it" is a property of the current call graph,
+# not of this module. Thread-local makes it safe by construction.
+_state = threading.local()
+
+
+def _get_frozen() -> Optional[datetime]:
+    return getattr(_state, "frozen_now", None)
 
 
 def now() -> datetime:
     """Current time — real wall clock in production, simulated time under a freeze."""
-    return _frozen_now if _frozen_now is not None else datetime.now()
+    frozen = _get_frozen()
+    return frozen if frozen is not None else datetime.now()
 
 
 def now_utc() -> datetime:
@@ -38,31 +51,30 @@ def now_utc() -> datetime:
     day-count logic (DTE) actually wants. Converting instead would drag the
     simulated date across a boundary and silently shift every DTE by a day.
     """
-    if _frozen_now is None:
+    frozen = _get_frozen()
+    if frozen is None:
         return datetime.now(timezone.utc)
-    if _frozen_now.tzinfo is None:
-        return _frozen_now.replace(tzinfo=timezone.utc)
-    return _frozen_now
+    if frozen.tzinfo is None:
+        return frozen.replace(tzinfo=timezone.utc)
+    return frozen
 
 
 def set_now(dt: Optional[datetime]) -> None:
-    """Freeze ``now()`` to ``dt`` (or clear the freeze with None)."""
-    global _frozen_now
-    _frozen_now = dt
+    """Freeze ``now()`` to ``dt`` (or clear the freeze with None). Thread-local."""
+    _state.frozen_now = dt
 
 
 def is_frozen() -> bool:
-    """True when a simulated time is currently in effect."""
-    return _frozen_now is not None
+    """True when a simulated time is in effect on THIS thread."""
+    return _get_frozen() is not None
 
 
 @contextmanager
 def frozen(dt: datetime):
     """Temporarily freeze ``now()`` to ``dt``, restoring the prior state on exit."""
-    global _frozen_now
-    prev = _frozen_now
-    _frozen_now = dt
+    prev = _get_frozen()
+    _state.frozen_now = dt
     try:
         yield
     finally:
-        _frozen_now = prev
+        _state.frozen_now = prev

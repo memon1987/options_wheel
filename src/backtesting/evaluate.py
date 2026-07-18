@@ -112,6 +112,8 @@ def _data_quality(result: SimulationResult, cycles: Sequence) -> Dict:
     """Facts a reader needs to judge whether the result rests on real data."""
     return {
         "decision_days": len(result.daily),
+        "days_with_a_qualifying_candidate": result.candidate_days,
+        "blocked_days_by_reason": result.rejections,
         "ledger_events": len(result.broker.ledger),
         "cycles_still_open_at_end": sum(1 for c in cycles if c.is_open),
         "option_marks": "daily bar closes (trade prints); bid/ask modeled",

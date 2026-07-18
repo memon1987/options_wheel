@@ -96,6 +96,31 @@ def render_markdown(report: FitnessReport) -> str:
         a(f"- {reason}")
     a("")
 
+    # Why the strategy stood down. A verdict that hides its own binding
+    # constraint invites the wrong action: "this symbol is unfit" reads very
+    # differently from "our gap filter excludes this symbol in high-vol regimes".
+    blocked = report.data_quality.get("blocked_days_by_reason") or {}
+    if blocked:
+        candidates = report.data_quality.get("days_with_a_qualifying_candidate")
+        a("### Why the strategy stood down")
+        a("")
+        a("| blocking reason | days |")
+        a("|---|---:|")
+        for reason, count in blocked.items():
+            a(f"| {reason} | {count} |")
+        a("")
+        top = next(iter(blocked))
+        a(f"The binding constraint was **{top}**.")
+        if candidates is not None:
+            a("")
+            a(f"The chain was actually *examined* on **{candidates}** of "
+              f"{report.decision_days} decision days and offered a qualifying "
+              f"candidate on those. On the rest an earlier stage blocked first, "
+              f"so this is NOT a count of days a tradeable option existed — "
+              f"where the binding constraint sits upstream of stage 7, the "
+              f"chain was never looked at.")
+        a("")
+
     # ---- Headline: strategy vs the only benchmark that matters --------------
     a("## Strategy vs buy-and-hold")
     a("")

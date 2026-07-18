@@ -16,6 +16,7 @@ from __future__ import annotations
 import pathlib
 import re
 from datetime import datetime, timedelta, timezone
+import pytest
 from unittest.mock import Mock
 
 from src.strategy.put_seller import PutSeller
@@ -149,3 +150,62 @@ class TestNoDirectWallClockReads:
             "these modules must call clock.now()/clock.now_utc() so a backtest "
             "can freeze time:\n" + "\n".join(offenders)
         )
+
+
+class TestFreezeNeverLeaks:
+    """A leaked freeze is the scariest failure mode in this design.
+
+    Reviewers proved the whole suite passed with SimClock's try/finally removed —
+    it worked only via CPython generator GC, and conftest's reset fixture masked
+    it. These pin the behavior directly.
+    """
+
+    def _clock(self):
+        from datetime import date
+
+        from src.backtesting.engine.clock import SimClock
+        return SimClock([date(2024, 6, 3), date(2024, 6, 4), date(2024, 6, 5)])
+
+    def test_exception_mid_iteration_still_clears_the_freeze(self):
+        sim = self._clock()
+        with pytest.raises(RuntimeError):
+            for _ in sim.steps():
+                assert clock.is_frozen()
+                raise RuntimeError("strategy blew up mid-replay")
+        assert not clock.is_frozen(), "freeze leaked after an exception"
+
+    def test_break_mid_iteration_still_clears_the_freeze(self):
+        sim = self._clock()
+        for _ in sim.steps():
+            assert clock.is_frozen()
+            break
+        assert not clock.is_frozen(), "freeze leaked after an early break"
+
+    def test_simclock_restores_an_outer_freeze_rather_than_clearing_it(self):
+        """SimClock and clock.frozen() must not have opposite semantics."""
+        outer = datetime(2030, 1, 1, 12, 0)
+        sim = self._clock()
+        with clock.frozen(outer):
+            for _ in sim.steps():
+                pass
+            assert clock.is_frozen(), "SimClock dropped the caller's freeze"
+            assert clock.now() == outer
+        assert not clock.is_frozen()
+
+    def test_freeze_is_not_visible_to_another_thread(self):
+        """cloud_run_server runs Flask threaded=True; a backtest freeze in one
+
+        thread must never reach a live trading decision in another.
+        """
+        import threading
+
+        seen = {}
+
+        def worker():
+            seen["frozen"] = clock.is_frozen()
+
+        with clock.frozen(datetime(2024, 6, 3, 16, 0)):
+            t = threading.Thread(target=worker)
+            t.start()
+            t.join()
+        assert seen["frozen"] is False, "freeze leaked across threads"

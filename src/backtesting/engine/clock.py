@@ -55,6 +55,10 @@ class SimClock:
         ``now()`` is the decision timestamp for ``day``. The freeze is cleared
         when iteration completes or the loop is exited.
         """
+        # Restore the prior value rather than clearing, so SimClock and
+        # clock.frozen() have the same semantics; clearing made a SimClock
+        # nested inside a frozen block silently drop the outer freeze.
+        previous = _clock.now() if _clock.is_frozen() else None
         try:
             for i, d in enumerate(self._days):
                 self._idx = i
@@ -62,4 +66,4 @@ class SimClock:
                 yield d
         finally:
             self._idx = len(self._days)
-            _clock.set_now(None)
+            _clock.set_now(previous)
