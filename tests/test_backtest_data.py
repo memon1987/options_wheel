@@ -672,17 +672,22 @@ class TestStrikeWindow:
         eligible = [s for s in (180.0, 185.0, 190.0, 200.0) if lo <= s <= hi]
         assert eligible == [180.0, 185.0, 190.0, 200.0]
 
-    def test_window_is_wide_enough_for_the_measured_delta_band(self):
+    @pytest.mark.parametrize("spot", [12.5, 100.0, 185.54, 932.0])
+    def test_window_admits_every_strike_in_the_measured_delta_band(self, spot):
         """Guards the constant against being 'optimised' into wrongness.
 
         Measured on NVDA over five sessions (2025-10-06 .. 2026-03-09), the
-        0.10-0.20 delta band spanned 0.917x-1.054x spot. The window must keep
-        clearing that with room to spare, or the filter starts changing which
-        strike the strategy picks instead of just how fast it gets there.
+        0.10-0.20 delta band spanned 0.917x-1.054x spot. Every strike in that
+        range must survive the real window function at any price scale, or the
+        filter starts changing which strike the strategy picks instead of just
+        how fast it gets there.
         """
-        worst_low, worst_high = 0.917, 1.054
-        assert 1.0 - STRIKE_WINDOW_PCT < worst_low - 0.05
-        assert 1.0 + STRIKE_WINDOW_PCT > worst_high + 0.05
+        lo, hi = strike_window(spot)
+        for factor in (0.917, 0.95, 1.0, 1.02, 1.054):
+            strike = spot * factor
+            assert lo <= strike <= hi, f"band strike {factor}x spot was clipped"
+        # And a margin beyond the measured edges, since the band moves with vol.
+        assert lo < spot * 0.85 and hi > spot * 1.15
 
     def test_bounds_are_forwarded_to_the_provider(self):
         p = MockProvider()
@@ -939,3 +944,103 @@ class TestProviderStrikeBounds:
 
         provider.get_contract_universe("NVDA", as_of, 8, strike_gte=50.0, strike_lte=300.0)
         assert len(seen) > n_after_first, "different window must not reuse the memo"
+
+
+class TestCacheModelFingerprint:
+    """bid/ask/delta/iv are COMPUTED, so the model is part of the cache key.
+
+    Without this, FC-042 Track C1 (real dividend yields) and C3 (spread-model
+    recalibration) would silently invalidate nothing: Track B's studies would
+    re-run warm and mix quotes priced under two different models, with no error
+    and no TTL.
+    """
+
+    def _fixture(self, tmp_path):
+        return _CacheFixture(tmp_path)
+
+    def _build(self, f, **kw):
+        return ChainBuilder(f.provider, store=f.store, **kw).build(
+            "XYZ", f.as_of, max_dte=7
+        )
+
+    def test_a_different_risk_free_rate_is_a_miss(self, tmp_path):
+        f = self._fixture(tmp_path)
+        cold = self._build(f, risk_free_rate=0.04)
+        after = f.calls()
+        warm = self._build(f, risk_free_rate=0.25)
+        assert f.calls() != after, "changed rate must refetch, not reuse deltas"
+        assert [q.delta for q in warm.puts] != [q.delta for q in cold.puts]
+
+    def test_a_different_dividend_yield_is_a_miss(self, tmp_path):
+        f = self._fixture(tmp_path)
+        self._build(f)
+        after = f.calls()
+        self._build(f, dividend_yields={"XYZ": 0.10})
+        assert f.calls() != after
+
+    def test_a_different_spread_model_is_a_miss(self, tmp_path):
+        f = self._fixture(tmp_path)
+        cold = self._build(f)
+        after = f.calls()
+        warm = self._build(f, spread_model=SpreadModel(base_frac=0.50))
+        assert f.calls() != after, "changed spread model must refetch"
+        assert [q.bid for q in warm.puts] != [q.bid for q in cold.puts]
+
+    def test_the_same_model_still_hits(self, tmp_path):
+        """The invalidation must not be so eager that nothing ever caches."""
+        f = self._fixture(tmp_path)
+        self._build(f, risk_free_rate=0.04)
+        after = f.calls()
+        self._build(f, risk_free_rate=0.04)
+        assert f.calls() == after
+
+    def test_dividend_yield_for_another_symbol_does_not_invalidate(self, tmp_path):
+        """The fingerprint is per-symbol; an unrelated entry must not bust it."""
+        f = self._fixture(tmp_path)
+        self._build(f, dividend_yields={"XYZ": 0.03})
+        after = f.calls()
+        self._build(f, dividend_yields={"XYZ": 0.03, "OTHER": 0.09})
+        assert f.calls() == after
+
+
+class TestCacheDurability:
+    def test_a_corrupt_file_is_discarded_rather_than_raising(self, tmp_path):
+        """A torn parquet must not wedge every future run on the same day."""
+        f = _CacheFixture(tmp_path)
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        path = f.store._path("XYZ", f.as_of)
+        assert path.exists()
+
+        path.write_bytes(b"not a parquet file")
+        after_corrupt = f.calls()
+        snap = f.builder().build("XYZ", f.as_of, max_dte=7)
+
+        assert snap is not None, "a corrupt entry must fall back to the provider"
+        assert f.calls() != after_corrupt, "it must actually refetch"
+        # And it must have healed, so the next run is warm again.
+        healed = f.calls()
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        assert f.calls() == healed
+
+    def test_a_zero_byte_file_is_discarded(self, tmp_path):
+        f = _CacheFixture(tmp_path)
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        f.store._path("XYZ", f.as_of).write_bytes(b"")
+        assert f.builder().build("XYZ", f.as_of, max_dte=7) is not None
+
+    def test_put_leaves_no_temp_file_behind(self, tmp_path):
+        f = _CacheFixture(tmp_path)
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        leftovers = list(f.store._path("XYZ", f.as_of).parent.glob("*.tmp"))
+        assert leftovers == []
+
+    def test_a_one_sided_strike_bound_does_not_raise(self, tmp_path):
+        """Latent landmine for Track B's config-override hook."""
+        f = _CacheFixture(tmp_path)
+        snap = f.builder().build("XYZ", f.as_of, max_dte=7)
+        f.store.put(snap, universe_dte=8, strike_gte=75.0, strike_lte=125.0, model="m")
+
+        only_lower = f.store.get("XYZ", f.as_of, strike_gte=90.0, model="m")
+        assert [q.strike for q in only_lower.puts] == [95.0, 100.0]
+        only_upper = f.store.get("XYZ", f.as_of, strike_lte=90.0, model="m")
+        assert [q.strike for q in only_upper.puts] == [85.0]

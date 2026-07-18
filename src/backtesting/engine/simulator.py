@@ -174,7 +174,7 @@ class Simulator:
         chains: Dict[str, Dict[date, ChainSnapshot]] = {}
         for symbol in self.symbols:
             closes = {b.bar_date: b.close for b in stock_bars.get(symbol, [])}
-            ceiling = self._cost_basis_ceiling(stock_bars.get(symbol, []))
+            ceiling, floor = self._strike_anchors(stock_bars.get(symbol, []))
             per_day: Dict[date, ChainSnapshot] = {}
             for day in days:
                 if day not in closes:
@@ -185,35 +185,55 @@ class Simulator:
                     self.max_dte,
                     underlying_price=closes[day],
                     cost_basis=ceiling,
+                    low_anchor=floor,
                 )
                 if snap is not None:
                     per_day[day] = snap
             chains[symbol] = per_day
         return chains
 
-    @staticmethod
-    def _cost_basis_ceiling(bars: Sequence[StockBar]) -> Optional[float]:
-        """An upper bound on any cost basis this run can reach, per symbol.
+    def _strike_anchors(
+        self, bars: Sequence[StockBar]
+    ) -> "tuple[Optional[float], Optional[float]]":
+        """``(cost_basis_ceiling, low_anchor)`` for this symbol's strike window.
 
         Chains are built for the whole window *before* the day loop starts, so
         at build time there is no position to read a real cost basis from. What
-        we can do is bound it. Shares only ever arrive by put assignment, and
-        the wheel only sells puts struck at or below spot, so the cost basis of
-        any lot this run acquires is at most the highest close in the window
-        (assignment at strike K <= close on the day it was sold, less premium).
-        Feeding that bound to ``strike_window`` guarantees the call ladder above
-        cost basis is fetched on every day, including for a position that goes
-        deeply underwater later.
+        we can do is bound the prices any position can be struck against:
 
-        Using the window's later closes to widen a *fetch* is not lookahead:
-        the window can only ever grow the set of contracts offered to the
-        strategy, never change any contract's point-in-time price, and the
-        alternative — a spot-centred window — is the one that would alter
-        decisions by hiding eligible calls. The cost is some extra strikes
-        fetched on trending symbols.
+        * **Ceiling** — shares only ever arrive by put assignment, and the wheel
+          only sells puts struck at or below spot, so no lot this run acquires
+          can cost more than the highest close (assignment at strike K <= the
+          close on the day it was sold, less premium). This keeps the call
+          ladder above cost basis fetched even for a position that goes deeply
+          underwater later.
+        * **Floor** — the mirror case: a short put stays on the book while the
+          underlying rallies, and its strike must remain in the chain or the
+          position marks at zero and cannot be closed. The lowest close bounds
+          the lowest strike the run can ever be short.
+
+        Both are computed from **decision-window bars only**. Warm-up bars are
+        loaded purely to give GapDetector its lookback, and a split inside the
+        warm-up buffer is explicitly tolerated (see ``run``) — for NVDA that
+        means a pre-split close of 1224.40 sitting in the same series as a ~180
+        spot. Including it would set the ceiling ~7x too high and silently turn
+        the strike filter into a no-op for every run starting within the warm-up
+        buffer of the June 2024 split.
+
+        Using the window's later closes to widen a *fetch* is not lookahead: it
+        can only grow the set of contracts offered to the strategy, never change
+        any contract's point-in-time price, and the alternative — a spot-centred
+        window — is the one that would alter decisions by hiding contracts the
+        strategy is holding. The cost is extra strikes fetched on trending
+        symbols, which grows with window length; see the plan's follow-up note
+        on building chains lazily per-day instead.
         """
-        closes = [b.close for b in bars if b.close > 0]
-        return max(closes) if closes else None
+        closes = [
+            b.close for b in bars if b.close > 0 and self.start <= b.bar_date <= self.end
+        ]
+        if not closes:
+            return None, None
+        return max(closes), min(closes)
 
     # ------------------------------------------------------------------ #
     # Run

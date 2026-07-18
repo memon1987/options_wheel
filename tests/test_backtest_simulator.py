@@ -344,19 +344,85 @@ class TestStrikeWindowCoversAssignedPositions:
     instead — see ``Simulator._cost_basis_ceiling``.
     """
 
-    def test_ceiling_is_the_highest_close_in_the_window(self, falling_then_flat):
-        days, closes, expirations = falling_then_flat
-        bars = ScriptedProvider("XYZ", closes, expirations).get_stock_bars(
-            "XYZ", days[0] - timedelta(days=90), days[-1]
-        )
-        ceiling = Simulator._cost_basis_ceiling(bars)
-        assert ceiling == pytest.approx(max(b.close for b in bars))
-        # No lot can cost more than this: shares arrive only by assignment on a
-        # put struck at or below the spot of the day it was sold.
-        assert ceiling >= max(closes.values())
+    def test_anchors_bracket_every_price_a_position_can_be_struck_against(
+        self, falling_then_flat
+    ):
+        """The property, not the implementation: no strike can escape the window.
 
-    def test_no_bars_yields_no_ceiling(self):
-        assert Simulator._cost_basis_ceiling([]) is None
+        Puts are sold at or below spot and assigned lots cost at most that
+        strike, so every price any position is struck against on any decision
+        day must lie between the two anchors.
+        """
+        days, closes, expirations = falling_then_flat
+        sim = _simulator("XYZ", closes, expirations, days)
+        bars = sim._load_stock_bars()["XYZ"]
+        ceiling, floor = sim._strike_anchors(bars)
+
+        decision_closes = [closes[d] for d in days]
+        assert ceiling >= max(decision_closes)
+        assert floor <= min(decision_closes)
+
+    def test_no_bars_yields_no_anchors(self, falling_then_flat):
+        days, closes, expirations = falling_then_flat
+        sim = _simulator("XYZ", closes, expirations, days)
+        assert sim._strike_anchors([]) == (None, None)
+
+    def test_warmup_bars_cannot_inflate_the_ceiling(self, falling_then_flat):
+        """A split inside the warm-up buffer must not neuter the strike filter.
+
+        Warm-up bars are tolerated across a split (the simulator only warns),
+        so NVDA's pre-split 1224.40 can sit in the same series as a ~180 spot.
+        Reading it as a cost basis would push the window's upper bound ~7x too
+        high and turn the filter into a no-op for the whole run.
+        """
+        days, closes, expirations = falling_then_flat
+        sim = _simulator("XYZ", closes, expirations, days)
+        bars = sim._load_stock_bars()["XYZ"]
+        pre_split = StockBar("XYZ", days[0] - timedelta(days=40),
+                             1224.40, 1224.40, 1224.40, 1224.40, 1_000_000)
+        ceiling, _ = sim._strike_anchors([pre_split, *bars])
+        assert ceiling < 200.0, "warm-up close leaked into the cost-basis ceiling"
+
+    def test_an_open_short_put_survives_a_rally_out_of_the_window(
+        self, falling_then_flat
+    ):
+        """The lower-bound mirror of the covered-call case.
+
+        A put sold near 0.93x spot leaves a spot-centred window once the
+        underlying rallies ~24%. The contract is then missing from the chain of
+        a position that is still open, which marks it at 0.00 and makes it
+        impossible to close — a winning early close silently becomes a
+        hold-to-expiry.
+        """
+        days = _weekdays(date(2024, 6, 3), 30)
+        warmup = _weekdays(date(2024, 3, 25), 45)
+        closes = {d: 100.0 for d in warmup}
+        for i, d in enumerate(days):  # 100 -> 160, a 60% rally
+            closes[d] = 100.0 + min(i, 20) * 3.0
+        expirations = [d for d in days if d.weekday() == 4]
+
+        class WideLadderProvider(ScriptedProvider):
+            def _ladder(self, spot):
+                return [float(k) for k in range(50, 251)]
+
+        provider = WideLadderProvider("XYZ", closes, expirations)
+        sim = Simulator(
+            Config(), provider, ChainBuilder(provider, risk_free_rate=0.04),
+            ["XYZ"], days[0], days[-1], starting_cash=50_000.0, max_dte=7,
+        )
+        stock_bars = sim._load_stock_bars()
+        chains = sim._build_chains(stock_bars, sim._trading_days(stock_bars))["XYZ"]
+
+        early_strike = 93.0  # a put sold near the start, ~0.93x spot of 100
+        peak_days = [d for d in chains if closes[d] == max(closes[x] for x in days)]
+        assert peak_days
+        assert max(closes[d] for d in days) * (1 - STRIKE_WINDOW_PCT) > early_strike, (
+            "precondition: a spot-centred window would drop the open put"
+        )
+        for day in peak_days:
+            assert [q for q in chains[day].puts if q.strike == early_strike], (
+                f"{day}: the still-open short put fell out of the chain"
+            )
 
     def test_calls_above_cost_basis_survive_a_60_percent_drawdown(
         self, falling_then_flat

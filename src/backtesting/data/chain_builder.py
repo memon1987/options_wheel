@@ -16,6 +16,7 @@ Correctness contract (enforced by tests):
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -58,26 +59,43 @@ STRIKE_WINDOW_PCT = 0.25
 
 
 def strike_window(
-    underlying_price: float, cost_basis: Optional[float] = None
+    underlying_price: float,
+    cost_basis: Optional[float] = None,
+    low_anchor: Optional[float] = None,
 ) -> Tuple[float, float]:
     """The strike range to fetch for an underlying at ``underlying_price``.
 
-    Symmetric +/-``STRIKE_WINDOW_PCT`` around spot, with the UPPER bound
-    extended to cover ``cost_basis`` when shares are held.
+    +/-``STRIKE_WINDOW_PCT`` around spot, with each bound pushed outward to keep
+    strikes the run may still be *holding* inside the window:
 
-    The extension is not cosmetic. A covered call must be struck above the
-    cost basis of the shares it covers (the strategy refuses to write one that
-    would lock in a loss on assignment), so for an underwater position the only
-    *eligible* calls are the ones above cost basis — which is exactly where a
-    spot-centred window stops looking. A position 30% underwater would find an
-    empty call ladder and simply never roll, and the replay would show the
-    position sitting idle rather than the covered call the live bot wrote.
+    * ``cost_basis`` extends the UPPER bound. A covered call must be struck
+      above the cost basis of the shares it covers (the strategy refuses to
+      write one that would lock in a loss on assignment), so for an underwater
+      position the only *eligible* calls are the ones above cost basis — which
+      is exactly where a spot-centred window stops looking. A position 30%
+      underwater would find an empty call ladder and never roll, and the replay
+      would show it sitting idle rather than writing the call the live bot did.
+
+    * ``low_anchor`` extends the LOWER bound, and is the mirror-image bug. A
+      short put struck near 0.93x spot leaves the window as soon as the
+      underlying rallies ~24%, and the contract is then missing from the chain
+      of a position that is still open. That is worse than it sounds: the
+      adapter has no intrinsic fallback for options, so the position marks at
+      0.00 (reporting the whole credit as profit) and any close or roll is
+      rejected "no_quote" — silently converting a winning early close into a
+      hold-to-expiry. Measured over 2024-07..2026-07 this clips a real position
+      on 21 AMD and 13 TSLA entry days.
     """
-    lo = underlying_price * (1.0 - STRIKE_WINDOW_PCT)
-    anchor_hi = underlying_price
-    if cost_basis is not None and cost_basis > anchor_hi:
-        anchor_hi = cost_basis
-    return lo, anchor_hi * (1.0 + STRIKE_WINDOW_PCT)
+    lo_anchor = underlying_price
+    if low_anchor is not None and low_anchor < lo_anchor:
+        lo_anchor = low_anchor
+    hi_anchor = underlying_price
+    if cost_basis is not None and cost_basis > hi_anchor:
+        hi_anchor = cost_basis
+    return (
+        lo_anchor * (1.0 - STRIKE_WINDOW_PCT),
+        hi_anchor * (1.0 + STRIKE_WINDOW_PCT),
+    )
 
 
 def _is_cacheable(as_of: date) -> bool:
@@ -166,6 +184,33 @@ class ChainBuilder:
         self._div = dividend_yields or {}
         self._store = store
 
+    def _model_fingerprint(self, underlying: str) -> str:
+        """Identity of every model input baked into a cached quote.
+
+        ``bid``, ``ask``, ``delta`` and ``implied_volatility`` are not fetched —
+        they are computed here from the risk-free rate, the symbol's dividend
+        yield and the spread model. None of that is implied by
+        ``(symbol, as_of)``, so without this in the cache key a run that changes
+        any of them reads back quotes computed under the OLD model and reports
+        them as its own, with no error and no TTL to expire them.
+
+        This is not a hypothetical: FC-042 Track C1 wires real dividend yields
+        and Track C3 recalibrates the spread model, while Track B's studies run
+        off this cache in between. A study re-run after C1/C3 would otherwise
+        silently mix two different pricing models.
+
+        Bumping ``SCHEMA`` invalidates every existing entry — do that whenever
+        the *derivation* changes rather than its inputs (a new IV solver, a
+        different moneyness definition).
+        """
+        parts = (
+            "v1",  # SCHEMA
+            f"r={self._r!r}",
+            f"q={self._div.get(underlying, 0.0)!r}",
+            f"spread={self._spread!r}",
+        )
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
     def build(
         self,
         underlying: str,
@@ -174,6 +219,7 @@ class ChainBuilder:
         *,
         underlying_price: Optional[float] = None,
         cost_basis: Optional[float] = None,
+        low_anchor: Optional[float] = None,
     ) -> Optional[ChainSnapshot]:
         """Construct the chain for ``underlying`` on ``as_of``.
 
@@ -188,6 +234,9 @@ class ChainBuilder:
             cost_basis: per-share cost basis of any shares held in this
                 underlying, which extends the strike window upward so covered
                 calls above cost basis stay reachable. See ``strike_window``.
+            low_anchor: lowest underlying price the run may still hold a short
+                option against, which extends the window downward. See
+                ``strike_window``.
 
         Returns:
             A ChainSnapshot, or None if the underlying price is unavailable for
@@ -210,7 +259,7 @@ class ChainBuilder:
         if underlying_price is None or underlying_price <= 0:
             return None
 
-        strike_gte, strike_lte = strike_window(underlying_price, cost_basis)
+        strike_gte, strike_lte = strike_window(underlying_price, cost_basis, low_anchor)
 
         if self._store is not None:
             hit = self._store.get(
@@ -220,6 +269,7 @@ class ChainBuilder:
                 strike_gte=strike_gte,
                 strike_lte=strike_lte,
                 underlying_price=underlying_price,
+                model=self._model_fingerprint(underlying),
             )
             if hit is not None:
                 return hit
@@ -233,6 +283,7 @@ class ChainBuilder:
                 universe_dte=universe_dte,
                 strike_gte=strike_gte,
                 strike_lte=strike_lte,
+                model=self._model_fingerprint(underlying),
             )
         return snapshot
 
