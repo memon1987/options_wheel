@@ -67,3 +67,5 @@ htmlcov/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+# Agent worktrees (transient)
+.claude/worktrees/
