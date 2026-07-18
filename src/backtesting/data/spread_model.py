@@ -94,11 +94,14 @@ class SpreadModel:
           Dividing a constant by ``mark`` injects spurious mark-dependence,
           and because they cluster deep OTM they corrupt the slope directly.
 
-        Measured on a real 450-contract chain sample those groups were 25% and
-        42% of rows; including them drove ``base_frac`` to 0.0129 against a
-        0.05 default (a ~4x tightening of modeled spreads, i.e. an optimistic
-        bias in exactly the delta band the strategy trades) and
-        ``otm_widening`` to 0.64 against 0.10.
+        Measured on a real 450-contract chain sample, those exclusions were
+        111 rows (24.7%) and 116 rows (25.8%) respectively — 223 of 450 rows
+        survive. (Raw floor-pinned rows number 190, but 74 of those are also
+        cheap-regime and are counted under that exclusion first.) Including
+        them drove ``base_frac`` to 0.0129 against a 0.05 default — a ~4x
+        tightening of modeled spreads, i.e. an optimistic bias in the delta
+        band the strategy actually trades — and ``otm_widening`` to 0.64
+        against 0.10.
 
         Args:
             samples: observed contracts.
