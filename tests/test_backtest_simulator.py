@@ -341,7 +341,7 @@ class TestStrikeWindowCoversAssignedPositions:
 
     Chains are built for the whole window before the day loop starts, so there
     is no live position to read a cost basis from. The simulator bounds it
-    instead — see ``Simulator._cost_basis_ceiling``.
+    instead — see ``Simulator._strike_anchors``.
     """
 
     def test_anchors_bracket_every_price_a_position_can_be_struck_against(

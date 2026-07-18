@@ -57,6 +57,10 @@ UNIVERSE_DTE_BUFFER = 1
 # have selected live, with no error raised anywhere.
 STRIKE_WINDOW_PCT = 0.25
 
+# Version of the cached-quote *derivation*. Bump to invalidate every existing
+# cache entry when the maths changes rather than its inputs.
+_FINGERPRINT_SCHEMA = "v1"
+
 
 def strike_window(
     underlying_price: float,
@@ -199,14 +203,18 @@ class ChainBuilder:
         off this cache in between. A study re-run after C1/C3 would otherwise
         silently mix two different pricing models.
 
-        Bumping ``SCHEMA`` invalidates every existing entry — do that whenever
-        the *derivation* changes rather than its inputs (a new IV solver, a
-        different moneyness definition).
+        Bumping ``_FINGERPRINT_SCHEMA`` invalidates every existing entry — do
+        that whenever the *derivation* changes rather than its inputs (a new IV
+        solver, a different moneyness definition).
+
+        Numeric inputs are formatted, not ``repr``'d, so that ``0`` and ``0.0``
+        — the same rate — do not fingerprint differently and cause a spurious
+        refetch.
         """
         parts = (
-            "v1",  # SCHEMA
-            f"r={self._r!r}",
-            f"q={self._div.get(underlying, 0.0)!r}",
+            _FINGERPRINT_SCHEMA,
+            f"r={float(self._r):.12g}",
+            f"q={float(self._div.get(underlying, 0.0)):.12g}",
             f"spread={self._spread!r}",
         )
         return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
