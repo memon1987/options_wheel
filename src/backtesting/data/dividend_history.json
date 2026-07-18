@@ -647,11 +647,6 @@
   ],
   "SPY": [
    {
-    "amount": 1.7814,
-    "ex_date": "2022-12-16",
-    "special": false
-   },
-   {
     "amount": 1.506204,
     "ex_date": "2023-03-17",
     "special": false
@@ -714,6 +709,11 @@
    {
     "amount": 1.796999,
     "ex_date": "2026-03-20",
+    "special": false
+   },
+   {
+    "amount": 1.903516,
+    "ex_date": "2026-06-18",
     "special": false
    }
   ],
@@ -858,6 +858,11 @@
    {
     "amount": 0.7075,
     "ex_date": "2026-04-10",
+    "special": false
+   },
+   {
+    "amount": 0.7075,
+    "ex_date": "2026-07-10",
     "special": false
    }
   ]

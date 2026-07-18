@@ -46,9 +46,14 @@ KNOWN_BIASES = [
         "published values. Dividend yield is treated as zero for every symbol, "
         "which is immaterial at ~7 DTE but not free.")),
     ("Dividends are modeled from a static table", (
-        "Both legs now collect dividends: the wheel is credited on each ex-date "
-        "it holds assigned shares, and the buy-and-hold benchmark collects the "
-        "whole stream over the window (FC-042 Track C). Amounts come from a "
+        "Both legs collect dividends WHEN THE TABLE COVERS THE RUN — the wheel "
+        "is credited on each ex-date it holds assigned shares, and the "
+        "buy-and-hold benchmark collects the whole stream over the window "
+        "(FC-042 Track C). Check the `dividend_coverage` line in the "
+        "data-quality block above before relying on that: a symbol absent from "
+        "the table, an unreadable table, or a window running past the table's "
+        "coverage all produce $0 on both legs, and the attribution section says "
+        "so explicitly when it happens. Amounts come from a "
         "committed table built from Alpaca's corporate-actions endpoint — "
         "as-declared rates, deliberately NOT split-adjusted, so they stay in "
         "the same units as the unadjusted bars and as-listed strikes. What "
@@ -59,7 +64,11 @@ KNOWN_BIASES = [
         "when extending a window forward. ETF rows (SPY/QQQ/IWM) are fund "
         "distributions rather than declared corporate dividends — same cash "
         "flow, lumpier composition, and year-end capital-gains distributions "
-        "are included.")),
+        "are included. Neither leg REINVESTS: the benchmark's dividends are "
+        "added as flat cash at the end rather than buying more shares, while "
+        "the wheel's land in cash on the ex-date where they can back the next "
+        "put. That asymmetry favours the wheel whenever the stock rises, and is "
+        "small relative to the stream itself.")),
     ("Ex-dividend early assignment is modeled; other early assignment is not", (
         "A short ITM call whose remaining extrinsic value is below the next "
         "day's dividend is assigned the evening before the ex-date, which is "
@@ -201,6 +210,18 @@ def render_markdown(report: FitnessReport) -> str:
     a("")
     a(f"_Memo: ${report.fees:,.2f} of fees is already deducted inside the option "
       f"row. Equity change over the window was ${report.total_pnl:+,.2f}._")
+
+    # A $0 dividend row means four very different things — pays nothing, not in
+    # the table, table unreadable, or never held shares. The bias footer below
+    # states flatly that both legs collect dividends, so where that is NOT true
+    # for this run it has to be said here, next to the number.
+    coverage = report.data_quality.get("dividend_coverage") or {}
+    if coverage and coverage.get("status") != "complete for this window":
+        a("")
+        a(f"> **Dividend data is incomplete for this run:** {coverage['status']}. "
+          f"The dividend row above and the benchmark's dividend line below are "
+          f"understated by an unknown amount, and the 'dividends are modeled' "
+          f"note in the bias list does not fully hold here.")
     if abs(report.reconciliation_gap) > 0.01:
         a("")
         a(f"> **Attribution does not reconcile** — the rows above sum to "

@@ -20,7 +20,11 @@ from ..utils.config import Config
 from .data.alpaca_provider import AlpacaDataProvider
 from .data.chain_builder import ChainBuilder
 from .data.chain_store import ChainStore
-from .data.dividends import DividendSchedule, load_default_schedule
+from .data.dividends import (
+    DividendSchedule,
+    describe_coverage,
+    load_default_schedule,
+)
 from .engine.simulator import SimulationResult, Simulator
 from .metrics.cycles import build_cycles, count_rolls
 from .metrics.fitness import FitnessReport, compute_fitness
@@ -136,6 +140,9 @@ def _score(
     # half-open lower bound encodes that.
     schedule = dividends or load_default_schedule()
     bench_divs = schedule.total_between(symbol, result.start, result.end)
+    quality["dividend_coverage"] = describe_coverage(
+        schedule, symbol, result.start, result.end
+    )
     return compute_fitness(
         symbol, result.daily, cycles, starting_cash,
         benchmark_prices=prices, benchmark_dividends_per_share=bench_divs,

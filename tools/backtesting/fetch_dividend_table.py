@@ -37,7 +37,7 @@ import collections
 import json
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -47,6 +47,11 @@ from src.backtesting.data.dividends import DIVIDEND_TABLE_PATH  # noqa: E402
 from src.utils.config import Config  # noqa: E402
 
 CORPORATE_ACTIONS_URL = "https://data.alpaca.markets/v1/corporate-actions"
+
+# How far the API's process-date window is padded past the ex-date window we
+# want. SPY's payable date lags its ex-date by ~6 weeks, the widest observed in
+# this universe; 90 days is comfortable headroom over that.
+PROCESS_DATE_PAD_DAYS = 90
 
 # Symbols with no dividend history at all. Distinguishing "we asked and the
 # answer is none" from "we never asked" is the whole point of recording these:
@@ -64,20 +69,32 @@ def fetch_cash_dividends(symbols, start: date, end: date, headers) -> dict:
     Pages until exhausted; the endpoint caps a response at ``limit`` rows and a
     14-symbol multi-year pull exceeds one page.
 
-    Note the endpoint filters on *process* date, not ex-date, so a handful of
-    rows can come back with an ex-date just before ``start`` (a dividend that
-    went ex in late December and settled in January). They are kept as-is: an
-    ex-date outside every replay window is never read, and trimming them would
-    risk dropping one that is inside the window at the far edge.
+    **The endpoint filters on PROCESS date, not ex-date, and the two can be six
+    weeks apart.** Querying it with the ex-date range you actually want silently
+    truncates BOTH edges. The trailing edge is the dangerous one: a dividend
+    that went ex inside the window but settles after it is simply absent, with
+    no error. Measured against the live API — SPY went ex 2026-06-18 and
+    processed 2026-07-31; VZ went ex 2026-07-10 and processed 2026-08-03. A
+    table built for a window ending 2026-07-18 dropped both, so a replay
+    under-credited VZ by a full quarter (~1.7% of price) and SPY by $1.90/share.
+
+    That error is not symmetric between the two legs. Buy-and-hold holds shares
+    every session and the wheel does not, so a missing dividend costs the
+    benchmark more than it costs the wheel — it flatters the wheel, which is
+    the exact bias this table exists to remove.
+
+    So the API window is padded by ``PROCESS_DATE_PAD_DAYS`` on both sides and
+    the caller filters on the real ex-date afterwards.
     """
     out = collections.defaultdict(list)
     page_token = None
+    pad = timedelta(days=PROCESS_DATE_PAD_DAYS)
     while True:
         params = {
             "symbols": ",".join(symbols),
             "types": "cash_dividend",
-            "start": start.isoformat(),
-            "end": end.isoformat(),
+            "start": (start - pad).isoformat(),
+            "end": (end + pad).isoformat(),
             "limit": 1000,
         }
         if page_token:
@@ -137,6 +154,13 @@ def main() -> int:
         for row in rows:
             rate = float(row.get("rate") or 0.0)
             if rate <= 0:
+                continue
+            # Filter on the EX-date, which is the only date the replay cares
+            # about. The API was queried on a padded process-date window, so
+            # without this the table's `since`/`until` would be a claim it does
+            # not honour in either direction.
+            ex_date = datetime.strptime(row["ex_date"], "%Y-%m-%d").date()
+            if not (since <= ex_date <= until):
                 continue
             entries.append(
                 {

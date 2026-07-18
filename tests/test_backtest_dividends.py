@@ -11,7 +11,7 @@ quarter.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -123,6 +123,41 @@ class TestCommittedTable:
         s = DividendSchedule.from_table()
         for etf in ("SPY", "QQQ", "IWM"):
             assert len(s.all_for(etf)) > 0, f"{etf} distributions missing"
+
+    def test_trailing_edge_is_not_truncated_by_process_date(self):
+        """Alpaca filters corporate actions on PROCESS date, not ex-date.
+
+        The two can be six weeks apart, so querying the endpoint with the
+        ex-date range you actually want silently drops dividends that went ex
+        inside the window but settle after it. The first build of this table did
+        exactly that and lost VZ 2026-07-10 (a full quarter, ~1.7% of price) and
+        SPY 2026-06-18 ($1.90/share).
+
+        That error is not symmetric: buy-and-hold holds shares every session and
+        the wheel does not, so a missing dividend costs the benchmark more than
+        the wheel — it FLATTERS the wheel, the exact bias this table removes.
+        These two rows are the regression pins.
+        """
+        s = DividendSchedule.from_table()
+        vz = {d.ex_date: d.amount for d in s.all_for("VZ")}
+        assert date(2026, 7, 10) in vz, (
+            "VZ 2026-07-10 missing — the fetch window was not padded past the "
+            "process date, so the table is truncated at its trailing edge"
+        )
+        assert vz[date(2026, 7, 10)] == pytest.approx(0.7075)
+
+        spy = {d.ex_date: d.amount for d in s.all_for("SPY")}
+        assert date(2026, 6, 18) in spy, "SPY 2026-06-18 missing (process date 2026-07-31)"
+
+    def test_no_ex_date_precedes_the_declared_since(self):
+        """`since` must be a bound the table honours, not a claim about the query."""
+        payload = json.load(open(DIVIDEND_TABLE_PATH))
+        since = datetime.strptime(payload["since"], "%Y-%m-%d").date()
+        until = datetime.strptime(payload["until"], "%Y-%m-%d").date()
+        for symbol, rows in payload["dividends"].items():
+            for row in rows:
+                ex = datetime.strptime(row["ex_date"], "%Y-%m-%d").date()
+                assert since <= ex <= until, f"{symbol} {ex} outside [{since}, {until}]"
 
     def test_income_names_have_plausible_yields(self):
         """A sanity floor: these are the names the whole track exists to judge."""
@@ -498,3 +533,136 @@ class TestReportRendersEveryVerdict:
         for verdict in ("fit", "marginal", "unfit", "insufficient"):
             report.verdict = lambda v=verdict: v
             render_markdown(report)  # must not raise
+
+
+class TestEvaluateWiring:
+    """`evaluate._score` is the ONLY production path that feeds both legs.
+
+    The reviewer's finding: zeroing `bench_divs` in `_score` — deleting the
+    benchmark's entire dividend stream, the single change Track C exists to make
+    — passed the whole suite, because every other test hand-passes
+    `benchmark_dividends_per_share` into `compute_fitness` and so pins the
+    arithmetic while leaving the wiring untested. These tests pin the wiring.
+    """
+
+    def _result(self, symbol="VZ", start=date(2025, 1, 2), end=date(2025, 6, 30)):
+        from src.backtesting.engine.simulator import DailyState, SimulationResult
+        from src.backtesting.engine.broker import BacktestBroker
+
+        daily = [
+            DailyState(day=d, equity=eq, cash=eq, reserved_collateral=2800.0,
+                       open_options=0, shares_held={})
+            for d, eq in ((start, 100_000.0), (end, 101_000.0))
+        ]
+        return SimulationResult(
+            symbols=[symbol], start=start, end=end, starting_cash=100_000.0,
+            daily=daily, broker=BacktestBroker(starting_cash=100_000.0),
+        )
+
+    class _Provider:
+        def __init__(self, prices):
+            self._prices = prices
+
+        def get_stock_bars(self, symbol, start, end):
+            from src.backtesting.data.provider import StockBar
+            return [
+                StockBar(symbol=symbol, bar_date=d, open=p, high=p, low=p,
+                         close=p, volume=1_000_000)
+                for d, p in self._prices.items()
+            ]
+
+    def test_benchmark_dividends_are_actually_wired_from_the_table(self):
+        """The number must come from the schedule, not from a default of zero."""
+        from src.backtesting.evaluate import _score
+
+        result = self._result()
+        provider = self._Provider({date(2025, 1, 2): 40.0, date(2025, 6, 30): 43.0})
+        report = _score("VZ", result, provider, 100_000.0,
+                        DividendSchedule.from_table())
+
+        assert report.benchmark is not None
+        assert report.benchmark.dividends_per_share > 0, (
+            "the benchmark collected no dividends on a known payer — the "
+            "schedule is not reaching compute_fitness"
+        )
+        assert report.benchmark.dividends > 0
+
+    def test_the_benchmark_interval_matches_the_prices_it_is_valued_on(self):
+        """`total_between` and `_buy_and_hold` must span the SAME days.
+
+        They agree today by construction, not by contract: one is given
+        result.start/result.end, the other reads daily[0].day/daily[-1].day.
+        If those ever diverge the benchmark collects a dividend stream from one
+        window and a price move from another.
+        """
+        from src.backtesting.evaluate import _score
+
+        start, end = date(2025, 1, 2), date(2025, 6, 30)
+        result = self._result(start=start, end=end)
+        provider = self._Provider({start: 40.0, end: 43.0})
+        schedule = DividendSchedule.from_table()
+        report = _score("VZ", result, provider, 100_000.0, schedule)
+
+        assert report.benchmark.dividends_per_share == pytest.approx(
+            schedule.total_between("VZ", result.daily[0].day, result.daily[-1].day)
+        )
+
+    def test_a_symbol_absent_from_the_table_is_reported_not_silent(self):
+        """$0 dividends must not read as 'this symbol pays nothing'."""
+        from src.backtesting.evaluate import _score
+
+        result = self._result(symbol="ZZZZ")
+        provider = self._Provider({date(2025, 1, 2): 40.0, date(2025, 6, 30): 43.0})
+        report = _score("ZZZZ", result, provider, 100_000.0,
+                        DividendSchedule.from_table())
+
+        coverage = report.data_quality["dividend_coverage"]
+        assert coverage["symbol_in_table"] is False
+        assert "NOT IN THE DIVIDEND TABLE" in coverage["status"]
+
+    def test_an_unloaded_table_is_reported_not_silent(self):
+        from src.backtesting.evaluate import _score
+
+        result = self._result()
+        provider = self._Provider({date(2025, 1, 2): 40.0, date(2025, 6, 30): 43.0})
+        report = _score("VZ", result, provider, 100_000.0, DividendSchedule.empty())
+
+        coverage = report.data_quality["dividend_coverage"]
+        assert coverage["table_loaded"] is False
+        assert "NO TABLE LOADED" in coverage["status"]
+
+    def test_a_window_past_the_tables_coverage_is_reported(self):
+        from src.backtesting.evaluate import _score
+
+        start, end = date(2025, 1, 2), date(2099, 1, 1)
+        result = self._result(start=start, end=end)
+        provider = self._Provider({start: 40.0, end: 43.0})
+        report = _score("VZ", result, provider, 100_000.0,
+                        DividendSchedule.from_table())
+
+        coverage = report.data_quality["dividend_coverage"]
+        assert coverage["window_exceeds_table"] is True
+        assert "covers ex-dates only through" in coverage["status"]
+
+    def test_incomplete_coverage_is_shouted_in_the_rendered_report(self):
+        """It has to reach the page, not just the dict."""
+        from src.backtesting.evaluate import _score
+        from src.backtesting.reporting.report import render_markdown
+
+        result = self._result(symbol="ZZZZ")
+        provider = self._Provider({date(2025, 1, 2): 40.0, date(2025, 6, 30): 43.0})
+        report = _score("ZZZZ", result, provider, 100_000.0,
+                        DividendSchedule.from_table())
+        md = render_markdown(report)
+        assert "Dividend data is incomplete for this run" in md
+
+    def test_complete_coverage_does_not_shout(self):
+        from src.backtesting.evaluate import _score
+        from src.backtesting.reporting.report import render_markdown
+
+        result = self._result()
+        provider = self._Provider({date(2025, 1, 2): 40.0, date(2025, 6, 30): 43.0})
+        report = _score("VZ", result, provider, 100_000.0,
+                        DividendSchedule.from_table())
+        md = render_markdown(report)
+        assert "Dividend data is incomplete for this run" not in md

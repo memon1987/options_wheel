@@ -73,12 +73,25 @@ class DividendSchedule:
     wall-clock date in the second.
     """
 
-    def __init__(self, by_symbol: Dict[str, List[Dividend]]) -> None:
+    def __init__(
+        self,
+        by_symbol: Dict[str, List[Dividend]],
+        *,
+        loaded: bool = True,
+        covers_through: Optional[date] = None,
+    ) -> None:
         self._by_symbol: Dict[str, List[Dividend]] = {
             symbol: sorted(divs, key=lambda d: d.ex_date)
             for symbol, divs in by_symbol.items()
         }
         self.symbols_without_data: set = set()
+        # Whether a real table was read. False means every query returns 0.0,
+        # which is indistinguishable from "pays nothing" at the call site — so
+        # the flag travels with the object and is surfaced in the report.
+        self.loaded = loaded
+        # Last ex-date the table can possibly know about. A window running past
+        # this credits nothing after it, silently, on both legs.
+        self.covers_through = covers_through
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -91,6 +104,7 @@ class DividendSchedule:
         raw = payload.get("dividends")
         if not raw:
             raise ValueError(f"{path} contains no dividend data")
+        until = payload.get("until")
         return cls(
             {
                 symbol: [
@@ -102,13 +116,17 @@ class DividendSchedule:
                     for row in rows
                 ]
                 for symbol, rows in raw.items()
-            }
+            },
+            loaded=True,
+            covers_through=(
+                datetime.strptime(until, "%Y-%m-%d").date() if until else None
+            ),
         )
 
     @classmethod
     def empty(cls) -> "DividendSchedule":
         """A schedule that pays nothing — the pre-FC-042 behavior, for tests."""
-        return cls({})
+        return cls({}, loaded=False)
 
     # ------------------------------------------------------------------ #
     # Queries
@@ -158,6 +176,51 @@ class DividendSchedule:
         return None
 
 
+def describe_coverage(
+    schedule: "DividendSchedule", symbol: str, start: date, end: date
+) -> Dict[str, object]:
+    """What the report must tell a reader about this run's dividend data.
+
+    ``dividends_credited: 0.0`` is identically what you see when the symbol pays
+    nothing, when it is absent from the table, when the table failed to load,
+    and when the wheel simply never held shares. Those mean very different
+    things, and the report asserting "both legs collect dividends" while any of
+    the middle two is true is worse than the pre-FC-042 state — the caveat that
+    used to protect the reader would have been removed without the modelling
+    that justified removing it.
+    """
+    known = schedule.has_symbol(symbol)
+    covers = schedule.covers_through
+    truncated = bool(covers and end > covers)
+    if not schedule.loaded:
+        status = "NO TABLE LOADED — no dividends modeled on either leg"
+    elif not known:
+        status = (
+            f"{symbol} IS NOT IN THE DIVIDEND TABLE — no dividends modeled on "
+            f"either leg. If it pays one, both the wheel and the benchmark "
+            f"understate it. Re-run tools/backtesting/fetch_dividend_table.py "
+            f"with --symbols {symbol}."
+        )
+    elif truncated:
+        status = (
+            f"table covers ex-dates only through {covers}, but this window ends "
+            f"{end} — dividends after {covers} are missing from both legs"
+        )
+    else:
+        status = "complete for this window"
+    return {
+        "status": status,
+        "symbol_in_table": known,
+        "table_loaded": schedule.loaded,
+        "table_covers_through": covers.isoformat() if covers else None,
+        "window_exceeds_table": truncated,
+        "known_ex_dates_in_window": (
+            sum(1 for d in schedule.all_for(symbol) if start < d.ex_date <= end)
+            if known else 0
+        ),
+    }
+
+
 def should_assign_early(
     *,
     strike: float,
@@ -200,9 +263,11 @@ def load_default_schedule() -> DividendSchedule:
     it is the opposite of what ``HistoricalEarningsCalendar`` does. A missing
     earnings table makes the replay *more permissive than live* — it rolls on
     days production refuses to — which is a silent optimistic bias worth
-    crashing over. A missing dividend table just restores the pre-FC-042
-    behavior of modelling no dividends, which is loudly described in the report's
-    bias footer and cannot be mistaken for a clean run.
+    crashing over. A missing dividend table restores the pre-FC-042 behavior of
+    modelling no dividends, which is survivable *only because* the resulting
+    schedule carries ``loaded=False`` through to ``describe_coverage`` and the
+    report says so in the attribution section. Without that it would be silent,
+    and silence here is indistinguishable from a symbol that pays nothing.
     """
     try:
         return DividendSchedule.from_table()

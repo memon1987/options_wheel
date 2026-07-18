@@ -517,6 +517,23 @@ class Simulator:
                     dividend=dividend,
                 ):
                     continue
+                # Two short calls on one underlying can both qualify on the same
+                # ex-eve. Assigning the second after the first has consumed the
+                # shares raises ValueError out of _remove_shares_fifo and kills
+                # a multi-hour run. Assign only what is actually covered and say
+                # so; the uncovered leftover is a cover-check bug elsewhere, and
+                # this is not the place to discover it by crashing.
+                if broker.shares(symbol) < 100 * pos.contracts:
+                    logger.warning(
+                        "Skipping ex-div early assignment: shares already gone",
+                        event_category="backtest",
+                        event_type="ex_dividend_assignment_uncovered",
+                        symbol=pos.symbol, underlying=symbol,
+                        day=day.isoformat(),
+                        shares_held=broker.shares(symbol),
+                        shares_needed=100 * pos.contracts,
+                    )
+                    continue
                 if broker.assign_call_early(pos.symbol, day, reason="ex_dividend"):
                     self._early_assignments += 1
                     logger.info(
