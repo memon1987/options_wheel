@@ -32,4 +32,6 @@ _List active plans here as they are added._
 - [fc-018.md](fc-018.md) — FC-018: Wheel-centric dashboard rebuild (frontend only), status: draft
 - [fc-019.md](fc-019.md) — FC-019: True P&L reconciliation (JNLC + OPTRD ingest), status: done
 - [fc-020.md](fc-020.md) — FC-020: FIFO cycle pairing for overlapping share lots, status: draft
+- [fc-030.md](fc-030.md) — FC-030: Drawdown-pause alerting (operator notification for extended pauses), status: draft
 - [fc-031.md](fc-031.md) — FC-031: Dashboard metrics overhaul (vetted portfolio metrics + bot execution health), status: done
+- [fc-032.md](fc-032.md) — FC-032: Backtesting engine overhaul (symbol wheel-fitness evaluation), status: draft

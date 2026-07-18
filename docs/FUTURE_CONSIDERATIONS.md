@@ -311,21 +311,43 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-030: Drawdown-pause observability — daily metric for paused symbols
+### FC-030: Drawdown-pause alerting — operator notification for extended pauses
 
-**Status:** Consideration — dashboard half absorbed by FC-031 (Bot Health drawdown-pause card: paused symbols, days paused, assignment-strike referenced). Remaining scope: operator alerting/escalation.
+**Status:** Plan published
 **Size estimate:** S
-**Owner:** unassigned
-**Plan file:** not yet
+**Owner:** Claude
+**Plan file:** `docs/plans/fc-030.md`
+
+**Scope note (2026-07-18):** the *observability* half shipped inside FC-031 (Bot Health drawdown-pause card). FC-030 now covers **alerting only** — notify the operator when a pause crosses ~7 trading days, via the project's first notification channel (Cloud Monitoring log-based alert → email). The **escalation** question (permit a below-cost-basis call after an extended pause) is split out to **FC-033**: it reverses part of FC-029 R2's hard floor, so it is a strategy change needing its own plan and two-reviewer scrutiny — and it should be decided on the pause-duration data this alerting will collect.
 
 **Problem / opportunity:** Surfaced by the FC-029 second-reviewer (peer review LOW 8). The R3 drawdown pause is a passive `return None` with `event_type=covered_call_drawdown_pause` events. AMZN cycle 2's 62-day idle is the existence proof that an extended pause can silently cost meaningful opportunity (~$1,500–3,000 in foregone premium across the period). Add a daily dashboard metric / alert: number of days each symbol has been continuously paused, with a threshold (e.g., 7 days) that triggers an operator notification. Could escalate further (e.g., ≥ 14 days → allow far-OTM strike below cost basis with explicit operator approval).
 
-**Open questions:**
-- Threshold day count for alert — 7? 10? 14?
-- Should we surface paused symbols in the per-symbol dashboard page, or only as a Bot Health card?
-- Is there an automated escalation path that's safe (e.g., allow one far-OTM call below cost) vs always operator-in-the-loop?
+**Open questions:** resolved in the plan — threshold 7 trading days (env-overridable); Bot Health card is the surface (shipped, FC-031); escalation deferred to FC-033.
 
-**Links:** FC-029 (introduces the drawdown pause), `docs/investigations/strategy-review-2026-05-07.md` §R3.
+**Links:** FC-029 (introduces the drawdown pause), FC-031 (pause card), FC-033 (escalation), `docs/investigations/strategy-review-2026-05-07.md` §R3.
+
+---
+
+### FC-033: Drawdown-pause escalation — permit a below-cost-basis call after an extended pause
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** Split out of FC-030 (2026-07-18). When a symbol sits paused for a long stretch, the shares are dead capital — AMZN's 62-day pause cost an estimated $1,500–3,000 in foregone premium. One candidate response: after N days paused (14? 21?), allow a single far-OTM call whose strike is *below* the assignment-strike floor, harvesting some premium while accepting a capped share loss if called away.
+
+**Why this is not FC-030:** it deliberately reverses part of FC-029 R2's hard cost-basis floor — the guard built specifically because the eroding floor caused the $9k of loss cycles. That makes it a strategy change (two-reviewer, high-stakes calibration per `~/CLAUDE.md`), not observability.
+
+**Prerequisite:** empirical pause-duration data. FC-030's alerting starts collecting it; AMZN and GOOGL entered pauses 2026-07-17. Decide only after seeing whether pauses typically resolve in days (escalation unnecessary) or drag for weeks (escalation valuable).
+
+**Open questions:**
+- Day threshold to permit escalation, and how far OTM must the strike be?
+- Operator-approval-in-the-loop, or automatic once configured?
+- Does a called-away-below-cost outcome here beat continued waiting, measured over the observed pause distribution?
+- Interaction with the FC-006 rolling engine (which has fired 0 times)?
+
+**Links:** FC-029 R2/R3 (hard floor + pause), FC-030 (alerting; source of the duration data), `docs/investigations/strategy-review-2026-05-07.md` §R3.
 
 ---
 
@@ -351,6 +373,117 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 - How does this interact with FC-003 (DTE target optimization from 7 to 2-3)?
 
 **Links:** FC-003 (DTE target optimization), FC-006 (rolling engine)
+
+---
+
+### FC-032: Backtesting engine overhaul — symbol wheel-fitness evaluation
+
+**Status:** Executing (Phases 0–2 done; Phase 1 coverage gate run 2026-07-09 → stay on free Alpaca data; Phase 3 in progress)
+**Size estimate:** L
+**Owner:** zeshan
+**Plan file:** `docs/plans/fc-032.md`
+
+**Problem / opportunity:** The original backtesting engine has never produced a single trade in any saved run (all `backtest_results/` artifacts show 0 trades). Root causes: it requests Alpaca option bars with `feed='iex'` (options come from OPRA) so chains are always empty; the covered-call scan crashes on a nonexistent `portfolio.positions` attribute; `_calculate_summary_metrics` is called but never defined; and it reimplements — and diverges from — the live strategy rules instead of replaying them. Separately, `tools/backtesting/scheduled_backtest.py` emits fabricated performance numbers when its (nonexistent-module) imports fail. We want a rebuilt engine whose purpose is **symbol wheel-fitness evaluation**: given a symbol, replay our live strategy rules over a 1–2 year lookback with real historical options data and report how the full wheel (CSP → assignment → covered calls → called away) would have performed — both on-demand for candidate symbols and on a cadence to flag risky symbols for demotion.
+
+**Open questions:**
+- Data budget: free Alpaca bars (Feb 2024+, no bid/ask/greeks) vs a paid vendor (ThetaData/ORATS) — decide after the Phase 1 data-quality report?
+- Reuse live strategy components via an adapter vs standalone reimplementation with parity tests?
+- One decision point per simulated day (EOD) vs mimicking the live 9/12/3 ET schedule?
+- Is the scheduled screening/demotion job part of this FC or a follow-up?
+
+**Links:** FC-017 (chain snapshots at decision points — same storage need, forward-looking), FC-001 (symbol universe optimization — this engine answers its backtest question), `docs/plans/fc-032.md`.
+
+---
+
+### FC-033: Synthetic pre-2024 premium extension for backtests
+
+**Status:** Consideration — explicitly deferred out of FC-032 v1
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** Alpaca's historical options data starts 2024-02-01, so FC-032 can only backtest ~2.4 years — a single, calm vol regime. Fitness verdicts risk overfitting to it. Extending backward requires *synthesising* option premiums from underlying price history, which is dangerous: Black-Scholes with trailing realized vol badly underprices seller premiums (IV exceeds RV ~85% of days; VIX/RV ≈ 1.18; the variance risk premium concentrates at short maturities — worst exactly for our weeklies; OTM put skew adds 3–5 vol points). Naive BS-with-RV understates a 30-delta weekly put premium by ~50–60%.
+
+If ever built, the recipe and its error bars are already written down in the FC-032 plan appendix: Yang-Zhang 21d realized vol × a per-symbol IV/HV factor calibrated from our real 2024+ chains, plus a skew bump; binomial with discrete dividends for ITM/dividend cases. Synthetic-regime results must be **labeled as such and never silently mixed** with real-data results.
+
+**Open questions:**
+- Is a wider, lower-fidelity window actually more informative than a narrow, high-fidelity one for a *fitness* verdict (which is comparative vs buy-and-hold, not absolute)?
+- Cheaper alternative: buy ThetaData/ORATS history (2012+/2007+, real quotes) — $25–99/mo or $599 one-time. That buys real data instead of modeled data for less engineering risk.
+- Would a multi-start-date ensemble on the real 2024+ window capture most of the timing-luck benefit at a fraction of the cost?
+
+**Links:** `docs/plans/fc-032.md` (non-goals + research appendix), FC-032.
+
+---
+
+### FC-034: Premium floor is not scale-free — four universe symbols can never trade
+
+**Status:** Consideration
+**Size estimate:** M (changes live trading behavior → requires a plan file)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** `min_put_premium: 0.50` is a **fixed dollar** floor applied identically to a $12 stock and a $600 one. The FC-032 coverage gate measured every decision day from 2024-02-01 to 2026-07-09 and found **F, PFE and KMI have zero usable decision days, and VZ has two** — a 0.10–0.20 delta weekly put on a low-priced underlying is worth pennies and can never clear $0.50. Independently confirmed against production: across 588 live Alpaca `FILL` activities and `options_wheel.trades_from_activities`, the bot has **never sold a put on any of the four**. They occupy 4 of 14 universe slots, consume screening API budget, and are structurally incapable of generating a trade.
+
+This is not a data problem (bar coverage was 122/122 for all 14 symbols) and not a bug — the filter is doing exactly what it says. The question is whether a dollar-denominated floor is the right *threshold shape*.
+
+**Open questions:**
+- Re-express the floor as a fraction of strike (e.g. ≥ 0.5% of strike), as annualized return on collateral, or keep a dollar floor with a per-symbol override?
+- A return-on-collateral floor is the economically meaningful one (it's what the wheel actually earns) — but it changes which contracts pass on *every* symbol, not just the cheap ones. Needs a backtest before it ships. FC-032's engine is exactly the tool; sequence this after FC-032 Phase 4.
+- Or simply demote F/PFE/KMI/VZ from the universe and leave the floor alone. Cheapest fix, but leaves the threshold mis-shaped for any future low-priced candidate.
+- Does `min_call_premium: 0.30` have the same defect on the call side? (Almost certainly — same shape, and calls are only sold post-assignment so the blast radius differs.)
+
+**Links:** `docs/investigations/fc-032-coverage-gate.md` (the measurement + production validation), FC-032, FC-001 (symbol universe optimization).
+
+---
+
+### FC-035: `poll_order_statuses` closed-orders fetch has never worked (latent NameError)
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not needed (single-file, isolated) — but it *does* change runtime behavior, so branch + PR
+
+**Problem / opportunity:** `src/strategy/wheel_engine.py` (~line 698, in `poll_order_statuses`) calls:
+
+```python
+closed_orders = self.alpaca.trading_client.get_orders(
+    filter=alpaca.trading.requests.GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100))
+```
+
+The module `alpaca` is **never imported** in that file — only `QueryOrderStatus`, in a local import on the line above. So this raises `NameError: name 'alpaca' is not defined` on every invocation. The surrounding `except Exception` swallows it and logs a debug line, "Could not fetch closed orders directly, using all_orders". Found by pyflakes while seaming the clock for FC-032; confirmed pre-existing (predates the FC-032 branch).
+
+**Consequence:** the closed-orders path has never once executed. Order-status polling sees only whatever `self.alpaca.get_orders()` returns (the SDK default), so `order_filled` / `order_expired` events may be under-reported. Worth checking whether the dashboard's order-status accuracy has been quietly leaning on the activities ingestor instead.
+
+**Open questions:**
+- Fix is one import (`from alpaca.trading.requests import GetOrdersRequest`). But this *enables* a code path that has never run in production — what does it start doing, and does it double-log `order_filled` events against the activities-derived ones?
+- Does `get_orders()` (no filter) already return closed orders, making the whole block dead code worth deleting instead?
+- Add a test that would have caught this: pyflakes/flake8 `undefined name` in CI. There are other pre-existing lint findings; a clean-then-gate pass is probably warranted.
+
+**Links:** FC-032 (found during the Phase 3 clock seam), `src/strategy/wheel_engine.py`.
+
+---
+
+### FC-036: Stage-4 execution gap check is dead in production
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not needed (single-file fix) — but it changes runtime behavior, so branch + PR
+
+**Problem / opportunity:** Found by the FC-032 backtest, which reproduced it faithfully — the replay is behaving correctly; **production is not**.
+
+`GapDetector._get_previous_close` (`src/risk/gap_detector.py`) does `df[df.index < current_time]` and takes `.iloc[-1]`. Alpaca stamps daily stock bars at **04:00 UTC**, which is before any of our decision times (9:35am ET = 13:35 UTC). So today's own bar satisfies the filter and "previous close" returns **today's close**.
+
+Verified against the live client on 2026-07-17: at a simulated 9:35am ET decision, `_get_previous_close` returned **202.81** while the latest bar in the frame was also **202.81** (dated the same day).
+
+**Consequence:** the Stage-4 execution gap check computes a gap of exactly 0.0% every single time and can never block a trade. The `execution_gap_threshold` config knob has no effect. Note this is *not* true of the Stage-2 gap-risk analysis, which computes `current_gap` correctly — so of our two gap controls, one works and one is inert, and nothing surfaces the disagreement.
+
+**Open questions:**
+- Fix by excluding the current session's bar (`df.index.date < current_time.date()`), or by requesting bars with an explicit end of yesterday?
+- Enabling a gate that has never fired changes live behavior. How much would it have blocked historically? The FC-032 engine can now answer this directly — run it with the gate fixed and compare.
+- Does the same 04:00-stamp assumption leak into any other windowed statistic?
+
+**Links:** FC-032 (`docs/plans/fc-032.md`), found during its two-reviewer pass; `docs/investigations/fc-032-parity-check.md`.
 
 ---
 
@@ -458,4 +591,4 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - Plan: `docs/plans/fc-031.md`
 - Investigations: `docs/investigations/dashboard-metrics-audit-2026-07-07.md` (per-metric methodology audit), `docs/investigations/fc-031-adversarial-review-2026-07-07.md` (adversarial PM review of the plan — 7 blockers incorporated pre-implementation)
 - Merge: direct merge commit `1e8f622` to main (2026-07-07) — no PR: GitHub App not connected for the org this session; branch `claude/dashboard-metrics-review-k1ze5g`, commits `5fa2e48` (plan+audit), `7b5a718` (implementation), `14f299d` (adversarial code-review fixes)
-- Notes: One accounting convention everywhere (net cash P&L + market value of holdings — the PM review caught that the draft's `(price − basis) × shares` add-back would have double-subtracted held-share cost, ~$24k error on AMD). Headline KPIs: Total P&L (realized cash / open value split), max drawdown (% + flow-adjusted $), XIRR labeled "annualized (single deposit)". TWR-indexed equity curve vs SPY; vs-B&H made symmetric (wheel MTM); FIFO open-lot basis + breakeven columns; cycle table RoC + $/day/$1k; separate put/call trade stats with held-to-expiry exercise-rate calibration vs live config delta bands (Symmetry Principle); net option cash flow bars. Bot Health: decision funnel, anomaly flags on the SPY-bar calendar, run reliability, drawdown-pause card (absorbs FC-030's dashboard half), falsifiable reconciliation banner (residual vs known gaps, share-count mismatch tracking). Removed: dead `win_rate`/`return_30d`, option-leg-only `/api/metrics/pnl-by-symbol`, fake freshness stamp, CAGR tile. Post-implementation 8-angle code review found + fixed 3 defects (cycle-stats fallback crash, unpopulated mismatch badge, /config not exposing threshold/bands) before merge. Tests 293 pytest + 72 vitest. **Post-merge closeout (2026-07-18):** deployment was blocked for 11 days — Cloud Build failed on the merge because 3 pre-existing call_seller tests reached LIVE prod BigQuery via the unmocked FC-029 cost-basis fallback (AAPL's real $305 assignment entered the 90-day window and tripped the mocked fixtures); fixed in PR #36 (test isolation), after which both services deployed (dashboard rev 00201, bot rev 00278). Views were applied earlier; SPY backfill ran 2026-07-18 (274 bars) and FEE backfill landed 1,017 rows (−$31.64 lifetime). Live verification: XIRR 31.3%, TWR 21.3%, max DD −10.3%/−$12.6k (May 29→Jun 26), reconciliation residual $223 (clean). The AMD known gap (−$1,594, FC-019) RESOLVED itself — OPTRD ledger nets to 0 shares, no mismatches — and the stale allowance was retired from KNOWN_RECONCILIATION_GAPS (the banner's stale-gap detector caught it, as designed).
+- Notes: One accounting convention everywhere (net cash P&L + market value of holdings — the PM review caught that the draft's `(price − basis) × shares` add-back would have double-subtracted held-share cost, ~$24k error on AMD). Headline KPIs: Total P&L (realized cash / open value split), max drawdown (% + flow-adjusted $), XIRR labeled "annualized (single deposit)". TWR-indexed equity curve vs SPY; vs-B&H made symmetric (wheel MTM); FIFO open-lot basis + breakeven columns; cycle table RoC + $/day/$1k; separate put/call trade stats with held-to-expiry exercise-rate calibration vs live config delta bands (Symmetry Principle); net option cash flow bars. Bot Health: decision funnel, anomaly flags on the SPY-bar calendar, run reliability, drawdown-pause card (absorbs FC-030's dashboard half), falsifiable reconciliation banner (residual vs known gaps, share-count mismatch tracking). Removed: dead `win_rate`/`return_30d`, option-leg-only `/api/metrics/pnl-by-symbol`, fake freshness stamp, CAGR tile. Post-implementation 8-angle code review found + fixed 3 defects (cycle-stats fallback crash, unpopulated mismatch badge, /config not exposing threshold/bands) before merge. Tests 293 pytest + 72 vitest. **Post-merge manual steps pending:** re-apply `fc018_views.sql` + `fc031_views.sql` via bq, `POST /ingest-stock-history?backfill_days=400` (SPY), `POST /ingest-activities?after=2025-10-01` (FEE).
