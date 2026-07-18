@@ -47,6 +47,34 @@ Read naively, this run says 6 symbols are "poor" and we should spend $99/mo. Rea
 
 `quality.py` now reports `in_band_fraction` (the true data-coverage number), `premium_shortfall_days`, and `limiting_factor() -> data | premium | none`, and `coverage_report.py` recommends a vendor purchase only for `data`-limited symbols.
 
+## How close is the data/premium call? (margins)
+
+`limiting_factor()` decides `data` vs `premium` on a bare majority — `premium` when more than half a symbol's unusable days were premium shortfalls. Since the "no vendor purchase" conclusion rests on that split, here is the margin for every symbol rather than just the verdict:
+
+| symbol | in-band % | unusable days | premium shortfalls | majority needs | margin | factor |
+|---|---:|---:|---:|---:|---:|---|
+| SPY / QQQ | 100% | 0 | 0 | — | — | none |
+| UNH | 100% | 7 | 7 | 3.5 | +3.5 | premium |
+| IWM | 100% | 9 | 9 | 4.5 | +4.5 | premium |
+| MSFT | 98% | 13 | 11 | 6.5 | +4.5 | premium |
+| NVDA | 99% | 19 | 18 | 9.5 | +8.5 | premium |
+| AMD | 98% | 26 | 23 | 13.0 | +10.0 | premium |
+| AMZN | 96% | 36 | 31 | 18.0 | +13.0 | premium |
+| AAPL | 92% | 47 | 37 | 23.5 | +13.5 | premium |
+| GOOGL | 94% | 50 | 43 | 25.0 | +18.0 | premium |
+| **F** | **57%** | 122 | 69 | 61.0 | **+8.0** | premium |
+| KMI | 68% | 122 | 83 | 61.0 | +22.0 | premium |
+| PFE | 73% | 89 | 89 | 61.0 | +28.0 | premium |
+| VZ | 90% | 120 | 108 | 60.0 | +48.0 | premium |
+
+**Read the margin next to the denominator, not on its own.** UNH's +3.5 and IWM's +4.5 look razor-thin, but those symbols have only 7 and 9 unusable days out of 122 — a classification flip there would move a handful of days and change nothing. Small margins on tiny denominators are not fragile.
+
+**The genuinely close call is F.** It clears the premium threshold by 8 days, and — unlike the liquid names — **53 of its 122 decision days (43%) had no in-band put at any price.** Calling F "premium-limited" is close to a coin flip. KMI (68% in-band) and PFE (73%) are more comfortable but still carry substantial no-candidate days.
+
+**Why this does not change the decision.** A vendor purchase only pays for symbols we would actually trade. F, PFE, KMI and VZ produce 0, 0, 0 and 2 usable days respectively — they are untradeable on premium grounds regardless of data quality, so better chain data would buy nothing on exactly the symbols whose classification is shakiest. The symbols we *do* trade run **92–100% in-band**, where the conclusion is not close at all.
+
+So the honest headline is: **0 data-limited among the symbols the strategy can actually trade; F's classification is within 8 days of the boundary but is moot because F cannot clear the premium floor either way.**
+
 ## The load-bearing number
 
 `days_with_bar = 122/122` on **every symbol, including the thinnest names.** The plan's flagship data risk —
