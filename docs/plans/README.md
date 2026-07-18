@@ -33,4 +33,4 @@ _List active plans here as they are added._
 - [fc-019.md](fc-019.md) — FC-019: True P&L reconciliation (JNLC + OPTRD ingest), status: done
 - [fc-020.md](fc-020.md) — FC-020: FIFO cycle pairing for overlapping share lots, status: draft
 - [fc-031.md](fc-031.md) — FC-031: Dashboard metrics overhaul (vetted portfolio metrics + bot execution health), status: done
-- [fc-037.md](fc-037.md) — FC-037: Multi-strategy extensibility — covered-call strategy in a separate portfolio, status: in review
+- [fc-038.md](fc-038.md) — FC-038: Multi-strategy extensibility — covered-call strategy in a separate portfolio, status: in review

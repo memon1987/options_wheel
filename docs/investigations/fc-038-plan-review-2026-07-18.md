@@ -1,6 +1,6 @@
-# FC-037 plan review — 2026-07-18
+# FC-038 plan review — 2026-07-18
 
-Two-reviewer adversarial pass on `docs/plans/fc-037.md` before any Phase 1 code,
+Two-reviewer adversarial pass on `docs/plans/fc-038.md` before any Phase 1 code,
 per the stakes-calibration rule in `~/CLAUDE.md` (Phase 1 refactors live-wheel
 code paths). Personas: senior options trader / Python dev, and production
 reliability engineer.

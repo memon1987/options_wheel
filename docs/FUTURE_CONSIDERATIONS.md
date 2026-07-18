@@ -329,14 +329,14 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ---
 
-### FC-037: Multi-strategy extensibility — covered-call strategy in a separate portfolio
+### FC-038: Multi-strategy extensibility — covered-call strategy in a separate portfolio
 
 **Status:** Plan drafted
 **Size estimate:** L
 **Owner:** Zeshan
-**Plan file:** `docs/plans/fc-037.md`
+**Plan file:** `docs/plans/fc-038.md`
 
-**Note:** drafted as FC-032 on 2026-07-07; renumbered to FC-037 on 2026-07-18 after a collision with the backtesting-engine overhaul, which claimed FC-032 on a parallel branch the same day and shipped first.
+**Note:** drafted as FC-032 on 2026-07-07; renumbered to FC-038 on 2026-07-18 after a collision with the backtesting-engine overhaul, which claimed FC-032 on a parallel branch the same day and shipped first.
 
 **Problem / opportunity:** We want to run a second strategy (standalone covered calls) reusing the existing engine, without the two strategies interfering. Research concluded: separate Alpaca account per strategy (position tagging is infeasible — Alpaca nets positions per symbol with no tags, assignments carry no client_order_id, and `reconcile_positions` adopts any untracked position into wheel state). Plan: extract extensibility seams (cost-basis provider, config namespacing, per-strategy state/dataset/order-id prefix), then a covered-call engine as a second Cloud Run service from the same image, in Alpaca paper account #2.
 
@@ -347,7 +347,7 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 **Resolved:** stock entry is manual via the Alpaca UI (2026-07-07) — the bot automates only call selling/closing/rolling; the covered-call universe derives from account holdings.
 
-**Links:** `docs/plans/fc-037.md`; related: FC-005 (per-symbol params), FC-014 (RiskManager consolidation), FC-015 (state cold-start).
+**Links:** `docs/plans/fc-038.md`; related: FC-005 (per-symbol params), FC-014 (RiskManager consolidation), FC-015 (state cold-start).
 
 ### FC-011: Support non-Friday option expirations (daily/weekly rolling expirations)
 
