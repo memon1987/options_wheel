@@ -72,6 +72,8 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 
 **Problem / opportunity:** AMD is our top premium generator but is gap-filtered on 47% of scans (262 of 553). Filter thresholds may be over-conservative for this symbol. A plan needs to weigh actual realized overnight gaps against the threshold and consider per-symbol tuning vs. a global change.
 
+**Updated 2026-07-18 (FC-032 engine walkthrough):** the binding constraint is broader than AMD and broader than gap *frequency*. NVDA was blocked on 18 of 20 decision days in Jun–Jul 2026 by the **40% realized-vol cap** (`max_historical_vol`) — its 30-day vol sat at 40–42%, so trading was noise around one hard line; the single day vol dipped to ~40% it traded. Validated against live: production also sold zero NVDA puts that window. Structural critique: the filter double-counts risk that delta-band strike selection already prices (IV rises → strikes auto-walk OTM → richer premium), is a binary cliff with no graduated response, and embargoes the top premium generators exactly when compensation is highest. **The A/B study to answer this empirically is Track B1 of `docs/plans/fc-042.md`** (filter off / vol-cap sweep / vol-relative percentile / half-size-instead-of-ban); any threshold change then gates on this FC's own plan + two reviewers. Note stage-4's execution gap check is dead (FC-036), so this filter is currently the *only* functioning gap control — do not simply disable it.
+
 **Open questions:**
 - What's the distribution of AMD's actual overnight gaps vs the current filter?
 - Do we support per-symbol gap thresholds, or keep one global?
@@ -418,7 +420,7 @@ This is not a data problem (bar coverage was 122/122 for all 14 symbols) and not
 - Or simply demote F/PFE/KMI/VZ from the universe and leave the floor alone. Cheapest fix, but leaves the threshold mis-shaped for any future low-priced candidate.
 - Does `min_call_premium: 0.30` have the same defect on the call side? (Almost certainly — same shape, and calls are only sold post-assignment so the blast radius differs.)
 
-**Links:** `docs/investigations/fc-032-coverage-gate.md` (the measurement + production validation), FC-032, FC-001 (symbol universe optimization).
+**Links:** `docs/investigations/fc-032-coverage-gate.md` (the measurement + production validation), FC-032, FC-001 (symbol universe optimization). **A/B study = Track B2 of `docs/plans/fc-042.md`.**
 
 ---
 
@@ -473,7 +475,7 @@ Note this is *not* true of the Stage-2 gap-risk analysis (`_detect_current_gap`,
 - Enabling a gate that has never fired changes live behavior. How much would it have blocked historically? The FC-032 engine can now answer this directly — run it with the gate fixed and compare.
 - Does the same 04:00-stamp assumption leak into any other windowed statistic?
 
-**Links:** FC-032 (`docs/plans/fc-032.md`), found during its two-reviewer pass; `docs/investigations/fc-032-parity-check.md`.
+**Links:** FC-032 (`docs/plans/fc-032.md`), found during its two-reviewer pass; `docs/investigations/fc-032-parity-check.md`. **Fix + would-have-blocked study = Track E1 of `docs/plans/fc-042.md`.**
 
 ---
 
@@ -554,6 +556,23 @@ Two defects:
 - Regression tests must include a short put on a C-containing ticker and a `BRK.B`-style class-share position.
 
 **Links:** found during the FC-038 two-reviewer plan pass — `docs/investigations/fc-038-plan-review-2026-07-18.md` (HIGH H1); flagged independently by both reviewers. Related: FC-038 (Phase 2 depends on this guard).
+
+---
+
+### FC-042: Backtest engine follow-on — performance, fidelity, and the filter studies
+
+**Status:** Plan published
+**Size estimate:** L (tracks are individually S/M)
+**Owner:** zeshan + Claude
+**Plan file:** `docs/plans/fc-042.md`
+
+**Problem / opportunity:** FC-032 shipped a working engine; three things separate it from answering the money questions. (1) Runs cost ~25 min/symbol — `ChainStore` is never constructed and contract discovery fetches ~70% unusable strikes. (2) Dividends/early assignment are unmodeled, blocking any verdict on income names. (3) The Jun–Jul 2026 walkthrough found NVDA blocked ~90% of the month by the gap filter's **40% vol cap** (not gap frequency), with NVDA's 30-day vol oscillating 40–42% against the hard line — trading was threshold noise on the symbol that is 155/241 lifetime put legs. The plan wires the cache + strike window (Track A), models dividends/early assignment (Track C), runs the gap-filter and premium-floor A/B studies feeding FC-002/FC-034 (Track B), and fixes FC-036/FC-035 behind quantifying studies (Track E). Includes a parallel-agent execution map. **No live thresholds change under this FC** — studies produce evidence; changes gate on FC-002/FC-034 plans.
+
+**Open questions:**
+- Vol-relative gate percentile (80th?) and graduated-response shape for B1.
+- Dividend source: yfinance vs Alpaca corporate-actions endpoint (both validated reachable).
+
+**Links:** `docs/plans/fc-042.md`, FC-002, FC-034, FC-035, FC-036, `docs/investigations/fc-032-parity-check.md`, `docs/investigations/fc-032-coverage-gate.md`.
 
 ---
 
