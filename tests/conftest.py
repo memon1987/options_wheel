@@ -60,6 +60,31 @@ def _no_production_bigquery(monkeypatch, request):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_alpaca_credentials(monkeypatch):
+    """Every test sees the same fake Alpaca credentials.
+
+    `Config()` validates that ALPACA_API_KEY_ID / ALPACA_SECRET_KEY are set
+    and raises otherwise. Tests that build a real Config (test_clock_seam,
+    test_backtest_simulator — which want the real settings.yaml values, e.g.
+    profit_taking_min_hold_hours) therefore passed on a developer machine
+    with a .env file and failed in Cloud Build with 18 errors, because the
+    result depended on ambient environment.
+
+    Credentials are set UNCONDITIONALLY rather than only-when-missing: the
+    point is that the suite behaves identically everywhere. A unit test must
+    never reach a real broker, so a real key present in the shell is a
+    hazard here, not a convenience. Same principle as
+    `_no_production_bigquery` above.
+    """
+    # config/settings.yaml substitutes ${ALPACA_API_KEY}. Note the
+    # validation error used to name ALPACA_API_KEY_ID, which is not read by
+    # anything — corrected in src/utils/config.py alongside this fixture.
+    monkeypatch.setenv("ALPACA_API_KEY", "test_api_key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "test_secret_key")
+    yield
+
+
 # ==================== Configuration Fixtures ====================
 
 @pytest.fixture
@@ -496,7 +521,7 @@ def mock_option_client():
 def mock_env_vars():
     """Patch environment variables for testing."""
     env_vars = {
-        'ALPACA_API_KEY_ID': 'test_api_key',
+        'ALPACA_API_KEY': 'test_api_key',
         'ALPACA_SECRET_KEY': 'test_secret_key',
         'GCS_BUCKET_NAME': 'test-bucket',
         'GOOGLE_CLOUD_PROJECT': 'test-project'
