@@ -45,14 +45,20 @@ KNOWN_BIASES = [
         "IV and delta are Black-Scholes inversions from the bar close, not "
         "published values. Dividend yield is treated as zero for every symbol, "
         "which is immaterial at ~7 DTE but not free.")),
-    ("Dividends are NOT modeled — and this flatters the wheel", (
-        "No dividend is credited to either leg. Because the buy-and-hold "
-        "benchmark holds shares on every day while the wheel holds them only "
-        "occasionally, the benchmark forgoes far more dividend income than the "
-        "strategy does. On a ~6.5%-yield name over a 2.4-year window that "
-        "understates buy-and-hold by roughly 15 percentage points — enough to "
-        "flip the 'beat buy-and-hold' line on the income-heavy symbols. Treat "
-        "the comparison as favourable to the wheel on any dividend payer.")),
+    ("Dividends are NOT modeled — and the bias runs BOTH ways", (
+        "No dividend is credited to either leg, and the direction of that bias "
+        "is not uniform; stating only one side of it is worse than stating "
+        "none. It FLATTERS the wheel on the buy-and-hold comparison (a WARN): "
+        "the benchmark holds shares every day and forgoes the entire dividend "
+        "stream, worth ~15 points on a 6.5% yielder over 2.4 years. But it "
+        "PENALISES the wheel on total return and return-on-collateral — the "
+        "absolute gates that actually produce an 'unfit' verdict — because "
+        "real dividends earned while holding assigned shares are simply "
+        "missing. On a 5-7% yielder that alone can push annualized return "
+        "under the 4% risk-free floor. So on the income names (F, PFE, KMI, "
+        "VZ) the verdict is biased TOWARD unfit even though the headline "
+        "benchmark line leans the other way. Do not judge a dividend payer on "
+        "this engine until dividends are modeled.")),
     ("Early assignment is NOT modeled", (
         "Short ITM calls are held to expiry. A real short call whose remaining "
         "extrinsic value is less than an upcoming dividend is frequently "

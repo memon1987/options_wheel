@@ -250,8 +250,15 @@ class FitnessReport:
         return self.total_return - self.benchmark.total_return
 
     def verdict(self) -> str:
-        """fit | marginal | unfit, with the reasons attached via verdict_reasons."""
+        """fit | marginal | unfit | insufficient.
+
+        ``insufficient`` is deliberately NOT ``unfit``: it means the window did
+        not contain enough completed cycles to judge, which implies lengthening
+        the window or fixing a threshold — not dropping the symbol.
+        """
         reasons = self.verdict_reasons()
+        if any(r.startswith("INSUFFICIENT") for r in reasons):
+            return "insufficient"
         if any(r.startswith("BLOCK") for r in reasons):
             return "unfit"
         if any(r.startswith("WARN") for r in reasons):
@@ -263,7 +270,29 @@ class FitnessReport:
         reasons: List[str] = []
 
         if not self.closed_cycles:
-            reasons.append("BLOCK: no completed wheel cycle in the window")
+            # NOT a BLOCK: "no cycle closed" is a statement about the window,
+            # not the symbol. A name that made money on every decision day was
+            # being recommended for demotion because its cycle happened to
+            # straddle the window edge. INSUFFICIENT keeps it out of the
+            # demotion list while still refusing to call it fit.
+            # These share a label but imply opposite actions: a symbol that
+            # never opened a position is a config/data question (can it trade
+            # at all?), while one that was deployed almost every day is a
+            # window-length question (it just didn't round-trip in time).
+            if self.days_in_position == 0:
+                reasons.append(
+                    "INSUFFICIENT: never opened a position in the window — "
+                    "this is a question about whether the strategy CAN trade "
+                    "this symbol (premium floor, delta band, gap filter), not "
+                    "about how it performed"
+                )
+            else:
+                reasons.append(
+                    f"INSUFFICIENT: deployed on {self.days_in_position} of "
+                    f"{self.decision_days} decision days but no cycle closed "
+                    f"inside the window — lengthen the window to judge it; the "
+                    f"return below excludes the open position's outcome"
+                )
             return reasons
 
         # Check activity before performance: a return earned on 3% of the days

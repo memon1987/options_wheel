@@ -1,0 +1,258 @@
+"""Screen mode — evaluate the whole universe on a cadence.
+
+Where `evaluate` answers "is this candidate symbol a fit?", screen answers
+"which symbols we currently trade have stopped being one?" It runs every
+configured symbol through the same engine, writes one row per symbol to
+`options_wheel.backtest_runs`, and flags demotion candidates.
+
+**Demotion stays a human decision.** The row carries `demote=true` as a
+recommendation and the reasons behind it; nothing here changes the trading
+universe. The plan is explicit that two cycles should be observed before any
+automation is wired, and the fidelity caveats (unmodeled dividends, unmodeled
+early assignment, a single vol regime) are exactly why.
+
+A symbol that fails still gets a row, carrying its error. Dropping it would make
+the run look like it screened fewer symbols than it attempted — the difference
+between "this symbol is fine" and "this symbol was never checked".
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+from typing import Dict, List, Optional, Sequence
+
+import structlog
+
+from ..utils.config import Config
+from .data.alpaca_provider import ALPACA_OPTIONS_HISTORY_START, UnadjustedCorporateAction
+from .evaluate import evaluate_symbol
+from .reporting.bq_writer import BacktestRunWriter, build_row, config_hash
+
+logger = structlog.get_logger(__name__)
+
+ENGINE_VERSION = "fc-032-phase-5"
+
+# Default lookback for a screening run. Long enough for a meaningful number of
+# cycles, short enough that a symbol's *recent* behavior dominates — a demotion
+# decision should not be anchored to how a name traded two years ago.
+DEFAULT_LOOKBACK_DAYS = 365
+
+
+@dataclass
+class SymbolResult:
+    symbol: str
+    report: object = None
+    sensitivity: Optional[dict] = None
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.report is not None
+
+    @property
+    def verdict(self) -> str:
+        return self.report.verdict() if self.ok else "error"
+
+
+@dataclass
+class ScreenResult:
+    run_id: str
+    start: date
+    end: date
+    results: List[SymbolResult] = field(default_factory=list)
+    persisted: bool = False
+    run_kind: str = "full"
+    universe_size: int = 0
+
+    @property
+    def demote_candidates(self) -> List[str]:
+        return [r.symbol for r in self.results if r.ok and r.verdict == "unfit"]
+
+    @property
+    def failures(self) -> List[str]:
+        return [r.symbol for r in self.results if not r.ok]
+
+    def tally(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for r in self.results:
+            out[r.verdict] = out.get(r.verdict, 0) + 1
+        return out
+
+
+def run_screen(
+    *,
+    config: Optional[Config] = None,
+    symbols: Optional[Sequence[str]] = None,
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+    starting_cash: float = 100_000.0,
+    persist: bool = True,
+    run_sensitivity: bool = True,
+) -> ScreenResult:
+    """Evaluate every symbol and (optionally) persist the results.
+
+    Args:
+        config: strategy config; the universe comes from ``config.stock_symbols``.
+        symbols: override the universe.
+        start/end: evaluation window; defaults to the last year, clamped to
+            Alpaca's options-history floor.
+        starting_cash: per-symbol capital. Each symbol is evaluated
+            independently on the same notional, so verdicts are comparable.
+        persist: write to BigQuery.
+        run_sensitivity: also replay at the bid. Doubles runtime; worth it,
+            because a verdict that flips on the fill assumption is not a verdict.
+    """
+    config = config or Config()
+    universe = list(symbols or config.stock_symbols)
+    end = end or date.today()
+    start = start or (end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+    if start < ALPACA_OPTIONS_HISTORY_START:
+        logger.info("Clamping screen window to Alpaca's options-history floor",
+                    requested=start.isoformat(),
+                    floor=ALPACA_OPTIONS_HISTORY_START.isoformat())
+        start = ALPACA_OPTIONS_HISTORY_START
+
+    run_id = uuid.uuid4().hex[:16]
+    cfg_hash = config_hash(config)
+    # A run covering the whole configured universe is 'full'; anything narrower
+    # is 'adhoc' and must never be mistaken for the current state of the
+    # universe by a "latest run" query.
+    run_kind = "full" if set(universe) == set(config.stock_symbols) else "adhoc"
+    logger.info("Screen run starting",
+                event_category="backtest", event_type="screen_started",
+                run_id=run_id, symbols=len(universe),
+                window=f"{start}..{end}", config_hash=cfg_hash)
+
+    # Construct the writer BEFORE the loop: a missing credential or wrong
+    # project discovered after ~a minute per symbol wastes the entire run and
+    # leaves the results only in memory.
+    writer = BacktestRunWriter() if persist else None
+    if persist and not writer.enabled:
+        logger.error(
+            "BigQuery writer unavailable — screening anyway, but results will "
+            "NOT be persisted. Fix credentials/GCP_PROJECT to record this run.",
+            event_category="backtest", event_type="screen_writer_unavailable",
+        )
+
+    result = ScreenResult(run_id=run_id, start=start, end=end,
+                          run_kind=run_kind, universe_size=len(universe))
+    for symbol in universe:
+        try:
+            report, sensitivity = evaluate_symbol(
+                symbol, start, end, config=config,
+                starting_cash=starting_cash, run_sensitivity=run_sensitivity,
+            )
+            result.results.append(SymbolResult(symbol, report, sensitivity))
+            logger.info("Screened symbol",
+                        event_category="backtest", event_type="screen_symbol_done",
+                        symbol=symbol, verdict=report.verdict(),
+                        total_return=round(report.total_return, 4))
+        except UnadjustedCorporateAction as exc:
+            # A split in the window is a data-scope limit, not a symbol verdict.
+            # Recording it as an error keeps it out of the demote list, where it
+            # would read as a judgement about the symbol.
+            result.results.append(SymbolResult(symbol, error=f"corporate_action: {exc}"))
+            logger.warning("Symbol skipped: unmodelled corporate action",
+                           event_category="backtest",
+                           event_type="screen_symbol_skipped",
+                           symbol=symbol, reason=str(exc)[:200])
+        except Exception as exc:  # noqa: BLE001 - one bad symbol must not kill the run
+            result.results.append(SymbolResult(symbol, error=str(exc)))
+            logger.error("Symbol FAILED during screen",
+                         event_category="backtest",
+                         event_type="screen_symbol_failed",
+                         symbol=symbol, error=str(exc)[:300])
+
+    if persist:
+        rows = [
+            build_row(run_id=run_id, symbol=r.symbol, report=r.report,
+                      sensitivity=r.sensitivity, cfg_hash=cfg_hash,
+                      engine_version=ENGINE_VERSION, error=r.error,
+                      run_kind=run_kind, universe_size=len(universe),
+                      window_start=start, window_end=end)
+            for r in result.results
+        ]
+        result.persisted = writer.write(rows)
+
+    logger.info("Screen run complete",
+                event_category="backtest", event_type="screen_completed",
+                run_id=run_id, tally=result.tally(),
+                demote_candidates=result.demote_candidates,
+                failures=result.failures, persisted=result.persisted)
+    return result
+
+
+def render_screen_summary(result: ScreenResult) -> str:
+    """Operator-facing summary. Demotions are recommendations, not actions."""
+    out: List[str] = []
+    a = out.append
+    a(f"# Universe screen — {result.start} → {result.end}")
+    a("")
+    scope = ("full universe" if result.run_kind == "full"
+             else "**ad-hoc subset — not a picture of the whole universe**")
+    a(f"Run `{result.run_id}` · {len(result.results)} symbols · {scope} · "
+      f"persisted: {'yes' if result.persisted else '**NO**'}")
+    a("")
+
+    a("| symbol | verdict | return | vs B&H | ann. on collateral | days in position |")
+    a("|---|---|---:|---:|---:|---:|")
+    for r in sorted(result.results, key=lambda x: (x.verdict, x.symbol)):
+        if not r.ok:
+            a(f"| {r.symbol} | **error** | — | — | — | — |")
+            continue
+        rep = r.report
+        aroc = rep.annualized_return_on_collateral
+        aroc_cell = f"{aroc:+.2%}" if aroc is not None else "—"
+        # An absent benchmark must render as "—", never "+0.00%": the latter
+        # reads as "exactly matched buy-and-hold", i.e. fabricated evidence in
+        # the table that justifies a demotion.
+        excess = rep.excess_return
+        excess_cell = f"{excess:+.2%}" if excess is not None else "—"
+        a(f"| {rep.symbol} | {rep.verdict()} | {rep.total_return:+.2%} "
+          f"| {excess_cell} | {aroc_cell} "
+          f"| {rep.days_in_position_fraction:.0%} |")
+    a("")
+
+    if result.demote_candidates:
+        a("## Demotion candidates")
+        a("")
+        a("These scored **unfit**. A recommendation for a human to weigh, not "
+          "an action.")
+        a("")
+        a("> **Weigh it against the engine's biases, which do not all point the "
+          "same way.** Unmodeled dividends *flatter* the wheel on the "
+          "buy-and-hold comparison, but *penalise* it on the absolute gates "
+          "(`lost money`, `below the risk-free rate`) that actually produce a "
+          "demotion — the wheel forgoes real dividends whenever it holds "
+          "assigned shares. On a 5–7% yielder that alone can push it under the "
+          "floor, so **on income names this list is biased toward demoting**. "
+          "Unmodeled early assignment is optimistic in the other direction. "
+          "Do not demote a dividend payer on this engine until dividends are "
+          "modeled.")
+        a("")
+        for symbol in result.demote_candidates:
+            r = next(x for x in result.results if x.symbol == symbol)
+            a(f"- **{symbol}** — " + "; ".join(r.report.verdict_reasons()))
+        a("")
+    else:
+        a("No demotion candidates in this run.")
+        a("")
+
+    if result.failures:
+        a("## Failed to screen")
+        a("")
+        a("These produced no verdict at all. They are **not** implicitly fine — "
+          "they were never checked.")
+        a("")
+        for symbol in result.failures:
+            r = next(x for x in result.results if x.symbol == symbol)
+            a(f"- **{symbol}** — {(r.error or '')[:160]}")
+        a("")
+
+    if not result.persisted:
+        a("> **Results were not persisted to BigQuery.** This summary is the only "
+          "record of the run.")
+        a("")
+    return "\n".join(out)

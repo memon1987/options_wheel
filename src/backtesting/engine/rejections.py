@@ -61,7 +61,22 @@ class RejectionTally:
     def processor(self, logger, name, event_dict):
         try:
             event_type = event_dict.get("event_type", "")
-            day = clock.now().date() if clock.is_frozen() else None
+            # structlog.configure() is PROCESS-global, so this processor sees
+            # events from every thread. clock.is_frozen() is thread-local and is
+            # the only reliable "this event came from the replay" signal.
+            #
+            # Tagging outside this guard mislabelled LIVE events as backtest=true
+            # — the mirror of the analytics-singleton bug, and worse for its own
+            # purpose: FC-039 filters `backtest != true`, so a mislabelled live
+            # event is silently DROPPED from real analysis. A false negative is
+            # worse than the untagged-replay false positive this fills.
+            if not clock.is_frozen():
+                return event_dict
+            day = clock.now().date()
+
+            # Synthetic cycles must be distinguishable from live ones in Cloud
+            # Logging. Promised by the plan (§5).
+            event_dict.setdefault("backtest", True)
             reason = _REASONS.get(event_type)
             if reason and day is not None:
                 self._seen.add((day, reason))

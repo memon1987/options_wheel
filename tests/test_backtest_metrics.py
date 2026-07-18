@@ -293,11 +293,40 @@ class TestFitness:
                             build_cycles(ledger), 100.0)
         assert r.max_drawdown == pytest.approx(-0.25)  # 120 -> 90
 
-    def test_verdict_blocks_when_no_cycle_completed(self):
+    def test_no_completed_cycle_is_insufficient_evidence_not_a_demotion(self):
+        """A window that ends mid-cycle says nothing about the symbol.
+
+        This previously returned "unfit", so a name that made money on every
+        decision day was recommended for demotion purely because its cycle
+        straddled the window edge.
+        """
         days = [D(2025, 1, 6), D(2025, 1, 8)]
         r = compute_fitness("XYZ", _states(days, [100_000, 100_000]), [], 100_000.0)
-        assert r.verdict() == "unfit"
-        assert any("no completed wheel cycle" in x for x in r.verdict_reasons())
+        assert r.verdict() == "insufficient"
+        assert r.verdict() != "unfit"
+        # Zero days deployed: a question about whether it CAN trade.
+        assert any("never opened a position" in x for x in r.verdict_reasons())
+
+    def test_traded_but_unclosed_cycle_reads_differently_from_never_traded(self):
+        """98%-deployed-and-profitable and 0%-never-traded imply opposite actions.
+
+        Both lack a closed cycle, but one asks "lengthen the window" and the
+        other asks "can this symbol trade at all?".
+        """
+        days = [D(2025, 1, 6) + __import__("datetime").timedelta(days=i)
+                for i in range(10)]
+        states = [
+            DailyState(day=d, equity=101_000.0, cash=92_000.0,
+                       reserved_collateral=9_000.0, open_options=1, shares_held={})
+            for d in days
+        ]
+        r = compute_fitness("XYZ", states, [], 100_000.0,
+                            data_quality={"decision_days": len(days)})
+        assert r.verdict() == "insufficient"
+        assert r.days_in_position == len(days)
+        reasons = r.verdict_reasons()
+        assert any("no cycle closed" in x for x in reasons)
+        assert not any("never opened a position" in x for x in reasons)
 
     def test_verdict_blocks_on_a_loss(self):
         r = self._report(equities=(100_000, 99_000, 98_000))
@@ -597,3 +626,60 @@ class TestRejectionTally:
         t = self._tally()
         assert t.processor(None, "info", {}) == {}
         assert t.processor(None, "info", {"event_type": None}) is not None
+
+    def test_replay_events_are_tagged_so_they_cannot_pollute_live_forensics(self):
+        """FC-039 reads real roll_cycle_completed events; a screen must not
+
+        contribute synthetic zero-roll cycles indistinguishable from live ones.
+        """
+        from datetime import datetime as _dt
+
+        t = self._tally()
+        with clock.frozen(_dt(2025, 1, 6, 16, 0)):
+            out = t.processor(None, "info",
+                              {"event_type": "roll_cycle_completed",
+                               "rolls_executed": 0})
+        assert out["backtest"] is True
+
+    def test_a_LIVE_event_from_another_thread_is_never_tagged(self):
+        """structlog.configure() is process-global, so this processor sees every
+
+        thread's events. Tagging outside the thread-local freeze mislabelled
+        live events as backtest=true — and since FC-039 filters
+        `backtest != true`, a mislabelled live event is silently DROPPED from
+        real analysis. That false negative is worse than an untagged replay.
+        """
+        import threading
+        import time
+        from datetime import datetime as _dt
+
+        t = self._tally()
+        seen, stop = {}, threading.Event()
+
+        def live():
+            while not stop.is_set():
+                ed = t.processor(None, "info", {"event_type": "order_filled"})
+                seen["tag"] = ed.get("backtest")
+                time.sleep(0.005)
+
+        th = threading.Thread(target=live)
+        th.start()
+        try:
+            with clock.frozen(_dt(2025, 1, 6, 16, 0)):
+                time.sleep(0.04)
+        finally:
+            stop.set()
+            th.join()
+
+        assert seen.get("tag") is None, (
+            "a live event on another thread was tagged backtest=true and would "
+            "be dropped from FC-039's analysis"
+        )
+
+    def test_an_explicit_tag_is_not_overwritten(self):
+        from datetime import datetime as _dt
+
+        t = self._tally()
+        with clock.frozen(_dt(2025, 1, 6, 16, 0)):
+            out = t.processor(None, "info", {"event_type": "x", "backtest": False})
+        assert out["backtest"] is False
