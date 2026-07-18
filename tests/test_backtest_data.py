@@ -14,7 +14,11 @@ from typing import Dict, List
 import pytest
 
 from src.backtesting.data import greeks
-from src.backtesting.data.chain_builder import ChainBuilder
+from src.backtesting.data.chain_builder import (
+    ChainBuilder,
+    STRIKE_WINDOW_PCT,
+    strike_window,
+)
 from src.backtesting.data.chain_store import ChainStore
 from src.backtesting.data.provider import OptionBar, OptionContract, StockBar
 from src.backtesting.data.quality import evaluate_coverage
@@ -113,21 +117,32 @@ class MockProvider:
         self.bar_dates: Dict[str, List[date]] = {}
         self.bar_close: Dict[str, float] = {}
         self.stock: Dict[date, float] = {}
+        # Call recorders: the cache tests assert on *calls made*, not on
+        # elapsed time, so a cache that silently refetched would still fail.
+        self.universe_calls: List[tuple] = []
+        self.option_bar_calls: List[tuple] = []
 
     def add_contract(self, c: OptionContract, close: float, traded_on: List[date]):
         self.contracts.append(c)
         self.bar_close[c.symbol] = close
         self.bar_dates[c.symbol] = traded_on
 
-    def get_contract_universe(self, underlying, as_of, max_dte):
+    def get_contract_universe(
+        self, underlying, as_of, max_dte, *, strike_gte=None, strike_lte=None
+    ):
         hi = as_of + timedelta(days=max_dte)
-        return [
+        self.universe_calls.append((underlying, as_of, max_dte, strike_gte, strike_lte))
+        out = [
             c
             for c in self.contracts
             if c.underlying == underlying and as_of <= c.expiration <= hi
         ]
+        if strike_gte is not None:
+            out = [c for c in out if strike_gte <= c.strike <= strike_lte]
+        return out
 
     def get_option_bars(self, symbols, start, end):
+        self.option_bar_calls.append((tuple(symbols), start, end))
         out: Dict[str, List[OptionBar]] = {}
         for s in symbols:
             days = [d for d in self.bar_dates.get(s, []) if start <= d <= end]
@@ -618,3 +633,414 @@ class TestRealtimeClamp:
             assert _is_settled(date.today() - timedelta(days=1))
             # And the request cutoff still tracks real time, not 2024.
             assert _delayed_end(date.today()).year == date.today().year
+
+
+# --------------------------------------------------------------------------- #
+# FC-042 A2 — the strike window
+# --------------------------------------------------------------------------- #
+class TestStrikeWindow:
+    def test_symmetric_around_spot_when_no_shares_are_held(self):
+        lo, hi = strike_window(200.0)
+        assert lo == pytest.approx(150.0)
+        assert hi == pytest.approx(250.0)
+
+    def test_cost_basis_below_spot_does_not_shrink_the_window(self):
+        """A profitable position must not narrow the ladder."""
+        assert strike_window(200.0, cost_basis=120.0) == strike_window(200.0)
+
+    def test_cost_basis_above_spot_extends_the_upper_bound_only(self):
+        """The underwater case the window exists to protect."""
+        lo, hi = strike_window(100.0, cost_basis=180.0)
+        assert lo == pytest.approx(75.0), "lower bound still anchored to spot"
+        assert hi == pytest.approx(225.0), "upper bound must clear cost basis"
+        assert hi > 180.0, "a call at cost basis has to be inside the window"
+
+    def test_an_underwater_covered_call_stays_reachable(self):
+        """The regression this parameter exists for.
+
+        Shares bought at 180 with spot now 100: every *eligible* covered call
+        (struck at or above cost basis) sits 80%+ above spot. A spot-centred
+        window stops at 125 and the call ladder comes back empty — the replay
+        would show the position never rolling, which is a strategy conclusion
+        drawn from a data-fetch bug.
+        """
+        spot, basis = 100.0, 180.0
+        _, spot_only_hi = strike_window(spot)
+        assert spot_only_hi < basis, "precondition: spot window excludes cost basis"
+
+        lo, hi = strike_window(spot, cost_basis=basis)
+        eligible = [s for s in (180.0, 185.0, 190.0, 200.0) if lo <= s <= hi]
+        assert eligible == [180.0, 185.0, 190.0, 200.0]
+
+    @pytest.mark.parametrize("spot", [12.5, 100.0, 185.54, 932.0])
+    def test_window_admits_every_strike_in_the_measured_delta_band(self, spot):
+        """Guards the constant against being 'optimised' into wrongness.
+
+        Measured on NVDA over five sessions (2025-10-06 .. 2026-03-09), the
+        0.10-0.20 delta band spanned 0.917x-1.054x spot. Every strike in that
+        range must survive the real window function at any price scale, or the
+        filter starts changing which strike the strategy picks instead of just
+        how fast it gets there.
+        """
+        lo, hi = strike_window(spot)
+        for factor in (0.917, 0.95, 1.0, 1.02, 1.054):
+            strike = spot * factor
+            assert lo <= strike <= hi, f"band strike {factor}x spot was clipped"
+        # And a margin beyond the measured edges, since the band moves with vol.
+        assert lo < spot * 0.85 and hi > spot * 1.15
+
+    def test_bounds_are_forwarded_to_the_provider(self):
+        p = MockProvider()
+        as_of, exp = date(2025, 1, 6), date(2025, 1, 10)
+        p.stock = {as_of: 100.0}
+        p.add_contract(
+            OptionContract(_occ("XYZ", exp, "put", 95), "XYZ", exp, 95.0, "put"),
+            close=0.5, traded_on=[as_of],
+        )
+        ChainBuilder(p).build("XYZ", as_of, max_dte=7)
+
+        _, _, _, gte, lte = p.universe_calls[-1]
+        assert gte == pytest.approx(75.0)
+        assert lte == pytest.approx(125.0)
+
+    def test_builder_narrows_a_provider_that_ignores_the_bounds(self):
+        """The Protocol lets a provider return a superset; the chain may not.
+
+        Without local narrowing, the same request would yield a wider chain
+        from a lax provider than from the cache, and a cached run would
+        silently disagree with a fresh one.
+        """
+        p = MockProvider()
+        as_of, exp = date(2025, 1, 6), date(2025, 1, 10)
+        p.stock = {as_of: 100.0}
+        for strike in (50.0, 95.0, 400.0):  # 50 and 400 are far outside +/-25%
+            p.add_contract(
+                OptionContract(_occ("XYZ", exp, "put", strike), "XYZ", exp, strike, "put"),
+                close=0.5, traded_on=[as_of],
+            )
+        # Force the lax-provider case: strip the mock's own strike filtering.
+        p.get_contract_universe = lambda u, a, m, **kw: [
+            c for c in p.contracts if a <= c.expiration <= a + timedelta(days=m)
+        ]
+
+        snap = ChainBuilder(p).build("XYZ", as_of, max_dte=7)
+        assert [q.strike for q in snap.puts] == [95.0]
+
+
+# --------------------------------------------------------------------------- #
+# FC-042 A1 — the chain cache
+# --------------------------------------------------------------------------- #
+class _CacheFixture:
+    """A three-strike chain plus a store, for the cache tests."""
+
+    def __init__(self, tmp_path, strikes=(85.0, 95.0, 100.0), spot=100.0):
+        self.provider = MockProvider()
+        self.as_of = date(2025, 1, 6)
+        self.exp = date(2025, 1, 10)
+        self.provider.stock = {self.as_of: spot}
+        for strike in strikes:
+            self.provider.add_contract(
+                OptionContract(
+                    _occ("XYZ", self.exp, "put", strike), "XYZ", self.exp, strike, "put"
+                ),
+                close=max(0.05, (spot - strike) * 0.02 + 0.30),
+                traded_on=[self.as_of],
+            )
+        self.store = ChainStore(str(tmp_path))
+
+    def builder(self):
+        return ChainBuilder(self.provider, risk_free_rate=0.04, store=self.store)
+
+    def calls(self):
+        return len(self.provider.universe_calls), len(self.provider.option_bar_calls)
+
+
+class TestChainCache:
+    def test_second_build_makes_zero_provider_calls(self, tmp_path):
+        """A1's acceptance criterion, at unit scale: calls, not wall-clock."""
+        f = _CacheFixture(tmp_path)
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        cold = f.calls()
+        assert cold[0] > 0 and cold[1] > 0, "cold run must actually fetch"
+
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        assert f.calls() == cold, "warm run must make no provider calls at all"
+
+    def test_warm_chain_is_identical_to_cold(self, tmp_path):
+        """The cache must be invisible to results, not merely fast."""
+        f = _CacheFixture(tmp_path)
+        cold = f.builder().build("XYZ", f.as_of, max_dte=7)
+        warm = f.builder().build("XYZ", f.as_of, max_dte=7)
+
+        assert warm.underlying_price == cold.underlying_price
+        assert len(warm.puts) == len(cold.puts) and len(warm.calls) == len(cold.calls)
+        for a, b in zip(cold.all_quotes(), warm.all_quotes()):
+            assert a == b, "round-trip changed a quote"
+
+    def test_a_narrower_cached_window_is_a_miss(self, tmp_path):
+        """Fail closed: a file that cannot be proven to cover must refetch.
+
+        This is the covered-call case in cache form — the first run held no
+        shares and cached a spot-centred window; the second run is underwater
+        and needs strikes above cost basis. Serving the narrow file would hide
+        every eligible call and look exactly like a day they did not trade.
+        """
+        f = _CacheFixture(tmp_path)
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        after_cold = f.calls()
+
+        f.builder().build("XYZ", f.as_of, max_dte=7, cost_basis=180.0)
+        assert f.calls() != after_cold, "wider request must go back to the provider"
+
+    def test_a_wider_cached_window_is_a_hit_and_is_narrowed(self, tmp_path):
+        f = _CacheFixture(tmp_path, strikes=(85.0, 95.0, 100.0, 200.0), spot=100.0)
+        # Cache a wide window (cost basis 180 -> upper bound 225).
+        wide = f.builder().build("XYZ", f.as_of, max_dte=7, cost_basis=180.0)
+        assert 200.0 in [q.strike for q in wide.puts]
+        after_cold = f.calls()
+
+        narrow = f.builder().build("XYZ", f.as_of, max_dte=7)
+        assert f.calls() == after_cold, "narrower request is covered: no refetch"
+        assert 200.0 not in [q.strike for q in narrow.puts], "must narrow on read"
+        assert [q.strike for q in narrow.puts] == [85.0, 95.0, 100.0]
+
+    def test_a_shorter_cached_dte_reach_is_a_miss(self, tmp_path):
+        f = _CacheFixture(tmp_path)
+        f.builder().build("XYZ", f.as_of, max_dte=3)
+        after_cold = f.calls()
+        f.builder().build("XYZ", f.as_of, max_dte=14)
+        assert f.calls() != after_cold
+
+    def test_a_longer_cached_dte_reach_is_narrowed_on_read(self, tmp_path):
+        """A 14-DTE file must not smuggle a 10-DTE contract into a 7-DTE run."""
+        p = MockProvider()
+        as_of = date(2025, 1, 6)
+        p.stock = {as_of: 100.0}
+        for exp in (date(2025, 1, 10), date(2025, 1, 17)):  # 4 and 11 DTE
+            p.add_contract(
+                OptionContract(_occ("XYZ", exp, "put", 95), "XYZ", exp, 95.0, "put"),
+                close=0.5, traded_on=[as_of],
+            )
+        store = ChainStore(str(tmp_path))
+
+        wide = ChainBuilder(p, store=store).build("XYZ", as_of, max_dte=14)
+        assert sorted(q.dte for q in wide.puts) == [4, 11]
+
+        narrow = ChainBuilder(p, store=store).build("XYZ", as_of, max_dte=7)
+        assert sorted(q.dte for q in narrow.puts) == [4]
+
+    def test_a_different_underlying_close_is_a_miss(self, tmp_path):
+        """Every delta in the file was computed against the cached close."""
+        f = _CacheFixture(tmp_path)
+        f.builder().build("XYZ", f.as_of, max_dte=7, underlying_price=100.0)
+        after_cold = f.calls()
+        f.builder().build("XYZ", f.as_of, max_dte=7, underlying_price=101.0)
+        assert f.calls() != after_cold
+
+    def test_todays_chain_is_never_persisted(self, tmp_path):
+        """Today's session is still forming — caching it freezes a partial day.
+
+        Exercised through the bypass that makes it reachable at all: supplying
+        underlying_price skips the stock-bar fetch that would otherwise return
+        nothing for today.
+        """
+        f = _CacheFixture(tmp_path)
+        today = date.today()
+        f.builder().build("XYZ", today, max_dte=7, underlying_price=100.0)
+        assert f.store.get("XYZ", today) is None
+        assert not f.store.has("XYZ", today)
+
+        # A settled past session, by contrast, is cached.
+        f.builder().build("XYZ", f.as_of, max_dte=7, underlying_price=100.0)
+        assert f.store.has("XYZ", f.as_of)
+
+    def test_an_empty_chain_is_cached_rather_than_refetched_forever(self, tmp_path):
+        """A genuinely empty day must not look like a cache miss every run."""
+        p = MockProvider()
+        as_of = date(2025, 1, 6)
+        p.stock = {as_of: 100.0}
+        store = ChainStore(str(tmp_path))
+
+        first = ChainBuilder(p, store=store).build("XYZ", as_of, max_dte=7)
+        assert first is not None and first.all_quotes() == []
+        after_cold = (len(p.universe_calls), len(p.option_bar_calls))
+
+        second = ChainBuilder(p, store=store).build("XYZ", as_of, max_dte=7)
+        assert second is not None and second.all_quotes() == []
+        assert (len(p.universe_calls), len(p.option_bar_calls)) == after_cold
+
+    def test_a_file_without_provenance_cannot_satisfy_a_bounded_request(self, tmp_path):
+        """Legacy/undeclared files fail closed rather than being assumed wide."""
+        f = _CacheFixture(tmp_path)
+        snap = ChainBuilder(f.provider).build("XYZ", f.as_of, max_dte=7)
+        f.store.put(snap)  # no provenance declared
+
+        assert f.store.get("XYZ", f.as_of) is not None, "unbounded read still works"
+        assert f.store.get(
+            "XYZ", f.as_of, universe_dte=8, strike_gte=75.0, strike_lte=125.0
+        ) is None
+
+    def test_caching_is_off_unless_a_store_is_supplied(self, tmp_path):
+        """Default-off keeps one unit test from reading another's chain."""
+        f = _CacheFixture(tmp_path)
+        ChainBuilder(f.provider).build("XYZ", f.as_of, max_dte=7)
+        assert not f.store.has("XYZ", f.as_of)
+
+
+class TestProviderStrikeBounds:
+    """The provider half of A2, against a stubbed Alpaca client."""
+
+    def _provider_capturing_requests(self):
+        from src.backtesting.data.alpaca_provider import AlpacaDataProvider
+
+        provider = AlpacaDataProvider(api_key="k", secret_key="s", paper=True)
+        seen = []
+
+        class _Resp:
+            next_page_token = None
+            option_contracts = []
+
+        def _stub(req):
+            seen.append(req)
+            return _Resp()
+
+        provider._trading.get_option_contracts = _stub
+        return provider, seen
+
+    def test_bounds_are_sent_as_strings_not_floats(self):
+        """The SDK types strike_price_gte/lte as Optional[str].
+
+        Passing a float fails pydantic validation and 500s every contract-
+        discovery call — which would surface as 'no contracts' on every day of
+        every backtest, i.e. a silent zero-trade run rather than a crash.
+        """
+        provider, seen = self._provider_capturing_requests()
+        provider.get_contract_universe(
+            "NVDA", date(2025, 10, 6), 8, strike_gte=139.155, strike_lte=231.925
+        )
+        assert seen, "no request was issued"
+        for req in seen:
+            assert isinstance(req.strike_price_gte, str)
+            assert isinstance(req.strike_price_lte, str)
+            assert req.strike_price_gte == "139.16"
+            assert req.strike_price_lte == "231.93"
+
+    def test_unbounded_request_sends_no_strike_filter(self):
+        """Existing callers must keep the full ladder."""
+        provider, seen = self._provider_capturing_requests()
+        provider.get_contract_universe("NVDA", date(2025, 10, 6), 8)
+        for req in seen:
+            assert req.strike_price_gte is None
+            assert req.strike_price_lte is None
+
+    def test_memo_is_keyed_by_the_strike_window(self):
+        """Otherwise a narrow first call would poison every later wide one."""
+        provider, seen = self._provider_capturing_requests()
+        as_of = date(2025, 10, 6)
+        provider.get_contract_universe("NVDA", as_of, 8, strike_gte=100.0, strike_lte=200.0)
+        n_after_first = len(seen)
+        provider.get_contract_universe("NVDA", as_of, 8, strike_gte=100.0, strike_lte=200.0)
+        assert len(seen) == n_after_first, "identical window must hit the memo"
+
+        provider.get_contract_universe("NVDA", as_of, 8, strike_gte=50.0, strike_lte=300.0)
+        assert len(seen) > n_after_first, "different window must not reuse the memo"
+
+
+class TestCacheModelFingerprint:
+    """bid/ask/delta/iv are COMPUTED, so the model is part of the cache key.
+
+    Without this, FC-042 Track C1 (real dividend yields) and C3 (spread-model
+    recalibration) would silently invalidate nothing: Track B's studies would
+    re-run warm and mix quotes priced under two different models, with no error
+    and no TTL.
+    """
+
+    def _fixture(self, tmp_path):
+        return _CacheFixture(tmp_path)
+
+    def _build(self, f, **kw):
+        return ChainBuilder(f.provider, store=f.store, **kw).build(
+            "XYZ", f.as_of, max_dte=7
+        )
+
+    def test_a_different_risk_free_rate_is_a_miss(self, tmp_path):
+        f = self._fixture(tmp_path)
+        cold = self._build(f, risk_free_rate=0.04)
+        after = f.calls()
+        warm = self._build(f, risk_free_rate=0.25)
+        assert f.calls() != after, "changed rate must refetch, not reuse deltas"
+        assert [q.delta for q in warm.puts] != [q.delta for q in cold.puts]
+
+    def test_a_different_dividend_yield_is_a_miss(self, tmp_path):
+        f = self._fixture(tmp_path)
+        self._build(f)
+        after = f.calls()
+        self._build(f, dividend_yields={"XYZ": 0.10})
+        assert f.calls() != after
+
+    def test_a_different_spread_model_is_a_miss(self, tmp_path):
+        f = self._fixture(tmp_path)
+        cold = self._build(f)
+        after = f.calls()
+        warm = self._build(f, spread_model=SpreadModel(base_frac=0.50))
+        assert f.calls() != after, "changed spread model must refetch"
+        assert [q.bid for q in warm.puts] != [q.bid for q in cold.puts]
+
+    def test_the_same_model_still_hits(self, tmp_path):
+        """The invalidation must not be so eager that nothing ever caches."""
+        f = self._fixture(tmp_path)
+        self._build(f, risk_free_rate=0.04)
+        after = f.calls()
+        self._build(f, risk_free_rate=0.04)
+        assert f.calls() == after
+
+    def test_dividend_yield_for_another_symbol_does_not_invalidate(self, tmp_path):
+        """The fingerprint is per-symbol; an unrelated entry must not bust it."""
+        f = self._fixture(tmp_path)
+        self._build(f, dividend_yields={"XYZ": 0.03})
+        after = f.calls()
+        self._build(f, dividend_yields={"XYZ": 0.03, "OTHER": 0.09})
+        assert f.calls() == after
+
+
+class TestCacheDurability:
+    def test_a_corrupt_file_is_discarded_rather_than_raising(self, tmp_path):
+        """A torn parquet must not wedge every future run on the same day."""
+        f = _CacheFixture(tmp_path)
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        path = f.store._path("XYZ", f.as_of)
+        assert path.exists()
+
+        path.write_bytes(b"not a parquet file")
+        after_corrupt = f.calls()
+        snap = f.builder().build("XYZ", f.as_of, max_dte=7)
+
+        assert snap is not None, "a corrupt entry must fall back to the provider"
+        assert f.calls() != after_corrupt, "it must actually refetch"
+        # And it must have healed, so the next run is warm again.
+        healed = f.calls()
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        assert f.calls() == healed
+
+    def test_a_zero_byte_file_is_discarded(self, tmp_path):
+        f = _CacheFixture(tmp_path)
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        f.store._path("XYZ", f.as_of).write_bytes(b"")
+        assert f.builder().build("XYZ", f.as_of, max_dte=7) is not None
+
+    def test_put_leaves_no_temp_file_behind(self, tmp_path):
+        f = _CacheFixture(tmp_path)
+        f.builder().build("XYZ", f.as_of, max_dte=7)
+        leftovers = list(f.store._path("XYZ", f.as_of).parent.glob("*.tmp"))
+        assert leftovers == []
+
+    def test_a_one_sided_strike_bound_does_not_raise(self, tmp_path):
+        """Latent landmine for Track B's config-override hook."""
+        f = _CacheFixture(tmp_path)
+        snap = f.builder().build("XYZ", f.as_of, max_dte=7)
+        f.store.put(snap, universe_dte=8, strike_gte=75.0, strike_lte=125.0, model="m")
+
+        only_lower = f.store.get("XYZ", f.as_of, strike_gte=90.0, model="m")
+        assert [q.strike for q in only_lower.puts] == [95.0, 100.0]
+        only_upper = f.store.get("XYZ", f.as_of, strike_lte=90.0, model="m")
+        assert [q.strike for q in only_upper.puts] == [85.0]

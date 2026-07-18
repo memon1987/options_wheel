@@ -19,6 +19,7 @@ import structlog
 from ..utils.config import Config
 from .data.alpaca_provider import AlpacaDataProvider
 from .data.chain_builder import ChainBuilder
+from .data.chain_store import ChainStore
 from .engine.simulator import SimulationResult, Simulator
 from .metrics.cycles import build_cycles, count_rolls
 from .metrics.fitness import FitnessReport, compute_fitness
@@ -43,15 +44,28 @@ def evaluate_symbol(
     starting_cash: float = 100_000.0,
     fill_haircut: float = DEFAULT_FILL_HAIRCUT,
     run_sensitivity: bool = True,
+    chain_store: Optional[ChainStore] = None,
+    use_cache: bool = True,
 ) -> tuple:
     """Replay ``symbol`` and score it.
+
+    Args:
+        chain_store: parquet chain cache to use; defaults to one rooted at
+            ``cache/backtest/`` (gitignored).
+        use_cache: set False to force every chain to be rebuilt from the API.
 
     Returns:
         ``(FitnessReport, sensitivity_dict_or_None)``.
     """
     config = config or Config()
     provider = AlpacaDataProvider.from_config(config)
-    builder = ChainBuilder(provider)
+    # Cache on by default. Chains for settled sessions are immutable, and the
+    # sensitivity pass below replays the identical window a second time under a
+    # different fill assumption — without a cache that pays the full API bill
+    # twice over for chains that cannot differ between the two passes.
+    if use_cache and chain_store is None:
+        chain_store = ChainStore()
+    builder = ChainBuilder(provider, store=chain_store if use_cache else None)
     max_dte = getattr(config, "put_target_dte", 7)
 
     result = _run(

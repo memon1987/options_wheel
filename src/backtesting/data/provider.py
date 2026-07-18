@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Protocol, runtime_checkable
+from typing import Dict, List, Optional, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -66,7 +66,13 @@ class OptionsDataProvider(Protocol):
     """
 
     def get_contract_universe(
-        self, underlying: str, as_of: date, max_dte: int
+        self,
+        underlying: str,
+        as_of: date,
+        max_dte: int,
+        *,
+        strike_gte: Optional[float] = None,
+        strike_lte: Optional[float] = None,
     ) -> List[OptionContract]:
         """List contracts tradeable on ``as_of`` expiring within ``max_dte`` days.
 
@@ -74,6 +80,11 @@ class OptionsDataProvider(Protocol):
         ``status=inactive``) so historical dates see the chain that existed then,
         and must exclude anything expiring before ``as_of`` (already gone) or
         after ``as_of + max_dte`` (outside the decision horizon).
+
+        ``strike_gte``/``strike_lte``, when supplied, bound the strike ladder.
+        They are a cost optimisation only: an implementation may ignore them
+        (returning a superset is always correct), but must never return strikes
+        outside a bound it does honour.
         """
         ...
 

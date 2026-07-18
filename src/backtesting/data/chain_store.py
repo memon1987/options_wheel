@@ -8,17 +8,34 @@ sweeps, report regeneration, the parity check — hit disk instead of the API.
 Layout: ``<cache_dir>/<UNDERLYING>/<YYYY-MM-DD>.parquet``, one file per chain.
 Each row is a ChainQuote; the underlying price rides along as a column (constant
 within a file) so a snapshot round-trips without a sidecar.
+
+**Why there is no TTL.** A chain for a settled past session is immutable: it is
+derived from that day's final daily bars, which Alpaca does not restate. The
+entry can therefore live forever. What the key ``(underlying, as_of)`` does NOT
+capture is how *much* of that day was fetched — the DTE reach and the strike
+window both narrow the result — so each file also records the request it
+answers, and a read is a hit only when the file provably covers the new request
+(``_covers``) and is narrowed back to it. Getting that wrong would not be a slow
+backtest but a wrong one: a chain missing the strikes the caller asked for looks
+exactly like a day on which those strikes did not trade.
+
+Today's session is excluded from the cache upstream — see
+``chain_builder._is_cacheable``.
 """
 
 from __future__ import annotations
 
+import os
 from datetime import date
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import structlog
 
 from .chain_builder import ChainQuote, ChainSnapshot
+
+logger = structlog.get_logger(__name__)
 
 _COLUMNS = [
     "symbol",
@@ -37,7 +54,34 @@ _COLUMNS = [
     "volume",
     "modeled_spread",
     "modeled_greeks",
+    # Provenance of the *request* that produced this file, not of any one quote.
+    # Constant within a file; see the coverage check in ``get``.
+    "universe_dte",
+    "strike_gte",
+    "strike_lte",
+    # Identity of the pricing model that COMPUTED bid/ask/delta/iv above. Those
+    # are derived, not fetched, so a file priced under a different model answers
+    # a different question — see ChainBuilder._model_fingerprint.
+    "model",
 ]
+
+# Written into the provenance columns when a caller persists a snapshot without
+# declaring what window it was built under. Such a file can still be read back
+# wholesale, but it can never satisfy a *bounded* request: we cannot prove it
+# covers one. Fail closed — a false cache hit is a silently wrong backtest.
+_UNKNOWN = float("nan")
+
+# Strike bounds are floats recomputed per run; compare them with a tolerance
+# well below one strike increment (the tightest ladders are $0.50 wide).
+_BOUND_TOL = 1e-6
+
+# The underlying close is the anchor every delta in the file was computed
+# against, so it is compared far more strictly than the window bounds.
+_PRICE_TOL = 1e-9
+
+
+def _close(a: float, b: float) -> bool:
+    return abs(a - b) <= _PRICE_TOL * max(1.0, abs(a), abs(b))
 
 
 class ChainStore:
@@ -52,34 +96,153 @@ class ChainStore:
     def has(self, underlying: str, as_of: date) -> bool:
         return self._path(underlying, as_of).exists()
 
-    def put(self, snapshot: ChainSnapshot) -> None:
-        """Persist a snapshot (overwrites any existing file for that day)."""
+    def put(
+        self,
+        snapshot: ChainSnapshot,
+        *,
+        universe_dte: Optional[int] = None,
+        strike_gte: Optional[float] = None,
+        strike_lte: Optional[float] = None,
+        model: str = "",
+    ) -> None:
+        """Persist a snapshot (overwrites any existing file for that day).
+
+        ``universe_dte``/``strike_gte``/``strike_lte``/``model`` record the
+        request the snapshot answers, so ``get`` can later prove the file covers
+        a new request instead of assuming it.
+
+        The write is atomic: a temp file in the same directory, then
+        ``os.replace``. Without that, an interrupted or concurrent write leaves
+        a truncated parquet behind, and since the reader cannot repair one, every
+        later run would die on the same day until someone found and deleted it
+        by hand. Parallel study runs over overlapping symbols (FC-042 Track B
+        runs B1 and B2 concurrently) make that a routine event, not an exotic one.
+        """
         path = self._path(snapshot.underlying, snapshot.as_of)
         path.parent.mkdir(parents=True, exist_ok=True)
-        rows = [self._quote_to_row(q) for q in snapshot.all_quotes()]
+        provenance = {
+            "universe_dte": _UNKNOWN if universe_dte is None else float(universe_dte),
+            "strike_gte": _UNKNOWN if strike_gte is None else float(strike_gte),
+            "strike_lte": _UNKNOWN if strike_lte is None else float(strike_lte),
+            "model": model,
+        }
+        rows = [{**self._quote_to_row(q), **provenance} for q in snapshot.all_quotes()]
         if not rows:
             # A real "no contracts traded" day: write one sentinel row (empty
             # symbol) carrying the underlying price so a later read distinguishes
             # an empty chain from a cache miss.
-            rows = [self._empty_row(snapshot)]
-        pd.DataFrame(rows, columns=_COLUMNS).to_parquet(path, index=False)
+            rows = [{**self._empty_row(snapshot), **provenance}]
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            pd.DataFrame(rows, columns=_COLUMNS).to_parquet(tmp, index=False)
+            os.replace(tmp, path)  # atomic within a filesystem
+        finally:
+            if tmp.exists():
+                tmp.unlink()
 
-    def get(self, underlying: str, as_of: date) -> Optional[ChainSnapshot]:
-        """Load a cached snapshot, or None on a cache miss."""
+    def get(
+        self,
+        underlying: str,
+        as_of: date,
+        *,
+        universe_dte: Optional[int] = None,
+        strike_gte: Optional[float] = None,
+        strike_lte: Optional[float] = None,
+        underlying_price: Optional[float] = None,
+        model: Optional[str] = None,
+    ) -> Optional[ChainSnapshot]:
+        """Load a cached snapshot, or None on a cache miss.
+
+        A file is a hit only if it *covers* the request: built with at least as
+        long a DTE reach, at least as wide a strike window, and under the same
+        pricing model. A covering file is then narrowed to exactly the requested
+        window, so that reading from cache and building from the provider return
+        the identical chain — the property that makes the cache invisible to
+        results rather than merely fast.
+
+        Passing no bounds asks for the file as written, with no coverage claim.
+
+        An unreadable file is treated as a miss and deleted rather than raised:
+        it is a corrupt cache entry, and the caller can always rebuild from the
+        provider. Propagating the error instead would wedge every future run.
+        """
         path = self._path(underlying, as_of)
         if not path.exists():
             return None
-        df = pd.read_parquet(path)
-        underlying_price = float(df["underlying_price"].iloc[0]) if not df.empty else 0.0
+        try:
+            df = pd.read_parquet(path)
+        except Exception:
+            logger.warning(
+                "Discarding an unreadable chain-cache file",
+                event_category="backtest_data",
+                event_type="chain_cache_corrupt",
+                symbol=underlying,
+                as_of=as_of.isoformat(),
+                path=str(path),
+            )
+            path.unlink(missing_ok=True)
+            return None
+        if df.empty:
+            return None
+        if not self._covers(df, universe_dte, strike_gte, strike_lte, model):
+            return None
+
+        cached_price = float(df["underlying_price"].iloc[0])
+        if underlying_price is not None and not _close(cached_price, underlying_price):
+            # The file was built against a different close for the same session
+            # (a restated bar, or a raw/adjusted mix). Every delta in it was
+            # computed against that price, so it cannot answer this request.
+            return None
+
         puts, calls = [], []
         for _, r in df.iterrows():
             if not r["symbol"]:  # sentinel row for an empty chain
+                continue
+            strike = float(r["strike"])
+            if strike_gte is not None and strike < strike_gte:
+                continue
+            if strike_lte is not None and strike > strike_lte:
+                continue
+            if universe_dte is not None and int(r["dte"]) > universe_dte:
                 continue
             q = self._row_to_quote(r)
             (puts if q.option_type == "put" else calls).append(q)
         puts.sort(key=lambda x: x.strike)
         calls.sort(key=lambda x: x.strike)
-        return ChainSnapshot(underlying, as_of, underlying_price, puts, calls)
+        return ChainSnapshot(underlying, as_of, cached_price, puts, calls)
+
+    @staticmethod
+    def _covers(
+        df,
+        universe_dte: Optional[int],
+        strike_gte: Optional[float],
+        strike_lte: Optional[float],
+        model: Optional[str] = None,
+    ) -> bool:
+        """Whether the file's build window is a superset of the request."""
+        if model is not None:
+            # Not a width comparison: a different model is a different answer,
+            # never a wider one. Absent column => pre-fingerprint file => miss.
+            if "model" not in df.columns or str(df["model"].iloc[0]) != model:
+                return False
+        if universe_dte is not None:
+            stored = df["universe_dte"].iloc[0] if "universe_dte" in df.columns else _UNKNOWN
+            if pd.isna(stored) or int(stored) < universe_dte:
+                return False
+        if strike_gte is not None or strike_lte is not None:
+            if "strike_gte" not in df.columns or "strike_lte" not in df.columns:
+                return False
+            lo, hi = df["strike_gte"].iloc[0], df["strike_lte"].iloc[0]
+            if pd.isna(lo) or pd.isna(hi):
+                return False
+            # Tolerance: the bounds are recomputed from a float close each run,
+            # so an exact-equality test would miss on the last bit and refetch
+            # every single day for no reason.
+            if strike_gte is not None and float(lo) > strike_gte + _BOUND_TOL:
+                return False
+            if strike_lte is not None and float(hi) < strike_lte - _BOUND_TOL:
+                return False
+        return True
 
     # ------------------------------------------------------------------ #
     @staticmethod

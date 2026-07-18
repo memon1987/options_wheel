@@ -195,7 +195,13 @@ class AlpacaDataProvider(OptionsDataProvider):
     # Contract discovery
     # ------------------------------------------------------------------ #
     def get_contract_universe(
-        self, underlying: str, as_of: date, max_dte: int
+        self,
+        underlying: str,
+        as_of: date,
+        max_dte: int,
+        *,
+        strike_gte: Optional[float] = None,
+        strike_lte: Optional[float] = None,
     ) -> List[OptionContract]:
         """List contracts tradeable on ``as_of`` expiring within ``max_dte`` days.
 
@@ -205,8 +211,19 @@ class AlpacaDataProvider(OptionsDataProvider):
         Alpaca (it exposes no listing date), but standard weekly/monthly options
         are listed well before ``as_of``, so the expiration-window filter is the
         practical point-in-time gate.
+
+        ``strike_gte``/``strike_lte`` bound the strike ladder server-side. The
+        full ladder is mostly dead weight: on NVDA 2025-10-06 (spot 185.54) the
+        unbounded universe is 148 contracts spanning strikes $50-$390, while the
+        0.10-0.20 delta band the strategy actually trades sits between 0.92x and
+        1.05x spot. The caller owns the policy of how wide to ask (see
+        ``chain_builder.strike_window``); this method only forwards the bound.
+
+        Bounding is a pure *fetch* optimisation and must stay a superset of what
+        the strategy could select — a bound tight enough to clip the delta band
+        would silently change decisions rather than merely speed them up.
         """
-        cache_key = (underlying, as_of, max_dte)
+        cache_key = (underlying, as_of, max_dte, strike_gte, strike_lte)
         cached = self._universe_cache.get(cache_key)
         if cached is not None:
             return list(cached)
@@ -216,6 +233,11 @@ class AlpacaDataProvider(OptionsDataProvider):
         contracts: Dict[str, OptionContract] = {}
         n_adjusted = 0
 
+        # The SDK types these as Optional[str] (not float): passing a float
+        # fails pydantic validation outright, so format explicitly.
+        strike_gte_s = None if strike_gte is None else f"{strike_gte:.2f}"
+        strike_lte_s = None if strike_lte is None else f"{strike_lte:.2f}"
+
         for status in (AssetStatus.ACTIVE, AssetStatus.INACTIVE):
             page_token: Optional[str] = None
             while True:
@@ -224,6 +246,8 @@ class AlpacaDataProvider(OptionsDataProvider):
                     status=status,
                     expiration_date_gte=exp_gte,
                     expiration_date_lte=exp_lte,
+                    strike_price_gte=strike_gte_s,
+                    strike_price_lte=strike_lte_s,
                     limit=10_000,
                     page_token=page_token,
                 )

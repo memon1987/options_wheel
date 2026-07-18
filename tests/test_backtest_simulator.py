@@ -12,7 +12,7 @@ from typing import Dict, List
 
 import pytest
 
-from src.backtesting.data.chain_builder import ChainBuilder
+from src.backtesting.data.chain_builder import STRIKE_WINDOW_PCT, ChainBuilder
 from src.backtesting.data.provider import OptionBar, OptionContract, StockBar
 from src.backtesting.engine.no_op_analytics import NoOpAnalyticsWriter
 from src.backtesting.engine.simulator import Simulator, restrict_symbols
@@ -44,7 +44,12 @@ class ScriptedProvider:
         base = round(spot)
         return [float(base + k) for k in range(-12, 13)]
 
-    def get_contract_universe(self, underlying, as_of, max_dte):
+    def get_contract_universe(
+        self, underlying, as_of, max_dte, *, strike_gte=None, strike_lte=None
+    ):
+        # Deliberately IGNORES the strike bounds — the Protocol permits a
+        # provider to return a superset, and the builder is responsible for
+        # narrowing. Keeping one mock ignore them keeps that guarantee tested.
         spot = self.closes.get(as_of)
         if spot is None:
             return []
@@ -329,3 +334,138 @@ class TestAnalyticsIsolationIsReal:
 
         assert analytics_module._instance is before
         assert not clock.is_frozen()
+
+
+class TestStrikeWindowCoversAssignedPositions:
+    """FC-042 A2 at simulator scale.
+
+    Chains are built for the whole window before the day loop starts, so there
+    is no live position to read a cost basis from. The simulator bounds it
+    instead — see ``Simulator._strike_anchors``.
+    """
+
+    def test_anchors_bracket_every_price_a_position_can_be_struck_against(
+        self, falling_then_flat
+    ):
+        """The property, not the implementation: no strike can escape the window.
+
+        Puts are sold at or below spot and assigned lots cost at most that
+        strike, so every price any position is struck against on any decision
+        day must lie between the two anchors.
+        """
+        days, closes, expirations = falling_then_flat
+        sim = _simulator("XYZ", closes, expirations, days)
+        bars = sim._load_stock_bars()["XYZ"]
+        ceiling, floor = sim._strike_anchors(bars)
+
+        decision_closes = [closes[d] for d in days]
+        assert ceiling >= max(decision_closes)
+        assert floor <= min(decision_closes)
+
+    def test_no_bars_yields_no_anchors(self, falling_then_flat):
+        days, closes, expirations = falling_then_flat
+        sim = _simulator("XYZ", closes, expirations, days)
+        assert sim._strike_anchors([]) == (None, None)
+
+    def test_warmup_bars_cannot_inflate_the_ceiling(self, falling_then_flat):
+        """A split inside the warm-up buffer must not neuter the strike filter.
+
+        Warm-up bars are tolerated across a split (the simulator only warns),
+        so NVDA's pre-split 1224.40 can sit in the same series as a ~180 spot.
+        Reading it as a cost basis would push the window's upper bound ~7x too
+        high and turn the filter into a no-op for the whole run.
+        """
+        days, closes, expirations = falling_then_flat
+        sim = _simulator("XYZ", closes, expirations, days)
+        bars = sim._load_stock_bars()["XYZ"]
+        pre_split = StockBar("XYZ", days[0] - timedelta(days=40),
+                             1224.40, 1224.40, 1224.40, 1224.40, 1_000_000)
+        ceiling, _ = sim._strike_anchors([pre_split, *bars])
+        assert ceiling < 200.0, "warm-up close leaked into the cost-basis ceiling"
+
+    def test_an_open_short_put_survives_a_rally_out_of_the_window(
+        self, falling_then_flat
+    ):
+        """The lower-bound mirror of the covered-call case.
+
+        A put sold near 0.93x spot leaves a spot-centred window once the
+        underlying rallies ~24%. The contract is then missing from the chain of
+        a position that is still open, which marks it at 0.00 and makes it
+        impossible to close — a winning early close silently becomes a
+        hold-to-expiry.
+        """
+        days = _weekdays(date(2024, 6, 3), 30)
+        warmup = _weekdays(date(2024, 3, 25), 45)
+        closes = {d: 100.0 for d in warmup}
+        for i, d in enumerate(days):  # 100 -> 160, a 60% rally
+            closes[d] = 100.0 + min(i, 20) * 3.0
+        expirations = [d for d in days if d.weekday() == 4]
+
+        class WideLadderProvider(ScriptedProvider):
+            def _ladder(self, spot):
+                return [float(k) for k in range(50, 251)]
+
+        provider = WideLadderProvider("XYZ", closes, expirations)
+        sim = Simulator(
+            Config(), provider, ChainBuilder(provider, risk_free_rate=0.04),
+            ["XYZ"], days[0], days[-1], starting_cash=50_000.0, max_dte=7,
+        )
+        stock_bars = sim._load_stock_bars()
+        chains = sim._build_chains(stock_bars, sim._trading_days(stock_bars))["XYZ"]
+
+        early_strike = 93.0  # a put sold near the start, ~0.93x spot of 100
+        peak_days = [d for d in chains if closes[d] == max(closes[x] for x in days)]
+        assert peak_days
+        assert max(closes[d] for d in days) * (1 - STRIKE_WINDOW_PCT) > early_strike, (
+            "precondition: a spot-centred window would drop the open put"
+        )
+        for day in peak_days:
+            assert [q for q in chains[day].puts if q.strike == early_strike], (
+                f"{day}: the still-open short put fell out of the chain"
+            )
+
+    def test_calls_above_cost_basis_survive_a_60_percent_drawdown(
+        self, falling_then_flat
+    ):
+        """The failure this exists to prevent, end to end.
+
+        Price slides 100 -> 70 and a put assigned near 92 leaves the position
+        well underwater. Every covered call the strategy may write is struck at
+        or above ~92, but a spot-centred window on a 70 handle stops at 87.50 —
+        so the eligible call ladder would come back empty and the replay would
+        report a position that simply never rolled.
+        """
+        days, closes, expirations = falling_then_flat
+
+        class WideLadderProvider(ScriptedProvider):
+            """A full ladder, not one pinned to +/-12 around spot.
+
+            ScriptedProvider's default ladder is itself narrower than the
+            window under test, so with it this assertion would pass or fail on
+            the mock's shape rather than on the filter's.
+            """
+
+            def _ladder(self, spot):
+                return [float(k) for k in range(50, 151)]
+
+        provider = WideLadderProvider("XYZ", closes, expirations)
+        builder = ChainBuilder(provider, risk_free_rate=0.04)
+        sim = Simulator(
+            Config(), provider, builder, ["XYZ"], days[0], days[-1],
+            starting_cash=50_000.0, max_dte=7,
+        )
+        stock_bars = sim._load_stock_bars()
+        chains = sim._build_chains(stock_bars, sim._trading_days(stock_bars))["XYZ"]
+
+        trough = min(closes[d] for d in days)
+        trough_days = [d for d in chains if closes.get(d) == trough]
+        assert trough_days, "fixture must reach a trough inside the decision window"
+        assert trough * (1 + STRIKE_WINDOW_PCT) < 92.0, (
+            "precondition: a spot-centred window would clip the eligible calls"
+        )
+
+        for day in trough_days:
+            above_basis = [q for q in chains[day].calls if q.strike >= 92.0]
+            assert above_basis, (
+                f"{day}: no covered call at or above cost basis in the chain"
+            )
