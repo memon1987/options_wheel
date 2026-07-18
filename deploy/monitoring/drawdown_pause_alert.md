@@ -71,12 +71,21 @@ below their assignment strike. Correct short-term, expensive if it persists
 silently — AMZN's 62-day implicit pause (Feb 6 → Apr 10, 2026) cost an
 estimated $1,500–3,000 in foregone premium and was only found post-hoc.
 
-**Threshold:** 7 trading days, overridable per-revision without touching the
-policy:
+**Threshold:** 7 trading days, declared in `cloudbuild.yaml`'s dashboard
+deploy step.
+
+> **Change it in `cloudbuild.yaml`, not with `--update-env-vars`.** The deploy
+> uses `--set-env-vars`, which **replaces the entire env set** — an
+> out-of-band `--update-env-vars` value is silently wiped on the next deploy.
+> (Observed 2026-07-18: the fire-drill override vanished on the following
+> build. Harmless only because the code default matched.)
+
+For a temporary override (e.g. a fire drill), `--update-env-vars` is fine as
+long as you know it lasts only until the next deploy:
 
 ```bash
 gcloud run services update options-wheel-dashboard --region=us-central1 \
-  --update-env-vars PAUSE_ALERT_THRESHOLD_DAYS=7
+  --update-env-vars PAUSE_ALERT_THRESHOLD_DAYS=1
 ```
 
 **Match filter** — the marker string is `ALERT_MARKER` in

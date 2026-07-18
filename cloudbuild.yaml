@@ -87,15 +87,27 @@ steps:
       - '-c'
       - |
         echo "Verifying canary revision is ready..."
-        STATUS=$(gcloud run revisions list --service=options-wheel-strategy \
-          --region=us-central1 --limit=1 \
-          --format="value(status.conditions[0].status)")
-        echo "Latest revision status: $${STATUS}"
-        if [ "$${STATUS}" != "True" ]; then
-          echo "FAIL: Canary revision not ready"
-          exit 1
-        fi
-        echo "PASS: Canary revision is ready"
+        # Poll rather than sample once: a revision still coming up reports
+        # "Unknown", and a single-shot check turns that race into a false
+        # build failure (observed 2026-07-18 — the deploy had succeeded).
+        # "False" is a genuine failure and exits immediately.
+        for i in $(seq 1 30); do
+          STATUS=$(gcloud run revisions list --service=options-wheel-strategy \
+            --region=us-central1 --limit=1 \
+            --format="value(status.conditions[0].status)")
+          echo "attempt $${i}/30 — Bot canary status: $${STATUS}"
+          if [ "$${STATUS}" = "True" ]; then
+            echo "PASS: Canary revision is ready"
+            exit 0
+          fi
+          if [ "$${STATUS}" = "False" ]; then
+            echo "FAIL: Canary revision failed to become ready"
+            exit 1
+          fi
+          sleep 5
+        done
+        echo "FAIL: timed out after 150s waiting for Bot canary revision"
+        exit 1
     id: 'smoke-test-bot'
     waitFor: ['deploy-bot-canary']
 
@@ -126,7 +138,10 @@ steps:
       - '--max-instances=2'
       - '--min-instances=0'
       - '--timeout=300'
-      - '--set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID'
+      # NOTE: --set-env-vars REPLACES the entire env set. Anything applied
+      # out-of-band via --update-env-vars is wiped on the next deploy, so
+      # every persistent dashboard env var must be declared here.
+      - '--set-env-vars=TRADING_BOT_URL=https://options-wheel-strategy-799970961417.us-central1.run.app,GCP_PROJECT=$PROJECT_ID,PAUSE_ALERT_THRESHOLD_DAYS=7'
       - '--no-traffic'
       - '--tag=canary'
     id: 'deploy-dashboard-canary'
@@ -139,15 +154,27 @@ steps:
       - '-c'
       - |
         echo "Verifying dashboard canary revision is ready..."
-        STATUS=$(gcloud run revisions list --service=options-wheel-dashboard \
-          --region=us-central1 --limit=1 \
-          --format="value(status.conditions[0].status)")
-        echo "Latest revision status: $${STATUS}"
-        if [ "$${STATUS}" != "True" ]; then
-          echo "FAIL: Dashboard canary revision not ready"
-          exit 1
-        fi
-        echo "PASS: Dashboard canary revision is ready"
+        # Poll rather than sample once: a revision still coming up reports
+        # "Unknown", and a single-shot check turns that race into a false
+        # build failure (observed 2026-07-18 — the deploy had succeeded).
+        # "False" is a genuine failure and exits immediately.
+        for i in $(seq 1 30); do
+          STATUS=$(gcloud run revisions list --service=options-wheel-dashboard \
+            --region=us-central1 --limit=1 \
+            --format="value(status.conditions[0].status)")
+          echo "attempt $${i}/30 — Dashboard canary status: $${STATUS}"
+          if [ "$${STATUS}" = "True" ]; then
+            echo "PASS: Dashboard canary revision is ready"
+            exit 0
+          fi
+          if [ "$${STATUS}" = "False" ]; then
+            echo "FAIL: Dashboard canary revision failed to become ready"
+            exit 1
+          fi
+          sleep 5
+        done
+        echo "FAIL: timed out after 150s waiting for Dashboard canary revision"
+        exit 1
     id: 'smoke-test-dashboard'
     waitFor: ['deploy-dashboard-canary']
 
