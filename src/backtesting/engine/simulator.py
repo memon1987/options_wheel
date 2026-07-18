@@ -232,6 +232,14 @@ class Simulator:
         try:
             for day in sim_clock.steps():
                 try:
+                    # Pre-trade housekeeping, exactly as production does before
+                    # every cycle (cloud_run_server /run). reconcile_positions()
+                    # is what teaches WheelStateManager that yesterday's put
+                    # expired or was assigned — run_strategy_cycle() never calls
+                    # it. Without this the state machine latches after the first
+                    # trade and the replay sells one put and then nothing.
+                    engine.reconcile_positions()
+
                     cycle = engine.run_strategy_cycle()
                     self._execute_opportunities(engine, exec_engine, cycle, client)
                     # Production runs the roll cycle Friday afternoon, after the

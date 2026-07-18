@@ -26,7 +26,7 @@ than production and silently inflate the opportunity set.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -227,9 +227,21 @@ class BacktestAlpacaClient:
         which GapDetector swallows into "no previous close" and blocks every
         trade. Mirroring live's stamp also reproduces live's semantics: today's
         bar sorts before the decision timestamp and is therefore included.
+
+        ``days`` is a CALENDAR-day lookback, not a bar count — the live client
+        builds ``start = end - timedelta(days=days)``. Slicing the last ``days``
+        *bars* instead hands the caller ~43% more history (50 calendar days is
+        ~35 sessions), which silently changes every windowed statistic computed
+        on it. GapDetector's gap *frequency* is a ratio over exactly this
+        window: with the longer window NVDA measured 18.6% against a 15% limit
+        and was blocked for all of Nov 2025, while live traded it on 7 days.
         """
-        bars = [b for b in self._stock_bars.get(symbol, []) if b.bar_date <= self.today]
-        bars = bars[-days:] if days else bars
+        cutoff = self.today - timedelta(days=days) if days else None
+        bars = [
+            b
+            for b in self._stock_bars.get(symbol, [])
+            if b.bar_date <= self.today and (cutoff is None or b.bar_date > cutoff)
+        ]
         if not bars:
             return pd.DataFrame()
         index = pd.DatetimeIndex(

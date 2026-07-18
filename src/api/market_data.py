@@ -2,7 +2,6 @@
 
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
-import time
 import pandas as pd
 import numpy as np
 import structlog
@@ -13,8 +12,15 @@ from ..utils.config import Config
 
 logger = structlog.get_logger(__name__)
 
-# Default cache TTL in seconds (5 minutes)
-_DEFAULT_CACHE_TTL = 300
+# Default cache TTL (5 minutes).
+#
+# Ages are measured with clock.now(), not time.time(). In production the two
+# are identical. During a backtest replay they are not: hundreds of simulated
+# days pass within a few seconds of wall time, so a wall-clock TTL never
+# expires and the strategy is served day one's option chain forever — it will
+# happily propose a contract that expired weeks ago. Measuring age in
+# simulated time makes the cache expire between simulated days, as intended.
+_DEFAULT_CACHE_TTL = timedelta(seconds=300)
 
 
 class MarketDataManager:
@@ -30,8 +36,8 @@ class MarketDataManager:
         self.alpaca = alpaca_client
         self.config = config
         # Caches: dict of symbol -> (value, timestamp)
-        self._metrics_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
-        self._options_chain_cache: Dict[str, Tuple[Dict[str, List[Dict[str, Any]]], float]] = {}
+        self._metrics_cache: Dict[str, Tuple[Dict[str, Any], datetime]] = {}
+        self._options_chain_cache: Dict[str, Tuple[Dict[str, List[Dict[str, Any]]], datetime]] = {}
         self._cache_ttl = _DEFAULT_CACHE_TTL
         
     def get_stock_metrics(self, symbol: str) -> Dict[str, Any]:
@@ -51,7 +57,7 @@ class MarketDataManager:
             cached = self._metrics_cache.get(symbol)
             if cached is not None:
                 value, ts = cached
-                if time.time() - ts < self._cache_ttl:
+                if clock.now() - ts < self._cache_ttl:
                     logger.debug("Using cached stock metrics",
                                 event_category="data",
                                 event_type="stock_metrics_cache_hit",
@@ -95,7 +101,7 @@ class MarketDataManager:
                 'meets_volume_criteria': meets_volume_criteria,
                 'suitable_for_wheel': meets_price_criteria and meets_volume_criteria
             }
-            self._metrics_cache[symbol] = (result, time.time())
+            self._metrics_cache[symbol] = (result, clock.now())
             return result
 
         except Exception as e:
@@ -178,7 +184,7 @@ class MarketDataManager:
             cached = self._options_chain_cache.get(symbol)
             if cached is not None:
                 value, ts = cached
-                if time.time() - ts < self._cache_ttl:
+                if clock.now() - ts < self._cache_ttl:
                     logger.debug("Using cached options chain",
                                 event_category="data",
                                 event_type="options_chain_cache_hit",
@@ -238,7 +244,7 @@ class MarketDataManager:
                     calls.append(option_data)
             
             result = {'puts': puts, 'calls': calls}
-            self._options_chain_cache[symbol] = (result, time.time())
+            self._options_chain_cache[symbol] = (result, clock.now())
             return result
 
         except Exception as e:
