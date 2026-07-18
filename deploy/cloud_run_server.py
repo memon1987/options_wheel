@@ -1072,6 +1072,13 @@ def get_config():
                     error=str(e))
         return jsonify({'error': f"Config retrieval failed: {str(e)}"}), 500
 
+# A screened symbol replays a year of decisions; measured at roughly a minute
+# each, so only a handful fit inside a synchronous request. The full universe
+# belongs in a Cloud Run Job.
+SCREEN_REQUEST_TIMEOUT_S = 300
+SCREEN_SYNC_SYMBOL_LIMIT = 3
+
+
 @app.route('/backtest/screen', methods=['POST'])
 @require_api_key
 def backtest_screen():
@@ -1109,6 +1116,30 @@ def backtest_screen():
         symbols = [s.strip().upper() for s in symbols_arg.split(',')] if symbols_arg else None
         # Sensitivity doubles the runtime; allow a scheduler to skip it.
         run_sensitivity = request.args.get('sensitivity', 'true').lower() != 'false'
+
+        # A full-universe screen takes far longer than this service's request
+        # timeout (300s) and the scheduler's attempt deadline (180s). Letting it
+        # start would time out mid-run, after some rows had already been
+        # written — a partial table plus a failure status, which is the worst of
+        # both. Refuse loudly and point at the right primitive instead.
+        requested = symbols or config.stock_symbols
+        budget = int(request.args.get('max_symbols', SCREEN_SYNC_SYMBOL_LIMIT))
+        if len(requested) > budget:
+            return jsonify({
+                'status': 'refused',
+                'reason': 'too_many_symbols_for_synchronous_run',
+                'requested_symbols': len(requested),
+                'sync_limit': budget,
+                'detail': (
+                    f'A synchronous screen of {len(requested)} symbols would '
+                    f'exceed this service\'s {SCREEN_REQUEST_TIMEOUT_S}s request '
+                    f'timeout and the scheduler\'s attempt deadline, timing out '
+                    f'mid-run after partially writing to BigQuery. Run the full '
+                    f'universe as a Cloud Run Job (see docs/bigquery/'
+                    f'backtest_runs.md), or pass ?symbols=A,B to screen a few.'
+                ),
+                'timestamp': datetime.now().isoformat(),
+            }), 413
 
         result = run_screen(
             config=config,

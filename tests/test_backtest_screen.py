@@ -184,3 +184,23 @@ class TestWindow:
             result = run_screen(symbols=["XYZ"], persist=False, run_sensitivity=False,
                                 start=date(2020, 1, 1), end=date(2025, 6, 30))
         assert result.start == ALPACA_OPTIONS_HISTORY_START
+
+
+class TestSyncScreenIsBounded:
+    """A full-universe screen exceeds Cloud Run's 300s request timeout and the
+    scheduler's 180s attempt deadline. Starting one synchronously would time out
+    mid-run AFTER partially writing to BigQuery — a partial table reported as a
+    failure. The endpoint refuses instead and points at the Cloud Run Job.
+    """
+
+    def _client(self):
+        import importlib
+        mod = importlib.import_module("deploy.cloud_run_server")
+        mod.app.config["TESTING"] = True
+        return mod, mod.app.test_client()
+
+    def test_limit_is_small_enough_to_finish_inside_the_request_timeout(self):
+        mod, _ = self._client()
+        # ~1 min/symbol measured; the limit must leave headroom under 300s.
+        assert mod.SCREEN_SYNC_SYMBOL_LIMIT * 60 < mod.SCREEN_REQUEST_TIMEOUT_S
+        assert mod.SCREEN_SYNC_SYMBOL_LIMIT >= 1
