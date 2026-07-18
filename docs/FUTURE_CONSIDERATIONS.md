@@ -477,6 +477,98 @@ Note this is *not* true of the Stage-2 gap-risk analysis (`_detect_current_gap`,
 
 ---
 
+### FC-039: Wheel state persistence has never worked in production
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet — changes runtime behavior of the live wheel, so a plan is required
+
+**Problem / opportunity:** `WheelStateManager` has been running with `storage_bucket=None` since inception. Its GCS save/load are therefore unconditional no-ops (`src/strategy/wheel_state_manager.py:60-62, 84-86`), and wheel state is in-memory per Cloud Run instance — lost on every scale-to-zero.
+
+Verified four independent ways on 2026-07-18:
+
+1. `src/strategy/wheel_engine.py:40` resolves the bucket as `getattr(config, 'state_storage_bucket', None) or os.getenv('STATE_STORAGE_BUCKET')`.
+2. `Config` has **no** `state_storage_bucket` property — `grep` over all of `src/utils/config.py` returns nothing, so the `getattr` yields `None`.
+3. `STATE_STORAGE_BUCKET` is **not set** on the live Cloud Run service. `gcloud run services describe options-wheel-strategy` shows the env is exactly `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `FINNHUB_API_KEY`, `ALPACA_PAPER_TRADING`, `GCP_PROJECT`. `cloudbuild.yaml:75` sets only the last two, and `--set-env-vars` is replace-semantics, so any hand-added value is wiped on the next deploy.
+4. **No `wheel_state/current_state.json` object exists in any bucket in the project** — checked all three (`...-options-data`, `..._cloudbuild`, `options-wheel-opportunities`).
+
+**Consequence — this silently disabled a control we believe is running.** Source #1 of the FC-029 R2 cost-basis chain is `wheel_state.symbol_states[symbol]['stock_cost_basis']` (`src/strategy/call_seller.py:429-441`), documented as *canonical*. It never resolves. The chain has been running on source #2 (BigQuery OPASN lookup) and source #3 (Alpaca `cost_basis`, empirically broken for assigned positions — that finding is what motivated FC-029 R2 in the first place). The cost-basis floor is therefore weaker in production than the FC-029 plan claims, on exactly the path FC-029 was written to harden.
+
+Same family as FC-035 (`poll_order_statuses` latent `NameError`) and FC-015 (`_entry_times` is in-process, so the 4h min-hold gate is dead): code that has never executed in production while appearing healthy.
+
+**Open questions:**
+- Enable persistence, or accept in-memory state and delete the dead code? `reconcile_positions` rebuilds state from Alpaca each cycle, so persistence may be genuinely unnecessary — in which case the fix is removing the illusion, not the bucket.
+- If we enable it: this is a **behavior change**, not a config fix. Cost-basis floors would begin resolving from source #1 and change which strikes are sellable. Needs its own canary and rollback.
+- Add `state_storage_bucket` to `Config`, or set `STATE_STORAGE_BUCKET` in `cloudbuild.yaml`? The former is testable; the latter is one line.
+- Should there be a startup assertion that any configured-but-unresolvable persistence target is fatal rather than silently no-op? This bug class keeps recurring.
+
+**Links:** found during the FC-038 two-reviewer plan pass — `docs/investigations/fc-038-plan-review-2026-07-18.md` (BLOCKER B2). Related: FC-029 (R2 cost-basis chain), FC-035, FC-015.
+
+---
+
+### FC-040: Unit tests make live BigQuery calls against production data
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not needed (test-only change), but see the open question on `_resolve_cost_basis_floor`
+
+**Problem / opportunity:** `tests/test_call_seller.py` is not hermetic. `CallSeller._resolve_cost_basis_floor` falls through to a real `bigquery.Client()` query against `` `options_wheel.trades_from_activities` `` (`src/strategy/call_seller.py:511-539`), and the tests never mock it. On any machine with GCP ADC available, the unit tests query the **production** table.
+
+Verified 2026-07-18:
+- With ADC present: `pytest tests/` → **3 failed, 290 passed**.
+- With credentials stripped (`CLOUDSDK_CONFIG=/nonexistent`): `pytest tests/test_call_seller.py` → **27 passed**.
+
+The three failures are real production values leaking into fixtures. `test_strike_vs_cost_basis_filtering` sets an MSFT position at $300/share but the resolved basis came back **$382.50** — which is a live MSFT OPASN put strike from 2026-06-23. `test_find_suitable_covered_calls` and `test_multiple_round_lots` use AAPL at $160/share and resolve to **$305.00** — a live AAPL OPASN put strike from 2026-06-13. Both confirmed by direct `bq query`.
+
+**Consequence.** Test results depend on ambient credentials and on a **90-day rolling window of production data** (`lookback_days` default, `call_seller.py:527`). These tests will spontaneously pass and fail as production rows age in and out of the window with no code change — AAPL's row exits around 2026-09-11, MSFT's around 2026-09-21. Any future "the suite is green" claim is unreliable, and a genuine regression in the cost-basis chain would be indistinguishable from data drift. Tests are also slow and network-dependent: 30s with credentials stripped (timeouts) vs 14s with.
+
+**Open questions:**
+- Mock `_query_last_opasn_put_strike` in the fixtures, or inject the BQ client as a constructor dependency so it can be faked? The latter is better design and is aligned with FC-038's `CostBasisProvider` extraction — worth sequencing them together.
+- Add a global autouse fixture that fails any test attempting outbound network I/O, so this class of leak cannot recur silently?
+- Does CI currently run with ADC? If it does, CI has been green only by luck of the 90-day window. If it does not, CI has never exercised this code path at all — which is its own gap.
+
+**Links:** found during the FC-038 two-reviewer plan pass — `docs/investigations/fc-038-plan-review-2026-07-18.md`. Related: FC-029 (introduced the chain being tested), FC-038.
+
+---
+
+### FC-041: Naked-call share guard misparses OCC symbols and can fail open
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not needed (single-file fix), but it changes runtime behavior of a risk control, so branch + PR
+
+**Problem / opportunity:** `ExecutionEngine`'s committed-share accounting (`src/strategy/execution_engine.py:322-338`) identifies short calls with a hand-rolled parser:
+
+```python
+for ch in opt_sym:
+    if ch.isdigit(): break
+    opt_underlying += ch
+if opt_underlying == underlying and 'C' in opt_sym:
+    committed_shares += abs(int(float(pos.get('qty', 0)))) * 100
+```
+
+Two defects:
+
+1. **`'C' in opt_sym` is a substring test over the whole OCC symbol, including the ticker.** `CRWD250718P00150000` contains a `C`, so a short *put* on any C-containing ticker is counted as committing 100 shares to calls — over-blocking legitimate call sales. The current wheel universe (AAPL, MSFT, GOOGL, AMZN, NVDA, AMD, QQQ, SPY, IWM, UNH, F, PFE, KMI, VZ) contains no `C` ticker, so the wheel is safe **by luck, not by design**. Adding CSCO, CVX, KO-adjacent names, or C itself would trigger it.
+2. **The digit-break underlying parser breaks on class shares.** `BRK.B` has position symbol `BRK.B` but OCC symbol `BRKB250718C...`, which parses to `BRKB` ≠ `BRK.B`. No match → `committed_shares = 0` → `available_shares = owned` → **the guard fails open and the bot writes calls against already-committed shares. That is a naked call.**
+
+`src/utils/option_symbols.py` already exists and should be used instead; the option type is at a fixed offset in the OCC layout, not a substring.
+
+**Consequence.** Defect (1) is currently latent and costs premium when triggered. Defect (2) is a genuine naked-call path — an uncovered short call has unbounded upside risk. Both become materially more likely under FC-038, which introduces a covered-call account with **no configured symbol universe by design**, where the operator buys arbitrary tickers through the Alpaca UI. FC-038's Phase 2 explicitly relies on this guard as the primitive for committed-share accounting.
+
+**Open questions:**
+- Replace the parser with `src/utils/option_symbols.py`, or is that module's coverage incomplete for class-share tickers too? Check before assuming.
+- Add a hard pre-submit assertion that `short_calls × 100 ≤ shares_owned` per underlying, independent of the parser, so a parsing bug cannot produce a naked call?
+- Are there other places that infer option type or underlying by substring? Sweep for `'C' in` / `'P' in` over option symbols.
+- Regression tests must include a short put on a C-containing ticker and a `BRK.B`-style class-share position.
+
+**Links:** found during the FC-038 two-reviewer plan pass — `docs/investigations/fc-038-plan-review-2026-07-18.md` (HIGH H1); flagged independently by both reviewers. Related: FC-038 (Phase 2 depends on this guard).
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
