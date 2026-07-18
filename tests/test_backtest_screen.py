@@ -199,6 +199,31 @@ class TestSyncScreenIsBounded:
         mod.app.config["TESTING"] = True
         return mod, mod.app.test_client()
 
+    def test_full_universe_request_is_refused_not_started(self):
+        """Starting it would time out mid-run after partially writing to BQ."""
+        import os
+
+        mod, client = self._client()
+        assert not os.environ.get("STRATEGY_API_KEY"), "auth would mask the 413"
+        # 14 symbols, well over the sync limit.
+        resp = client.post("/backtest/screen?symbols=A,B,C,D,E,F,G,H,I,J,K,L,M,N")
+        assert resp.status_code == 413
+        body = resp.get_json()
+        assert body["status"] == "refused"
+        assert body["requested_symbols"] == 14
+        assert "Cloud Run Job" in body["detail"]
+
+    def test_a_small_request_is_not_refused_by_the_guard(self):
+        """The guard must not block the path it is meant to leave open."""
+        from unittest.mock import patch as _patch
+
+        mod, client = self._client()
+        with _patch("src.backtesting.screen.evaluate_symbol",
+                    return_value=(_FakeReport("NVDA"), None)):
+            resp = client.post("/backtest/screen?symbols=NVDA&persist=false"
+                               "&sensitivity=false&start=2025-01-01&end=2025-06-30")
+        assert resp.status_code != 413, resp.get_json()
+
     def test_limit_is_small_enough_to_finish_inside_the_request_timeout(self):
         mod, _ = self._client()
         # ~1 min/symbol measured; the limit must leave headroom under 300s.
