@@ -186,14 +186,24 @@ class AnalyticsWriter:
     # Generic write
     # ------------------------------------------------------------------
 
-    def _write(self, table_name: str, row: dict) -> None:
-        """Insert a single row into a named table."""
+    def _write(self, table_name: str, row: dict, row_id: Optional[str] = None) -> None:
+        """Insert a single row into a named table.
+
+        Args:
+            row_id: optional streaming-insert dedupe key. BigQuery collapses
+                repeat inserts carrying the same id on a best-effort basis
+                within its dedupe window (same pattern as the activities
+                ingestor). Callers that can re-emit the same logical row —
+                e.g. a poller with no persistence — should pass one.
+        """
         if not self._enabled or table_name not in self._tables:
             return
         if "timestamp" not in row:
             row["timestamp"] = datetime.now(timezone.utc).isoformat()
         try:
-            errors = self._client.insert_rows_json(self._tables[table_name], [row])
+            errors = self._client.insert_rows_json(
+                self._tables[table_name], [row],
+                row_ids=[row_id] if row_id else None)
             if errors:
                 logger.error("AnalyticsWriter insert errors",
                             table=table_name, errors=str(errors)[:200])
@@ -308,7 +318,7 @@ class AnalyticsWriter:
             "filled_qty": filled_qty,
             "submitted_at": submitted_at or None,
             "filled_at": filled_at or None,
-        })
+        }, row_id=f"{order_id}:{status}" if order_id else None)
 
     # ------------------------------------------------------------------
     # Query helpers (for dashboard)

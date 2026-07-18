@@ -23,6 +23,11 @@ from ..api.earnings_calendar import EarningsCalendarService
 
 logger = structlog.get_logger(__name__)
 
+# Max closed orders fetched per poll. Alpaca caps a page at 500; 100 is ample
+# for a 7-day window (worst observed 7-day density: 36) and the code warns
+# rather than silently truncating if that ever stops being true.
+CLOSED_ORDER_PAGE_LIMIT = 100
+
 
 class WheelEngine:
     """Main engine for executing options wheel strategy."""
@@ -697,6 +702,37 @@ class WheelEngine:
                                 error=str(e))
 
     @staticmethod
+    def _ts(value: Any) -> str:
+        """Render a timestamp for BigQuery, mapping None to '' (not 'None').
+
+        `str(None)` yields the literal string 'None', which BigQuery rejects
+        for a TIMESTAMP column — the row is dropped and only a log line
+        records it. Expired and canceled orders always have a null
+        `filled_at`, so this is the common case, not the edge case.
+        """
+        return '' if value is None else str(value)
+
+    @staticmethod
+    def _classify_order_strategy(symbol: str, side: str) -> str:
+        """Classify an order as sell/buy-to-close of a put/call.
+
+        The option type comes from the OCC symbol's type field via
+        `parse_option_symbol`, NOT from a substring test: `'P' in symbol` is
+        true for every AAPL, SPY and PFE contract, which would label their
+        calls as puts. The verb comes from `side`, since the bot buys to
+        close (early profit-taking) as well as sells to open.
+        """
+        parsed = parse_option_symbol(symbol)
+        option_type = parsed.get('option_type', 'unknown')
+        # An equity symbol is not an option: parse_option_symbol falls back to
+        # a type for short strings, so require a real strike before trusting
+        # it. Otherwise an equity order for PFE would classify as sell_put.
+        if option_type not in ('put', 'call') or not parsed.get('strike_price'):
+            return 'unknown'
+        verb = 'buy_to_close' if str(side).lower() == 'buy' else 'sell'
+        return f"{verb}_{option_type}"
+
+    @staticmethod
     def _normalize_sdk_order(order: Any) -> Optional[Dict[str, Any]]:
         """Normalize a raw Alpaca SDK ``Order`` into the AlpacaClient dict shape.
 
@@ -766,6 +802,7 @@ class WheelEngine:
             # Also check closed/filled orders
             try:
                 # Use the trading client directly to get closed orders
+                from alpaca.common.enums import Sort
                 from alpaca.trading.enums import QueryOrderStatus
                 from alpaca.trading.requests import GetOrdersRequest
                 # Bound to the 7-day window this method's docstring has always
@@ -776,19 +813,41 @@ class WheelEngine:
                 closed_orders = self.alpaca.trading_client.get_orders(
                     filter=GetOrdersRequest(
                         status=QueryOrderStatus.CLOSED,
-                        after=clock.now() - timedelta(days=7),
-                        limit=100
+                        after=clock.now_utc() - timedelta(days=7),
+                        direction=Sort.DESC,
+                        limit=CLOSED_ORDER_PAGE_LIMIT
                     )
                 )
+                # No pagination: at the page limit the OLDEST orders in the
+                # window are dropped, and with no persistence they are never
+                # logged. Make the ceiling visible before it silently bites.
+                if len(closed_orders) >= CLOSED_ORDER_PAGE_LIMIT:
+                    logger.warning("Closed-orders fetch hit the page limit; "
+                                   "older orders in the window were not polled",
+                                   event_category="error",
+                                   event_type="closed_orders_truncated",
+                                   limit=CLOSED_ORDER_PAGE_LIMIT)
             except Exception as e:
-                logger.debug("Could not fetch closed orders directly, using all_orders",
-                           event_category="error", event_type="closed_orders_failed",
-                           error=str(e))
+                # This was `logger.debug`, which is suppressed entirely at the
+                # production log level — it is why a NameError on every single
+                # invocation went unnoticed from April to July. A regression
+                # back to a no-op must be visible.
+                logger.warning("Could not fetch closed orders; order status "
+                               "polling will report nothing this cycle",
+                               event_category="error", event_type="closed_orders_failed",
+                               error=str(e))
                 closed_orders = []
+                stats_closed_fetch_ok = False
+            else:
+                stats_closed_fetch_ok = True
 
-            # Track statistics
+            # Track statistics. `closed_fetch_ok` is surfaced to the caller so
+            # a silent regression to a no-op is detectable from the job result
+            # rather than only from a log line.
             stats = {
                 'orders_checked': 0,
+                'closed_orders_fetched': len(closed_orders),
+                'closed_fetch_ok': stats_closed_fetch_ok,
                 'filled_logged': 0,
                 'expired_logged': 0,
                 'canceled_logged': 0,
@@ -811,117 +870,80 @@ class WheelEngine:
                 if normalized and normalized['order_id']:
                     orders_by_id[normalized['order_id']] = normalized
 
-            # Process open + closed orders
+            # Process open + closed orders. The three terminal states share one
+            # body: they previously had three near-identical copies, and every
+            # copy carried the same defects (symbol-substring strategy guess,
+            # `str(None)` timestamps, dropped columns).
+            terminal_states = {
+                'filled': ('order_filled', 'filled_logged'),
+                'expired': ('order_expired', 'expired_logged'),
+                'canceled': ('order_canceled', 'canceled_logged'),
+                'cancelled': ('order_canceled', 'canceled_logged'),
+            }
+
             for order in orders_by_id.values():
                 try:
                     stats['orders_checked'] += 1
-                    order_id = str(order.get('order_id', ''))
-                    status = order.get('status', '').lower()
-                    symbol = order.get('symbol', '')
+                    order_id = str(order.get('order_id', '') or '')
+                    status = (order.get('status') or '').lower()
+                    symbol = order.get('symbol', '') or ''
 
                     # Only log final states
-                    if status == 'filled':
-                        # Extract underlying from option symbol
-                        underlying = self._extract_underlying_from_option_symbol(symbol)
-                        # Determine strategy from option type
-                        strategy = 'sell_put' if 'P' in symbol else 'sell_call' if 'C' in symbol else 'unknown'
+                    if status not in terminal_states:
+                        continue
+                    event_type, stat_key = terminal_states[status]
 
-                        log_order_status_update(
-                            logger,
-                            event_type="order_filled",
+                    side = (order.get('side') or '')
+                    underlying = self._extract_underlying_from_option_symbol(symbol)
+                    strategy = self._classify_order_strategy(symbol, side)
+                    # `filled_at`/`submitted_at` are None on non-filled orders.
+                    # str(None) -> the literal 'None', which BigQuery rejects
+                    # for a TIMESTAMP column and silently drops the row.
+                    filled_at = self._ts(order.get('filled_at'))
+                    submitted_at = self._ts(order.get('submitted_at'))
+
+                    log_order_status_update(
+                        logger,
+                        event_type=event_type,
+                        order_id=order_id,
+                        symbol=symbol,
+                        status=status,
+                        underlying=underlying or symbol,
+                        strategy=strategy,
+                        side=side,
+                        filled_qty=order.get('filled_qty', 0),
+                        filled_avg_price=order.get('filled_avg_price'),
+                        filled_at=filled_at
+                    )
+                    stats[stat_key] += 1
+
+                    # Analytics: write order status
+                    try:
+                        analytics = get_analytics_writer()
+                        analytics.write_order_status(
                             order_id=order_id,
                             symbol=symbol,
                             status=status,
+                            side=side,
                             underlying=underlying or symbol,
-                            strategy=strategy,
-                            filled_qty=order.get('filled_qty', 0),
-                            filled_avg_price=order.get('filled_avg_price'),
-                            filled_at=str(order.get('filled_at', ''))
+                            order_type=order.get('order_type', '') or '',
+                            filled_price=float(order.get('filled_avg_price') or 0),
+                            filled_qty=int(order.get('filled_qty', 0) or 0),
+                            submitted_at=submitted_at,
+                            filled_at=filled_at,
                         )
-                        stats['filled_logged'] += 1
-
-                        # Analytics: write order status for filled order
-                        try:
-                            analytics = get_analytics_writer()
-                            analytics.write_order_status(
-                                order_id=order.get('order_id'),
-                                symbol=order.get('symbol'),
-                                status=order.get('status'),
-                                side=order.get('side'),
-                                filled_price=float(order.get('filled_avg_price') or 0),
-                                filled_qty=int(order.get('filled_qty', 0)),
-                                filled_at=str(order.get('filled_at', '')),
-                            )
-                        except Exception:
-                            logger.debug("Analytics write_order_status failed (filled)",
-                                        order_id=order_id, exc_info=True)
-
-                    elif status == 'expired':
-                        underlying = self._extract_underlying_from_option_symbol(symbol)
-                        strategy = 'sell_put' if 'P' in symbol else 'sell_call' if 'C' in symbol else 'unknown'
-
-                        log_order_status_update(
-                            logger,
-                            event_type="order_expired",
-                            order_id=order_id,
-                            symbol=symbol,
-                            status=status,
-                            underlying=underlying or symbol,
-                            strategy=strategy
-                        )
-                        stats['expired_logged'] += 1
-
-                        # Analytics: write order status for expired order
-                        try:
-                            analytics = get_analytics_writer()
-                            analytics.write_order_status(
-                                order_id=order.get('order_id'),
-                                symbol=order.get('symbol'),
-                                status=order.get('status'),
-                                side=order.get('side'),
-                                filled_price=float(order.get('filled_avg_price') or 0),
-                                filled_qty=int(order.get('filled_qty', 0)),
-                                filled_at=str(order.get('filled_at', '')),
-                            )
-                        except Exception:
-                            logger.debug("Analytics write_order_status failed (expired)",
-                                        order_id=order_id, exc_info=True)
-
-                    elif status in ('canceled', 'cancelled'):
-                        underlying = self._extract_underlying_from_option_symbol(symbol)
-                        strategy = 'sell_put' if 'P' in symbol else 'sell_call' if 'C' in symbol else 'unknown'
-
-                        log_order_status_update(
-                            logger,
-                            event_type="order_canceled",
-                            order_id=order_id,
-                            symbol=symbol,
-                            status=status,
-                            underlying=underlying or symbol,
-                            strategy=strategy
-                        )
-                        stats['canceled_logged'] += 1
-
-                        # Analytics: write order status for canceled order
-                        try:
-                            analytics = get_analytics_writer()
-                            analytics.write_order_status(
-                                order_id=order.get('order_id'),
-                                symbol=order.get('symbol'),
-                                status=order.get('status'),
-                                side=order.get('side'),
-                                filled_price=float(order.get('filled_avg_price') or 0),
-                                filled_qty=int(order.get('filled_qty', 0)),
-                                filled_at=str(order.get('filled_at', '')),
-                            )
-                        except Exception:
-                            logger.debug("Analytics write_order_status failed (canceled)",
-                                        order_id=order_id, exc_info=True)
+                    except Exception:
+                        logger.warning("Analytics write_order_status failed",
+                                       event_category="error",
+                                       event_type="order_status_write_failed",
+                                       order_id=order_id, status=status, exc_info=True)
 
                 except Exception as order_error:
+                    # `order` holds raw datetimes; the JSON log renderer cannot
+                    # serialize those, and raising in here would abort the poll.
                     logger.warning("Failed to process order status",
                                   event_category="error", event_type="order_status_failed",
-                                  order=order,
+                                  order_id=str(order.get('order_id', '') or ''),
                                   error=str(order_error))
                     stats['errors'] += 1
 

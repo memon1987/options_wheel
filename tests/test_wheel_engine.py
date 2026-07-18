@@ -332,7 +332,10 @@ class _FakeSDKOrder:
         self.filled_qty = filled_qty
         self.filled_avg_price = filled_avg_price
         self.submitted_at = datetime(2026, 7, 17, 10, 0, 0)
-        self.filled_at = datetime(2026, 7, 17, 10, 0, 5)
+        # Real expired/canceled orders carry filled_at=None. Hard-coding a
+        # datetime here is what let the str(None) -> 'None' bug hide.
+        self.filled_at = (datetime(2026, 7, 17, 10, 0, 5)
+                          if status == "filled" else None)
 
 
 class TestPollOrderStatusesClosedOrders:
@@ -359,9 +362,15 @@ class TestPollOrderStatusesClosedOrders:
     def _run(self, closed_orders):
         self.mock_alpaca.trading_client.get_orders.return_value = closed_orders
         with patch('src.strategy.wheel_engine.log_order_status_update') as log_status, \
-             patch('src.strategy.wheel_engine.get_analytics_writer'):
+             patch('src.strategy.wheel_engine.get_analytics_writer') as get_writer:
+            self.writer = Mock()
+            get_writer.return_value = self.writer
             stats = self.engine.poll_order_statuses()
         return stats, log_status
+
+    def _payloads(self):
+        """kwargs of every write_order_status call made during the run."""
+        return [c.kwargs for c in self.writer.write_order_status.call_args_list]
 
     def test_closed_orders_are_fetched_and_logged(self):
         """Regression: the NameError made this path a permanent no-op.
@@ -404,7 +413,7 @@ class TestPollOrderStatusesClosedOrders:
         _, kwargs = self.mock_alpaca.trading_client.get_orders.call_args
         after = kwargs['filter'].after
         assert after is not None, "closed-orders fetch is unbounded"
-        assert (clock.now() - after).days == 7
+        assert (clock.now_utc() - after).days == 7
 
     def test_expired_order_with_no_fill_price_still_logs(self):
         """Expired orders carry filled_avg_price=None (15% of live closed orders).
@@ -470,3 +479,117 @@ class TestPollOrderStatusesClosedOrders:
         ])
         assert stats['filled_logged'] == 1
         assert log_status.call_count == 1
+
+    # --- fixes required by adversarial review -------------------------- #
+
+    def test_expired_order_sends_empty_not_none_string_for_filled_at(self):
+        """`str(None)` -> 'None', which BigQuery rejects for a TIMESTAMP.
+
+        `write_order_status` maps falsy -> NULL, but the non-empty string
+        'None' is truthy, so it reached BigQuery and the row was dropped.
+        Every expired/canceled order has filled_at=None, so this was ~17%
+        of qualifying orders silently lost.
+        """
+        self._run([
+            _FakeSDKOrder("ord-e", "AAPL260717P00140000", "expired",
+                          filled_qty=0, filled_avg_price=None),
+        ])
+        payload = self._payloads()[0]
+        assert payload['filled_at'] == '', (
+            f"filled_at={payload['filled_at']!r} would be rejected as a TIMESTAMP"
+        )
+        assert payload['filled_at'] != 'None'
+
+    def test_call_on_p_containing_underlying_is_not_labeled_a_put(self):
+        """`'P' in symbol` labeled every AAPL/SPY/PFE call as a put.
+
+        Three of the configured symbols contain 'P', so this was structural,
+        not an edge case.
+        """
+        _, log_status = self._run([
+            _FakeSDKOrder("ord-c", "AAPL260715C00317500", "filled"),
+        ])
+        assert log_status.call_args.kwargs['strategy'] == 'sell_call'
+        assert self._payloads()[0]['underlying'] == 'AAPL'
+
+    def test_buy_to_close_is_not_labeled_a_sell(self):
+        """The bot buys to close; labeling those as sells inverts attribution."""
+        _, log_status = self._run([
+            _FakeSDKOrder("ord-b", "IWM260721P00289000", "filled", side="buy"),
+        ])
+        assert log_status.call_args.kwargs['strategy'] == 'buy_to_close_put'
+        assert self._payloads()[0]['side'] == 'buy'
+
+    def test_equity_symbol_is_not_classified_as_an_option(self):
+        """parse_option_symbol falls back to a type on short strings."""
+        assert WheelEngine._classify_order_strategy('PFE', 'sell') == 'unknown'
+        assert WheelEngine._classify_order_strategy('', '') == 'unknown'
+
+    def test_analytics_payload_carries_the_audit_columns(self):
+        """underlying/order_type/submitted_at were computed and discarded,
+        leaving the audit table's grouping column blank."""
+        self._run([
+            _FakeSDKOrder("ord-a", "AAPL260717P00150000", "filled"),
+        ])
+        payload = self._payloads()[0]
+        assert payload['underlying'] == 'AAPL'
+        assert payload['order_type'] == 'limit'
+        assert payload['submitted_at'] == '2026-07-17 10:00:00'
+        assert payload['filled_price'] == 2.50
+
+    def test_closed_fetch_failure_is_visible_to_the_caller(self):
+        """A debug log is suppressed at production level — that is how the
+        original NameError hid for three months."""
+        self.mock_alpaca.trading_client.get_orders.side_effect = RuntimeError("boom")
+        with patch('src.strategy.wheel_engine.log_order_status_update'), \
+             patch('src.strategy.wheel_engine.get_analytics_writer'):
+            stats = self.engine.poll_order_statuses()
+        assert stats['closed_fetch_ok'] is False
+        assert stats['closed_orders_fetched'] == 0
+
+    def test_successful_fetch_reports_ok(self):
+        stats, _ = self._run([
+            _FakeSDKOrder("ord-1", "AAPL260717P00150000", "filled"),
+        ])
+        assert stats['closed_fetch_ok'] is True
+        assert stats['closed_orders_fetched'] == 1
+
+    def test_analytics_write_is_deduped_by_order_and_status(self):
+        """The job re-polls the same closed orders ~30x per 7-day window with
+        no persistence, so the write needs an idempotency key."""
+        from src.data.analytics_writer import AnalyticsWriter
+
+        writer = AnalyticsWriter.__new__(AnalyticsWriter)
+        writer._enabled = True
+        writer._tables = {"order_statuses": "tbl"}
+        writer._client = Mock()
+        writer._client.insert_rows_json.return_value = []
+
+        writer.write_order_status(order_id="ord-1", symbol="AAPL260717P00150000",
+                                  status="filled")
+        _, kwargs = writer._client.insert_rows_json.call_args
+        assert kwargs['row_ids'] == ["ord-1:filled"]
+
+    def test_page_limit_truncation_is_warned(self):
+        """At the page limit the oldest orders are dropped and, with no
+        persistence, never logged."""
+        from src.strategy.wheel_engine import CLOSED_ORDER_PAGE_LIMIT
+        orders = [
+            _FakeSDKOrder(f"ord-{i}", "AAPL260717P00150000", "filled")
+            for i in range(CLOSED_ORDER_PAGE_LIMIT)
+        ]
+        with patch('src.strategy.wheel_engine.logger') as mock_logger:
+            self._run(orders)
+        warned = [c for c in mock_logger.warning.call_args_list
+                  if c.kwargs.get('event_type') == 'closed_orders_truncated']
+        assert len(warned) == 1
+
+    def test_closed_fetch_uses_utc_and_descending_order(self):
+        """clock.now() is naive local; the API bound must be UTC-aware."""
+        from alpaca.common.enums import Sort
+
+        self._run([])
+        _, kwargs = self.mock_alpaca.trading_client.get_orders.call_args
+        req = kwargs['filter']
+        assert req.after.tzinfo is not None, "after= must be timezone-aware"
+        assert req.direction == Sort.DESC
