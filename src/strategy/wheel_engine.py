@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import os
 import structlog
 
+from ..utils import clock
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..risk.gap_detector import GapDetector
@@ -26,21 +27,45 @@ logger = structlog.get_logger(__name__)
 class WheelEngine:
     """Main engine for executing options wheel strategy."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, alpaca_client: Optional[AlpacaClient] = None,
+                 wheel_state: Optional[WheelStateManager] = None,
+                 allow_bigquery_cost_basis: bool = True,
+                 earnings_calendar: Optional[Any] = None):
         """Initialize the wheel strategy engine.
 
         Args:
             config: Configuration instance
+            alpaca_client: Broker/data client. Defaults to the real AlpacaClient.
+                A backtest injects an adapter here; because every downstream
+                component already takes the client by constructor injection,
+                this single seam redirects the whole graph.
+            wheel_state: State manager. Defaults to the configured GCS bucket
+                (or in-memory when unset). A backtest injects a bucket-less
+                instance so a replay can never touch production state.
+            allow_bigquery_cost_basis: forwarded to CallSeller. A backtest passes
+                False so the cost-basis floor cannot fall back to querying
+                production trade history mid-replay.
+            earnings_calendar: earnings service used by the rolling cycle.
+                Defaults to constructing the live Finnhub-backed service. A
+                backtest injects a point-in-time calendar, because Finnhub can
+                only answer "when is the *next* earnings date" — meaningless
+                when replaying 2024.
         """
         self.config = config
-        self.alpaca = AlpacaClient(config)
+        self.alpaca = alpaca_client if alpaca_client is not None else AlpacaClient(config)
         self.market_data = MarketDataManager(self.alpaca, config)
         self.gap_detector = GapDetector(config, self.alpaca)
         self.put_seller = PutSeller(self.alpaca, self.market_data, config)
-        state_bucket = getattr(config, 'state_storage_bucket', None) or os.getenv('STATE_STORAGE_BUCKET')
-        self.wheel_state = WheelStateManager(storage_bucket=state_bucket)
+        if wheel_state is not None:
+            self.wheel_state = wheel_state
+        else:
+            state_bucket = getattr(config, 'state_storage_bucket', None) or os.getenv('STATE_STORAGE_BUCKET')
+            self.wheel_state = WheelStateManager(storage_bucket=state_bucket)
         self.call_seller = CallSeller(self.alpaca, self.market_data, config,
-                                      wheel_state_manager=self.wheel_state)
+                                      wheel_state_manager=self.wheel_state,
+                                      allow_bigquery_cost_basis=allow_bigquery_cost_basis)
+
+        self._injected_earnings_calendar = earnings_calendar
 
         # Track pending orders within current execution cycle to prevent duplicates
         self._pending_underlyings = set()
@@ -54,7 +79,7 @@ class WheelEngine:
         Returns:
             Summary of actions taken
         """
-        start_time = datetime.now()
+        start_time = clock.now()
         logger.info("Starting strategy cycle",
                    event_category="system", event_type="strategy_cycle_started")
 
@@ -94,7 +119,7 @@ class WheelEngine:
             cycle_summary['closed_positions'] = len([a for a in cycle_summary['actions'] if a['action_type'] == 'close_position'])
 
             # Calculate cycle duration
-            end_time = datetime.now()
+            end_time = clock.now()
             duration_seconds = (end_time - start_time).total_seconds()
 
             # Enhanced system event logging
@@ -163,7 +188,7 @@ class WheelEngine:
                     # Update wheel state to track new call position
                     if action.get('contracts'):
                         self.wheel_state.add_call_position(
-                            symbol, action['contracts'], action.get('premium', 0), datetime.now()
+                            symbol, action['contracts'], action.get('premium', 0), clock.now()
                         )
             else:
                 logger.info("Covered call selling blocked by wheel state",
@@ -255,7 +280,7 @@ class WheelEngine:
             List of actions for new opportunities
         """
         actions = []
-        start_time = datetime.now()
+        start_time = clock.now()
 
         try:
             # Get suitable stocks for wheel strategy
@@ -264,7 +289,7 @@ class WheelEngine:
             # Filter by gap risk
             stock_symbols = [stock['symbol'] for stock in suitable_stocks]
             gap_filtered_symbols = self.gap_detector.filter_stocks_by_gap_risk(
-                stock_symbols, datetime.now()
+                stock_symbols, clock.now()
             )
 
             # Convert back to stock objects
@@ -281,7 +306,7 @@ class WheelEngine:
                        filtered_out_symbols=", ".join(filtered_out))
 
             # Log performance metric for market scan
-            scan_duration = (datetime.now() - start_time).total_seconds()
+            scan_duration = (clock.now() - start_time).total_seconds()
             log_performance_metric(
                 logger,
                 metric_name="market_scan_duration",
@@ -317,7 +342,7 @@ class WheelEngine:
                 wheel_phase = self.wheel_state.get_wheel_phase(symbol)
 
                 # Check execution gap before proceeding (Stage 4)
-                execution_check = self.gap_detector.can_execute_trade(symbol, datetime.now())
+                execution_check = self.gap_detector.can_execute_trade(symbol, clock.now())
                 if not execution_check['can_execute']:
                     logger.info("STAGE 4: Execution gap check BLOCKED",
                                event_category="filtering",
@@ -558,7 +583,7 @@ class WheelEngine:
                     'can_open_new_positions': self._can_open_new_positions(positions),
                     'positions_remaining': max(0, self.config.max_total_positions - len(option_positions))
                 },
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': clock.now().isoformat(),
                 'wheel_state': {
                     'symbols_in_put_phase': len(self.wheel_state.get_symbols_by_phase(WheelPhase.SELLING_PUTS)),
                     'symbols_holding_stock': len(self.wheel_state.get_symbols_by_phase(WheelPhase.HOLDING_STOCK)),
@@ -641,7 +666,7 @@ class WheelEngine:
                         # Calculate days held
                         days_held = 0
                         if acquisition_date:
-                            days_held = (datetime.now() - acquisition_date).days
+                            days_held = (clock.now() - acquisition_date).days
 
                         log_position_update(
                             logger,
@@ -870,7 +895,7 @@ class WheelEngine:
 
             # --- Primary: Check Alpaca Activities API for assignments/expirations ---
             try:
-                cutoff_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+                cutoff_date = (clock.now() - timedelta(days=7)).strftime('%Y-%m-%d')
                 activities = self.alpaca.get_account_activities(
                     'OPASN,OPEXP', after=cutoff_date
                 )
@@ -908,9 +933,9 @@ class WheelEngine:
                             # Handle both YYYY-MM-DD and ISO datetime formats
                             act_date = datetime.fromisoformat(act_date_str.replace('Z', '+00:00'))
                         else:
-                            act_date = datetime.now()
+                            act_date = clock.now()
                     except (ValueError, TypeError):
-                        act_date = datetime.now()
+                        act_date = clock.now()
 
                     if activity_type == 'OPASN' and underlying:
                         # Option assignment: shares = contracts * 100
@@ -1118,7 +1143,7 @@ class WheelEngine:
                             symbol=symbol,
                             shares=new_shares,
                             cost_basis=per_share_cost,
-                            assignment_date=datetime.now(),
+                            assignment_date=clock.now(),
                         )
                     except Exception as e:
                         logger.warning("Failed to update wheel state for put assignment",
@@ -1175,7 +1200,7 @@ class WheelEngine:
                             symbol=symbol,
                             shares=shares_called,
                             strike_price=strike_price,
-                            assignment_date=datetime.now(),
+                            assignment_date=clock.now(),
                         )
 
                         # Analytics: record wheel cycle completion
@@ -1186,7 +1211,7 @@ class WheelEngine:
                             analytics.write_wheel_cycle(
                                 symbol=symbol,
                                 call_strike=strike_price,
-                                assignment_date=datetime.now().strftime('%Y-%m-%d'),
+                                assignment_date=clock.now().strftime('%Y-%m-%d'),
                                 capital_gain=capital_gain,
                                 shares=shares_called,
                             )
@@ -1345,7 +1370,7 @@ class WheelEngine:
         Returns:
             Summary dict with rolls_evaluated, rolls_executed, rolls_skipped.
         """
-        start_time = datetime.now()
+        start_time = clock.now()
 
         if not self.config.rolling_enabled:
             return {'skipped': 'rolling_disabled'}
@@ -1354,8 +1379,8 @@ class WheelEngine:
 
         # Initialize rolling components
         risk_manager = RiskManager(self.config)
-        earnings_calendar = None
-        if self.config.earnings_enabled:
+        earnings_calendar = self._injected_earnings_calendar
+        if earnings_calendar is None and self.config.earnings_enabled:
             earnings_calendar = EarningsCalendarService(self.config)
 
         roller = CallRoller(
@@ -1410,7 +1435,7 @@ class WheelEngine:
             else:
                 results['rolls_skipped'] += 1
 
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (clock.now() - start_time).total_seconds()
         log_system_event(
             logger, event_type="roll_cycle_completed", status="completed",
             rolls_evaluated=results['rolls_evaluated'],

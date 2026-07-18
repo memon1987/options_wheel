@@ -23,6 +23,16 @@ class TestCallSellerEvaluateOpportunity:
         self.mock_config.call_drawdown_pause_threshold = 0.05
 
         self.call_seller = CallSeller(self.mock_alpaca, self.mock_market_data, self.mock_config)
+        # Unit isolation: stub the FC-029 BQ cost-basis fallback to "not
+        # found" so it falls through to the mocked Alpaca value. With ambient
+        # GCP credentials (Cloud Build, dev machines with ADC) the real
+        # fallback reaches LIVE production BigQuery and the resolved floor
+        # drifts with the prod 90-day assignment window — AAPL's real $305
+        # assignment (2026-06-13) made the mocked $160 price read as a
+        # drawdown pause and broke these tests in CI. The BQ branch itself
+        # is covered by TestCallSellerCostBasisFloorFC029 with a patched
+        # client.
+        self.call_seller._lookup_last_opasn_put_strike = Mock(return_value=0.0)
 
         # Default stock metrics
         self.mock_market_data.get_stock_metrics.return_value = {
@@ -169,6 +179,16 @@ class TestCallSellerExecuteSale:
         self.mock_config = Mock(spec=Config)
 
         self.call_seller = CallSeller(self.mock_alpaca, self.mock_market_data, self.mock_config)
+        # Unit isolation: stub the FC-029 BQ cost-basis fallback to "not
+        # found" so it falls through to the mocked Alpaca value. With ambient
+        # GCP credentials (Cloud Build, dev machines with ADC) the real
+        # fallback reaches LIVE production BigQuery and the resolved floor
+        # drifts with the prod 90-day assignment window — AAPL's real $305
+        # assignment (2026-06-13) made the mocked $160 price read as a
+        # drawdown pause and broke these tests in CI. The BQ branch itself
+        # is covered by TestCallSellerCostBasisFloorFC029 with a patched
+        # client.
+        self.call_seller._lookup_last_opasn_put_strike = Mock(return_value=0.0)
 
     def test_execute_call_sale_success(self):
         """Test successful call sale execution."""
@@ -293,6 +313,16 @@ class TestCallSellerEarlyClose:
         self.mock_config.profit_taking_static_target = 0.50
 
         self.call_seller = CallSeller(self.mock_alpaca, self.mock_market_data, self.mock_config)
+        # Unit isolation: stub the FC-029 BQ cost-basis fallback to "not
+        # found" so it falls through to the mocked Alpaca value. With ambient
+        # GCP credentials (Cloud Build, dev machines with ADC) the real
+        # fallback reaches LIVE production BigQuery and the resolved floor
+        # drifts with the prod 90-day assignment window — AAPL's real $305
+        # assignment (2026-06-13) made the mocked $160 price read as a
+        # drawdown pause and broke these tests in CI. The BQ branch itself
+        # is covered by TestCallSellerCostBasisFloorFC029 with a patched
+        # client.
+        self.call_seller._lookup_last_opasn_put_strike = Mock(return_value=0.0)
 
     def test_should_close_at_profit_target(self):
         """Test closing when profit target is reached."""
@@ -583,6 +613,7 @@ class TestCallSellerCostBasisFloorFC029:
         assert result is None
         self.mock_market_data.find_suitable_calls.assert_not_called()
 
+    @pytest.mark.real_bq_lookup
     def test_lookup_last_opasn_put_strike_handles_bq_failure(self):
         """``_lookup_last_opasn_put_strike`` must return 0 on any BQ exception.
 

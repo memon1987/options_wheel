@@ -347,3 +347,18 @@ def get_analytics_writer() -> AnalyticsWriter:
     if _instance is None:
         _instance = AnalyticsWriter()
     return _instance
+
+
+def set_analytics_writer(writer: Optional[AnalyticsWriter]) -> Optional[AnalyticsWriter]:
+    """Override the singleton; returns the previous value so callers can restore it.
+
+    Strategy code reaches for this writer from inside its methods rather than
+    taking it by constructor injection, so a backtest has no seam to use. It
+    installs a no-op writer here for the duration of a replay — otherwise a
+    simulated trade would write rows into the production analytics tables.
+    Passing ``None`` restores lazy construction of the real writer.
+    """
+    global _instance
+    previous = _instance
+    _instance = writer
+    return previous

@@ -4,6 +4,7 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime
 import structlog
 
+from ..utils import clock
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
@@ -93,7 +94,7 @@ class PutSeller:
                 'capital_required': position_details['capital_required'],
                 'max_profit': position_details['max_profit'],
                 'breakeven': position_details['breakeven'],
-                'timestamp': datetime.now().isoformat()
+                'timestamp': clock.now().isoformat()
             }
             
             logger.info("Put opportunity identified",
@@ -282,7 +283,7 @@ class PutSeller:
                             'error': 'insufficient_buying_power',
                             'message': f'Need ${collateral_required:,.2f} but only ${available_bp:,.2f} available',
                             'symbol': option_symbol,
-                            'timestamp': datetime.now().isoformat()
+                            'timestamp': clock.now().isoformat()
                         }
 
                     logger.info("Buying power check passed",
@@ -309,7 +310,7 @@ class PutSeller:
                         'message': f'Could not validate buying power: {str(bp_error)}',
                         'symbol': option_symbol,
                         'strategy': 'sell_put',
-                        'timestamp': datetime.now().isoformat()
+                        'timestamp': clock.now().isoformat()
                     }
 
             # Calculate limit price: mid + 10% of spread (biased toward ask for premium collection)
@@ -354,7 +355,7 @@ class PutSeller:
                     'contracts': contracts,
                     'limit_price': limit_price,
                     'strategy': 'sell_put',
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': clock.now().isoformat()
                 }
 
                 # Enhanced logging for BigQuery analytics
@@ -375,7 +376,7 @@ class PutSeller:
                 )
 
                 # Track entry time for hold period (min_hold_hours)
-                self._entry_times[option_symbol] = datetime.now()
+                self._entry_times[option_symbol] = clock.now()
 
                 return result
 
@@ -406,7 +407,7 @@ class PutSeller:
                     'non_retryable': non_retryable,
                     'symbol': option_symbol,
                     'strategy': 'sell_put',
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': clock.now().isoformat()
                 }
                 
         except Exception as e:
@@ -427,7 +428,7 @@ class PutSeller:
                 'message': str(e),
                 'symbol': opportunity.get('option_symbol', ''),
                 'strategy': 'sell_put',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': clock.now().isoformat()
             }
     
     def _parse_dte_from_option_symbol(self, option_symbol: str) -> int:
@@ -543,7 +544,7 @@ class PutSeller:
                 # Hold period check: skip profit-target if position too new
                 entry_time = self._entry_times.get(option_symbol)
                 if entry_time:
-                    hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+                    hours_held = (clock.now() - entry_time).total_seconds() / 3600
                     if hours_held < self.config.profit_taking_min_hold_hours:
                         return False
 

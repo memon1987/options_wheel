@@ -8,11 +8,11 @@ position, and reuses the existing find_suitable_calls framework.
 """
 
 import time
-from datetime import datetime, date
 from typing import Dict, Any, List, Optional, Tuple
 
 import structlog
 
+from ..utils import clock
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..api.earnings_calendar import EarningsCalendarService
@@ -318,16 +318,16 @@ class CallRoller:
             # Update state
             self.wheel_state.remove_position(underlying, 'call', btc_filled_qty, 'rolled')
             self.wheel_state.add_call_position(
-                underlying, stc_filled_qty, stc_filled_price, datetime.now())
+                underlying, stc_filled_qty, stc_filled_price, clock.now())
             self.wheel_state.set_active_call_details(
                 underlying, new_symbol, stc_filled_price,
                 opportunity['new_strike'], stc_filled_qty,
-                datetime.now().strftime('%Y-%m-%d'))
+                clock.now().strftime('%Y-%m-%d'))
             self.wheel_state.record_call_roll(
                 underlying, old_symbol, new_symbol, stc_filled_qty,
                 net_premium, btc_total, stc_total,
                 opportunity['old_strike'], opportunity['new_strike'],
-                datetime.now().strftime('%Y-%m-%d'))
+                clock.now().strftime('%Y-%m-%d'))
 
             log_position_update(
                 logger, event_type="call_roll_completed",
