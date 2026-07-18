@@ -362,3 +362,88 @@ class TestSyncGuardCannotBeBypassed:
                                "&sensitivity=false&start=2025-01-01&end=2025-06-30")
         assert resp.status_code != 413
         assert resp.get_json()["symbols_screened"] == 1
+
+
+class TestDemotionArtifactIsHonest:
+    """Everything in the table that justifies a demotion must be real."""
+
+    def test_absent_benchmark_never_renders_as_zero(self):
+        """'+0.00%' reads as 'exactly matched buy-and-hold' — fabricated evidence."""
+        rep = _FakeReport(verdict="unfit")
+        rep.excess_return = None
+        r = ScreenResult(run_id="r", start=date(2025, 1, 1), end=date(2025, 12, 31))
+        r.results = [SymbolResult("XYZ", rep)]
+        md = render_screen_summary(r)
+        assert "+0.00%" not in md
+        assert "| — |" in md
+
+    def test_insufficient_evidence_is_not_a_demotion_candidate(self):
+        rep = _FakeReport(verdict="insufficient")
+        r = ScreenResult(run_id="r", start=date(2025, 1, 1), end=date(2025, 12, 31))
+        r.results = [SymbolResult("XYZ", rep)]
+        assert r.demote_candidates == []
+
+    def test_insufficient_row_is_not_flagged_for_demotion(self):
+        row = build_row(run_id="r", symbol="X",
+                        report=_FakeReport(verdict="insufficient"),
+                        sensitivity=None, cfg_hash="h", engine_version="v")
+        assert row["demote"] is False
+        assert row["verdict"] == "insufficient"
+
+    def test_a_verdict_that_flips_on_fill_is_not_a_demotion(self):
+        """The docs say a flipping verdict 'is not a verdict' — so don't act on it."""
+        row = build_row(run_id="r", symbol="X", report=_FakeReport(verdict="unfit"),
+                        sensitivity={"bid_return": 0.01, "verdict_flips": True},
+                        cfg_hash="h", engine_version="v")
+        assert row["verdict"] == "unfit"
+        assert row["verdict_flips_on_fill"] is True
+        assert row["demote"] is False, (
+            "a verdict the engine itself calls unstable must not drive capital"
+        )
+
+    def test_a_stable_unfit_verdict_still_demotes(self):
+        row = build_row(run_id="r", symbol="X", report=_FakeReport(verdict="unfit"),
+                        sensitivity={"bid_return": 0.01, "verdict_flips": False},
+                        cfg_hash="h", engine_version="v")
+        assert row["demote"] is True
+
+
+class TestAnalyticsIsolationIsThreadLocal:
+    """A replay must never redirect a concurrent LIVE cycle's telemetry.
+
+    cloud_run_server runs Flask threaded=True at containerConcurrency 10 with
+    maxScale 1 — one process, ten concurrent requests. A process-global swap
+    discarded live analytics rows, including the error that warns of
+    re-execution risk.
+    """
+
+    def test_a_concurrent_thread_never_sees_the_replay_writer(self):
+        import threading
+        import time
+
+        from src.backtesting.engine.no_op_analytics import NoOpAnalyticsWriter
+        from src.data import analytics_writer as aw
+
+        seen, stop = [], threading.Event()
+
+        def live():
+            while not stop.is_set():
+                seen.append(type(aw.get_analytics_writer()).__name__)
+                time.sleep(0.005)
+
+        t = threading.Thread(target=live)
+        t.start()
+        try:
+            time.sleep(0.03)
+            prev = aw.set_analytics_writer(NoOpAnalyticsWriter())
+            time.sleep(0.05)
+            aw.set_analytics_writer(prev)
+            time.sleep(0.02)
+        finally:
+            stop.set()
+            t.join()
+
+        assert seen, "probe thread never ran"
+        assert "NoOpAnalyticsWriter" not in seen, (
+            "a replay redirected a concurrent thread's analytics"
+        )

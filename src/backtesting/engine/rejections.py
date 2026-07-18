@@ -59,6 +59,12 @@ class RejectionTally:
 
     # ------------------------------------------------------------------ #
     def processor(self, logger, name, event_dict):
+        # Tag every event emitted during a replay. Without this, synthetic
+        # cycles are indistinguishable from live ones in Cloud Logging — and
+        # FC-039's investigation rests on reading real roll_cycle_completed
+        # events, which a screen run would otherwise pollute with zero-roll
+        # replays. Promised by the plan (§5) and previously not done.
+        event_dict.setdefault("backtest", True)
         try:
             event_type = event_dict.get("event_type", "")
             day = clock.now().date() if clock.is_frozen() else None

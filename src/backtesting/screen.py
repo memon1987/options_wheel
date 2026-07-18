@@ -205,8 +205,13 @@ def render_screen_summary(result: ScreenResult) -> str:
         rep = r.report
         aroc = rep.annualized_return_on_collateral
         aroc_cell = f"{aroc:+.2%}" if aroc is not None else "—"
+        # An absent benchmark must render as "—", never "+0.00%": the latter
+        # reads as "exactly matched buy-and-hold", i.e. fabricated evidence in
+        # the table that justifies a demotion.
+        excess = rep.excess_return
+        excess_cell = f"{excess:+.2%}" if excess is not None else "—"
         a(f"| {rep.symbol} | {rep.verdict()} | {rep.total_return:+.2%} "
-          f"| {(rep.excess_return or 0):+.2%} | {aroc_cell} "
+          f"| {excess_cell} | {aroc_cell} "
           f"| {rep.days_in_position_fraction:.0%} |")
     a("")
 

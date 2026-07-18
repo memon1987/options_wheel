@@ -250,8 +250,15 @@ class FitnessReport:
         return self.total_return - self.benchmark.total_return
 
     def verdict(self) -> str:
-        """fit | marginal | unfit, with the reasons attached via verdict_reasons."""
+        """fit | marginal | unfit | insufficient.
+
+        ``insufficient`` is deliberately NOT ``unfit``: it means the window did
+        not contain enough completed cycles to judge, which implies lengthening
+        the window or fixing a threshold — not dropping the symbol.
+        """
         reasons = self.verdict_reasons()
+        if any(r.startswith("INSUFFICIENT") for r in reasons):
+            return "insufficient"
         if any(r.startswith("BLOCK") for r in reasons):
             return "unfit"
         if any(r.startswith("WARN") for r in reasons):
@@ -263,7 +270,16 @@ class FitnessReport:
         reasons: List[str] = []
 
         if not self.closed_cycles:
-            reasons.append("BLOCK: no completed wheel cycle in the window")
+            # NOT a BLOCK: "no cycle closed" is a statement about the window,
+            # not the symbol. A name that made money on every decision day was
+            # being recommended for demotion because its cycle happened to
+            # straddle the window edge. INSUFFICIENT keeps it out of the
+            # demotion list while still refusing to call it fit.
+            reasons.append(
+                "INSUFFICIENT: no wheel cycle completed inside the window — "
+                "not enough evidence to judge this symbol (lengthen the window "
+                "or check whether it can trade at all)"
+            )
             return reasons
 
         # Check activity before performance: a return earned on 3% of the days

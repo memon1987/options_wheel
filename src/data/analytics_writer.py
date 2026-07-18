@@ -26,6 +26,7 @@ Design principles:
 """
 
 import os
+import threading
 import structlog
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -340,9 +341,21 @@ class AnalyticsWriter:
 
 _instance: Optional[AnalyticsWriter] = None
 
+# THREAD-LOCAL override, for the same reason src/utils/clock.py is thread-local.
+# cloud_run_server runs Flask with threaded=True at containerConcurrency 10 and
+# maxScale 1 — one process, ten concurrent requests. A backtest replay swapping
+# a PROCESS-GLOBAL singleton silently routed a concurrently-running live
+# trading cycle's analytics into the no-op writer, discarding its rows
+# (including the write_error that warns of re-execution risk). The dashboard
+# then shows a clean run over a trade whose telemetry was thrown away.
+_override = threading.local()
+
 
 def get_analytics_writer() -> AnalyticsWriter:
-    """Get or create the AnalyticsWriter singleton."""
+    """Get the writer for THIS thread: a replay override, else the singleton."""
+    override = getattr(_override, "writer", None)
+    if override is not None:
+        return override
     global _instance
     if _instance is None:
         _instance = AnalyticsWriter()
@@ -350,15 +363,17 @@ def get_analytics_writer() -> AnalyticsWriter:
 
 
 def set_analytics_writer(writer: Optional[AnalyticsWriter]) -> Optional[AnalyticsWriter]:
-    """Override the singleton; returns the previous value so callers can restore it.
+    """Override the writer FOR THIS THREAD; returns the previous override.
 
     Strategy code reaches for this writer from inside its methods rather than
     taking it by constructor injection, so a backtest has no seam to use. It
     installs a no-op writer here for the duration of a replay — otherwise a
     simulated trade would write rows into the production analytics tables.
-    Passing ``None`` restores lazy construction of the real writer.
+
+    Thread-local by construction: a replay must never redirect a concurrently
+    running live cycle's telemetry. Passing ``None`` clears this thread's
+    override and restores the shared singleton.
     """
-    global _instance
-    previous = _instance
-    _instance = writer
+    previous = getattr(_override, "writer", None)
+    _override.writer = writer
     return previous

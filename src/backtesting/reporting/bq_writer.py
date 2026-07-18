@@ -264,7 +264,17 @@ def build_row(*, run_id: str, symbol: str, report, sensitivity: Optional[dict],
 
         "verdict": verdict,
         # Demotion is a *recommendation*; the plan keeps the decision human.
-        "demote": verdict == "unfit",
+        #
+        # Two verdicts deliberately do NOT set it:
+        #   'insufficient' — the window did not contain a completed cycle, which
+        #     is a statement about the window, not the symbol;
+        #   any verdict that flips between mid-fill and bid-fill — the report's
+        #     own bias footer says such a verdict "is not a verdict", so acting
+        #     on it would contradict the engine's own caveat.
+        "demote": (
+            verdict == "unfit"
+            and not (sensitivity or {}).get("verdict_flips", False)
+        ),
         "verdict_reasons": report.verdict_reasons(),
         "binding_constraint": _binding(report),
 

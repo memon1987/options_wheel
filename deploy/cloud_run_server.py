@@ -1123,11 +1123,21 @@ def backtest_screen():
         # Sensitivity doubles the runtime; allow a scheduler to skip it.
         run_sensitivity = request.args.get('sensitivity', 'true').lower() != 'false'
 
-        # A full-universe screen takes far longer than this service's request
-        # timeout (300s) and the scheduler's attempt deadline (180s). Letting it
-        # start would time out mid-run, after some rows had already been
-        # written — a partial table plus a failure status, which is the worst of
-        # both. Refuse loudly and point at the right primitive instead.
+        # A screened symbol replays a year of decisions. MEASURED cold — the
+        # only mode that exists, since ChainStore is not wired in and Cloud
+        # Run's filesystem is ephemeral anyway — that is ~25 min per symbol,
+        # ~50 with the sensitivity pass. Not the "~1 min" an earlier version of
+        # this comment asserted without measuring.
+        #
+        # Against a 300s request timeout, NO synchronous multi-symbol run is
+        # defensible; even one symbol overruns. A timeout does not corrupt the
+        # table (persistence is a single write after the loop, so a timeout
+        # writes ZERO rows, not partial ones — an earlier version of this
+        # comment claimed otherwise) but it does burn ~25 min of Alpaca quota
+        # shared with the live bot and leaves no record.
+        #
+        # So this endpoint is for genuinely small, opt-in probes only. The
+        # monthly universe run belongs in the Cloud Run Job.
         requested = symbols or config.stock_symbols
         # Clamp, never trust. ?max_symbols=999 would otherwise disable the guard
         # entirely, and a non-integer would raise into the 500 handler.
@@ -1186,7 +1196,11 @@ def backtest_screen():
         #   - clean -> 200 'ok'
         # Collapsing the middle case into 5xx makes "recorded and mostly fine"
         # page identically to "no data at all".
-        if not result.persisted:
+        # ?persist=false is an advertised, legitimate mode; reporting 500 for
+        # its documented use trains operators to ignore 500s from the one
+        # endpoint whose 500 means "no record of this run exists".
+        persist_requested = request.args.get('persist', 'true').lower() != 'false'
+        if persist_requested and not result.persisted:
             payload['status'] = 'not_persisted'
             return jsonify(payload), 500
         if result.failures:

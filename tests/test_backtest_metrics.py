@@ -293,11 +293,18 @@ class TestFitness:
                             build_cycles(ledger), 100.0)
         assert r.max_drawdown == pytest.approx(-0.25)  # 120 -> 90
 
-    def test_verdict_blocks_when_no_cycle_completed(self):
+    def test_no_completed_cycle_is_insufficient_evidence_not_a_demotion(self):
+        """A window that ends mid-cycle says nothing about the symbol.
+
+        This previously returned "unfit", so a name that made money on every
+        decision day was recommended for demotion purely because its cycle
+        straddled the window edge.
+        """
         days = [D(2025, 1, 6), D(2025, 1, 8)]
         r = compute_fitness("XYZ", _states(days, [100_000, 100_000]), [], 100_000.0)
-        assert r.verdict() == "unfit"
-        assert any("no completed wheel cycle" in x for x in r.verdict_reasons())
+        assert r.verdict() == "insufficient"
+        assert r.verdict() != "unfit"
+        assert any("not enough evidence" in x for x in r.verdict_reasons())
 
     def test_verdict_blocks_on_a_loss(self):
         r = self._report(equities=(100_000, 99_000, 98_000))
@@ -595,5 +602,21 @@ class TestRejectionTally:
 
     def test_processor_never_raises_into_the_run(self):
         t = self._tally()
-        assert t.processor(None, "info", {}) == {}
+        # Returns the (tagged) dict rather than raising, whatever it is handed.
+        assert t.processor(None, "info", {}) == {"backtest": True}
         assert t.processor(None, "info", {"event_type": None}) is not None
+
+    def test_replay_events_are_tagged_so_they_cannot_pollute_live_forensics(self):
+        """FC-039 reads real roll_cycle_completed events; a screen must not
+
+        contribute synthetic zero-roll cycles indistinguishable from live ones.
+        """
+        t = self._tally()
+        out = t.processor(None, "info",
+                          {"event_type": "roll_cycle_completed", "rolls_executed": 0})
+        assert out["backtest"] is True
+
+    def test_an_explicit_tag_is_not_overwritten(self):
+        t = self._tally()
+        out = t.processor(None, "info", {"event_type": "x", "backtest": False})
+        assert out["backtest"] is False

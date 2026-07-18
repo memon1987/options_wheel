@@ -162,9 +162,14 @@ WHERE ABS(IFNULL(reconciliation_gap, 0)) > 0.01;
 report and in `src/backtesting/reporting/report.py`. The two that most affect a
 demotion decision:
 
-- **Dividends are not modeled**, and this *flatters the wheel* — the buy-and-hold
-  benchmark holds shares every day and forgoes the entire dividend stream, while
-  the wheel holds them only intermittently (~15 points on a 6.5% yielder over
-  2.4 years). Weigh `excess_return` accordingly on income names.
+- **Dividends are not modeled, and the bias runs BOTH ways.** It *flatters* the
+  wheel on `excess_return` (the benchmark holds shares every day and forgoes the
+  whole dividend stream — ~15 points on a 6.5% yielder over 2.4 years), but it
+  *penalises* the wheel on `total_return` and return-on-collateral, which are the
+  **absolute gates that actually produce a demotion**. On a 5–7% yielder the
+  missing dividends alone can push annualized return under the 4% risk-free
+  floor. So on the income names the demote flag is biased **toward** demoting
+  while the headline comparison leans the other way. Do not judge a dividend
+  payer on this engine yet.
 - **Early assignment is not modeled**, also optimistic, and concentrated on the
   same dividend payers.
