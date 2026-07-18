@@ -14,6 +14,12 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import List, Dict, Any, Optional
 
 from services.bigquery import get_bigquery_service
+from services.pause_alert import (
+    CHECK_FAILED_MARKER,
+    DEFAULT_THRESHOLD_DAYS,
+    format_pause_alert,
+    select_alertable_pauses,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -289,37 +295,6 @@ async def bot_health_drawdown_pauses() -> Dict[str, Any]:
     return await _evaluate_drawdown_pauses()
 
 
-def select_alertable_pauses(pauses: List[Dict[str, Any]],
-                            threshold_days: int) -> List[Dict[str, Any]]:
-    """Pauses at or beyond the alert threshold, longest-paused first.
-
-    Pure function so the threshold boundary is unit-testable without any
-    BigQuery or live-proxy involvement (FC-030).
-    """
-    qualifying = [p for p in pauses
-                  if (p.get("trading_days_paused") or 0) >= threshold_days]
-    return sorted(qualifying,
-                  key=lambda p: p.get("trading_days_paused") or 0,
-                  reverse=True)
-
-
-def format_pause_alert(symbols: List[Dict[str, Any]], threshold_days: int) -> str:
-    """One-line digest for the alert log. Single line => single email.
-
-    The marker DRAWDOWN_PAUSE_ALERT is what the Cloud Monitoring
-    log-based policy matches on; do not rename it without updating
-    deploy/monitoring/drawdown_pause_alert.md.
-    """
-    parts = [
-        f"{p['symbol']} {p.get('trading_days_paused')}d "
-        f"({(p.get('pct_below_strike') or 0) * 100:.1f}% below "
-        f"${p.get('assignment_strike')})"
-        for p in symbols
-    ]
-    return (f"DRAWDOWN_PAUSE_ALERT {len(symbols)} symbol(s) paused "
-            f">={threshold_days} trading days: " + "; ".join(parts))
-
-
 @router.post("/bot-health/pause-alert-check")
 async def pause_alert_check() -> Dict[str, Any]:
     """FC-030: evaluate drawdown pauses and log an alert if any are extended.
@@ -332,21 +307,22 @@ async def pause_alert_check() -> Dict[str, Any]:
     Returns the evaluation either way so the check is manually invokable.
     """
     try:
-        threshold_days = int(os.getenv("PAUSE_ALERT_THRESHOLD_DAYS", "7"))
+        threshold_days = int(os.getenv("PAUSE_ALERT_THRESHOLD_DAYS",
+                                       str(DEFAULT_THRESHOLD_DAYS)))
     except (TypeError, ValueError):
-        threshold_days = 7
+        threshold_days = DEFAULT_THRESHOLD_DAYS
 
     try:
         result = await _evaluate_drawdown_pauses()
     except Exception as exc:  # noqa: BLE001 - must never raise past the scheduler
         # A silent evaluator is the FC-006 failure mode. Log loudly.
-        logger.warning("DRAWDOWN_PAUSE_ALERT_CHECK_FAILED evaluation raised: %s", exc)
+        logger.warning("%s evaluation raised: %s", CHECK_FAILED_MARKER, exc)
         return {"status": "degraded", "reason": str(exc),
                 "threshold_days": threshold_days}
 
     if not result.get("positions_available"):
-        logger.warning("DRAWDOWN_PAUSE_ALERT_CHECK_FAILED live positions "
-                       "unavailable; pause state could not be evaluated")
+        logger.warning("%s live positions unavailable; pause state "
+                       "could not be evaluated", CHECK_FAILED_MARKER)
         return {"status": "degraded", "reason": "live positions unavailable",
                 "threshold_days": threshold_days}
 
