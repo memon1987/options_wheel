@@ -218,7 +218,8 @@ def render_markdown(report: FitnessReport) -> str:
     coverage = report.data_quality.get("dividend_coverage") or {}
     if coverage and coverage.get("status") != "complete for this window":
         a("")
-        a(f"> **Dividend data is incomplete for this run:** {coverage['status']}. "
+        status = str(coverage["status"]).rstrip(".")
+        a(f"> **Dividend data is incomplete for this run:** {status}. "
           f"The dividend row above and the benchmark's dividend line below are "
           f"understated by an unknown amount, and the 'dividends are modeled' "
           f"note in the bias list does not fully hold here.")
