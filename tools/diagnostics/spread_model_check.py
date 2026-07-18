@@ -13,11 +13,24 @@ same contract.
 
 Caveat worth carrying into any conclusion: quotes sampled outside regular
 trading hours are wider than intraday, which makes the model look *better*
-(closer to reality) than it is. The script reports whether the market was open.
+(closer to reality) than it is. Session state is resolved from Alpaca's own
+market clock (which knows holidays and half-days), not from a local-hour guess.
+
+Pass ``--require-rth`` to make the script refuse to emit any conclusion unless
+the market is genuinely open. Use that flag whenever the output is going to be
+quoted as an intraday measurement — an after-hours sample labelled "intraday"
+is the exact failure this tool exists to prevent.
+
+``--calibrate`` fits a SpreadModel from the collected sample and prints the
+parameters together with their provenance (n, date, session, symbols) so the
+committed constants can never be separated from the measurement behind them.
 
 Usage:
     python tools/diagnostics/spread_model_check.py
     python tools/diagnostics/spread_model_check.py --symbols NVDA AMD --out spread.json
+    # the calibration run (must be during US market hours):
+    python tools/diagnostics/spread_model_check.py --require-rth --calibrate \
+        --out docs/investigations/spread-rth-sample.json
 """
 
 import argparse
@@ -35,9 +48,31 @@ from src.utils.config import Config  # noqa: E402
 from src.utils.option_symbols import parse_option_symbol  # noqa: E402
 
 
+def resolve_session(client) -> tuple[bool, str]:
+    """Return (is_rth, description) using Alpaca's market clock.
+
+    The broker clock is authoritative: it accounts for weekends, exchange
+    holidays and early closes, none of which a local-hour heuristic sees. If
+    the clock call fails we return ``False`` — refusing to claim RTH is the
+    safe direction, since a false "intraday" label is what corrupts the
+    conclusion.
+    """
+    try:
+        clock = client.trading_client.get_clock()
+        if clock.is_open:
+            return True, f"market OPEN (closes {clock.next_close:%Y-%m-%d %H:%M %Z})"
+        return False, f"market CLOSED (next open {clock.next_open:%Y-%m-%d %H:%M %Z})"
+    except Exception as exc:  # noqa: BLE001 - diagnostic tool
+        return False, f"market clock unavailable ({str(exc)[:50]}) - assuming CLOSED"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Modeled vs real option spreads.")
     ap.add_argument("--symbols", nargs="*")
+    ap.add_argument("--require-rth", action="store_true",
+                    help="Refuse to emit a conclusion unless the market is open.")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="Fit a SpreadModel from the sample and print it with provenance.")
     ap.add_argument("--min-mark", type=float, default=0.20)
     ap.add_argument("--max-mark", type=float, default=3.00)
     ap.add_argument("--max-moneyness", type=float, default=0.15,
@@ -49,6 +84,16 @@ def main() -> int:
     symbols = args.symbols or ["NVDA", "AAPL", "IWM", "AMD"]
     client = AlpacaClient(config)
     model = SpreadModel()
+
+    # Resolve the session BEFORE pulling chains, so a gated run fails fast
+    # instead of burning API calls on a sample it will refuse to use.
+    rth, session_desc = resolve_session(client)
+    if args.require_rth and not rth:
+        print(f"--require-rth given but {session_desc}.\n"
+              "Refusing to sample: an out-of-hours measurement cannot stand in "
+              "for an intraday one. Re-run while the market is open.",
+              file=sys.stderr)
+        return 2
 
     rows = []
     for symbol in symbols:
@@ -90,6 +135,9 @@ def main() -> int:
             rows.append({
                 "symbol": symbol, "strike": strike, "spot": round(spot, 2),
                 "dte": dte, "mark": round(mark, 3),
+                "moneyness": round(moneyness, 4),
+                # SpreadModel.calibrate() consumes mark/moneyness/half_spread.
+                "half_spread": round(real_half, 4),
                 "real_half_spread": round(real_half, 4),
                 "modeled_half_spread": round(modeled_half, 4),
                 "ratio_real_over_modeled": round(real_half / modeled_half, 3)
@@ -119,11 +167,27 @@ def main() -> int:
           f"({wider / len(ratios) * 100:.0f}%) — wider is conservative for a seller")
 
     now = datetime.now()
-    rth = 0 if now.weekday() >= 5 else (1 if 9 <= now.hour < 16 else 0)
-    print(f"\n  sampled {now:%Y-%m-%d %H:%M} local — "
-          f"{'during' if rth else 'OUTSIDE'} regular trading hours."
-          + ("" if rth else " Out-of-hours quotes are WIDER than intraday, so the"
-                            " model looks closer to reality here than it is."))
+    print(f"\n  sampled {now:%Y-%m-%d %H:%M} local — {session_desc}")
+    print(f"  session: {'REGULAR TRADING HOURS' if rth else 'OUTSIDE regular trading hours'}"
+          + ("" if rth else " — out-of-hours quotes are WIDER than intraday, so the"
+                            " model looks closer to reality here than it is."
+                            " NOT a valid intraday measurement."))
+
+    calibrated = None
+    if args.calibrate:
+        calibrated = SpreadModel.calibrate(rows)
+        print(f"\n{'='*60}\nCALIBRATED PARAMS\n{'='*60}")
+        print(f"  base_frac     {calibrated.base_frac:.4f}  (default {SpreadModel().base_frac})")
+        print(f"  otm_widening  {calibrated.otm_widening:.4f}  "
+              f"(default {SpreadModel().otm_widening})")
+        print("  provenance:")
+        print(f"    n        {len(rows)}")
+        print(f"    date     {now:%Y-%m-%d %H:%M} local")
+        print(f"    session  {'RTH' if rth else 'OUT-OF-HOURS (NOT usable for calibration)'}")
+        print(f"    symbols  {', '.join(sorted({r['symbol'] for r in rows}))}")
+        if not rth:
+            print("\n  These params are NOT fit to commit: the sample is out-of-hours.",
+                  file=sys.stderr)
 
     if args.out:
         with open(args.out, "w") as fh:
@@ -134,6 +198,12 @@ def main() -> int:
                 "modeled_over_real": (med_modeled / med_real) if med_real else None,
                 "modeled_wider_pct": wider / len(ratios) * 100,
                 "during_regular_hours": bool(rth),
+                "session": session_desc,
+                "symbols": sorted({r["symbol"] for r in rows}),
+                "calibrated": ({
+                    "base_frac": calibrated.base_frac,
+                    "otm_widening": calibrated.otm_widening,
+                } if calibrated else None),
                 "rows": rows,
             }, fh, indent=1)
         print(f"\nWrote {len(rows)} comparisons to {args.out}")
