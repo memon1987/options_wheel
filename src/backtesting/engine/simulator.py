@@ -174,17 +174,46 @@ class Simulator:
         chains: Dict[str, Dict[date, ChainSnapshot]] = {}
         for symbol in self.symbols:
             closes = {b.bar_date: b.close for b in stock_bars.get(symbol, [])}
+            ceiling = self._cost_basis_ceiling(stock_bars.get(symbol, []))
             per_day: Dict[date, ChainSnapshot] = {}
             for day in days:
                 if day not in closes:
                     continue  # symbol did not trade that session
                 snap = self.builder.build(
-                    symbol, day, self.max_dte, underlying_price=closes[day]
+                    symbol,
+                    day,
+                    self.max_dte,
+                    underlying_price=closes[day],
+                    cost_basis=ceiling,
                 )
                 if snap is not None:
                     per_day[day] = snap
             chains[symbol] = per_day
         return chains
+
+    @staticmethod
+    def _cost_basis_ceiling(bars: Sequence[StockBar]) -> Optional[float]:
+        """An upper bound on any cost basis this run can reach, per symbol.
+
+        Chains are built for the whole window *before* the day loop starts, so
+        at build time there is no position to read a real cost basis from. What
+        we can do is bound it. Shares only ever arrive by put assignment, and
+        the wheel only sells puts struck at or below spot, so the cost basis of
+        any lot this run acquires is at most the highest close in the window
+        (assignment at strike K <= close on the day it was sold, less premium).
+        Feeding that bound to ``strike_window`` guarantees the call ladder above
+        cost basis is fetched on every day, including for a position that goes
+        deeply underwater later.
+
+        Using the window's later closes to widen a *fetch* is not lookahead:
+        the window can only ever grow the set of contracts offered to the
+        strategy, never change any contract's point-in-time price, and the
+        alternative — a spot-centred window — is the one that would alter
+        decisions by hiding eligible calls. The cost is some extra strikes
+        fetched on trending symbols.
+        """
+        closes = [b.close for b in bars if b.close > 0]
+        return max(closes) if closes else None
 
     # ------------------------------------------------------------------ #
     # Run

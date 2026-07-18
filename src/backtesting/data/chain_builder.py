@@ -18,13 +18,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import structlog
 
 from . import greeks
 from .provider import OptionsDataProvider
 from .spread_model import SpreadModel
+
+if TYPE_CHECKING:  # chain_store imports ChainQuote/ChainSnapshot from here
+    from .chain_store import ChainStore
 
 logger = structlog.get_logger(__name__)
 
@@ -41,6 +44,60 @@ logger = structlog.get_logger(__name__)
 # strategy's own filter — flooring included — decides what qualifies. One day is
 # the exact buffer: a 9-calendar-day contract floors to DTE 8 and live rejects it.
 UNIVERSE_DTE_BUFFER = 1
+
+# Half-width of the strike ladder we fetch, as a fraction of the as-of close.
+#
+# Measured on NVDA: the 0.10-0.20 delta band the strategy trades at 7 DTE sits
+# between 0.917x and 1.054x spot across five sampled sessions (2025-10-06 ..
+# 2026-03-09), while the unbounded universe spans 0.27x to 2.10x. 25% is roughly
+# three times the observed worst-case band edge — deliberately loose, because
+# the failure mode of a too-tight window is not a slow backtest but a silently
+# different one: clip the band and the strategy selects a strike it would never
+# have selected live, with no error raised anywhere.
+STRIKE_WINDOW_PCT = 0.25
+
+
+def strike_window(
+    underlying_price: float, cost_basis: Optional[float] = None
+) -> Tuple[float, float]:
+    """The strike range to fetch for an underlying at ``underlying_price``.
+
+    Symmetric +/-``STRIKE_WINDOW_PCT`` around spot, with the UPPER bound
+    extended to cover ``cost_basis`` when shares are held.
+
+    The extension is not cosmetic. A covered call must be struck above the
+    cost basis of the shares it covers (the strategy refuses to write one that
+    would lock in a loss on assignment), so for an underwater position the only
+    *eligible* calls are the ones above cost basis — which is exactly where a
+    spot-centred window stops looking. A position 30% underwater would find an
+    empty call ladder and simply never roll, and the replay would show the
+    position sitting idle rather than the covered call the live bot wrote.
+    """
+    lo = underlying_price * (1.0 - STRIKE_WINDOW_PCT)
+    anchor_hi = underlying_price
+    if cost_basis is not None and cost_basis > anchor_hi:
+        anchor_hi = cost_basis
+    return lo, anchor_hi * (1.0 + STRIKE_WINDOW_PCT)
+
+
+def _is_cacheable(as_of: date) -> bool:
+    """Whether a chain for ``as_of`` is final and safe to persist forever.
+
+    Only settled past sessions are. Today's chain is still forming, and caching
+    it would freeze a partial session as if it were final — every later run
+    would read back a chain that never existed at any decision point, with no
+    TTL to expire it.
+
+    In practice the provider already refuses to serve today: ``_is_settled``
+    drops any bar dated today or later, so a chain built for today comes back
+    with zero quotes (verified: ``get_stock_bars(today)`` returns 0 bars, so
+    ``build`` returns None before reaching this point). That makes this guard
+    defence in depth rather than the primary control — but the primary control
+    is one caller away from being bypassed, because a caller that supplies
+    ``underlying_price`` explicitly skips the stock-bar fetch entirely and would
+    otherwise persist an empty chain for today as though it were the truth.
+    """
+    return as_of < date.today()
 
 
 @dataclass(frozen=True)
@@ -89,6 +146,7 @@ class ChainBuilder:
         spread_model: Optional[SpreadModel] = None,
         risk_free_rate: float = 0.04,
         dividend_yields: Optional[Dict[str, float]] = None,
+        store: Optional["ChainStore"] = None,
     ) -> None:
         """
         Args:
@@ -97,11 +155,16 @@ class ChainBuilder:
             risk_free_rate: continuous risk-free rate for BS.
             dividend_yields: optional per-symbol continuous dividend yield; a
                 symbol absent from the map is treated as non-dividend-paying.
+            store: optional parquet cache. ``None`` (the default) disables
+                caching entirely — deliberately opt-in, so a unit test never
+                reads a chain another test wrote. Application entry points
+                (``evaluate``, the tools) pass one; see ``build``.
         """
         self._provider = provider
         self._spread = spread_model or SpreadModel()
         self._r = risk_free_rate
         self._div = dividend_yields or {}
+        self._store = store
 
     def build(
         self,
@@ -110,6 +173,7 @@ class ChainBuilder:
         max_dte: int,
         *,
         underlying_price: Optional[float] = None,
+        cost_basis: Optional[float] = None,
     ) -> Optional[ChainSnapshot]:
         """Construct the chain for ``underlying`` on ``as_of``.
 
@@ -121,19 +185,78 @@ class ChainBuilder:
             underlying_price: the underlying's ``as_of`` close; fetched from the
                 provider if not supplied (the simulator supplies it to avoid a
                 redundant fetch).
+            cost_basis: per-share cost basis of any shares held in this
+                underlying, which extends the strike window upward so covered
+                calls above cost basis stay reachable. See ``strike_window``.
 
         Returns:
             A ChainSnapshot, or None if the underlying price is unavailable for
             ``as_of`` (e.g. a non-trading day or before data coverage).
+
+        **Caching.** When a store is configured, a covering cache entry short-
+        circuits both provider calls. Chains for a *settled past session* are
+        immutable — the daily bars they are built from are final, and Alpaca
+        never restates them — so there is no TTL and no invalidation policy to
+        get wrong. Correctness rests on the entry being a *superset* of the
+        request (same or wider strike window, same or longer DTE reach) and on
+        the read path narrowing it back to exactly what was asked for, so a warm
+        run and a cold run produce identical chains. The one thing that is NOT
+        immutable is today's session, which is still forming; see
+        ``_is_cacheable``.
         """
+        universe_dte = max_dte + UNIVERSE_DTE_BUFFER
         if underlying_price is None:
             underlying_price = self._underlying_close(underlying, as_of)
         if underlying_price is None or underlying_price <= 0:
             return None
 
-        contracts = self._provider.get_contract_universe(
-            underlying, as_of, max_dte + UNIVERSE_DTE_BUFFER
+        strike_gte, strike_lte = strike_window(underlying_price, cost_basis)
+
+        if self._store is not None:
+            hit = self._store.get(
+                underlying,
+                as_of,
+                universe_dte=universe_dte,
+                strike_gte=strike_gte,
+                strike_lte=strike_lte,
+                underlying_price=underlying_price,
+            )
+            if hit is not None:
+                return hit
+
+        snapshot = self._build_uncached(
+            underlying, as_of, universe_dte, underlying_price, strike_gte, strike_lte
         )
+        if self._store is not None and _is_cacheable(as_of):
+            self._store.put(
+                snapshot,
+                universe_dte=universe_dte,
+                strike_gte=strike_gte,
+                strike_lte=strike_lte,
+            )
+        return snapshot
+
+    def _build_uncached(
+        self,
+        underlying: str,
+        as_of: date,
+        universe_dte: int,
+        underlying_price: float,
+        strike_gte: float,
+        strike_lte: float,
+    ) -> ChainSnapshot:
+        contracts = self._provider.get_contract_universe(
+            underlying,
+            as_of,
+            universe_dte,
+            strike_gte=strike_gte,
+            strike_lte=strike_lte,
+        )
+        # Re-apply the window locally. The provider bound is an optimisation a
+        # provider is allowed to ignore (see the Protocol), and the cache read
+        # path narrows to the window unconditionally — so without this the same
+        # request could yield a wider chain cold than warm.
+        contracts = [c for c in contracts if strike_gte <= c.strike <= strike_lte]
         if not contracts:
             return ChainSnapshot(underlying, as_of, underlying_price)
 

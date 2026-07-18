@@ -8,6 +8,19 @@ sweeps, report regeneration, the parity check — hit disk instead of the API.
 Layout: ``<cache_dir>/<UNDERLYING>/<YYYY-MM-DD>.parquet``, one file per chain.
 Each row is a ChainQuote; the underlying price rides along as a column (constant
 within a file) so a snapshot round-trips without a sidecar.
+
+**Why there is no TTL.** A chain for a settled past session is immutable: it is
+derived from that day's final daily bars, which Alpaca does not restate. The
+entry can therefore live forever. What the key ``(underlying, as_of)`` does NOT
+capture is how *much* of that day was fetched — the DTE reach and the strike
+window both narrow the result — so each file also records the request it
+answers, and a read is a hit only when the file provably covers the new request
+(``_covers``) and is narrowed back to it. Getting that wrong would not be a slow
+backtest but a wrong one: a chain missing the strikes the caller asked for looks
+exactly like a day on which those strikes did not trade.
+
+Today's session is excluded from the cache upstream — see
+``chain_builder._is_cacheable``.
 """
 
 from __future__ import annotations
@@ -37,7 +50,26 @@ _COLUMNS = [
     "volume",
     "modeled_spread",
     "modeled_greeks",
+    # Provenance of the *request* that produced this file, not of any one quote.
+    # Constant within a file; see the coverage check in ``get``.
+    "universe_dte",
+    "strike_gte",
+    "strike_lte",
 ]
+
+# Written into the provenance columns when a caller persists a snapshot without
+# declaring what window it was built under. Such a file can still be read back
+# wholesale, but it can never satisfy a *bounded* request: we cannot prove it
+# covers one. Fail closed — a false cache hit is a silently wrong backtest.
+_UNKNOWN = float("nan")
+
+# Strike bounds are floats recomputed per run; compare them with a tolerance
+# well below one strike increment (the tightest ladders are $0.50 wide).
+_BOUND_TOL = 1e-6
+
+
+def _close(a: float, b: float) -> bool:
+    return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
 
 
 class ChainStore:
@@ -52,34 +84,112 @@ class ChainStore:
     def has(self, underlying: str, as_of: date) -> bool:
         return self._path(underlying, as_of).exists()
 
-    def put(self, snapshot: ChainSnapshot) -> None:
-        """Persist a snapshot (overwrites any existing file for that day)."""
+    def put(
+        self,
+        snapshot: ChainSnapshot,
+        *,
+        universe_dte: Optional[int] = None,
+        strike_gte: Optional[float] = None,
+        strike_lte: Optional[float] = None,
+    ) -> None:
+        """Persist a snapshot (overwrites any existing file for that day).
+
+        ``universe_dte``/``strike_gte``/``strike_lte`` record the request the
+        snapshot answers, so ``get`` can later prove the file covers a new
+        request instead of assuming it.
+        """
         path = self._path(snapshot.underlying, snapshot.as_of)
         path.parent.mkdir(parents=True, exist_ok=True)
-        rows = [self._quote_to_row(q) for q in snapshot.all_quotes()]
+        provenance = {
+            "universe_dte": _UNKNOWN if universe_dte is None else float(universe_dte),
+            "strike_gte": _UNKNOWN if strike_gte is None else float(strike_gte),
+            "strike_lte": _UNKNOWN if strike_lte is None else float(strike_lte),
+        }
+        rows = [{**self._quote_to_row(q), **provenance} for q in snapshot.all_quotes()]
         if not rows:
             # A real "no contracts traded" day: write one sentinel row (empty
             # symbol) carrying the underlying price so a later read distinguishes
             # an empty chain from a cache miss.
-            rows = [self._empty_row(snapshot)]
+            rows = [{**self._empty_row(snapshot), **provenance}]
         pd.DataFrame(rows, columns=_COLUMNS).to_parquet(path, index=False)
 
-    def get(self, underlying: str, as_of: date) -> Optional[ChainSnapshot]:
-        """Load a cached snapshot, or None on a cache miss."""
+    def get(
+        self,
+        underlying: str,
+        as_of: date,
+        *,
+        universe_dte: Optional[int] = None,
+        strike_gte: Optional[float] = None,
+        strike_lte: Optional[float] = None,
+        underlying_price: Optional[float] = None,
+    ) -> Optional[ChainSnapshot]:
+        """Load a cached snapshot, or None on a cache miss.
+
+        A file is a hit only if it *covers* the request: built with at least as
+        long a DTE reach and at least as wide a strike window. A covering file
+        is then narrowed to exactly the requested window, so that reading from
+        cache and building from the provider return the identical chain — the
+        property that makes the cache invisible to results rather than merely
+        fast.
+
+        Passing no bounds asks for the file as written, with no coverage claim.
+        """
         path = self._path(underlying, as_of)
         if not path.exists():
             return None
         df = pd.read_parquet(path)
-        underlying_price = float(df["underlying_price"].iloc[0]) if not df.empty else 0.0
+        if df.empty:
+            return None
+        if not self._covers(df, universe_dte, strike_gte, strike_lte):
+            return None
+
+        cached_price = float(df["underlying_price"].iloc[0])
+        if underlying_price is not None and not _close(cached_price, underlying_price):
+            # The file was built against a different close for the same session
+            # (a restated bar, or a raw/adjusted mix). Every delta in it was
+            # computed against that price, so it cannot answer this request.
+            return None
+
         puts, calls = [], []
         for _, r in df.iterrows():
             if not r["symbol"]:  # sentinel row for an empty chain
+                continue
+            if strike_gte is not None and not (strike_gte <= float(r["strike"]) <= strike_lte):
+                continue
+            if universe_dte is not None and int(r["dte"]) > universe_dte:
                 continue
             q = self._row_to_quote(r)
             (puts if q.option_type == "put" else calls).append(q)
         puts.sort(key=lambda x: x.strike)
         calls.sort(key=lambda x: x.strike)
-        return ChainSnapshot(underlying, as_of, underlying_price, puts, calls)
+        return ChainSnapshot(underlying, as_of, cached_price, puts, calls)
+
+    @staticmethod
+    def _covers(
+        df,
+        universe_dte: Optional[int],
+        strike_gte: Optional[float],
+        strike_lte: Optional[float],
+    ) -> bool:
+        """Whether the file's build window is a superset of the request."""
+        if universe_dte is not None:
+            stored = df["universe_dte"].iloc[0] if "universe_dte" in df.columns else _UNKNOWN
+            if pd.isna(stored) or int(stored) < universe_dte:
+                return False
+        if strike_gte is not None or strike_lte is not None:
+            if "strike_gte" not in df.columns or "strike_lte" not in df.columns:
+                return False
+            lo, hi = df["strike_gte"].iloc[0], df["strike_lte"].iloc[0]
+            if pd.isna(lo) or pd.isna(hi):
+                return False
+            # Tolerance: the bounds are recomputed from a float close each run,
+            # so an exact-equality test would miss on the last bit and refetch
+            # every single day for no reason.
+            if strike_gte is not None and float(lo) > strike_gte + _BOUND_TOL:
+                return False
+            if strike_lte is not None and float(hi) < strike_lte - _BOUND_TOL:
+                return False
+        return True
 
     # ------------------------------------------------------------------ #
     @staticmethod

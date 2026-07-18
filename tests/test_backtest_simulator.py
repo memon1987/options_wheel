@@ -12,7 +12,7 @@ from typing import Dict, List
 
 import pytest
 
-from src.backtesting.data.chain_builder import ChainBuilder
+from src.backtesting.data.chain_builder import STRIKE_WINDOW_PCT, ChainBuilder
 from src.backtesting.data.provider import OptionBar, OptionContract, StockBar
 from src.backtesting.engine.no_op_analytics import NoOpAnalyticsWriter
 from src.backtesting.engine.simulator import Simulator, restrict_symbols
@@ -44,7 +44,12 @@ class ScriptedProvider:
         base = round(spot)
         return [float(base + k) for k in range(-12, 13)]
 
-    def get_contract_universe(self, underlying, as_of, max_dte):
+    def get_contract_universe(
+        self, underlying, as_of, max_dte, *, strike_gte=None, strike_lte=None
+    ):
+        # Deliberately IGNORES the strike bounds — the Protocol permits a
+        # provider to return a superset, and the builder is responsible for
+        # narrowing. Keeping one mock ignore them keeps that guarantee tested.
         spot = self.closes.get(as_of)
         if spot is None:
             return []
@@ -329,3 +334,72 @@ class TestAnalyticsIsolationIsReal:
 
         assert analytics_module._instance is before
         assert not clock.is_frozen()
+
+
+class TestStrikeWindowCoversAssignedPositions:
+    """FC-042 A2 at simulator scale.
+
+    Chains are built for the whole window before the day loop starts, so there
+    is no live position to read a cost basis from. The simulator bounds it
+    instead — see ``Simulator._cost_basis_ceiling``.
+    """
+
+    def test_ceiling_is_the_highest_close_in_the_window(self, falling_then_flat):
+        days, closes, expirations = falling_then_flat
+        bars = ScriptedProvider("XYZ", closes, expirations).get_stock_bars(
+            "XYZ", days[0] - timedelta(days=90), days[-1]
+        )
+        ceiling = Simulator._cost_basis_ceiling(bars)
+        assert ceiling == pytest.approx(max(b.close for b in bars))
+        # No lot can cost more than this: shares arrive only by assignment on a
+        # put struck at or below the spot of the day it was sold.
+        assert ceiling >= max(closes.values())
+
+    def test_no_bars_yields_no_ceiling(self):
+        assert Simulator._cost_basis_ceiling([]) is None
+
+    def test_calls_above_cost_basis_survive_a_60_percent_drawdown(
+        self, falling_then_flat
+    ):
+        """The failure this exists to prevent, end to end.
+
+        Price slides 100 -> 70 and a put assigned near 92 leaves the position
+        well underwater. Every covered call the strategy may write is struck at
+        or above ~92, but a spot-centred window on a 70 handle stops at 87.50 —
+        so the eligible call ladder would come back empty and the replay would
+        report a position that simply never rolled.
+        """
+        days, closes, expirations = falling_then_flat
+
+        class WideLadderProvider(ScriptedProvider):
+            """A full ladder, not one pinned to +/-12 around spot.
+
+            ScriptedProvider's default ladder is itself narrower than the
+            window under test, so with it this assertion would pass or fail on
+            the mock's shape rather than on the filter's.
+            """
+
+            def _ladder(self, spot):
+                return [float(k) for k in range(50, 151)]
+
+        provider = WideLadderProvider("XYZ", closes, expirations)
+        builder = ChainBuilder(provider, risk_free_rate=0.04)
+        sim = Simulator(
+            Config(), provider, builder, ["XYZ"], days[0], days[-1],
+            starting_cash=50_000.0, max_dte=7,
+        )
+        stock_bars = sim._load_stock_bars()
+        chains = sim._build_chains(stock_bars, sim._trading_days(stock_bars))["XYZ"]
+
+        trough = min(closes[d] for d in days)
+        trough_days = [d for d in chains if closes.get(d) == trough]
+        assert trough_days, "fixture must reach a trough inside the decision window"
+        assert trough * (1 + STRIKE_WINDOW_PCT) < 92.0, (
+            "precondition: a spot-centred window would clip the eligible calls"
+        )
+
+        for day in trough_days:
+            above_basis = [q for q in chains[day].calls if q.strike >= 92.0]
+            assert above_basis, (
+                f"{day}: no covered call at or above cost basis in the chain"
+            )
