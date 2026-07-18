@@ -29,11 +29,21 @@ from .cycles import WheelCycle
 
 TRADING_DAYS_PER_YEAR = 252
 
-# Below this fraction of decision days with capital deployed, a symbol is judged
+# Below this fraction of decision days holding a position, a symbol is judged
 # untradeable rather than scored. The wheel sells ~7 DTE, so a symbol it can
 # actually trade sits in a position most of the time; 25% is well under a
-# continuously-wheeled name and well above a symbol that traded once or twice.
-MIN_UTILIZATION = 0.25
+# continuously-wheeled name (NVDA measured 76%) and well above one that traded
+# once or twice (KMI measured 3%).
+MIN_DAYS_IN_POSITION = 0.25
+
+# Absolute performance floor. Beating buy-and-hold over a short window is close
+# to a coin flip, so a purely relative gate lets a sub-cash result read "fit".
+RISK_FREE_RATE = 0.04
+
+# Account-equity drawdown that should draw attention. With max_position_size
+# 0.35 and one open position per symbol in evaluate mode, equity simply cannot
+# fall 20%, so the old gate could never fire.
+MAX_DRAWDOWN_WARN = -0.08
 
 
 @dataclass
@@ -87,8 +97,10 @@ class FitnessReport:
     sortino: float = 0.0
 
     # Activity. A symbol the strategy cannot actually trade produces a tiny,
-    # flattering return on a handful of days; utilization is what exposes that.
+    # flattering return on a handful of days; this is what exposes that.
     days_in_position: int = 0
+    avg_collateral: float = 0.0  # mean reserved collateral across decision days
+    peak_collateral: float = 0.0
 
     benchmark: Optional[BuyAndHold] = None
     data_quality: Dict = field(default_factory=dict)
@@ -184,18 +196,43 @@ class FitnessReport:
         return sum(1 for c in self.cycles if c.assigned) / len(self.cycles)
 
     @property
-    def utilization(self) -> float:
-        """Fraction of decision days with capital actually deployed.
+    def days_in_position_fraction(self) -> float:
+        """Fraction of decision days on which ANY position was held.
 
-        The wheel only earns while it holds something. A symbol whose premiums
-        rarely clear the strategy's floor shows a *good-looking* return on the
-        few days it traded and nothing the rest of the time — KMI managed one
-        8-day cycle in 273 days, +138% annualized on that cycle, +0.06% overall.
-        Utilization is what makes that visible instead of flattering.
+        Named for what it measures. It is a *time* occupancy, not a capital one:
+        a symbol tying up 3% of the account every single day scores 1.0 here.
+        Read it beside ``avg_collateral`` / ``return_on_collateral``, which are
+        the capital-weighted views.
+
+        Its job is to expose the symbol the strategy cannot trade at all. KMI
+        managed one 8-day cycle in 273 days — +138% annualized on that cycle,
+        +0.06% overall — which is not a performance result, it is an absence of
+        one.
         """
         if not self.decision_days:
             return 0.0
         return self.days_in_position / self.decision_days
+
+    @property
+    def return_on_collateral(self) -> Optional[float]:
+        """Total P&L over average collateral committed — the plan's headline.
+
+        ``total_return`` divides by the whole account, so it is dominated by the
+        arbitrary starting-cash choice: one contract against $100k dilutes any
+        result by ~5x and makes the wheel structurally lose to buy-and-hold in a
+        rising market regardless of merit. Return on the capital actually put at
+        risk is the scale-free number.
+        """
+        if self.avg_collateral <= 0:
+            return None
+        return self.total_pnl / self.avg_collateral
+
+    @property
+    def annualized_return_on_collateral(self) -> Optional[float]:
+        roc = self.return_on_collateral
+        if roc is None or self.days <= 0:
+            return None
+        return roc * (365.0 / self.days)
 
     @property
     def decision_days(self) -> int:
@@ -232,16 +269,28 @@ class FitnessReport:
         # Check activity before performance: a return earned on 3% of the days
         # is not a verdict about the strategy, it is a verdict about whether the
         # strategy can trade this symbol at all.
-        if self.decision_days and self.utilization < MIN_UTILIZATION:
+        if self.decision_days and self.days_in_position_fraction < MIN_DAYS_IN_POSITION:
             reasons.append(
-                f"BLOCK: capital deployed on only {self.days_in_position} of "
-                f"{self.decision_days} decision days ({self.utilization:.0%}) — "
-                f"the strategy cannot consistently trade this symbol, so the "
-                f"return below is not a meaningful sample"
+                f"BLOCK: held a position on only {self.days_in_position} of "
+                f"{self.decision_days} decision days "
+                f"({self.days_in_position_fraction:.0%}) — the strategy cannot "
+                f"consistently trade this symbol, so the return below is not a "
+                f"meaningful sample"
             )
 
         if self.total_pnl <= 0:
             reasons.append(f"BLOCK: strategy lost money ({self.total_return:+.2%})")
+
+        # An absolute floor, not just a relative one. Beating buy-and-hold over a
+        # short window is close to a coin flip, so without this a symbol can read
+        # FIT on a result that loses to cash.
+        aroc = self.annualized_return_on_collateral
+        if aroc is not None and 0 < self.total_pnl and aroc < RISK_FREE_RATE:
+            reasons.append(
+                f"BLOCK: {aroc:+.2%} annualized on committed collateral is below "
+                f"the {RISK_FREE_RATE:.1%} risk-free rate — the capital would "
+                f"have earned more sitting in T-bills"
+            )
 
         if self.excess_return is not None and self.excess_return < 0:
             reasons.append(
@@ -255,14 +304,26 @@ class FitnessReport:
                 "this is mostly a long-stock position"
             )
 
-        if self.max_drawdown < -0.20:
-            reasons.append(f"WARN: max drawdown {self.max_drawdown:.1%}")
-
-        if self.days and self.days_underwater / self.days > 0.30:
+        # Threshold set against what account equity can actually move. With
+        # max_position_size 0.35 and one open position per symbol, a -20% gate
+        # was arithmetically unreachable — inert, not conservative.
+        if self.max_drawdown < MAX_DRAWDOWN_WARN:
             reasons.append(
-                f"WARN: held shares below cost basis {self.days_underwater} of "
-                f"{self.days} days ({self.days_underwater / self.days:.0%})"
+                f"WARN: max account drawdown {self.max_drawdown:.1%} "
+                f"(on peak collateral of ${self.peak_collateral:,.0f})"
             )
+
+        # Both sides of this ratio must be decision days; self.days is calendar
+        # days, which understated the fraction by ~30% and made the gate harder
+        # to trip on the wheel's self-declared signature failure mode.
+        if self.decision_days:
+            underwater_fraction = self.days_underwater / self.decision_days
+            if underwater_fraction > 0.30:
+                reasons.append(
+                    f"WARN: held shares below cost basis on {self.days_underwater} "
+                    f"of {self.decision_days} decision days "
+                    f"({underwater_fraction:.0%})"
+                )
 
         if not reasons:
             reasons.append("OK: profitable, beat buy-and-hold, premium-driven")
@@ -307,6 +368,10 @@ def compute_fitness(
         1 for d in daily if d.open_options > 0 or any(v > 0 for v in d.shares_held.values())
     )
     report.unrealized_stock_pnl = _unrealized_stock_pnl(daily, cycles, benchmark_prices or {})
+    collaterals = [d.reserved_collateral for d in daily]
+    deployed = [c for c in collaterals if c > 0]
+    report.avg_collateral = sum(deployed) / len(deployed) if deployed else 0.0
+    report.peak_collateral = max(collaterals) if collaterals else 0.0
 
     equity = [d.equity for d in daily]
     report.max_drawdown = _max_drawdown(equity)

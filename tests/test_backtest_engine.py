@@ -214,3 +214,134 @@ class TestSimClock:
         with time_seam.frozen(datetime(2024, 6, 1, 10, 0)):
             assert time_seam.now() == datetime(2024, 6, 1, 10, 0)
         assert not time_seam.is_frozen()
+
+
+class TestBuyToCloseCashCheck:
+    """A cash-secured account cannot take a margin loan to close a losing call.
+
+    Regression for an adversarial-review finding: buy_to_close performed no cash
+    check, so an expensive buyback drove cash to -$4,727. That matters most in
+    exactly the case rolling exists for — a deep-ITM covered call, when cash is
+    tight because it went into the assigned shares. Live: order rejected, shares
+    called away. Sim (before this): roll succeeds, escaping the loss.
+    """
+
+    def _covered(self, cash):
+        from datetime import date as _d
+
+        from src.backtesting.engine.broker import BacktestBroker
+        b = BacktestBroker(starting_cash=cash)
+        b._add_stock("XYZ", 100, 10.0, _d(2025, 1, 6))
+        b.sell_call_to_open("C1", "XYZ", 12.0, _d(2025, 1, 17), 1, 1.00, 0.90, _d(2025, 1, 6))
+        return b
+
+    def test_expensive_buyback_is_rejected_and_cash_stays_positive(self):
+        from datetime import date as _d
+
+        b = self._covered(1200.0)
+        assert b.buy_to_close("C1", 1, 60.0, 61.0, _d(2025, 1, 10)) is None
+        assert b.cash > 0
+        assert "C1" in b.options, "rejected close must leave the position open"
+
+    def test_affordable_buyback_still_works(self):
+        from datetime import date as _d
+
+        b = self._covered(50_000.0)
+        assert b.buy_to_close("C1", 1, 0.50, 0.55, _d(2025, 1, 10)) is not None
+        assert "C1" not in b.options
+
+    def test_csp_buyback_may_use_its_own_released_collateral(self):
+        """The reserve backing the very put being closed is not a blocker."""
+        from datetime import date as _d
+
+        from src.backtesting.engine.broker import BacktestBroker
+        b = BacktestBroker(starting_cash=9_100.0)
+        b.sell_put_to_open("P1", "XYZ", 90.0, _d(2025, 1, 17), 1, 1.00, 0.90, _d(2025, 1, 6))
+        assert b.available_cash < 500  # nearly all cash is reserved
+        assert b.buy_to_close("P1", 1, 0.40, 0.45, _d(2025, 1, 10)) is not None
+
+
+class TestSplitGuard:
+    """Raw bars are right for point-in-time chains but cannot span a split."""
+
+    def _bars(self, closes):
+        from datetime import date as _d, timedelta as _td
+
+        from src.backtesting.data.provider import StockBar
+        start = _d(2024, 6, 3)
+        return [
+            StockBar(symbol="NVDA", bar_date=start + _td(days=i), open=c, high=c,
+                     low=c, close=c, volume=1)
+            for i, c in enumerate(closes)
+        ]
+
+    def test_detects_a_ten_for_one_split(self):
+        from src.backtesting.data.alpaca_provider import detect_split
+
+        # NVDA's real 2024-06-10 split: 1208.88 -> 121.79
+        got = detect_split(self._bars([1150.0, 1164.37, 1208.88, 121.79, 120.91]))
+        assert got is not None
+        _, ratio = got
+        assert ratio == pytest.approx(0.101, abs=0.002)
+
+    def test_ordinary_volatility_is_not_flagged(self):
+        from src.backtesting.data.alpaca_provider import detect_split
+
+        # A brutal but real -25% earnings gap must not be mistaken for a split.
+        assert detect_split(self._bars([100.0, 75.0, 78.0, 70.0, 95.0])) is None
+
+
+class TestCoverAccounting:
+    """A covered call must be covered by shares nothing else has claimed.
+
+    Regression for an adversarial-review finding: the cover check counted TOTAL
+    shares, so two calls could be written against the same 100 shares. On
+    settlement the broker credited proceeds for 200 shares while holding 100 and
+    only logged a warning — $10,595 of phantom cash in the demonstrated case.
+    """
+
+    def _long_100(self, cash=100_000.0):
+        from datetime import date as _d
+
+        from src.backtesting.engine.broker import BacktestBroker
+        b = BacktestBroker(starting_cash=cash)
+        b._add_stock("XYZ", 100, 100.0, _d(2025, 1, 6))
+        return b
+
+    def test_second_call_against_the_same_shares_is_rejected(self):
+        from datetime import date as _d
+
+        b = self._long_100()
+        assert b.sell_call_to_open("C1", "XYZ", 105.0, _d(2025, 1, 17), 1,
+                                   1.0, 0.9, _d(2025, 1, 6)) is not None
+        assert b.sell_call_to_open("C2", "XYZ", 106.0, _d(2025, 1, 17), 1,
+                                   1.0, 0.9, _d(2025, 1, 6)) is None
+        assert b.pledged_shares("XYZ") == 100
+        assert b.uncovered_shares("XYZ") == 0
+
+    def test_settlement_cannot_mint_cash(self):
+        from datetime import date as _d
+
+        b = self._long_100()
+        b.sell_call_to_open("C1", "XYZ", 105.0, _d(2025, 1, 17), 1,
+                            1.0, 0.9, _d(2025, 1, 6))
+        b.settle_expirations(_d(2025, 1, 17), {"XYZ": 120.0})
+        # 100k cash + 10,500 called away @105 + 97.46 premium net of $0.04 fees.
+        assert b.cash == pytest.approx(110_597.46, abs=0.01)
+        assert b.shares("XYZ") == 0
+
+    def test_disposing_more_shares_than_held_raises(self):
+        """Silently inventing shares is how a ledger mints money."""
+        b = self._long_100()
+        with pytest.raises(ValueError, match="more than held"):
+            b._remove_shares_fifo("XYZ", 200)
+
+    def test_a_second_call_is_allowed_once_shares_support_it(self):
+        from datetime import date as _d
+
+        b = self._long_100()
+        b._add_stock("XYZ", 100, 100.0, _d(2025, 1, 6))  # now 200 shares
+        assert b.sell_call_to_open("C1", "XYZ", 105.0, _d(2025, 1, 17), 1,
+                                   1.0, 0.9, _d(2025, 1, 6)) is not None
+        assert b.sell_call_to_open("C2", "XYZ", 106.0, _d(2025, 1, 17), 1,
+                                   1.0, 0.9, _d(2025, 1, 6)) is not None

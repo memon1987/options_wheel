@@ -41,6 +41,7 @@ from ...strategy.wheel_engine import WheelEngine
 from ...strategy.wheel_state_manager import WheelStateManager
 from ...utils.config import Config
 from ..data.chain_builder import ChainBuilder, ChainSnapshot
+from ..data.alpaca_provider import UnadjustedCorporateAction, detect_split
 from ..data.provider import OptionsDataProvider, StockBar
 from .alpaca_adapter import BacktestAlpacaClient
 from .broker import BacktestBroker
@@ -193,6 +194,23 @@ class Simulator:
                 f"No trading days for {self.symbols} in {self.start}..{self.end}; "
                 "refusing to report a zero-trade run as a successful backtest."
             )
+        # Refuse a window containing an unmodelled corporate action. Raw bars
+        # are correct for point-in-time chain work but cannot span a split: the
+        # benchmark, the equity curve and the gap filter would all read a -90%
+        # crash that never happened.
+        for symbol, bars in stock_bars.items():
+            split = detect_split(bars)
+            if split is not None:
+                split_date, ratio = split
+                raise UnadjustedCorporateAction(
+                    f"{symbol} moved {ratio:.3f}x on {split_date} — a split or "
+                    f"other corporate action the engine does not model. Prices "
+                    f"before and after are in different units, so the "
+                    f"buy-and-hold benchmark, equity curve and gap filter would "
+                    f"all be wrong. Choose a window that does not span "
+                    f"{split_date}."
+                )
+
         chains = self._build_chains(stock_bars, days)
 
         broker = BacktestBroker(

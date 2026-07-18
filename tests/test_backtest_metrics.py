@@ -383,7 +383,7 @@ class TestFitness:
         r = compute_fitness("KMI", states, build_cycles(ledger), 100_000.0,
                             data_quality={"decision_days": len(days)})
         assert r.days_in_position == 2
-        assert r.utilization == pytest.approx(0.10)
+        assert r.days_in_position_fraction == pytest.approx(0.10)
         assert r.verdict() == "unfit"
         assert any("cannot consistently trade this symbol" in x
                    for x in r.verdict_reasons())
@@ -404,7 +404,7 @@ class TestFitness:
         r = compute_fitness("XYZ", states, build_cycles(ledger), 100_000.0,
                             benchmark_prices=prices,
                             data_quality={"decision_days": len(days)})
-        assert r.utilization == 1.0
+        assert r.days_in_position_fraction == 1.0
         assert not any("cannot consistently trade" in x for x in r.verdict_reasons())
 
     def test_max_drawdown_never_renders_as_negative_zero(self):
@@ -416,6 +416,53 @@ class TestFitness:
                             build_cycles(ledger), 100.0)
         assert r.max_drawdown == 0.0
         assert f"{r.max_drawdown:.2%}" == "0.00%"
+
+    def test_sub_risk_free_result_is_blocked_even_if_it_beat_buy_and_hold(self):
+        """A relative gate alone let +2.46%/yr read FIT because B&H did worse.
+
+        Beating buy-and-hold over a short window is close to a coin flip; without
+        an absolute floor the verdict selects on noise.
+        """
+        days = [D(2025, 1, 6) + __import__("datetime").timedelta(days=i) for i in range(40)]
+        ledger = [
+            _ev(days[0], "sell_put_open", symbol="P1", contracts=1,
+                cash_delta=20.0, detail={"collateral": 9000.0}),
+            _ev(days[-1], "expire_worthless", symbol="P1", contracts=1),
+        ]
+        states = [
+            DailyState(day=d, equity=100_000.0 + 20.0, cash=91_020.0,
+                       reserved_collateral=9000.0, open_options=1, shares_held={})
+            for d in days
+        ]
+        prices = {d: 100.0 for d in days}
+        prices[days[-1]] = 90.0  # buy-and-hold loses, so the relative gate passes
+        r = compute_fitness("XYZ", states, build_cycles(ledger), 100_000.0,
+                            benchmark_prices=prices,
+                            data_quality={"decision_days": len(days)})
+        assert r.excess_return > 0, "should have beaten buy-and-hold"
+        aroc = r.annualized_return_on_collateral
+        assert aroc is not None and aroc < 0.04
+        assert r.verdict() == "unfit"
+        assert any("risk-free rate" in x for x in r.verdict_reasons())
+
+    def test_return_on_collateral_is_not_diluted_by_idle_cash(self):
+        """The account figure is dominated by the arbitrary starting-cash choice."""
+        days = [D(2025, 1, 6) + __import__("datetime").timedelta(days=i) for i in range(365)]
+        ledger = [
+            _ev(days[0], "sell_put_open", symbol="P1", contracts=1,
+                cash_delta=900.0, detail={"collateral": 9000.0}),
+            _ev(days[-1], "expire_worthless", symbol="P1", contracts=1),
+        ]
+        states = [
+            DailyState(day=d, equity=100_900.0, cash=91_900.0,
+                       reserved_collateral=9000.0, open_options=1, shares_held={})
+            for d in days
+        ]
+        r = compute_fitness("XYZ", states, build_cycles(ledger), 100_000.0,
+                            data_quality={"decision_days": len(days)})
+        assert r.total_return == pytest.approx(0.009)          # 0.9% on the account
+        assert r.return_on_collateral == pytest.approx(0.10)   # 10% on capital at risk
+        assert r.avg_collateral == pytest.approx(9000.0)
 
     def test_win_rate_needs_closed_cycles(self):
         days = [D(2025, 1, 6), D(2025, 1, 8)]

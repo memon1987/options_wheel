@@ -91,6 +91,43 @@ def _delayed_end(end: date) -> datetime:
     )
 
 
+# A one-day move this extreme is a corporate action, not a market move. NVDA's
+# 10:1 split shows up as 1208.88 -> 121.79 (0.101x) on 2024-06-10.
+SPLIT_RATIO_LOW = 0.6
+SPLIT_RATIO_HIGH = 1.6
+
+
+class UnadjustedCorporateAction(RuntimeError):
+    """The underlying series contains a split the engine does not model."""
+
+
+def detect_split(bars: List[StockBar]) -> Optional[tuple]:
+    """Return ``(date, ratio)`` of the first split-sized move, else None.
+
+    Bars are deliberately fetched RAW (unadjusted), because historical option
+    strikes are as-listed-at-the-time and are never retroactively adjusted: on
+    2024-06-05 NVDA's raw close of 1224.40 sits against strikes 1220/1225/1230,
+    and post-split its raw close of 125.20 sits against 124.5/125/125.5. Raw is
+    therefore the *correct* input for point-in-time chain building — switching
+    to adjusted bars would price a ~122 stock against ~1225 strikes and produce
+    garbage deltas on every pre-split day.
+
+    What raw bars cannot survive is a split *inside* the window: the equity
+    curve, the buy-and-hold benchmark and GapDetector's gap frequency all read a
+    -90% crash that never happened. Modelling the corporate action properly
+    (share multiplication plus OCC contract adjustment) is real work; until then
+    the honest move is to refuse the window rather than emit a confident
+    fabrication.
+    """
+    for prev, curr in zip(bars, bars[1:]):
+        if prev.close <= 0:
+            continue
+        ratio = curr.close / prev.close
+        if ratio < SPLIT_RATIO_LOW or ratio > SPLIT_RATIO_HIGH:
+            return curr.bar_date, ratio
+    return None
+
+
 def _is_settled(bar_date: date) -> bool:
     """Whether a daily bar is a completed session.
 

@@ -113,6 +113,18 @@ class BacktestBroker:
     def shares(self, underlying: str) -> int:
         return sum(lot.shares for lot in self.stock_lots.get(underlying, []))
 
+    def pledged_shares(self, underlying: str) -> int:
+        """Shares already committed as cover for open short calls."""
+        return sum(
+            100 * p.contracts
+            for p in self.options.values()
+            if p.underlying == underlying and p.option_type == "call"
+        )
+
+    def uncovered_shares(self, underlying: str) -> int:
+        """Shares free to back a new covered call."""
+        return max(0, self.shares(underlying) - self.pledged_shares(underlying))
+
     def average_cost_basis(self, underlying: str) -> Optional[float]:
         lots = self.stock_lots.get(underlying, [])
         total = sum(lot.shares for lot in lots)
@@ -175,9 +187,15 @@ class BacktestBroker:
         bid: float,
         opened: date,
     ) -> Optional[float]:
-        """Sell-to-open a covered call. Returns fill/share, or None if not enough
-        shares to cover."""
-        if self.shares(underlying) < 100 * contracts:
+        """Sell-to-open a covered call. Returns fill/share, or None if there are
+        not enough UNPLEDGED shares to cover it.
+
+        Counting total shares is not enough: shares backing an already-open
+        short call are spoken for. Ignoring that let the wheel write a second
+        call against the same 100 shares — a naked call in a cash account, which
+        the live broker rejects outright.
+        """
+        if self.uncovered_shares(underlying) < 100 * contracts:
             return None
         fill = self.sell_fill(mark, bid)
         premium = fill * 100 * contracts
@@ -203,14 +221,40 @@ class BacktestBroker:
         ask: float,
         close_date: date,
     ) -> Optional[float]:
-        """Buy-to-close ``contracts`` of a short option. Returns fill/share, or
-        None if the position doesn't exist or has too few contracts."""
+        """Buy-to-close ``contracts`` of a short option.
+
+        Returns the fill per share, or None if the position doesn't exist, has
+        too few contracts, or the debit exceeds available cash.
+
+        The cash check matters most in exactly the case rolling exists for: when
+        a covered call goes deep ITM the buy-to-close leg is expensive, and cash
+        is tight because it went into the assigned shares. Without the check the
+        simulated account takes an interest-free margin loan and completes a
+        roll a real cash account would have had rejected — letting the sim
+        escape losing covered calls that the live bot cannot.
+
+        Collateral released by this close is counted as available, since the two
+        settle together; only a genuine shortfall rejects.
+        """
         pos = self.options.get(symbol)
         if pos is None or contracts > pos.contracts:
             return None
         fill = self.buy_fill(mark, ask)
         cost = fill * 100 * contracts
         fees = self.fees_per_contract * contracts
+
+        freed = (
+            (pos.collateral / pos.contracts) * contracts
+            if pos.option_type == "put" else 0.0
+        )
+        if cost + fees > self.available_cash + freed + 1e-9:
+            logger.info(
+                "buy-to-close rejected: insufficient cash",
+                symbol=symbol, cost=round(cost + fees, 2),
+                available=round(self.available_cash + freed, 2),
+            )
+            return None
+
         self.cash -= cost + fees
         released = 0.0
         if pos.option_type == "put":
@@ -341,9 +385,15 @@ class BacktestBroker:
                 lot.shares -= remaining
                 remaining = 0
         if remaining > 0:
-            logger.warning(
-                "called away more shares than held", underlying=underlying,
-                short=remaining,
+            # Never silently dispose of shares that do not exist. Doing so
+            # credits proceeds for them and mints cash out of nothing: two
+            # covered calls written against 100 shares settled for 200 and
+            # produced $10,595 of phantom equity. A ledger that can invent
+            # money is worse than one that stops.
+            raise ValueError(
+                f"cannot dispose {shares} shares of {underlying}: {remaining} "
+                f"more than held. The cover check that should have prevented "
+                f"this short call is broken."
             )
         if not lots:
             self.stock_lots.pop(underlying, None)

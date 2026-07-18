@@ -29,17 +29,44 @@ KNOWN_BIASES = [
         "decisions: identical contracts price ~7% below live's fill, rising to "
         "~20% once contract selection differs. Conservative — the strategy's "
         "true premium capture is higher than reported.")),
-    ("Bid/ask is modeled", (
+    ("Bid/ask is modeled, not calibrated", (
         "Alpaca sells no historical option quotes at any price, so spreads come "
-        "from a calibrated model, not observation. Fills use mid minus a haircut; "
-        "see the fill-sensitivity section for the bid-fill worst case.")),
+        "from a parametric model running on its DEFAULT parameters — "
+        "SpreadModel.calibrate() exists but is not invoked in this path. "
+        "Measured against 452 live OTM put quotes the model is ~2.2x WIDER than "
+        "reality (median half-spread $0.064 modeled vs $0.030 real), so fills "
+        "err against the strategy. Conservative, but by accident rather than by "
+        "calibration.")),
     ("Greeks are computed", (
         "IV and delta are Black-Scholes inversions from the bar close, not "
-        "published values.")),
-    ("One decision per day", (
+        "published values. Dividend yield is treated as zero for every symbol, "
+        "which is immaterial at ~7 DTE but not free.")),
+    ("Dividends are NOT modeled — and this flatters the wheel", (
+        "No dividend is credited to either leg. Because the buy-and-hold "
+        "benchmark holds shares on every day while the wheel holds them only "
+        "occasionally, the benchmark forgoes far more dividend income than the "
+        "strategy does. On a ~6.5%-yield name over a 2.4-year window that "
+        "understates buy-and-hold by roughly 15 percentage points — enough to "
+        "flip the 'beat buy-and-hold' line on the income-heavy symbols. Treat "
+        "the comparison as favourable to the wheel on any dividend payer.")),
+    ("Early assignment is NOT modeled", (
+        "Short ITM calls are held to expiry. A real short call whose remaining "
+        "extrinsic value is less than an upcoming dividend is frequently "
+        "assigned the day before the ex-date, so the replay keeps shares — and "
+        "any later appreciation — that a live account would have lost. "
+        "Optimistic, and concentrated on the same dividend payers as above.")),
+    ("One decision per day, with zero decision-to-fill latency", (
         "The live bot scans three times daily; the replay decides once at the "
-        "close. Intraday profit-target touches are taken late, which is "
-        "conservative.")),
+        "close. Production also splits scanning from execution across separate "
+        "invocations minutes-to-hours apart, whereas the replay executes at the "
+        "same instant and price it decided on — so the replay always gets the "
+        "price it saw. Optimistic.")),
+    ("Splits and other corporate actions are NOT modeled", (
+        "Underlying bars are deliberately unadjusted, because historical option "
+        "strikes are as-listed-at-the-time and never retroactively adjusted; "
+        "adjusted bars would price a post-split underlying against pre-split "
+        "strikes. A run whose window spans a split is REFUSED outright rather "
+        "than reported.")),
     ("Single vol regime", (
         "Alpaca's option history starts 2024-02-01, so results cover one "
         "market regime. A shifted start date can flip a marginal verdict.")),
@@ -89,7 +116,14 @@ def render_markdown(report: FitnessReport) -> str:
         a("")
         a("_Buy-and-hold benchmark unavailable (no price at window edges)._")
     a("")
-    a(f"Annualized: {report.annualized_return:+.2%}")
+    a(f"Annualized on the whole account: {report.annualized_return:+.2%}")
+    aroc = report.annualized_return_on_collateral
+    if aroc is not None:
+        a("")
+        a(f"**Annualized on committed collateral: {aroc:+.2%}** "
+          f"(${report.avg_collateral:,.0f} average). This is the scale-free "
+          f"number — the account figure above is diluted by the arbitrary "
+          f"${report.starting_cash:,.0f} allocation and mostly measures idle cash.")
     a("")
 
     # ---- Attribution: the flagship number ----------------------------------
@@ -100,7 +134,7 @@ def render_markdown(report: FitnessReport) -> str:
     a(f"| Option premium (net of buybacks and fees) | ${report.option_pnl:+,.2f} |")
     a(f"| Stock — realized (called away) | ${report.stock_pnl:+,.2f} |")
     a(f"| Stock — unrealized (still held) | ${report.unrealized_stock_pnl:+,.2f} |")
-    a(f"| Dividends | ${report.dividends:+,.2f} |")
+    a(f"| Dividends _(not modeled — see biases)_ | ${report.dividends:+,.2f} |")
     a(f"| **Total** | **${report.attribution_total:+,.2f}** |")
     a("")
     a(f"_Memo: ${report.fees:,.2f} of fees is already deducted inside the option "
@@ -136,9 +170,12 @@ def render_markdown(report: FitnessReport) -> str:
     a(f"- Puts sold: {report.puts_sold} · calls sold: {report.calls_sold} · "
       f"rolls: {report.rolls}")
     if report.decision_days:
-        a(f"- Capital deployed on **{report.days_in_position} of "
-          f"{report.decision_days}** decision days (**{report.utilization:.0%}** "
-          f"utilization)")
+        a(f"- Held a position on **{report.days_in_position} of "
+          f"{report.decision_days}** decision days "
+          f"(**{report.days_in_position_fraction:.0%}**)")
+        if report.avg_collateral > 0:
+            a(f"- Average collateral committed while in a position: "
+              f"**${report.avg_collateral:,.0f}** (peak ${report.peak_collateral:,.0f})")
     if report.win_rate is not None:
         a(f"- Win rate: **{report.win_rate:.0%}** "
           f"(expected to be high at 0.10-0.20 delta — read with the worst cycle below)")
@@ -165,11 +202,17 @@ def render_markdown(report: FitnessReport) -> str:
     # ---- Risk --------------------------------------------------------------
     a("## Risk")
     a("")
-    a(f"- Max drawdown: **{report.max_drawdown:.2%}**")
-    a(f"- Sharpe {report.sharpe:.2f} · Sortino {report.sortino:.2f}")
-    underwater_pct = (report.days_underwater / report.days) if report.days else 0.0
-    a(f"- Days holding shares below cost basis: **{report.days_underwater}** "
-      f"({underwater_pct:.0%} of the window) — the wheel's signature failure mode")
+    a(f"- Max drawdown: **{report.max_drawdown:.2%}** _(of total account equity, "
+      f"which is mostly idle cash — not of the position)_")
+    a(f"- Sharpe {report.sharpe:.2f} · Sortino {report.sortino:.2f} "
+      f"_(also on total equity; flattered by the idle-cash denominator, "
+      f"so treat as relative-only)_")
+    underwater_pct = (
+        report.days_underwater / report.decision_days if report.decision_days else 0.0
+    )
+    a(f"- Days holding shares below cost basis: **{report.days_underwater}** of "
+      f"{report.decision_days} decision days ({underwater_pct:.0%}) — the "
+      f"wheel's signature failure mode")
     a("")
 
     if report.data_quality:
@@ -248,7 +291,9 @@ def render_json(report: FitnessReport, *, sensitivity: Optional[dict] = None) ->
         "activity": {
             "decision_days": report.decision_days,
             "days_in_position": report.days_in_position,
-            "utilization": report.utilization,
+            "days_in_position_fraction": report.days_in_position_fraction,
+            "avg_collateral": report.avg_collateral,
+            "peak_collateral": report.peak_collateral,
         },
         "benchmark": (
             {
