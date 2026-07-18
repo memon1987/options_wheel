@@ -507,29 +507,17 @@ Same family as FC-035 (`poll_order_statuses` latent `NameError`) and FC-015 (`_e
 
 ---
 
-### FC-040: Unit tests make live BigQuery calls against production data
+### FC-040: Unit tests make live BigQuery calls against production data — ALREADY FIXED, entry withdrawn
 
-**Status:** Consideration
-**Size estimate:** S
-**Owner:** unassigned
-**Plan file:** not needed (test-only change), but see the open question on `_resolve_cost_basis_floor`
+**Status:** Withdrawn 2026-07-18 — the bug was real but had already been fixed on `main` before this entry was filed.
 
-**Problem / opportunity:** `tests/test_call_seller.py` is not hermetic. `CallSeller._resolve_cost_basis_floor` falls through to a real `bigquery.Client()` query against `` `options_wheel.trades_from_activities` `` (`src/strategy/call_seller.py:511-539`), and the tests never mock it. On any machine with GCP ADC available, the unit tests query the **production** table.
+**What happened.** This entry was filed on 2026-07-18 during the FC-038 review, claiming the bug existed on `main`. It did not. `tests/conftest.py` on `main` already carries an autouse `_no_production_bigquery` fixture that stubs `CallSeller._lookup_last_opasn_put_strike`, with a `@pytest.mark.real_bq_lookup` escape hatch for the one test that genuinely exercises the fallback.
 
-Verified 2026-07-18:
-- With ADC present: `pytest tests/` → **3 failed, 290 passed**.
-- With credentials stripped (`CLOUDSDK_CONFIG=/nonexistent`): `pytest tests/test_call_seller.py` → **27 passed**.
+That fixture's own docstring documents the identical finding — same mechanism, same AAPL `$305` value, same drawdown-pause symptom — so the diagnosis here was a rediscovery, not a new bug.
 
-The three failures are real production values leaking into fixtures. `test_strike_vs_cost_basis_filtering` sets an MSFT position at $300/share but the resolved basis came back **$382.50** — which is a live MSFT OPASN put strike from 2026-06-23. `test_find_suitable_covered_calls` and `test_multiple_round_lots` use AAPL at $160/share and resolve to **$305.00** — a live AAPL OPASN put strike from 2026-06-13. Both confirmed by direct `bq query`.
+**Why the false positive.** The verification was run in the FC-038 worktree, which is based on `main` from before PR #35 merged and therefore predates the fixture. The lesson is procedural and worth keeping: **verify a claimed `main` bug against `main`, not against a feature branch's base.** Every other finding in that review pass was re-checked against `main` afterward; FC-039 and FC-041 survived, this one did not.
 
-**Consequence.** Test results depend on ambient credentials and on a **90-day rolling window of production data** (`lookback_days` default, `call_seller.py:527`). These tests will spontaneously pass and fail as production rows age in and out of the window with no code change — AAPL's row exits around 2026-09-11, MSFT's around 2026-09-21. Any future "the suite is green" claim is unreliable, and a genuine regression in the cost-basis chain would be indistinguishable from data drift. Tests are also slow and network-dependent: 30s with credentials stripped (timeouts) vs 14s with.
-
-**Open questions:**
-- Mock `_query_last_opasn_put_strike` in the fixtures, or inject the BQ client as a constructor dependency so it can be faked? The latter is better design and is aligned with FC-038's `CostBasisProvider` extraction — worth sequencing them together.
-- Add a global autouse fixture that fails any test attempting outbound network I/O, so this class of leak cannot recur silently?
-- Does CI currently run with ADC? If it does, CI has been green only by luck of the 90-day window. If it does not, CI has never exercised this code path at all — which is its own gap.
-
-**Links:** found during the FC-038 two-reviewer plan pass — `docs/investigations/fc-038-plan-review-2026-07-18.md`. Related: FC-029 (introduced the chain being tested), FC-038.
+**Links:** `tests/conftest.py` (`_no_production_bigquery`); `docs/investigations/fc-038-plan-review-2026-07-18.md`.
 
 ---
 
@@ -540,7 +528,7 @@ The three failures are real production values leaking into fixtures. `test_strik
 **Owner:** unassigned
 **Plan file:** not needed (single-file fix), but it changes runtime behavior of a risk control, so branch + PR
 
-**Problem / opportunity:** `ExecutionEngine`'s committed-share accounting (`src/strategy/execution_engine.py:322-338`) identifies short calls with a hand-rolled parser:
+**Problem / opportunity:** `ExecutionEngine`'s committed-share accounting (`src/strategy/execution_engine.py:333` (on `main`)) identifies short calls with a hand-rolled parser:
 
 ```python
 for ch in opt_sym:
