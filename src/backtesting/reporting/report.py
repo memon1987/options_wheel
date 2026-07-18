@@ -105,7 +105,18 @@ def render_markdown(report: FitnessReport) -> str:
     a("")
 
     verdict = report.verdict()
-    badge = {"fit": "FIT", "marginal": "MARGINAL", "unfit": "UNFIT"}[verdict]
+    # "insufficient" was missing here and raised KeyError, so rendering a report
+    # for any symbol that closed no cycle in the window crashed outright —
+    # which is precisely the income names (F/PFE/KMI/VZ) this FC exists to make
+    # judgeable. Unknown verdicts degrade to the raw string rather than a crash:
+    # a report is the artifact you reach for when something looks wrong, so it
+    # must not be the thing that fails.
+    badge = {
+        "fit": "FIT",
+        "marginal": "MARGINAL",
+        "unfit": "UNFIT",
+        "insufficient": "INSUFFICIENT EVIDENCE",
+    }.get(verdict, verdict.upper())
     a(f"## Verdict: {badge}")
     a("")
     for reason in report.verdict_reasons():

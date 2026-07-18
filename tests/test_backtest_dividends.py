@@ -438,3 +438,63 @@ class TestSimulatorDividendCredit:
         sim._credit_dividends(b, date(2025, 1, 30), date(2025, 1, 29))
         sim._credit_dividends(b, date(2025, 1, 31), date(2025, 1, 30))
         assert len([e for e in b.ledger if e.kind == "dividend"]) == 1
+
+
+class TestReportRendersEveryVerdict:
+    """render_markdown crashed on `insufficient` — the income names' usual verdict.
+
+    Pre-existing on main: the badge lookup was a bare dict index over three of
+    the four verdicts `FitnessReport.verdict()` can return. Any symbol that
+    closed no cycle inside the window rendered a KeyError instead of a report,
+    which is exactly F/PFE/KMI/VZ — the names Track C exists to make judgeable.
+    """
+
+    def _report(self, closed_cycle: bool):
+        from src.backtesting.engine.simulator import DailyState
+        from src.backtesting.metrics.fitness import compute_fitness
+
+        days = [date(2025, 1, 2), date(2025, 6, 30)]
+        daily = [
+            DailyState(day=d, equity=eq, cash=eq, reserved_collateral=2800.0,
+                       open_options=1, shares_held={})
+            for d, eq in zip(days, (100_000.0, 103_000.0))
+        ]
+        cycles = []
+        if closed_cycle:
+            from src.backtesting.metrics.cycles import WheelCycle
+            cycles = [WheelCycle(underlying="VZ", start=days[0], end=days[1],
+                                 option_pnl=3000.0, max_collateral=2800.0)]
+        return compute_fitness(
+            "VZ", daily, cycles, 100_000.0,
+            benchmark_prices={days[0]: 40.0, days[1]: 43.0},
+            benchmark_dividends_per_share=1.355,
+            data_quality={"decision_days": 2},
+        )
+
+    def test_insufficient_verdict_renders(self):
+        from src.backtesting.reporting.report import render_markdown
+
+        report = self._report(closed_cycle=False)
+        assert report.verdict() == "insufficient"
+        md = render_markdown(report)  # used to raise KeyError
+        assert "INSUFFICIENT EVIDENCE" in md
+
+    def test_benchmark_dividends_are_shown_to_the_reader(self):
+        """The number must reach the page, not just the dataclass."""
+        from src.backtesting.reporting.report import render_markdown
+
+        md = render_markdown(self._report(closed_cycle=True))
+        # $100k // $40 = 2500 whole shares, * $1.355 = $3,387.50, rendered to $0dp.
+        assert "$3,388** of dividends" in md
+        assert "$1.3550/share over 2500 shares" in md
+        # And the price-only return is kept visible beside it, so a reader can
+        # see how much of buy-and-hold's result is the dividend stream.
+        assert "price return alone was +7.50%" in md
+
+    def test_every_verdict_string_has_a_badge(self):
+        from src.backtesting.reporting.report import render_markdown
+
+        report = self._report(closed_cycle=True)
+        for verdict in ("fit", "marginal", "unfit", "insufficient"):
+            report.verdict = lambda v=verdict: v
+            render_markdown(report)  # must not raise
