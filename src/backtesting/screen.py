@@ -237,7 +237,7 @@ def render_screen_summary(result: ScreenResult) -> str:
             a(f"- **{symbol}** — " + "; ".join(r.report.verdict_reasons()))
         a("")
     else:
-        a("No demotion candidates: every symbol scored fit or marginal.")
+        a("No demotion candidates in this run.")
         a("")
 
     if result.failures:

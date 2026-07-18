@@ -189,10 +189,11 @@ class TestWindow:
 class TestSyncScreenIsBounded:
     """(Opts the gate on: these assert the 413 behavior *behind* the gate.)
 
-    A full-universe screen exceeds Cloud Run's 300s request timeout and the
-    scheduler's 180s attempt deadline. Starting one synchronously would time out
-    mid-run AFTER partially writing to BigQuery — a partial table reported as a
-    failure. The endpoint refuses instead and points at the Cloud Run Job.
+    A screened symbol takes ~25 min cold (~50 with sensitivity) against a 300s
+    request timeout, so no synchronous multi-symbol run can finish. A timeout
+    writes NO rows — persistence is a single write after the loop — but it burns
+    ~25 min of the Alpaca quota the live bot shares and leaves no record. The
+    endpoint refuses instead and points at the Cloud Run Job.
     """
 
     def setup_method(self):
@@ -236,9 +237,9 @@ class TestSyncScreenIsBounded:
 
     def test_limit_is_small_enough_to_finish_inside_the_request_timeout(self):
         mod, _ = self._client()
-        # ~1 min/symbol measured; the limit must leave headroom under 300s.
-        assert mod.SCREEN_SYNC_SYMBOL_LIMIT * 60 < mod.SCREEN_REQUEST_TIMEOUT_S
-        assert mod.SCREEN_SYNC_SYMBOL_LIMIT >= 1
+        # The limit is a backstop only: at ~25 min/symbol measured, NO
+        # synchronous run finishes, which is why the endpoint ships disabled.
+        assert 1 <= mod.SCREEN_SYNC_SYMBOL_LIMIT <= 3
 
 
 class TestSchemaContract:

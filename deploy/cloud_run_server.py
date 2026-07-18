@@ -1183,10 +1183,13 @@ def backtest_screen():
                 'requested_symbols': len(requested),
                 'sync_limit': budget,
                 'detail': (
-                    f'A synchronous screen of {len(requested)} symbols would '
-                    f'exceed this service\'s {SCREEN_REQUEST_TIMEOUT_S}s request '
-                    f'timeout and the scheduler\'s attempt deadline, timing out '
-                    f'mid-run after partially writing to BigQuery. Run the full '
+                    f'A synchronous screen of {len(requested)} symbols cannot '
+                    f'finish: a symbol takes ~25 min cold (~50 with the '
+                    f'sensitivity pass) against this service\'s '
+                    f'{SCREEN_REQUEST_TIMEOUT_S}s request timeout. A timeout '
+                    f'writes NO rows (persistence is a single write after the '
+                    f'loop), but it burns ~25 min of the Alpaca quota the live '
+                    f'bot shares and leaves no record. Run the full '
                     f'universe as a Cloud Run Job (see the "Running a full screen" '
                     f'section of docs/bigquery/backtest_runs.md), or pass '
                     f'?symbols=A,B for an ad-hoc subset — which is recorded as '

@@ -45,23 +45,20 @@ KNOWN_BIASES = [
         "IV and delta are Black-Scholes inversions from the bar close, not "
         "published values. Dividend yield is treated as zero for every symbol, "
         "which is immaterial at ~7 DTE but not free.")),
-    ("Dividends are NOT modeled — and this flatters the wheel", (
-"No dividend is credited to either leg, and the direction of that bias is"
-        "NOT uniform — stating only one side of it is worse than stating none:"
-        ""
-        "  * On `excess_return` (a WARN) it FLATTERS the wheel: the buy-and-hold"
-        "    benchmark holds shares every day and forgoes the entire dividend stream,"
-        "    while the wheel holds them only intermittently. ~15 points on a 6.5%"
-        "    yielder over 2.4 years."
-        "  * On `total_pnl` and return-on-collateral — the ABSOLUTE gates that actually"
-        "    produce a demotion — it PENALISES the wheel: real dividends earned while"
-        "    holding assigned shares are simply missing. On a 5-7% yielder that is"
-        "    comfortably enough to push annualized return under the 4% risk-free floor."
-        ""
-        "So on precisely the income names (F, PFE, KMI, VZ) the demote recommendation is"
-        "biased TOWARD demoting, even though the headline benchmark comparison leans the"
-        "other way. Do not judge a dividend payer on this engine until dividends are"
-        "modeled.")),
+    ("Dividends are NOT modeled — and the bias runs BOTH ways", (
+        "No dividend is credited to either leg, and the direction of that bias "
+        "is not uniform; stating only one side of it is worse than stating "
+        "none. It FLATTERS the wheel on the buy-and-hold comparison (a WARN): "
+        "the benchmark holds shares every day and forgoes the entire dividend "
+        "stream, worth ~15 points on a 6.5% yielder over 2.4 years. But it "
+        "PENALISES the wheel on total return and return-on-collateral — the "
+        "absolute gates that actually produce an 'unfit' verdict — because "
+        "real dividends earned while holding assigned shares are simply "
+        "missing. On a 5-7% yielder that alone can push annualized return "
+        "under the 4% risk-free floor. So on the income names (F, PFE, KMI, "
+        "VZ) the verdict is biased TOWARD unfit even though the headline "
+        "benchmark line leans the other way. Do not judge a dividend payer on "
+        "this engine until dividends are modeled.")),
     ("Early assignment is NOT modeled", (
         "Short ITM calls are held to expiry. A real short call whose remaining "
         "extrinsic value is less than an upcoming dividend is frequently "

@@ -624,8 +624,7 @@ class TestRejectionTally:
 
     def test_processor_never_raises_into_the_run(self):
         t = self._tally()
-        # Returns the (tagged) dict rather than raising, whatever it is handed.
-        assert t.processor(None, "info", {}) == {"backtest": True}
+        assert t.processor(None, "info", {}) == {}
         assert t.processor(None, "info", {"event_type": None}) is not None
 
     def test_replay_events_are_tagged_so_they_cannot_pollute_live_forensics(self):
@@ -633,12 +632,54 @@ class TestRejectionTally:
 
         contribute synthetic zero-roll cycles indistinguishable from live ones.
         """
+        from datetime import datetime as _dt
+
         t = self._tally()
-        out = t.processor(None, "info",
-                          {"event_type": "roll_cycle_completed", "rolls_executed": 0})
+        with clock.frozen(_dt(2025, 1, 6, 16, 0)):
+            out = t.processor(None, "info",
+                              {"event_type": "roll_cycle_completed",
+                               "rolls_executed": 0})
         assert out["backtest"] is True
 
-    def test_an_explicit_tag_is_not_overwritten(self):
+    def test_a_LIVE_event_from_another_thread_is_never_tagged(self):
+        """structlog.configure() is process-global, so this processor sees every
+
+        thread's events. Tagging outside the thread-local freeze mislabelled
+        live events as backtest=true — and since FC-039 filters
+        `backtest != true`, a mislabelled live event is silently DROPPED from
+        real analysis. That false negative is worse than an untagged replay.
+        """
+        import threading
+        import time
+        from datetime import datetime as _dt
+
         t = self._tally()
-        out = t.processor(None, "info", {"event_type": "x", "backtest": False})
+        seen, stop = {}, threading.Event()
+
+        def live():
+            while not stop.is_set():
+                ed = t.processor(None, "info", {"event_type": "order_filled"})
+                seen["tag"] = ed.get("backtest")
+                time.sleep(0.005)
+
+        th = threading.Thread(target=live)
+        th.start()
+        try:
+            with clock.frozen(_dt(2025, 1, 6, 16, 0)):
+                time.sleep(0.04)
+        finally:
+            stop.set()
+            th.join()
+
+        assert seen.get("tag") is None, (
+            "a live event on another thread was tagged backtest=true and would "
+            "be dropped from FC-039's analysis"
+        )
+
+    def test_an_explicit_tag_is_not_overwritten(self):
+        from datetime import datetime as _dt
+
+        t = self._tally()
+        with clock.frozen(_dt(2025, 1, 6, 16, 0)):
+            out = t.processor(None, "info", {"event_type": "x", "backtest": False})
         assert out["backtest"] is False
