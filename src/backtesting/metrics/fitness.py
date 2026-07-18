@@ -48,16 +48,40 @@ MAX_DRAWDOWN_WARN = -0.08
 
 @dataclass
 class BuyAndHold:
-    """The benchmark: the same capital, in the stock, for the same window."""
+    """The benchmark: the same capital, in the stock, for the same window.
+
+    The dividend stream is part of the benchmark's return, not a rounding
+    detail. Modelling dividends on the wheel leg alone would not remove the old
+    both-directions bias — it would invert it, and hand the wheel a free ~15
+    points against a 6.5% yielder over a multi-year window. Both legs collect
+    dividends or neither does.
+    """
 
     shares: int
     entry_price: float
     exit_price: float
     starting_cash: float
+    dividends_per_share: float = 0.0
+
+    @property
+    def dividends(self) -> float:
+        """Total cash a continuous holder of ``shares`` collects over the window."""
+        return self.shares * self.dividends_per_share
+
+    @property
+    def price_return(self) -> float:
+        """Capital appreciation only — what this benchmark used to report."""
+        if self.starting_cash <= 0:
+            return 0.0
+        return self.shares * (self.exit_price - self.entry_price) / self.starting_cash
 
     @property
     def final_value(self) -> float:
-        return self.starting_cash + self.shares * (self.exit_price - self.entry_price)
+        return (
+            self.starting_cash
+            + self.shares * (self.exit_price - self.entry_price)
+            + self.dividends
+        )
 
     @property
     def total_return(self) -> float:
@@ -366,6 +390,7 @@ def compute_fitness(
     starting_cash: float,
     *,
     benchmark_prices: Optional[Dict[date, float]] = None,
+    benchmark_dividends_per_share: float = 0.0,
     data_quality: Optional[Dict] = None,
     rolls: int = 0,
 ) -> FitnessReport:
@@ -408,7 +433,9 @@ def compute_fitness(
     report.days_underwater = _days_underwater(daily, cycles, benchmark_prices or {})
 
     if benchmark_prices:
-        report.benchmark = _buy_and_hold(daily, benchmark_prices, starting_cash)
+        report.benchmark = _buy_and_hold(
+            daily, benchmark_prices, starting_cash, benchmark_dividends_per_share
+        )
 
     return report
 
@@ -521,9 +548,18 @@ def _unrealized_stock_pnl(
 
 
 def _buy_and_hold(
-    daily: Sequence[DailyState], prices: Dict[date, float], starting_cash: float
+    daily: Sequence[DailyState],
+    prices: Dict[date, float],
+    starting_cash: float,
+    dividends_per_share: float = 0.0,
 ) -> Optional[BuyAndHold]:
-    """Whole shares bought at the first close, held to the last."""
+    """Whole shares bought at the first close, held to the last, dividends kept.
+
+    ``dividends_per_share`` must already be scoped to the holding period the
+    caller is modelling — see ``DividendSchedule.total_between``, which excludes
+    an ex-date falling on the entry day (a buyer at that close does not receive
+    it) and includes one falling on the exit day.
+    """
     entry_day, exit_day = daily[0].day, daily[-1].day
     entry = prices.get(entry_day)
     exit_ = prices.get(exit_day)
@@ -533,5 +569,9 @@ def _buy_and_hold(
     if shares <= 0:
         return None
     return BuyAndHold(
-        shares=shares, entry_price=entry, exit_price=exit_, starting_cash=starting_cash
+        shares=shares,
+        entry_price=entry,
+        exit_price=exit_,
+        starting_cash=starting_cash,
+        dividends_per_share=dividends_per_share,
     )

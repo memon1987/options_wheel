@@ -1,0 +1,875 @@
+{
+ "dividends": {
+  "AAPL": [
+   {
+    "amount": 0.23,
+    "ex_date": "2023-02-10",
+    "special": false
+   },
+   {
+    "amount": 0.24,
+    "ex_date": "2023-05-12",
+    "special": false
+   },
+   {
+    "amount": 0.24,
+    "ex_date": "2023-08-11",
+    "special": false
+   },
+   {
+    "amount": 0.24,
+    "ex_date": "2023-11-10",
+    "special": false
+   },
+   {
+    "amount": 0.24,
+    "ex_date": "2024-02-09",
+    "special": false
+   },
+   {
+    "amount": 0.25,
+    "ex_date": "2024-05-10",
+    "special": false
+   },
+   {
+    "amount": 0.25,
+    "ex_date": "2024-08-12",
+    "special": false
+   },
+   {
+    "amount": 0.25,
+    "ex_date": "2024-11-08",
+    "special": false
+   },
+   {
+    "amount": 0.25,
+    "ex_date": "2025-02-10",
+    "special": false
+   },
+   {
+    "amount": 0.26,
+    "ex_date": "2025-05-12",
+    "special": false
+   },
+   {
+    "amount": 0.26,
+    "ex_date": "2025-08-11",
+    "special": false
+   },
+   {
+    "amount": 0.26,
+    "ex_date": "2025-11-10",
+    "special": false
+   },
+   {
+    "amount": 0.26,
+    "ex_date": "2026-02-09",
+    "special": false
+   },
+   {
+    "amount": 0.27,
+    "ex_date": "2026-05-11",
+    "special": false
+   }
+  ],
+  "AMD": [],
+  "AMZN": [],
+  "F": [
+   {
+    "amount": 0.15,
+    "ex_date": "2023-02-10",
+    "special": false
+   },
+   {
+    "amount": 0.65,
+    "ex_date": "2023-02-10",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2023-04-25",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2023-07-24",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2023-10-31",
+    "special": false
+   },
+   {
+    "amount": 0.18,
+    "ex_date": "2024-02-15",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2024-02-15",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2024-05-07",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2024-08-07",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2024-11-07",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2025-02-18",
+    "special": true
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2025-02-18",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2025-05-12",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2025-08-11",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2025-11-07",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2026-02-13",
+    "special": false
+   },
+   {
+    "amount": 0.15,
+    "ex_date": "2026-05-12",
+    "special": false
+   }
+  ],
+  "GOOGL": [
+   {
+    "amount": 0.2,
+    "ex_date": "2024-06-10",
+    "special": false
+   },
+   {
+    "amount": 0.2,
+    "ex_date": "2024-09-09",
+    "special": false
+   },
+   {
+    "amount": 0.2,
+    "ex_date": "2024-12-09",
+    "special": false
+   },
+   {
+    "amount": 0.2,
+    "ex_date": "2025-03-10",
+    "special": false
+   },
+   {
+    "amount": 0.21,
+    "ex_date": "2025-06-09",
+    "special": false
+   },
+   {
+    "amount": 0.21,
+    "ex_date": "2025-09-08",
+    "special": false
+   },
+   {
+    "amount": 0.21,
+    "ex_date": "2025-12-08",
+    "special": false
+   },
+   {
+    "amount": 0.21,
+    "ex_date": "2026-03-09",
+    "special": false
+   },
+   {
+    "amount": 0.22,
+    "ex_date": "2026-06-08",
+    "special": false
+   }
+  ],
+  "IWM": [
+   {
+    "amount": 0.630667,
+    "ex_date": "2023-03-23",
+    "special": false
+   },
+   {
+    "amount": 0.508675,
+    "ex_date": "2023-06-07",
+    "special": false
+   },
+   {
+    "amount": 0.828876,
+    "ex_date": "2023-09-26",
+    "special": false
+   },
+   {
+    "amount": 0.733879,
+    "ex_date": "2023-12-20",
+    "special": false
+   },
+   {
+    "amount": 0.522126,
+    "ex_date": "2024-03-21",
+    "special": false
+   },
+   {
+    "amount": 0.562204,
+    "ex_date": "2024-06-11",
+    "special": false
+   },
+   {
+    "amount": 0.752193,
+    "ex_date": "2024-09-25",
+    "special": false
+   },
+   {
+    "amount": 0.694004,
+    "ex_date": "2024-12-17",
+    "special": false
+   },
+   {
+    "amount": 0.459853,
+    "ex_date": "2025-03-18",
+    "special": false
+   },
+   {
+    "amount": 0.575625,
+    "ex_date": "2025-06-16",
+    "special": false
+   },
+   {
+    "amount": 0.676797,
+    "ex_date": "2025-09-16",
+    "special": false
+   },
+   {
+    "amount": 0.842454,
+    "ex_date": "2025-12-16",
+    "special": false
+   },
+   {
+    "amount": 0.442026,
+    "ex_date": "2026-03-17",
+    "special": false
+   },
+   {
+    "amount": 0.695129,
+    "ex_date": "2026-06-15",
+    "special": false
+   }
+  ],
+  "KMI": [
+   {
+    "amount": 0.2775,
+    "ex_date": "2023-01-30",
+    "special": false
+   },
+   {
+    "amount": 0.2825,
+    "ex_date": "2023-04-28",
+    "special": false
+   },
+   {
+    "amount": 0.2825,
+    "ex_date": "2023-07-28",
+    "special": false
+   },
+   {
+    "amount": 0.2825,
+    "ex_date": "2023-10-30",
+    "special": false
+   },
+   {
+    "amount": 0.2825,
+    "ex_date": "2024-01-30",
+    "special": false
+   },
+   {
+    "amount": 0.2875,
+    "ex_date": "2024-04-29",
+    "special": false
+   },
+   {
+    "amount": 0.2875,
+    "ex_date": "2024-07-31",
+    "special": false
+   },
+   {
+    "amount": 0.2875,
+    "ex_date": "2024-10-31",
+    "special": false
+   },
+   {
+    "amount": 0.2875,
+    "ex_date": "2025-02-03",
+    "special": false
+   },
+   {
+    "amount": 0.2925,
+    "ex_date": "2025-04-30",
+    "special": false
+   },
+   {
+    "amount": 0.2925,
+    "ex_date": "2025-07-31",
+    "special": false
+   },
+   {
+    "amount": 0.2925,
+    "ex_date": "2025-11-03",
+    "special": false
+   },
+   {
+    "amount": 0.2925,
+    "ex_date": "2026-02-02",
+    "special": false
+   },
+   {
+    "amount": 0.2975,
+    "ex_date": "2026-05-04",
+    "special": false
+   }
+  ],
+  "MSFT": [
+   {
+    "amount": 0.68,
+    "ex_date": "2023-02-15",
+    "special": false
+   },
+   {
+    "amount": 0.68,
+    "ex_date": "2023-05-17",
+    "special": false
+   },
+   {
+    "amount": 0.68,
+    "ex_date": "2023-08-16",
+    "special": false
+   },
+   {
+    "amount": 0.75,
+    "ex_date": "2023-11-15",
+    "special": false
+   },
+   {
+    "amount": 0.75,
+    "ex_date": "2024-02-14",
+    "special": false
+   },
+   {
+    "amount": 0.75,
+    "ex_date": "2024-05-15",
+    "special": false
+   },
+   {
+    "amount": 0.75,
+    "ex_date": "2024-08-15",
+    "special": false
+   },
+   {
+    "amount": 0.83,
+    "ex_date": "2024-11-21",
+    "special": false
+   },
+   {
+    "amount": 0.83,
+    "ex_date": "2025-02-20",
+    "special": false
+   },
+   {
+    "amount": 0.83,
+    "ex_date": "2025-05-15",
+    "special": false
+   },
+   {
+    "amount": 0.83,
+    "ex_date": "2025-08-21",
+    "special": false
+   },
+   {
+    "amount": 0.91,
+    "ex_date": "2025-11-20",
+    "special": false
+   },
+   {
+    "amount": 0.91,
+    "ex_date": "2026-02-19",
+    "special": false
+   },
+   {
+    "amount": 0.91,
+    "ex_date": "2026-05-21",
+    "special": false
+   }
+  ],
+  "NVDA": [
+   {
+    "amount": 0.04,
+    "ex_date": "2023-03-07",
+    "special": false
+   },
+   {
+    "amount": 0.04,
+    "ex_date": "2023-06-07",
+    "special": false
+   },
+   {
+    "amount": 0.04,
+    "ex_date": "2023-09-06",
+    "special": false
+   },
+   {
+    "amount": 0.04,
+    "ex_date": "2023-12-05",
+    "special": false
+   },
+   {
+    "amount": 0.04,
+    "ex_date": "2024-03-05",
+    "special": false
+   },
+   {
+    "amount": 0.01,
+    "ex_date": "2024-06-11",
+    "special": false
+   },
+   {
+    "amount": 0.01,
+    "ex_date": "2024-09-12",
+    "special": false
+   },
+   {
+    "amount": 0.01,
+    "ex_date": "2024-12-05",
+    "special": false
+   },
+   {
+    "amount": 0.01,
+    "ex_date": "2025-03-12",
+    "special": false
+   },
+   {
+    "amount": 0.01,
+    "ex_date": "2025-06-11",
+    "special": false
+   },
+   {
+    "amount": 0.01,
+    "ex_date": "2025-09-11",
+    "special": false
+   },
+   {
+    "amount": 0.01,
+    "ex_date": "2025-12-04",
+    "special": false
+   },
+   {
+    "amount": 0.01,
+    "ex_date": "2026-03-11",
+    "special": false
+   },
+   {
+    "amount": 0.25,
+    "ex_date": "2026-06-04",
+    "special": false
+   }
+  ],
+  "PFE": [
+   {
+    "amount": 0.41,
+    "ex_date": "2023-01-26",
+    "special": false
+   },
+   {
+    "amount": 0.41,
+    "ex_date": "2023-05-11",
+    "special": false
+   },
+   {
+    "amount": 0.41,
+    "ex_date": "2023-07-27",
+    "special": false
+   },
+   {
+    "amount": 0.41,
+    "ex_date": "2023-11-09",
+    "special": false
+   },
+   {
+    "amount": 0.42,
+    "ex_date": "2024-01-25",
+    "special": false
+   },
+   {
+    "amount": 0.42,
+    "ex_date": "2024-05-09",
+    "special": false
+   },
+   {
+    "amount": 0.42,
+    "ex_date": "2024-07-26",
+    "special": false
+   },
+   {
+    "amount": 0.42,
+    "ex_date": "2024-11-08",
+    "special": false
+   },
+   {
+    "amount": 0.43,
+    "ex_date": "2025-01-24",
+    "special": false
+   },
+   {
+    "amount": 0.43,
+    "ex_date": "2025-05-09",
+    "special": false
+   },
+   {
+    "amount": 0.43,
+    "ex_date": "2025-07-25",
+    "special": false
+   },
+   {
+    "amount": 0.43,
+    "ex_date": "2025-11-07",
+    "special": false
+   },
+   {
+    "amount": 0.43,
+    "ex_date": "2026-01-23",
+    "special": false
+   },
+   {
+    "amount": 0.43,
+    "ex_date": "2026-05-08",
+    "special": false
+   }
+  ],
+  "QQQ": [
+   {
+    "amount": 0.47223,
+    "ex_date": "2023-03-20",
+    "special": false
+   },
+   {
+    "amount": 0.50395,
+    "ex_date": "2023-06-20",
+    "special": false
+   },
+   {
+    "amount": 0.53555,
+    "ex_date": "2023-09-18",
+    "special": false
+   },
+   {
+    "amount": 0.80826,
+    "ex_date": "2023-12-18",
+    "special": false
+   },
+   {
+    "amount": 0.21584,
+    "ex_date": "2023-12-27",
+    "special": true
+   },
+   {
+    "amount": 0.57345,
+    "ex_date": "2024-03-18",
+    "special": false
+   },
+   {
+    "amount": 0.7615,
+    "ex_date": "2024-06-24",
+    "special": false
+   },
+   {
+    "amount": 0.67686,
+    "ex_date": "2024-09-23",
+    "special": false
+   },
+   {
+    "amount": 0.83466,
+    "ex_date": "2024-12-23",
+    "special": false
+   },
+   {
+    "amount": 0.71571,
+    "ex_date": "2025-03-24",
+    "special": false
+   },
+   {
+    "amount": 0.59111,
+    "ex_date": "2025-06-23",
+    "special": false
+   },
+   {
+    "amount": 0.69395,
+    "ex_date": "2025-09-22",
+    "special": false
+   },
+   {
+    "amount": 0.79408,
+    "ex_date": "2025-12-22",
+    "special": false
+   },
+   {
+    "amount": 0.73282,
+    "ex_date": "2026-03-23",
+    "special": false
+   },
+   {
+    "amount": 0.81349,
+    "ex_date": "2026-06-22",
+    "special": false
+   }
+  ],
+  "SPY": [
+   {
+    "amount": 1.506204,
+    "ex_date": "2023-03-17",
+    "special": false
+   },
+   {
+    "amount": 1.638367,
+    "ex_date": "2023-06-16",
+    "special": false
+   },
+   {
+    "amount": 1.583169,
+    "ex_date": "2023-09-15",
+    "special": false
+   },
+   {
+    "amount": 1.906073,
+    "ex_date": "2023-12-15",
+    "special": false
+   },
+   {
+    "amount": 1.594937,
+    "ex_date": "2024-03-15",
+    "special": false
+   },
+   {
+    "amount": 1.759024,
+    "ex_date": "2024-06-21",
+    "special": false
+   },
+   {
+    "amount": 1.745531,
+    "ex_date": "2024-09-20",
+    "special": false
+   },
+   {
+    "amount": 1.965548,
+    "ex_date": "2024-12-20",
+    "special": false
+   },
+   {
+    "amount": 1.695528,
+    "ex_date": "2025-03-21",
+    "special": false
+   },
+   {
+    "amount": 1.761117,
+    "ex_date": "2025-06-20",
+    "special": false
+   },
+   {
+    "amount": 1.831114,
+    "ex_date": "2025-09-19",
+    "special": false
+   },
+   {
+    "amount": 1.993368,
+    "ex_date": "2025-12-19",
+    "special": false
+   },
+   {
+    "amount": 1.796999,
+    "ex_date": "2026-03-20",
+    "special": false
+   },
+   {
+    "amount": 1.903516,
+    "ex_date": "2026-06-18",
+    "special": false
+   }
+  ],
+  "UNH": [
+   {
+    "amount": 1.65,
+    "ex_date": "2023-03-10",
+    "special": false
+   },
+   {
+    "amount": 1.88,
+    "ex_date": "2023-06-15",
+    "special": false
+   },
+   {
+    "amount": 1.88,
+    "ex_date": "2023-09-08",
+    "special": false
+   },
+   {
+    "amount": 1.88,
+    "ex_date": "2023-12-01",
+    "special": false
+   },
+   {
+    "amount": 1.88,
+    "ex_date": "2024-03-08",
+    "special": false
+   },
+   {
+    "amount": 2.1,
+    "ex_date": "2024-06-17",
+    "special": false
+   },
+   {
+    "amount": 2.1,
+    "ex_date": "2024-09-16",
+    "special": false
+   },
+   {
+    "amount": 2.1,
+    "ex_date": "2024-12-09",
+    "special": false
+   },
+   {
+    "amount": 2.1,
+    "ex_date": "2025-03-10",
+    "special": false
+   },
+   {
+    "amount": 2.21,
+    "ex_date": "2025-06-16",
+    "special": false
+   },
+   {
+    "amount": 2.21,
+    "ex_date": "2025-09-15",
+    "special": false
+   },
+   {
+    "amount": 2.21,
+    "ex_date": "2025-12-08",
+    "special": false
+   },
+   {
+    "amount": 2.21,
+    "ex_date": "2026-03-09",
+    "special": false
+   },
+   {
+    "amount": 2.32,
+    "ex_date": "2026-06-15",
+    "special": false
+   }
+  ],
+  "VZ": [
+   {
+    "amount": 0.6525,
+    "ex_date": "2023-01-09",
+    "special": false
+   },
+   {
+    "amount": 0.6525,
+    "ex_date": "2023-04-06",
+    "special": false
+   },
+   {
+    "amount": 0.6525,
+    "ex_date": "2023-07-07",
+    "special": false
+   },
+   {
+    "amount": 0.665,
+    "ex_date": "2023-10-06",
+    "special": false
+   },
+   {
+    "amount": 0.665,
+    "ex_date": "2024-01-09",
+    "special": false
+   },
+   {
+    "amount": 0.665,
+    "ex_date": "2024-04-09",
+    "special": false
+   },
+   {
+    "amount": 0.665,
+    "ex_date": "2024-07-10",
+    "special": false
+   },
+   {
+    "amount": 0.6775,
+    "ex_date": "2024-10-10",
+    "special": false
+   },
+   {
+    "amount": 0.6775,
+    "ex_date": "2025-01-10",
+    "special": false
+   },
+   {
+    "amount": 0.6775,
+    "ex_date": "2025-04-10",
+    "special": false
+   },
+   {
+    "amount": 0.6775,
+    "ex_date": "2025-07-10",
+    "special": false
+   },
+   {
+    "amount": 0.69,
+    "ex_date": "2025-10-10",
+    "special": false
+   },
+   {
+    "amount": 0.69,
+    "ex_date": "2026-01-12",
+    "special": false
+   },
+   {
+    "amount": 0.7075,
+    "ex_date": "2026-04-10",
+    "special": false
+   },
+   {
+    "amount": 0.7075,
+    "ex_date": "2026-07-10",
+    "special": false
+   }
+  ]
+ },
+ "generated": "2026-07-18",
+ "note": "Amounts are as-declared per share, NOT split-adjusted, matching the unadjusted bars and as-listed strikes the engine replays against. ETF rows (SPY/QQQ/IWM) are fund distributions, which bundle passed-through dividend income with year-end capital-gains distributions; the cash flow is identical, the composition is not. Symbols present with an empty list pay no dividend over the window and were confirmed by the fetch, not skipped.",
+ "since": "2023-01-01",
+ "source": "Alpaca /v1/corporate-actions (types=cash_dividend)",
+ "until": "2026-07-18"
+}

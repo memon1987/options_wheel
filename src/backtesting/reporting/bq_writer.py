@@ -13,7 +13,11 @@ a demotion decision. Writes here return success, and the caller surfaces it.
 
 **Every row carries its config hash and the engine's known biases.** A verdict
 read six months from now is meaningless without knowing which premium floor and
-delta band produced it, or that dividends were unmodeled at the time.
+delta band produced it, or which fidelity gaps were open at the time. Dividends
+were unmodeled before FC-042; rows from either side of that cutover are
+distinguishable by ``benchmark_dividends`` being null (before) or present
+(after), which is why the benchmark's price and dividend components are stored
+separately rather than only as a total.
 """
 
 from __future__ import annotations
@@ -67,11 +71,17 @@ def _schema():
         f("annualized_return", "FLOAT"),
         f("annualized_return_on_collateral", "FLOAT"),
         f("benchmark_return", "FLOAT"),
+        # Split out so a stored row stays interpretable across the FC-042 cutover:
+        # benchmark_return now INCLUDES dividends, and rows written before that
+        # have a null here rather than a silently different total.
+        f("benchmark_price_return", "FLOAT"),
+        f("benchmark_dividends", "FLOAT"),
         f("excess_return", "FLOAT"),
         # Attribution — never collapsed
         f("option_pnl", "FLOAT"),
         f("stock_pnl_realized", "FLOAT"),
         f("stock_pnl_unrealized", "FLOAT"),
+        f("dividends", "FLOAT"),
         f("option_pnl_share", "FLOAT"),
         f("reconciliation_gap", "FLOAT"),
         # Activity and risk
@@ -284,11 +294,14 @@ def build_row(*, run_id: str, symbol: str, report, sensitivity: Optional[dict],
         "annualized_return": report.annualized_return,
         "annualized_return_on_collateral": report.annualized_return_on_collateral,
         "benchmark_return": report.benchmark.total_return if report.benchmark else None,
+        "benchmark_price_return": report.benchmark.price_return if report.benchmark else None,
+        "benchmark_dividends": report.benchmark.dividends if report.benchmark else None,
         "excess_return": report.excess_return,
 
         "option_pnl": report.option_pnl,
         "stock_pnl_realized": report.stock_pnl,
         "stock_pnl_unrealized": report.unrealized_stock_pnl,
+        "dividends": report.dividends,
         "option_pnl_share": report.option_pnl_share,
         "reconciliation_gap": report.reconciliation_gap,
 

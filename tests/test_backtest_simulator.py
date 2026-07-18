@@ -13,9 +13,12 @@ from typing import Dict, List
 import pytest
 
 from src.backtesting.data.chain_builder import STRIKE_WINDOW_PCT, ChainBuilder
+from src.backtesting.data.dividends import Dividend, DividendSchedule
 from src.backtesting.data.provider import OptionBar, OptionContract, StockBar
 from src.backtesting.engine.no_op_analytics import NoOpAnalyticsWriter
 from src.backtesting.engine.simulator import Simulator, restrict_symbols
+from src.backtesting.metrics.cycles import build_cycles
+from src.backtesting.metrics.fitness import compute_fitness
 from src.data import analytics_writer as analytics_module
 from src.utils import clock
 from src.utils.config import Config
@@ -218,6 +221,113 @@ class TestDayLoop:
             assert state.reserved_collateral >= 0.0
             # Cash-secured: collateral never exceeds cash on hand.
             assert state.reserved_collateral <= state.cash + 1e-6
+
+
+class TestDividendsThroughTheDayLoop:
+    """FC-042 Track C, end to end.
+
+    The fixture's put is assigned 2024-06-07 at 92.00 and the run finishes still
+    holding those 100 shares, which makes it a clean bed for ex-date behavior.
+    """
+
+    ASSIGNED = date(2024, 6, 7)
+
+    def _run(self, fixture, ex_dates, amount=0.50):
+        days, closes, exps = fixture
+        schedule = DividendSchedule(
+            {"XYZ": [Dividend(ex_date=d, amount=amount) for d in ex_dates]}
+        )
+        sim = _simulator("XYZ", closes, exps, days, dividend_schedule=schedule)
+        return sim.run()
+
+    def test_dividend_is_credited_while_shares_are_held(self, falling_then_flat):
+        result = self._run(falling_then_flat, [date(2024, 6, 20)])
+        events = [e for e in result.broker.ledger if e.kind == "dividend"]
+        assert len(events) == 1
+        assert events[0].shares == 100
+        assert events[0].cash_delta == pytest.approx(50.0)
+        assert result.dividends_credited == pytest.approx(50.0)
+
+    def test_nothing_is_credited_before_assignment(self, falling_then_flat):
+        """No shares yet, so no dividend — the pre-assignment days are flat."""
+        result = self._run(falling_then_flat, [date(2024, 6, 5)])
+        assert not [e for e in result.broker.ledger if e.kind == "dividend"]
+        assert result.dividends_credited == 0.0
+
+    def test_an_ex_date_on_the_assignment_day_pays_nothing(self, falling_then_flat):
+        """The ownership test is the PREVIOUS close, and this is the crux of it.
+
+        Shares arrive at that day's expiration settlement, i.e. after the stock
+        already went ex. A holder who acquires on the ex-date does not collect;
+        crediting here would be free money, and it would appear on every cycle
+        whose assignment happened to land on an ex-date.
+        """
+        result = self._run(falling_then_flat, [self.ASSIGNED])
+        assert not [e for e in result.broker.ledger if e.kind == "dividend"]
+
+    def test_the_day_after_assignment_does_pay(self, falling_then_flat):
+        """Bracketing the case above: one session later, the shares are on the record."""
+        result = self._run(falling_then_flat, [date(2024, 6, 10)])
+        events = [e for e in result.broker.ledger if e.kind == "dividend"]
+        assert len(events) == 1
+        assert events[0].cash_delta == pytest.approx(50.0)
+
+    def test_dividends_land_in_equity_and_attribution_still_reconciles(
+        self, falling_then_flat
+    ):
+        """The acceptance criterion: attribution must still sum to the equity change.
+
+        A dividend that reaches cash but not the attribution table would make
+        every percentage in the report wrong by exactly that amount.
+        """
+        days, closes, exps = falling_then_flat
+        base = self._run(falling_then_flat, [])
+        with_div = self._run(falling_then_flat, [date(2024, 6, 20)])
+
+        # It is real money: equity is higher by exactly the dividend.
+        assert with_div.final_equity - base.final_equity == pytest.approx(50.0)
+
+        cycles = build_cycles(with_div.broker.ledger)
+        prices = {d: closes[d] for d in days}
+        report = compute_fitness(
+            "XYZ", with_div.daily, cycles, with_div.starting_cash,
+            benchmark_prices=prices,
+            benchmark_dividends_per_share=0.50,
+            data_quality={"decision_days": len(with_div.daily)},
+        )
+        assert report.dividends == pytest.approx(50.0)
+        assert report.reconciliation_gap == pytest.approx(0.0, abs=0.01)
+
+    def test_benchmark_collects_the_dividend_too(self, falling_then_flat):
+        """Crediting only the wheel would invert the bias, not remove it."""
+        days, closes, exps = falling_then_flat
+        result = self._run(falling_then_flat, [date(2024, 6, 20)])
+        cycles = build_cycles(result.broker.ledger)
+        prices = {d: closes[d] for d in days}
+
+        without = compute_fitness(
+            "XYZ", result.daily, cycles, result.starting_cash,
+            benchmark_prices=prices, data_quality={"decision_days": len(result.daily)},
+        )
+        with_ = compute_fitness(
+            "XYZ", result.daily, cycles, result.starting_cash,
+            benchmark_prices=prices, benchmark_dividends_per_share=0.50,
+            data_quality={"decision_days": len(result.daily)},
+        )
+        assert with_.benchmark.dividends > 0
+        assert with_.benchmark.total_return > without.benchmark.total_return
+        # And the wheel's edge shrinks accordingly — that is the bias correction.
+        assert with_.excess_return < without.excess_return
+
+    def test_no_schedule_means_no_dividends_anywhere(self, falling_then_flat):
+        """The pre-FC-042 model stays reachable and stays silent."""
+        days, closes, exps = falling_then_flat
+        sim = _simulator(
+            "XYZ", closes, exps, days, dividend_schedule=DividendSchedule.empty()
+        )
+        result = sim.run()
+        assert result.dividends_credited == 0.0
+        assert result.early_assignments == 0
 
 
 class TestNoProductionSideEffects:

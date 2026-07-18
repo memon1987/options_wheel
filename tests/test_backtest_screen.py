@@ -35,6 +35,7 @@ class _FakeReport:
         self.annualized_return_on_collateral = 0.12
         self.excess_return = 0.01
         self.option_pnl, self.stock_pnl, self.unrealized_stock_pnl = 1000.0, 0.0, 0.0
+        self.dividends = 0.0
         self.option_pnl_share, self.reconciliation_gap = 1.0, 0.0
         self.decision_days, self.days_in_position = 250, 200
         self.days_in_position_fraction = 0.8

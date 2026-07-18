@@ -20,6 +20,11 @@ from ..utils.config import Config
 from .data.alpaca_provider import AlpacaDataProvider
 from .data.chain_builder import ChainBuilder
 from .data.chain_store import ChainStore
+from .data.dividends import (
+    DividendSchedule,
+    describe_coverage,
+    load_default_schedule,
+)
 from .engine.simulator import SimulationResult, Simulator
 from .metrics.cycles import build_cycles, count_rolls
 from .metrics.fitness import FitnessReport, compute_fitness
@@ -67,20 +72,27 @@ def evaluate_symbol(
         chain_store = ChainStore()
     builder = ChainBuilder(provider, store=chain_store if use_cache else None)
     max_dte = getattr(config, "put_target_dte", 7)
+    # ONE schedule for both legs. The wheel's dividends come from this table via
+    # the broker ledger and the benchmark's from the same table via
+    # total_between; loading them separately would let the two drift apart and
+    # reintroduce, silently, exactly the directional bias this removes.
+    dividends = load_default_schedule()
 
     result = _run(
         symbol, start, end, config, provider, builder,
         starting_cash=starting_cash, fill_haircut=fill_haircut, max_dte=max_dte,
+        dividends=dividends,
     )
-    report = _score(symbol, result, provider, starting_cash)
+    report = _score(symbol, result, provider, starting_cash, dividends)
 
     sensitivity = None
     if run_sensitivity:
         bid_result = _run(
             symbol, start, end, config, provider, builder,
             starting_cash=starting_cash, fill_haircut=BID_FILL_HAIRCUT, max_dte=max_dte,
+            dividends=dividends,
         )
-        bid_report = _score(symbol, bid_result, provider, starting_cash)
+        bid_report = _score(symbol, bid_result, provider, starting_cash, dividends)
         sensitivity = {
             "mid_haircut": fill_haircut,
             "mid_return": report.total_return,
@@ -103,23 +115,38 @@ def evaluate_symbol(
 def _run(
     symbol: str, start: date, end: date, config, provider, builder, *,
     starting_cash: float, fill_haircut: float, max_dte: int,
+    dividends: Optional[DividendSchedule] = None,
 ) -> SimulationResult:
     simulator = Simulator(
         config, provider, builder, [symbol], start, end,
         starting_cash=starting_cash, max_dte=max_dte, fill_haircut=fill_haircut,
+        dividend_schedule=dividends,
     )
     return simulator.run()
 
 
 def _score(
-    symbol: str, result: SimulationResult, provider, starting_cash: float
+    symbol: str,
+    result: SimulationResult,
+    provider,
+    starting_cash: float,
+    dividends: Optional[DividendSchedule] = None,
 ) -> FitnessReport:
     cycles = build_cycles(result.broker.ledger)
     prices = _closes(provider, symbol, result.start, result.end)
     quality = _data_quality(result, cycles)
+    # Buy-and-hold enters at the close of result.start, so a dividend going ex
+    # ON that day belongs to the seller, not this holder — total_between's
+    # half-open lower bound encodes that.
+    schedule = dividends or load_default_schedule()
+    bench_divs = schedule.total_between(symbol, result.start, result.end)
+    quality["dividend_coverage"] = describe_coverage(
+        schedule, symbol, result.start, result.end
+    )
     return compute_fitness(
         symbol, result.daily, cycles, starting_cash,
-        benchmark_prices=prices, data_quality=quality, rolls=count_rolls(cycles),
+        benchmark_prices=prices, benchmark_dividends_per_share=bench_divs,
+        data_quality=quality, rolls=count_rolls(cycles),
     )
 
 
@@ -137,4 +164,10 @@ def _data_quality(result: SimulationResult, cycles: Sequence) -> Dict:
         "cycles_still_open_at_end": sum(1 for c in cycles if c.is_open),
         "option_marks": "daily bar closes (trade prints); bid/ask modeled",
         "greeks": "Black-Scholes inversions, not published values",
+        "dividends_credited": round(result.dividends_credited, 2),
+        "ex_dividend_early_assignments": result.early_assignments,
+        # The residual of C2: ITM short calls on an ex-date eve that had no mark
+        # to price extrinsic from, so the early-assignment test could not run.
+        # Non-zero means some early assignments may be missing.
+        "ex_div_calls_with_no_mark": result.unpriced_ex_div_calls,
     }
