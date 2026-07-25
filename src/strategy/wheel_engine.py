@@ -490,17 +490,22 @@ class WheelEngine:
                            reason="pending_order_in_current_cycle")
                 return True
 
-            # Check 2: Open/pending orders from Alpaca API
-            # This catches orders that were placed but not yet filled (race condition fix)
+            # Check 2: Open orders from Alpaca API. Catches orders placed but not
+            # yet filled — the only duplicate backstop that survives a Cloud Run
+            # cold start (Check 1 is in-process; Check 3 sees only filled
+            # positions). status='open' returns the whole unfilled set;
+            # 'pending_new' is a subset of it, so a second fetch is redundant.
             try:
                 open_orders = self.alpaca.get_orders(status='open')
-                pending_orders = self.alpaca.get_orders(status='pending_new')
-                all_pending = open_orders + pending_orders
 
-                # Check if any pending orders are for options on this underlying
-                for order in all_pending:
-                    # Option symbols contain the underlying (e.g., AMD251017P00207500 contains AMD)
-                    if underlying_symbol in order['symbol']:
+                # Match the OCC ROOT exactly — a substring test ("AMD" in symbol)
+                # false-matches unrelated tickers ('F' in 'PFE...', and 'C'/'P'
+                # match the option-type char in every OCC symbol), which would
+                # over-block legitimate entries now that this check is live.
+                for order in open_orders:
+                    order_underlying = self._extract_underlying_from_option_symbol(
+                        order['symbol'])
+                    if order_underlying == underlying_symbol:
                         logger.info("STAGE 6: Existing position check BLOCKED - open order exists",
                                    event_category="filtering",
                                    event_type="stage_6_blocked",
@@ -511,10 +516,18 @@ class WheelEngine:
                                    order_symbol=order['symbol'])
                         return True
             except Exception as order_error:
-                logger.warning("Failed to check open orders, continuing to position check",
-                             event_category="error", event_type="order_check_failed",
+                # FAIL CLOSED. get_orders is @api_retry-wrapped, so reaching here
+                # means retries were exhausted — a sustained failure, not a blip.
+                # This is now the load-bearing cold-start duplicate guard, and a
+                # duplicate order costs real money (FC-009); a paused entry costs
+                # only an opportunity. So we refuse the entry rather than fall
+                # through to Check 3, which cannot see resting unfilled orders.
+                logger.warning("STAGE 6: open-order check failed - BLOCKING entry (fail-closed)",
+                             event_category="filtering",
+                             event_type="stage_6_order_check_failed_blocking",
                              symbol=underlying_symbol,
                              error=str(order_error))
+                return True
 
             # Check 3: Filled positions from Alpaca
             positions = self.alpaca.get_positions()
@@ -712,8 +725,16 @@ class WheelEngine:
                        event_category="system",
                        event_type="order_poll_started")
 
-            # Get all orders (Alpaca returns recent orders by default)
-            all_orders = self.alpaca.get_orders()
+            # FC-043: pinned to the OPEN bucket to preserve this path's existing
+            # (dormant) behavior. Historically get_orders() with no arg returned
+            # only open orders — never filled/expired — so the loop below is a
+            # no-op in production and order_statuses has 0 rows. Fixing the
+            # get_orders wrapper (FC-043) would otherwise flip this to ALL/500
+            # and stream ~500 non-idempotent BQ writes every cycle. Properly
+            # activating this poll (fetch recent CLOSED with dedup) is PR #47 /
+            # FC-035, which owns the unresolved double-logging question. Do NOT
+            # widen this fetch here.
+            all_orders = self.alpaca.get_orders(status='open')
 
             # Also check closed/filled orders
             try:

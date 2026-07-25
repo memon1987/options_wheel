@@ -264,26 +264,92 @@ class TestWheelEngine:
         """FC-043: the duplicate guard's Check 2 must block on an open order.
 
         This is the only duplicate backstop that survives a Cloud Run cold
-        start (Check 1 is in-memory; Check 3 sees only filled positions). Before
-        FC-043, get_orders(status='open') returned [] unconditionally, so this
-        check never fired and the FC-009 duplicate-order window was unguarded.
+        start (Check 1 is in-memory; Check 3 sees only filled positions).
+        Unit test of the guard loop — it mocks the get_orders wrapper, so it
+        does NOT by itself prove the wrapper is fixed; that is proven by
+        test_stage6_check2_real_wrapper_blocks (which fails on the old wrapper)
+        and by TestAlpacaClientGetOrders.
         """
         self.wheel_engine._pending_underlyings = set()  # Check 1 empty
         self.mock_alpaca.get_positions.return_value = []  # Check 3 empty
-
-        def orders_by_status(status=None):
-            if status == 'open':
-                return [{
-                    'symbol': 'AMD250815P00150000',
-                    'order_id': 'ord-1',
-                    'status': 'new',  # an OPEN-bucket value, NOT 'open'
-                }]
-            return []  # pending_new
-        self.mock_alpaca.get_orders.side_effect = orders_by_status
+        self.mock_alpaca.get_orders.return_value = [{
+            'symbol': 'AMD250815P00150000',
+            'order_id': 'ord-1',
+            'status': 'new',  # an OPEN-bucket value, NOT 'open'
+        }]
 
         assert self.wheel_engine._has_existing_option_position('AMD') is True
         # A different underlying with no resting order is not blocked by Check 2.
         assert self.wheel_engine._has_existing_option_position('MSFT') is False
+
+    def test_stage6_check2_no_substring_overblock(self):
+        """FC-043: Check 2 must match the OCC root exactly, not by substring.
+
+        'F' (Ford) is a substring of 'PFE...'; the old `underlying in symbol`
+        test would over-block Ford whenever any Pfizer order rested. Now that
+        Check 2 is live, that would refuse legitimate entries.
+        """
+        self.wheel_engine._pending_underlyings = set()
+        self.mock_alpaca.get_positions.return_value = []
+        self.mock_alpaca.get_orders.return_value = [{
+            'symbol': 'PFE250815P00028000',  # Pfizer — contains 'F'
+            'order_id': 'ord-2',
+            'status': 'accepted',
+        }]
+
+        # 'F' must NOT be blocked by a Pfizer order (old substring test would).
+        assert self.wheel_engine._has_existing_option_position('F') is False
+        # PFE itself is correctly blocked.
+        assert self.wheel_engine._has_existing_option_position('PFE') is True
+
+    def test_stage6_check2_fails_closed_on_api_error(self):
+        """FC-043: a sustained get_orders failure must BLOCK, not fall through.
+
+        get_orders is @api_retry-wrapped, so an exception here means retries
+        were exhausted. Check 2 is now the load-bearing cold-start guard, and a
+        duplicate order costs real money (FC-009), so we refuse the entry rather
+        than fall through to Check 3 (which cannot see resting unfilled orders).
+        """
+        self.wheel_engine._pending_underlyings = set()
+        self.mock_alpaca.get_positions.return_value = []  # Check 3 would pass
+        self.mock_alpaca.get_orders.side_effect = Exception("Alpaca 503")
+
+        assert self.wheel_engine._has_existing_option_position('AMD') is True
+
+    @patch('src.api.alpaca_client.TradingClient')
+    @patch('src.api.alpaca_client.StockHistoricalDataClient')
+    @patch('src.api.alpaca_client.OptionHistoricalDataClient')
+    def test_stage6_check2_real_wrapper_blocks(self, mo, ms, mt, mock_config):
+        """FC-043 regression through the REAL get_orders wrapper.
+
+        Fails on the pre-fix wrapper: an open order's status.value is
+        'accepted', and the old code value-filtered `== 'open'` (a query token,
+        never a status value), dropping it -> Check 2 saw nothing -> no block.
+        """
+        from src.api.alpaca_client import AlpacaClient
+
+        raw_order = MagicMock()
+        raw_order.id = 'real-1'
+        raw_order.symbol = 'AMD250815P00150000'
+        raw_order.qty = '1'
+        raw_order.filled_qty = '0'
+        raw_order.side = MagicMock(value='sell')
+        raw_order.status = MagicMock(value='accepted')  # OPEN-bucket value
+        raw_order.order_type = MagicMock(value='limit')
+        raw_order.submitted_at = None
+        raw_order.filled_at = None
+        raw_order.filled_avg_price = None
+        # Mock ignores the filter arg -> returns the order for any query. Under
+        # the OLD wrapper the value-filter still drops it; under the new one the
+        # bucket routing keeps it.
+        mt.return_value.get_orders.return_value = [raw_order]
+        mt.return_value.get_all_positions.return_value = []  # Check 3 empty
+
+        real_client = AlpacaClient(mock_config)
+        self.wheel_engine.alpaca = real_client
+        self.wheel_engine._pending_underlyings = set()
+
+        assert self.wheel_engine._has_existing_option_position('AMD') is True
 
     def test_get_strategy_status(self):
         """Test getting strategy status summary."""

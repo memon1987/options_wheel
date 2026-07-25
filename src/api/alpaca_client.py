@@ -630,14 +630,20 @@ class AlpacaClient:
     
     # OrderStatus VALUES (order.status.value) that live in Alpaca's "open" query
     # bucket. Everything else (filled, expired, canceled, rejected, replaced,
-    # done_for_day, stopped) is in the "closed" bucket. Used to route a
-    # specific-value filter to the correct GetOrdersRequest — asking Alpaca for
-    # the wrong bucket is exactly the bug this method fixes: a value-filter that
-    # never fetched the rows it was filtering.
+    # done_for_day, calculated, stopped) is in the "closed" bucket. Used to
+    # route a specific-value filter to the correct GetOrdersRequest — asking
+    # Alpaca for the wrong bucket is exactly the bug this method fixes: a
+    # value-filter that never fetched the rows it was filtering.
+    #
+    # Only 'filled'/'expired' (CLOSED) and 'pending_new' (OPEN) are exercised by
+    # callers today and are live-verified. The rest of the partition is
+    # best-effort per Alpaca's status semantics (e.g. 'calculated' = "completed
+    # for the day" → CLOSED); a misfiled non-exercised value would make
+    # get_orders('<that value>') return [] silently, but none are called.
     _OPEN_STATUS_VALUES = frozenset({
         'new', 'accepted', 'accepted_for_bidding', 'partially_filled',
         'pending_new', 'pending_cancel', 'pending_replace', 'pending_review',
-        'held', 'calculated', 'suspended',
+        'held', 'suspended',
     })
 
     @api_retry
@@ -681,8 +687,13 @@ class AlpacaClient:
                     )
                     value_filter = normalized
 
-            # limit=500 so ALL/CLOSED are not silently truncated at Alpaca's
-            # default page size of 50.
+            # limit=500 raises Alpaca's default page size (50) to a safe bound
+            # for the current callers. It is a HARD CAP, not pagination: the
+            # OPEN bucket (duplicate guard, pending check) is always tiny, and
+            # the only CLOSED-bucket caller (portfolio "last 10 filled") wants
+            # the newest 10, which sit at the head of Alpaca's DESC order. A
+            # future caller needing full closed history must paginate with
+            # after=/until= — 500 will truncate it.
             orders = self.trading_client.get_orders(
                 filter=GetOrdersRequest(status=query_status, limit=500)
             )
