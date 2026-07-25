@@ -311,8 +311,10 @@ class PortfolioTracker:
             current_snapshot = self.get_current_portfolio_snapshot()
             performance_30d = self.calculate_performance_metrics(30)
             
-            # Get recent orders for activity summary
-            recent_orders = self.alpaca.get_orders('filled')[-10:]  # Last 10 filled orders
+            # Get recent orders for activity summary. Alpaca returns DESC
+            # (newest first), so the 10 most-recent filled orders are the HEAD,
+            # not the tail — [:10], not [-10:] (which returned the oldest 10).
+            recent_orders = self.alpaca.get_orders('filled')[:10]  # Last 10 filled orders
             
             report = {
                 'report_date': datetime.now().isoformat(),
