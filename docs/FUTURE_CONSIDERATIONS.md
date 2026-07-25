@@ -576,6 +576,21 @@ Two defects:
 
 ---
 
+### FC-043: `AlpacaClient.get_orders` status filter has never worked
+
+**Status:** Plan published
+**Size estimate:** S (one wrapper function; live-behavior change)
+**Owner:** zeshan + Claude
+**Plan file:** `docs/plans/fc-043.md`
+
+**Problem:** `AlpacaClient.get_orders(status=...)` (`src/api/alpaca_client.py:632`) has two independent defects: it never passes a `GetOrdersRequest`, so Alpaca's `status=open` REST default always applies (closed orders never fetched); and it value-filters `order.status.value == status`, but callers pass *query* tokens (`'open'`) that are never status *values* (`'open' not in [s.value for s in OrderStatus]`, verified). Net: the `status` argument has never selected the orders the caller asked for. **Three live callers broken:** the Stage-6 duplicate-order guard's Check 2 (`wheel_engine.py:496`, `status='open'`) returns `[]` unconditionally — and Check 2 is the *only* duplicate backstop that survives a Cloud Run cold start, i.e. the exact FC-009 window is currently unguarded; `wheel_engine.py:497` (`'pending_new'`); and `portfolio_tracker.py:315` (`'filled'`, "last 10 filled orders" — also always empty). Verified against live paper (500 closed orders; all four wrapper calls return 0).
+
+**Fix:** map the `status` string to the correct `QueryOrderStatus` bucket, fetch with an explicit `GetOrdersRequest(limit=500)`, value-filter only for specific status values. Fixes all three callers at the root. Live trading logic → two reviewers.
+
+**Links:** `docs/plans/fc-043.md`, FC-009 (confirmed duplicate-order bug this contributes to), FC-035/PR #47 (adjacent poll path, does not overlap — calls `trading_client` directly).
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
