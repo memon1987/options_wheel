@@ -591,6 +591,39 @@ Two defects:
 
 ---
 
+### FC-044: Daily execution grid — per-run decision telemetry + at-a-glance day view
+
+**Status:** Consideration
+**Size estimate:** L (two phases: telemetry backbone, then dashboard view)
+**Owner:** zeshan
+**Plan file:** not yet
+
+**Problem / opportunity:** Day-to-day troubleshooting of the hourly engine is currently archaeology: to answer "what did the bot do today and was it the desired behavior?" you have to grep Cloud Run logs across three endpoints. We want a dashboard view for a single day — a grid with symbols as rows and hourly executions as columns — where each cell shows at a glance what happened to that symbol in that run: which gate stopped it (and why), whether an opportunity was found, whether a trade was placed, or whether the run never happened at all. The goal is visual deviation-detection: a normal day has a recognizable shape, and an abnormal one (a gate suddenly blocking everything, a missing scheduler run, a symbol silently skipped for weeks) should be visible without reading a single log line.
+
+**The hard prerequisite — the data doesn't exist yet (surveyed 2026-07-25):** the grid cannot be built from BigQuery today; the finest live granularity is one `executions` row per endpoint invocation with **no symbol column**. Specifically:
+- All per-symbol gate/skip reasons (stage 1 stock filter, stage 7/8 chain criteria with rejection breakdowns, batch dedup, naked-call block, drawdown pause) are `logger.info` → Cloud Run logs only. The `options_wheel_logs` sink dataset technically retains them, but nothing normalized reads it and the dashboard was deliberately repointed off it in FC-012.
+- Two skips produce **zero telemetry anywhere**: insufficient-collateral drop in `select_batch` (`src/strategy/execution_engine.py:226` has no `else`) and the scanner's existing-position skip (`src/data/options_scanner.py:53`, bare `continue`).
+- **No run identifier joins one hour together.** `request_id` is bound per HTTP request (so a `/scan` at :00 and its `/run` at :15 get different ids) and — despite `executions`/`errors` having a `request_id` column — is never passed to `write_execution`/`write_error`, so the column is always `""`. The only scan→run correlator is the 20-min-TTL GCS opportunity blob.
+- **`options_wheel.scans` is a dead table with live readers.** Its writer was deleted in FC-012, yet the dashboard's Bot Health gate heatmap (`dashboard/backend/services/bigquery.py:303`) and the `gate_full_block_streak` anomaly flag (`:1393`) still query it — both presumably render empty today. No FC covered this until now.
+- The documented 9-stage funnel (`docs/logging/FILTERING_STAGES_LOGGING.md`) describes the CLI/backtest path, not production: stages 2–6 and 9 never execute in the live `/scan`→`/run` path, while the gates that *do* fire live (scanner position skip, batch collateral fit, batch dedup) have no stage number at all. A grid must be built on the **live** gate sequence, not the documented one.
+- `log_filtering_event()` (`src/utils/logging_events.py:421`) — the one helper defining a normalized `stage`/`status`/`symbol` contract — is dead code with zero call sites; it's a natural starting point for Phase 1.
+
+**Rough shape (detail belongs in the plan):**
+- *Phase 1 — decision telemetry:* a `run_id` minted at `/scan` and threaded through the GCS opportunity blob into `/run`; a new BQ `decision_events` table (run_id, run_ts, endpoint, symbol, gate, outcome, reason, metrics JSON) written at every gate verdict including the currently-silent skips; retire or repoint the dead `scans` readers.
+- *Phase 2 — the grid:* symbols × hourly runs for a selected day; cell encodes furthest-stage-reached / terminal outcome, click-through to the full decision trail for that symbol-run; a column that never happened (scheduler miss, endpoint 500) must render as visibly distinct from "ran, nothing tradeable" — silent non-execution is exactly the failure mode that has bitten before (FC-031 sat undeployed 11 days; roller never fired).
+
+**Open questions:**
+- Write-time events to a new table vs. a normalized view over the existing `options_wheel_logs` sink? (Sink is free and already flowing, but wildcard-table parsing per event type is brittle and the two zero-telemetry skips still need code changes either way.)
+- Cell semantics: terminal outcome only, or furthest-stage + reason? How to encode multi-contract evaluation (stage 7 rejects 40 contracts, accepts 1) without drowning the at-a-glance read?
+- What defines "expected behavior" for deviation highlighting — static schedule (6 runs/day × universe), or a learned baseline?
+- Volume/cost: ~14 symbols × ~4 gates × 6 runs/day is trivial (<500 rows/day), but per-contract stage-7 detail could be 100×; keep contract-level breakdown as aggregate counts in the metrics JSON?
+- Does Phase 1 subsume FC-030's pause-observability metric (drawdown pause becomes just another gate event)?
+- Retention: decision events are diagnostic, not canonical — partition + expire after N months?
+
+**Links:** FC-030 (pause alerting — overlapping telemetry), FC-036 (dead stage-4 gate — grid would have made this visible immediately), FC-014 (RiskManager never invoked live — same class of "documented gate doesn't fire"), FC-002 (gate-hit-rate analysis wants the same data), FC-012 (`scans` writer removal), `docs/investigations/dashboard-metrics-audit-2026-07-07.md` §Bot Health.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
