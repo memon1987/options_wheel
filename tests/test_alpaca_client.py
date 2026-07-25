@@ -470,3 +470,119 @@ class TestAlpacaClientErrorHandling:
             client.get_positions()
 
         assert "API Error" in str(exc_info.value)
+
+
+def _mock_order(status, symbol="AMD250815P00150000", side="sell", qty="1",
+                filled_qty="0"):
+    """Build a mock Alpaca order with the attributes get_orders reads."""
+    o = MagicMock()
+    o.id = f"id-{status}-{symbol}"
+    o.symbol = symbol
+    o.qty = qty
+    o.filled_qty = filled_qty
+    o.is_partial_fill = False
+    o.side = MagicMock(value=side)
+    o.status = MagicMock(value=status)
+    o.order_type = MagicMock(value="limit")
+    o.submitted_at = None
+    o.filled_at = None
+    o.filled_avg_price = None
+    return o
+
+
+class TestAlpacaClientGetOrders:
+    """FC-043: the status filter must route to the right query bucket.
+
+    The prior implementation called ``trading_client.get_orders()`` with no
+    request (Alpaca defaults to status=open, so closed orders were never
+    fetched) and value-filtered ``status.value == status`` against query tokens
+    like ``'open'`` that are never OrderStatus values — so every status filter
+    returned nothing useful. These tests pin the routing that fixes it.
+    """
+
+    @patch('src.api.alpaca_client.TradingClient')
+    @patch('src.api.alpaca_client.StockHistoricalDataClient')
+    @patch('src.api.alpaca_client.OptionHistoricalDataClient')
+    def _client(self, mo, ms, mt, mock_config, returned_orders):
+        mt.return_value.get_orders.return_value = returned_orders
+        client = AlpacaClient(mock_config)
+        return client, mt.return_value
+
+    def _query_status_arg(self, trading_client):
+        """The QueryOrderStatus the wrapper asked Alpaca for."""
+        _, kwargs = trading_client.get_orders.call_args
+        req = kwargs.get('filter') or trading_client.get_orders.call_args.args[0]
+        return req.status
+
+    def test_open_requests_the_open_bucket(self, mock_config):
+        # A resting order in the OPEN bucket has status.value 'accepted',
+        # never 'open'. The old code filtered value == 'open' and dropped it.
+        from alpaca.trading.enums import QueryOrderStatus
+        order = _mock_order("accepted")
+        client, tc = self._client(mock_config=mock_config, returned_orders=[order])
+
+        result = client.get_orders(status='open')
+
+        assert self._query_status_arg(tc) == QueryOrderStatus.OPEN
+        assert len(result) == 1, "an open order must be returned for status='open'"
+        assert result[0]['status'] == 'accepted'
+
+    def test_filled_requests_the_closed_bucket_and_value_filters(self, mock_config):
+        from alpaca.trading.enums import QueryOrderStatus
+        orders = [_mock_order("filled"), _mock_order("expired")]
+        client, tc = self._client(mock_config=mock_config, returned_orders=orders)
+
+        result = client.get_orders(status='filled')
+
+        assert self._query_status_arg(tc) == QueryOrderStatus.CLOSED, \
+            "'filled' lives in the CLOSED bucket — must fetch it, not the open default"
+        assert [o['status'] for o in result] == ['filled'], \
+            "value filter must drop the expired order"
+
+    def test_expired_requests_the_closed_bucket(self, mock_config):
+        from alpaca.trading.enums import QueryOrderStatus
+        orders = [_mock_order("filled"), _mock_order("expired")]
+        client, tc = self._client(mock_config=mock_config, returned_orders=orders)
+
+        result = client.get_orders(status='expired')
+
+        assert self._query_status_arg(tc) == QueryOrderStatus.CLOSED
+        assert [o['status'] for o in result] == ['expired']
+
+    def test_pending_new_requests_the_open_bucket(self, mock_config):
+        from alpaca.trading.enums import QueryOrderStatus
+        client, tc = self._client(
+            mock_config=mock_config, returned_orders=[_mock_order("pending_new")])
+
+        result = client.get_orders(status='pending_new')
+
+        assert self._query_status_arg(tc) == QueryOrderStatus.OPEN
+        assert [o['status'] for o in result] == ['pending_new']
+
+    def test_none_requests_all(self, mock_config):
+        from alpaca.trading.enums import QueryOrderStatus
+        orders = [_mock_order("filled"), _mock_order("accepted")]
+        client, tc = self._client(mock_config=mock_config, returned_orders=orders)
+
+        result = client.get_orders()
+
+        assert self._query_status_arg(tc) == QueryOrderStatus.ALL
+        assert len(result) == 2, "no value filter for status=None"
+
+    def test_closed_token_no_value_filter(self, mock_config):
+        from alpaca.trading.enums import QueryOrderStatus
+        orders = [_mock_order("filled"), _mock_order("expired")]
+        client, tc = self._client(mock_config=mock_config, returned_orders=orders)
+
+        result = client.get_orders(status='closed')
+
+        assert self._query_status_arg(tc) == QueryOrderStatus.CLOSED
+        assert len(result) == 2, "'closed' is a bucket token, not a value filter"
+
+    def test_request_carries_an_explicit_limit(self, mock_config):
+        # ALL/CLOSED must not silently truncate at Alpaca's default page of 50.
+        client, tc = self._client(mock_config=mock_config, returned_orders=[])
+        client.get_orders()
+        _, kwargs = tc.get_orders.call_args
+        req = kwargs.get('filter') or tc.get_orders.call_args.args[0]
+        assert req.limit is not None and req.limit >= 100

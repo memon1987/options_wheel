@@ -10,8 +10,8 @@ from functools import wraps
 
 from alpaca.trading.client import TradingClient
 from alpaca.data import OptionHistoricalDataClient, StockHistoricalDataClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, QueryOrderStatus
 from alpaca.data.requests import StockLatestQuoteRequest, OptionLatestQuoteRequest, OptionChainRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
@@ -628,22 +628,68 @@ class AlpacaClient:
                 'side': side
             }
     
+    # OrderStatus VALUES (order.status.value) that live in Alpaca's "open" query
+    # bucket. Everything else (filled, expired, canceled, rejected, replaced,
+    # done_for_day, stopped) is in the "closed" bucket. Used to route a
+    # specific-value filter to the correct GetOrdersRequest — asking Alpaca for
+    # the wrong bucket is exactly the bug this method fixes: a value-filter that
+    # never fetched the rows it was filtering.
+    _OPEN_STATUS_VALUES = frozenset({
+        'new', 'accepted', 'accepted_for_bidding', 'partially_filled',
+        'pending_new', 'pending_cancel', 'pending_replace', 'pending_review',
+        'held', 'calculated', 'suspended',
+    })
+
     @api_retry
     def get_orders(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get order history.
+        """Get order history, filtered by status.
 
         Args:
-            status: Filter by order status
+            status: One of the Alpaca query tokens ``'open'`` / ``'closed'``, a
+                specific ``OrderStatus`` value (e.g. ``'filled'``,
+                ``'pending_new'``), or ``None`` for all orders.
 
         Returns:
-            List of orders
+            List of order dicts.
+
+        Note:
+            ``status`` is NOT a value-only filter over Alpaca's default page.
+            Alpaca's REST default is ``status=open``, so closed orders (filled,
+            expired) are never returned unless we explicitly request the closed
+            bucket. This method routes the request to the correct
+            ``QueryOrderStatus`` bucket, then value-filters when the caller
+            named a specific status value. ``'open'`` is a *query* token, never
+            an ``OrderStatus`` value — filtering ``status.value == 'open'`` (the
+            prior behaviour) matched nothing.
         """
         try:
-            orders = self.trading_client.get_orders()
-            
+            query_status = QueryOrderStatus.ALL
+            value_filter: Optional[str] = None
+            if status is not None:
+                normalized = status.lower()
+                if normalized == 'open':
+                    query_status = QueryOrderStatus.OPEN
+                elif normalized == 'closed':
+                    query_status = QueryOrderStatus.CLOSED
+                else:
+                    # A specific OrderStatus value — fetch the bucket it lives in,
+                    # then keep only exact matches.
+                    query_status = (
+                        QueryOrderStatus.OPEN
+                        if normalized in self._OPEN_STATUS_VALUES
+                        else QueryOrderStatus.CLOSED
+                    )
+                    value_filter = normalized
+
+            # limit=500 so ALL/CLOSED are not silently truncated at Alpaca's
+            # default page size of 50.
+            orders = self.trading_client.get_orders(
+                filter=GetOrdersRequest(status=query_status, limit=500)
+            )
+
             order_list = []
             for order in orders:
-                if status is None or order.status.value.lower() == status.lower():
+                if value_filter is None or order.status.value.lower() == value_filter:
                     qty = int(order.qty)
                     filled_qty = int(order.filled_qty) if order.filled_qty else 0
                     is_partial_fill = filled_qty > 0 and filled_qty < qty

@@ -256,10 +256,35 @@ class TestWheelEngine:
         ]
         
         self.mock_alpaca.get_positions.return_value = positions_with_options
-        
+
         has_position = self.wheel_engine._has_existing_position('AAPL')
         assert has_position == True
-    
+
+    def test_stage6_check2_blocks_on_resting_open_order(self):
+        """FC-043: the duplicate guard's Check 2 must block on an open order.
+
+        This is the only duplicate backstop that survives a Cloud Run cold
+        start (Check 1 is in-memory; Check 3 sees only filled positions). Before
+        FC-043, get_orders(status='open') returned [] unconditionally, so this
+        check never fired and the FC-009 duplicate-order window was unguarded.
+        """
+        self.wheel_engine._pending_underlyings = set()  # Check 1 empty
+        self.mock_alpaca.get_positions.return_value = []  # Check 3 empty
+
+        def orders_by_status(status=None):
+            if status == 'open':
+                return [{
+                    'symbol': 'AMD250815P00150000',
+                    'order_id': 'ord-1',
+                    'status': 'new',  # an OPEN-bucket value, NOT 'open'
+                }]
+            return []  # pending_new
+        self.mock_alpaca.get_orders.side_effect = orders_by_status
+
+        assert self.wheel_engine._has_existing_option_position('AMD') is True
+        # A different underlying with no resting order is not blocked by Check 2.
+        assert self.wheel_engine._has_existing_option_position('MSFT') is False
+
     def test_get_strategy_status(self):
         """Test getting strategy status summary."""
         status = self.wheel_engine.get_strategy_status()
