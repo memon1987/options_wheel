@@ -578,7 +578,7 @@ Two defects:
 
 ### FC-043: `AlpacaClient.get_orders` status filter has never worked
 
-**Status:** Plan published
+**Status:** Done — merged (PR #51, `7e71f69`)
 **Size estimate:** S (one wrapper function; live-behavior change)
 **Owner:** zeshan + Claude
 **Plan file:** `docs/plans/fc-043.md`
