@@ -624,6 +624,36 @@ Two defects:
 
 ---
 
+### FC-045: `/monitor` misroutes covered calls to put-close logic (`'P' in symbol`)
+
+**Status:** Consideration
+**Size estimate:** S (one expression + test; live behavior path)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `deploy/cloud_run_server.py:688-689` classifies an option position by substring:
+
+```python
+is_put = 'P' in symbol      # evaluated FIRST
+is_call = 'C' in symbol
+```
+
+`symbol` is a full OCC symbol (e.g. `AAPL250815C00185000`), so the ticker's own letters are tested. Any underlying containing `P` matches `is_put`, and because `is_put` is checked first, **every covered call on those symbols is evaluated by `should_close_put_early()` instead of `should_close_call_early()`** and tagged `position_type='PUT'`.
+
+**Affected: 3 of 14 universe symbols — `AAPL`, `SPY`, `PFE`** (two are core holdings). Verified against `config/settings.yaml` 2026-07-28.
+
+**Actual impact today is telemetry, not money — verified, not assumed.** `should_close_put_early` and `should_close_call_early` currently converge: both call `_get_profit_target_for_dte`, which reads the *same* shared config (`profit_taking_dte_bands` / `profit_taking_static_target`) in both classes, and both stop-loss branches are gated off (`use_put_stop_loss: false`, `use_call_stop_loss: false` — FC-010). So the close *decision* is presently identical; what differs is the emitted event (`put_profit_target_reached`) and `position_type`, which mislabels call closes as put closes in the analytics/dashboard attribution for those symbols.
+
+**Latent severity is higher.** The moment `use_call_stop_loss` is re-enabled, or the two profit-target implementations diverge, this becomes a real behavioral bug — misrouted calls would silently consult the *put* stop-loss flag and never trigger call protection. It is a landmine, not just a label.
+
+**Fix:** use the canonical parser — `parse_option_symbol(symbol)['option_type']` (`src/utils/option_symbols.py`, fully-anchored OCC regex). Do not re-implement OCC parsing. Lower-stakes copies of the same substring pattern in `tools/testing/*` can ride along.
+
+**Why filed now:** surfaced during FC-035's plan verification. PR #47 fixed this same defect class inside the (now deleted) poll path via `_classify_order_strategy()`; that fix dies with the branch, but the live `/monitor` instance remains. Same bug family as FC-041 (naked-call guard OCC misparse) and the FC-043 Stage-6 substring over-block — **the third occurrence of substring-matching an OCC symbol**, which argues for a lint/grep guard rather than another one-off fix.
+
+**Links:** `docs/plans/fc-035.md` (where it was found), FC-041, FC-043, `src/utils/option_symbols.py`.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
