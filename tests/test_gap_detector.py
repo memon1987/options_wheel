@@ -217,6 +217,71 @@ class TestGateBehaviorInPercentUnits:
         assert result['can_execute'] is True
 
 
+class TestDegenerateQuoteIsBlocked:
+    """FC-036 review finding: at threshold 999 nothing else catches a bad quote.
+
+    A zero/one-sided IEX quote (routine on a halted or LULD symbol) makes the
+    midpoint ~half of fair value, i.e. a fabricated 50-100% "gap". The armed
+    gate blocked that only as an accident of the 1.5 threshold; during Phase A
+    shadow it would pass and we would sell into a halted market.
+    """
+
+    def _result(self, bid, ask, threshold=999):
+        df = _frame([
+            ("2026-07-27 04:00:00+00:00", 100.00),
+            ("2026-07-28 04:00:00+00:00", 100.00),
+        ])
+        gd, _ = _detector(df, quote={'bid': bid, 'ask': ask}, threshold=threshold)
+        return gd.can_execute_trade(
+            "NVDA", datetime(2026, 7, 28, 13, 35, tzinfo=timezone.utc))
+
+    def test_zero_bid_blocks_even_in_shadow(self):
+        result = self._result(0.0, 100.05)
+        assert result['can_execute'] is False
+        assert result['reason'] == 'bad_quote'
+
+    def test_zero_ask_blocks_even_in_shadow(self):
+        assert self._result(99.95, 0.0)['can_execute'] is False
+
+    def test_both_sides_zero_blocks(self):
+        assert self._result(0.0, 0.0)['can_execute'] is False
+
+    def test_missing_keys_block(self):
+        gd, _ = _detector(
+            _frame([("2026-07-27 04:00:00+00:00", 100.0),
+                    ("2026-07-28 04:00:00+00:00", 100.0)]),
+            quote={}, threshold=999)
+        assert gd.can_execute_trade(
+            "NVDA", datetime(2026, 7, 28, 13, 35, tzinfo=timezone.utc)
+        )['can_execute'] is False
+
+    def test_healthy_quote_still_passes_in_shadow(self):
+        assert self._result(99.95, 100.05)['can_execute'] is True
+
+
+class TestTimezoneFrameSafety:
+    """Taking .date() in the CALLER's frame reintroduces the FC-036 bug.
+
+    An Asia/Tokyo instant equal to 15:00 ET is already 'tomorrow' in Tokyo, so
+    a caller-frame date would let the session's own bar back in.
+    """
+
+    def test_tz_east_of_utc_still_excludes_todays_bar(self):
+        import pytz
+
+        df = _frame([
+            ("2026-07-27 04:00:00+00:00", 196.51),
+            ("2026-07-28 04:00:00+00:00", 197.01),   # today's own bar
+        ])
+        gd, _ = _detector(df)
+        # 15:00 ET on 2026-07-28 == 04:00 JST on 2026-07-29.
+        tokyo = pytz.timezone("Asia/Tokyo")
+        decision = tokyo.localize(datetime(2026, 7, 29, 4, 0))
+
+        assert gd._get_previous_close("NVDA", decision) == 196.51, \
+            "caller-frame date would return 197.01 — the original bug"
+
+
 class TestStage2Untouched:
     """Sentinel: the working control (_detect_current_gap) must not drift."""
 
