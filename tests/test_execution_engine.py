@@ -583,3 +583,56 @@ class TestProducerVocabulary:
                         ("src/strategy/put_seller.py", "'type': 'put'")):
             body = _P(f).read_text()
             assert want in body, f"{f} no longer declares {want}"
+
+
+class TestCommittedSharesCheck:
+    """FC-052: the oversell guard must count only real short CALLS.
+
+    It previously did `'C' in opt_sym` over a hand-rolled underlying, so a
+    short PUT on any ticker containing a "C" counted as a committed call —
+    over-reporting committed shares and starving the call side. Fifth instance
+    of the OCC-substring family (FC-041/043/045/048).
+    """
+
+    def _engine_with(self, positions):
+        alpaca = Mock()
+        alpaca.get_positions.return_value = positions
+        return ExecutionEngine(alpaca, Mock(spec=Config)), alpaca
+
+    def _run_call(self, engine, call_seller):
+        return engine.execute_batch(
+            [{"symbol": "CVX", "option_symbol": "CVX250117C00160000",
+              "strategy": "sell_call", "contracts": 1, "premium": 1.0,
+              "strike_price": 160, "shares_covered": 100,
+              "stock_cost_basis": 150.0}],
+            Mock(spec=PutSeller), call_seller=call_seller)
+
+    def test_a_short_put_on_a_c_ticker_does_not_consume_call_capacity(self):
+        """The bug: CVX...P... contains 'C', so it counted as a committed call."""
+        call_seller = Mock(spec=CallSeller)
+        call_seller.execute_call_sale.return_value = {"success": True, "order_id": "c1"}
+        engine, _ = self._engine_with([
+            {"symbol": "CVX", "qty": "100", "asset_class": "us_equity", "side": "long"},
+            # A short PUT on the same underlying. Not a call; must not commit shares.
+            {"symbol": "CVX250117P00140000", "qty": "-1", "asset_class": "us_option"},
+        ])
+
+        self._run_call(engine, call_seller)
+
+        call_seller.execute_call_sale.assert_called_once(), (
+            "a short PUT consumed the shares backing a legitimate covered call"
+        )
+
+    def test_a_real_short_call_still_consumes_capacity(self):
+        """The guard must keep working: don't over-correct into overselling."""
+        call_seller = Mock(spec=CallSeller)
+        call_seller.execute_call_sale.return_value = {"success": True, "order_id": "c1"}
+        engine, _ = self._engine_with([
+            {"symbol": "CVX", "qty": "100", "asset_class": "us_equity", "side": "long"},
+            # 100 shares already backing a short CALL -> nothing available.
+            {"symbol": "CVX250117C00170000", "qty": "-1", "asset_class": "us_option"},
+        ])
+
+        self._run_call(engine, call_seller)
+
+        call_seller.execute_call_sale.assert_not_called()
