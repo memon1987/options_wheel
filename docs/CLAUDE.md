@@ -203,16 +203,28 @@ Before modifying ANY dashboard or backend component, analyze:
 | Frontend Components | `dashboard/frontend/src/components/*.tsx` | UI display, user experience |
 | Frontend Pages | `dashboard/frontend/src/pages/*.tsx` | Feature functionality |
 
-### Example: Order Status Fix
+### Example: Order Status Display
 
-When fixing order status display from "Accepted" to "Filled/Expired":
+Order status (filled / expired / assigned) is **not** derived from bot logs. It
+comes from Alpaca's account-activities feed, which is authoritative and
+idempotent. Trace a change through these five layers:
 
-1. **Bot Layer**: Add `poll_order_statuses()` to log `order_filled`/`order_expired` events
-2. **BigQuery Layer**: Update `get_recent_trades()` query to join order status events
-3. **Backend Layer**: Ensure new fields (`order_status`, `order_id`) are returned
-4. **Frontend Hooks**: Add `order_status` to TypeScript interface
-5. **Frontend Components**: Update `mapEventToStatus()` to use new `order_status` field
-6. **Verify**: Premium calculations and other metrics remain unaffected
+1. **Ingest Layer**: `src/data/activities_ingestor.py` pulls Alpaca activities
+   (`FILL`, `OPASN`, `OPEXP`, ...) and dedupes on `activity_id`
+2. **BigQuery Layer**: rows land in `options_wheel.trades_from_activities`;
+   `trades_with_outcomes` joins them into per-position outcomes
+3. **Backend Layer**: `dashboard/backend/services/bigquery.py` queries those
+   views — confirm any new field is selected and returned
+4. **Frontend Hooks**: add the field to the TypeScript interface in
+   `dashboard/frontend/src/hooks/useApi.ts`
+5. **Frontend Components**: update the status mapping that renders it
+6. **Verify**: premium calculations and other aggregates are unaffected
+
+**Do not add a bot-side order-status poller.** One existed
+(`poll_order_statuses`) and was deleted in FC-035: it never executed in
+production, nothing read its output, and it would have been a second,
+non-idempotent writer of facts the activities feed already carries. See
+`docs/plans/fc-035.md`.
 
 ### Verification Steps
 

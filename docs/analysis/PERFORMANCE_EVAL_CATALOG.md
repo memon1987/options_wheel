@@ -48,7 +48,7 @@ WHERE event_type = 'early_close_executed' AND limit_price IS NOT NULL
 
 **Hypothesis:** Some positions that hit the profit target would have been more profitable if left to expire worthless (full premium capture).
 
-**Data required:** `order_filled`/`order_expired` events from `poll_order_statuses()`, plus historical position outcomes
+**Data required:** fills and expirations from `options_wheel.trades_from_activities` (FILL rows carry fill price/qty/time; OPEXP rows carry expirations), plus historical position outcomes. (Was blocked on `poll_order_statuses()`, deleted in FC-035 — it never executed; the activities feed is a superset and is authoritative.)
 
 **Query:**
 ```sql
@@ -280,7 +280,7 @@ GROUP BY side
 - Buy orders (closing): fill_price should be at or below limit_price
 - Total slippage in dollars — is it material compared to premium collected?
 
-**Status:** BLOCKED — needs fill_price data (available after Tier 1 deploy + poll_order_statuses)
+**Status:** Data source available — fill price comes from `options_wheel.trades_from_activities` (FILL rows). (Previously blocked on `poll_order_statuses`, deleted in FC-035. Whether this eval is now unblocked end to end is the eval owner's call.)
 
 **Config parameter:** Sell limit offset (currently 95% of mid in put_seller), close limit multiplier
 

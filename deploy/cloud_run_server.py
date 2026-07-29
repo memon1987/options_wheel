@@ -308,20 +308,12 @@ def trigger_strategy():
             opportunity_store = OpportunityStore(config)
 
             # --- Pre-trade housekeeping ---
-            # Poll previous order statuses so we have accurate state before new trades,
-            # then reconcile positions to ensure wheel state matches Alpaca reality.
+            # Reconcile positions so wheel state matches Alpaca reality before
+            # new trades. (The order-status poll that used to run here was
+            # deleted in FC-035: it had never executed, and the authoritative
+            # fill/expiration record comes from the activities ingestor.)
             try:
                 engine = WheelEngine(config)
-
-                poll_stats = engine.poll_order_statuses()
-                log_system_event(
-                    logger,
-                    event_type="pre_trade_order_poll_completed",
-                    status="completed",
-                    orders_checked=poll_stats.get('orders_checked', 0),
-                    filled_logged=poll_stats.get('filled_logged', 0),
-                    expired_logged=poll_stats.get('expired_logged', 0),
-                )
 
                 reconcile_stats = engine.reconcile_positions()
                 log_system_event(
@@ -780,7 +772,8 @@ def monitor_positions():
                                 order_detail = alpaca_client.get_order_by_id(order_id)
                                 fill_price = order_detail.get('filled_avg_price')
                             except Exception:
-                                pass  # Fill price captured later by poll_order_statuses
+                                pass  # Best-effort; authoritative fills come from
+                                #      the activities ingestor (trades_from_activities)
 
                         # Calculate profit/loss percentage
                         unrealized_pl = float(position.get('unrealized_pl', 0))
