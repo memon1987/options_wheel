@@ -23,6 +23,7 @@ sys.path.append('/app/src')
 
 from src.utils.config import Config
 from src.utils.logging_events import log_system_event, log_performance_metric, log_error_event, log_trade_event
+from src.utils.option_symbols import strict_option_type
 
 logger = structlog.get_logger(__name__)
 
@@ -677,9 +678,16 @@ def monitor_positions():
                     symbol = position['symbol']
                     qty = int(position['qty'])
 
-                    # Determine if it's a put or call
-                    is_put = 'P' in symbol
-                    is_call = 'C' in symbol
+                    # FC-045: classify by the OCC contract, not by substring.
+                    # `symbol` is a full OCC symbol, so `'P' in symbol` tested
+                    # the TICKER's own letters: every AAPL, SPY and PFE option
+                    # matched is_put -- and because is_put was checked first,
+                    # covered calls on those three underlyings were evaluated by
+                    # should_close_put_early and tagged position_type='PUT'.
+                    # Same defect family as FC-041/FC-043/FC-048.
+                    opt_type = strict_option_type(symbol)
+                    is_put = opt_type == 'put'
+                    is_call = opt_type == 'call'
 
                     # Check if position should be closed early
                     should_close = False
