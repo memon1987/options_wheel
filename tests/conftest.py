@@ -135,12 +135,12 @@ def test_config_data() -> Dict[str, Any]:
                 'gap_lookback_days': 30,
                 'max_gap_frequency': 0.10,
                 'earnings_avoidance_days': 5,
-                'premarket_gap_threshold': 0.03,
+                'premarket_gap_threshold': 2.0,
                 'market_open_delay_minutes': 15,
                 'max_historical_vol': 0.50,
                 'vol_lookback_days': 20,
                 'quality_gap_threshold': 0.05,
-                'execution_gap_threshold': 0.03,
+                'execution_gap_threshold': 1.5,
                 'execution_gap_lookback_hours': 24
             }
         },
@@ -213,12 +213,12 @@ def mock_config():
     config.gap_lookback_days = 30
     config.max_gap_frequency = 0.10
     config.earnings_avoidance_days = 5
-    config.premarket_gap_threshold = 0.03
+    config.premarket_gap_threshold = 2.0
     config.market_open_delay_minutes = 15
     config.max_historical_vol = 0.50
     config.vol_lookback_days = 20
     config.quality_gap_threshold = 0.05
-    config.execution_gap_threshold = 0.03
+    config.execution_gap_threshold = 1.5
     config.execution_gap_lookback_hours = 24
 
     # Monitoring settings

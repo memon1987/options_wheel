@@ -526,33 +526,40 @@ class GapDetector:
     def _get_previous_close(self, symbol: str, current_time: datetime) -> Optional[float]:
         """Get previous trading day's closing price.
 
+        Contract: the close of the last trading day **strictly before**
+        ``current_time``'s calendar date; ``None`` if no such bar is available
+        (the caller, ``can_execute_trade``, fails closed on None).
+
         Args:
             symbol: Stock symbol
-            current_time: Current time for reference
+            current_time: Current time for reference (naive or tz-aware)
 
         Returns:
             Previous close price or None
         """
         try:
-            # Look back to find previous trading day
-            lookback_date = current_time - timedelta(days=3)  # Look back 3 days to ensure we get data
-
-            # Get recent stock data
-            df = self.alpaca.get_stock_bars(symbol, days=5)
+            # days=10, not 5: a *calendar*-day lookback of 5 can span 4+
+            # consecutive non-trading days (holiday clusters, emergency
+            # closures) and leave no prior-session bar, which fails closed and
+            # halts trading. 10 spans >=2 sessions for any US closure on record.
+            # Same single API call either way.
+            df = self.alpaca.get_stock_bars(symbol, days=10)
             if df.empty:
                 return None
 
-            # Ensure current_time is timezone-aware for comparison with df.index
-            if current_time.tzinfo is None:
-                import pytz
-                current_time = pytz.UTC.localize(current_time)
-
-            # Find the most recent close before current time
-            recent_data = df[df.index < current_time]
-            if recent_data.empty:
+            # Date-based, not timestamp-based (FC-036): Alpaca stamps daily bars
+            # at midnight ET (04:00/05:00 UTC), so a timestamp comparison admits
+            # the current session's OWN partial bar at any intraday decision
+            # time -- making this return today's close and turning the overnight
+            # gap check into a ~20-minute pre-market drift measurement.
+            # Mirrors _detect_current_gap's pattern (Stage 2).
+            target_date = current_time.date()
+            df_dates = pd.Series([idx.date() for idx in df.index], index=df.index)
+            prior = df.loc[df_dates < target_date]
+            if prior.empty:
                 return None
 
-            return recent_data['close'].iloc[-1]
+            return prior['close'].iloc[-1]
 
         except Exception as e:
             logger.error("Failed to get previous close",

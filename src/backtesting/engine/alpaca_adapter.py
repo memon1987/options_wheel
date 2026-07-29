@@ -46,11 +46,12 @@ class UnsupportedBacktestCall(RuntimeError):
 
 
 # Alpaca stamps daily stock bars at MIDNIGHT ET — 04:00 UTC under EDT, 05:00 UTC
-# under EST. GapDetector's index comparison is sensitive to the stamp, so the
-# adapter reproduces it rather than inventing one. A fixed 04:00 is an hour off
-# for winter dates, which is harmless here because every stamp (04:00 or 05:00)
-# sorts before the 16:00 decision timestamp — the comparison outcome is
-# identical either way. Kept fixed for determinism; revisit only if some caller
+# under EST. The adapter reproduces the live stamp rather than inventing one.
+# A fixed 04:00 is an hour off for winter dates, which is harmless: since FC-036
+# GapDetector compares CALENDAR DATES (``idx.date()``), and both 04:00 and 05:00
+# UTC on trading day D yield date D. (Before FC-036 it compared timestamps, and
+# the stamp is what let the session's own bar pass as "previous close" — see
+# docs/plans/fc-036.md.) Kept fixed for determinism; revisit only if some caller
 # ever depends on the exact hour.
 _BAR_STAMP = time(4, 0)
 
@@ -226,12 +227,15 @@ class BacktestAlpacaClient:
         """Daily OHLCV up to and including the simulated date. Never beyond it.
 
         The index must be tz-aware UTC, exactly like the live client's
-        (``datetime64[ns, UTC]``, bars stamped 04:00 UTC). GapDetector localizes
-        `now` to UTC and does ``df[df.index < current_time]``; a naive index
-        raises "Invalid comparison between dtype=datetime64[ns] and datetime",
-        which GapDetector swallows into "no previous close" and blocks every
-        trade. Mirroring live's stamp also reproduces live's semantics: today's
-        bar sorts before the decision timestamp and is therefore included.
+        (``datetime64[ns, UTC]``, bars stamped 04:00 UTC), so that replay and
+        live derive identical trading dates from the index.
+
+        Since FC-036, GapDetector's ``_get_previous_close`` excludes the
+        decision date's own bar by CALENDAR DATE rather than by timestamp, so
+        replay and live now agree: the previous close is the prior session's.
+        In replay that makes the stage-4 gap a close-to-close measure, while
+        live compares a real-time quote against the same prior close — a
+        documented difference, not a defect (see docs/plans/fc-036.md D3).
 
         ``days`` is a CALENDAR-day lookback, not a bar count — the live client
         builds ``start = end - timedelta(days=days)``. Slicing the last ``days``
