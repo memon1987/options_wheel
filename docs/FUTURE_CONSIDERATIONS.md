@@ -455,7 +455,7 @@ The module `alpaca` is **never imported** in that file — only `QueryOrderStatu
 
 ### FC-036: Stage-4 execution gap check is dead in production
 
-**Status:** Consideration
+**Status:** Done — fix merged unarmed (PR #52, `44159d5`); **arming rejected on evidence**, see `docs/investigations/fc-036-gap-gate-study.md`
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not needed (single-file fix) — but it changes runtime behavior, so branch + PR
