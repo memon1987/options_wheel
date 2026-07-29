@@ -14,7 +14,7 @@ change to `gap_risk_controls` gates on FC-002's own plan plus two adversarial re
 
 > ### ⚠️ Read this before Layer 2: the engine arms are put-only
 >
-> **FC-048** (`c37f777` on main, filed independently while this study was running):
+> **FC-049** (`c37f777` on main, filed independently while this study was running):
 > `ExecutionEngine.execute_batch` routes on `opp.get('type', 'put')`
 > (`src/strategy/execution_engine.py:286`). The live `/scan` path sets `'type': 'call'`
 > (`options_scanner.py:340`); the path the **backtest replays** —
@@ -60,7 +60,7 @@ change to `gap_risk_controls` gates on FC-002's own plan plus two adversarial re
 > contingent and is flagged as such**: its only support is Layer 2, and 78% of its apparent
 > AMD gain is retained stock upside ($34,945 → $37,195 unrealized, against $181 → $688 of
 > option P&L) that a working call path would partly have called away. **Arm (e) must be
-> re-run after FC-048 is fixed before anyone acts on it.** The harness makes that a
+> re-run after FC-049 is fixed before anyone acts on it.** The harness makes that a
 > four-command job.
 >
 > *(This branch is not rebased onto `c37f777`; the finding is incorporated by reference.)*
@@ -85,7 +85,7 @@ FC-036 study, describes the **backtest engine**, not production.
 
 **2. Setting the wiring aside, the filter's premise does not hold in this window — it blocks
 the better days, not the worse ones.** This rests on real fills and on a daily-bar overlay,
-**neither of which involves the engine**, so neither is touched by FC-048. Against the 330 real fills, the
+**neither of which involves the engine**, so neither is touched by FC-049. Against the 330 real fills, the
 123 entries the status-quo rule would have refused earned **$8,691** of realized P&L at
 **$70.66/entry** against **$55.94/entry** for the 204 it would have allowed. Against 2,329
 synthetic daily entries priced from bars and a fill-calibrated IV model, the days it blocks
@@ -118,10 +118,10 @@ on all four symbols, under both IV models, and under ±20% premium scaling.
    blocks 100% of AMD's live window), and it is the leg with the least theoretical
    justification: a >2% overnight move on a 40-vol name is a **typical** day, not a tail.
 3. **The one arm worth carrying forward is (e), graduated response — contingent, and not
-   actionable until FC-048 is fixed.** It is the one arm that improves the engine without
+   actionable until FC-049 is fixed.** It is the one arm that improves the engine without
    removing the control (AMD ROC 210.41% → 229.33%, 9 puts instead of 2). But **its only
    support is Layer 2, which is put-only**, and 78% of that AMD gain is retained stock
-   upside a working call path would partly have called away. Re-run it after FC-048 before
+   upside a working call path would partly have called away. Re-run it after FC-049 before
    acting. Two further limits: its *stated* first option, "half size", **cannot be
    implemented** — `put_seller.py:182` hard-codes `contracts = 1` and there is no half
    contract — so only the delta-band variant was testable; and the graduated response is the
@@ -607,11 +607,11 @@ $119,778 of P&L ($122.97/entry), 1,355 allowed entries carrying $37,992 ($28.04/
 6. **Replay premium is understated ~20%** (median sim/live 0.797,
    [fc-032-parity-check.md](fc-032-parity-check.md)). Layer-2 dollar figures inherit that.
    It is roughly proportional across arms, so differences are more reliable than levels.
-7. **The engine barely trades, and FC-048 is a large part of why.** 1 put on GOOGL, 2–9 on
+7. **The engine barely trades, and FC-049 is a large part of why.** 1 put on GOOGL, 2–9 on
    AMD, 3–8 on IWM over 2.5 years; only NVDA clears the 10-entry bar. The original draft of
    this footer attributed that to stage-6 "already holding", the cost-basis drawdown pause,
    and FC-038's covered-call starvation. Those contribute, but the dominant mechanism is
-   simpler and was visible in this study's own output before FC-048 was filed:
+   simpler and was visible in this study's own output before FC-049 was filed:
    **`calls_sold = 0` in all 36 arms**. Once a symbol is assigned it can never be called
    away, so stage 6 blocks every subsequent put for the rest of the window — GOOGL holds
    shares on 616 of 621 days after its single put. Recorded here as a miss: the evidence was

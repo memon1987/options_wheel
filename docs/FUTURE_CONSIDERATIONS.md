@@ -777,7 +777,9 @@ The backtest replays `run_strategy_cycle()`, which uses the second producer. So 
 
 ---
 
-### FC-048: The stage-2 gap-risk filter is not wired into the live trading path
+### FC-049: The stage-2 gap-risk filter is not wired into the live trading path
+
+*(Renumbered from FC-048 at merge: FC-048 was concurrently allocated on main to the covered-call misroute found by the B2 study. Independent findings — but the same species: a control that looks active and is not.)*
 
 **Status:** Consideration
 **Size estimate:** M
