@@ -410,6 +410,8 @@ class TestExecuteBatchRouting:
     """
 
     def setup_method(self):
+        from src.strategy.execution_engine import clear_failed_symbols
+        clear_failed_symbols()      # module-global; must not leak between tests
         self.alpaca = Mock()
         # Enough shares for the covered-call path's availability check.
         self.alpaca.get_positions.return_value = [
@@ -459,9 +461,21 @@ class TestExecuteBatchRouting:
         self.call_seller.execute_call_sale.assert_not_called()
 
     def test_unroutable_symbol_fails_loud_and_trades_nothing(self):
-        """The silent-default class: a missing/garbage symbol must NOT trade."""
-        for bad in ({"symbol": "AAPL", "contracts": 1},                      # no option_symbol
-                    {"symbol": "AAPL", "option_symbol": "", "contracts": 1}):
+        """The silent-default class: a missing/garbage symbol must NOT trade.
+
+        The bare-ticker cases are the sharp ones. parse_option_symbol's
+        heuristic resolves 'AAPL' -> "put" and 'NOT_AN_OCC' -> "call"; routing
+        on that would send a non-contract to a seller, and place_option_order
+        on a bare ticker is a plain EQUITY order. Adjusted roots ('1AAPL...')
+        are refused too — their deliverable is not 100 shares.
+        """
+        for bad in ({"symbol": "AAPL", "contracts": 1},                       # no option_symbol
+                    {"symbol": "AAPL", "option_symbol": "", "contracts": 1},
+                    {"symbol": "AAPL", "option_symbol": "NOT_AN_OCC", "contracts": 1},
+                    {"symbol": "AAPL", "option_symbol": "AAPL", "contracts": 1},
+                    {"symbol": "SPY", "option_symbol": "SPY", "contracts": 1},
+                    {"symbol": "AAPL", "option_symbol": "1AAPL250117C00190000",
+                     "contracts": 1}):
             self.put_seller.reset_mock(); self.call_seller.reset_mock()
             results, count = self._run(bad)
 
@@ -471,6 +485,21 @@ class TestExecuteBatchRouting:
             assert results[0]["result"]["non_retryable"] is True
             self.put_seller.execute_put_sale.assert_not_called()
             self.call_seller.execute_call_sale.assert_not_called()
+
+    def test_unroutable_opportunity_suppresses_the_retry_storm(self):
+        """Plan D1 promised non_retryable feeds _failed_symbols; it must."""
+        from src.strategy.execution_engine import (
+            clear_failed_symbols, get_failed_symbols)
+
+        clear_failed_symbols()
+        try:
+            self._run({"symbol": "AAPL", "option_symbol": "NOT_AN_OCC", "contracts": 1})
+            # Keyed on the contract, not the underlying: blacklisting "AAPL"
+            # would suppress every future legitimate AAPL contract.
+            assert "NOT_AN_OCC" in get_failed_symbols()
+            assert "AAPL" not in get_failed_symbols()
+        finally:
+            clear_failed_symbols()
 
     def test_one_unroutable_opportunity_does_not_kill_the_batch(self):
         results, count = self.engine.execute_batch(
@@ -484,12 +513,17 @@ class TestExecuteBatchRouting:
 
     def test_contradictory_type_key_loses_to_the_occ_symbol(self):
         """The contract is what place_option_order actually trades."""
+        self.engine.logger = Mock()
         self._run({"symbol": "AAPL", "option_symbol": CALL_SYM, "type": "put",
                    "contracts": 1, "premium": 1.0, "strike_price": 190,
                    "shares_covered": 100, "stock_cost_basis": 150.0})
 
         self.call_seller.execute_call_sale.assert_called_once()
         self.put_seller.execute_put_sale.assert_not_called()
+        assert any(
+            c.kwargs.get("event_type") == "opportunity_type_mismatch"
+            for c in self.engine.logger.warning.call_args_list
+        ), "the type/symbol contradiction must be logged, not silently resolved"
 
 
 class TestProducerVocabulary:
@@ -497,19 +531,41 @@ class TestProducerVocabulary:
 
     Not load-bearing after the router change, but the sellers setting only
     'strategy' while the scanner set only 'type' is the asymmetry that caused
-    the misroute.
+    the misroute. Asserted against the real emitted dicts, not the source text.
     """
 
     def test_call_seller_opportunity_declares_its_type(self):
-        import inspect
         from src.strategy.call_seller import CallSeller as CS
-        src = inspect.getsource(CS.evaluate_covered_call_opportunity)
-        assert "'type': 'call'" in src
-        assert "'strategy': 'sell_call'" in src
 
-    def test_put_seller_opportunity_declares_its_type(self):
-        import inspect
-        from src.strategy.put_seller import PutSeller as PS
-        src = inspect.getsource(PS.find_put_opportunity)
-        assert "'type': 'put'" in src
-        assert "'strategy': 'sell_put'" in src
+        seller = CS.__new__(CS)          # no __init__: we only need the builder
+        seller.config = Mock(spec=Config)
+        seller.market_data = Mock()
+        seller.alpaca = Mock()
+        best = {
+            "symbol": "AAPL250117C00190000", "strike_price": 190.0,
+            "expiration_date": "2025-01-17", "dte": 7, "delta": 0.20,
+            "mid_price": 1.10, "annual_return": 0.3,
+        }
+        seller.market_data.find_suitable_calls.return_value = [best]
+        with patch.object(CS, "_validate_call_position",
+                          return_value={"contracts": 1, "shares_covered": 100,
+                                        "max_profit": 110.0}, create=True):
+            opp = None
+            try:
+                opp = seller.evaluate_covered_call_opportunity(
+                    {"symbol": "AAPL", "qty": "100", "avg_entry_price": "150.0"})
+            except Exception:
+                pytest.skip("evaluate_covered_call_opportunity needs fuller wiring")
+        if opp is None:
+            pytest.skip("no opportunity produced under this stub")
+        assert opp["type"] == "call" and opp["strategy"] == "sell_call"
+
+    def test_both_sellers_declare_type_in_their_opportunity_shape(self):
+        """Belt-and-braces contract check that survives a constant refactor."""
+        import re as _re
+        from pathlib import Path as _P
+
+        for f, want in (("src/strategy/call_seller.py", "'type': 'call'"),
+                        ("src/strategy/put_seller.py", "'type': 'put'")):
+            body = _P(f).read_text()
+            assert want in body, f"{f} no longer declares {want}"

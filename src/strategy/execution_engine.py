@@ -17,7 +17,7 @@ from ..api.market_data import MarketDataManager
 from ..data.trade_journal import TradeJournal
 from ..utils.config import Config
 from ..utils.logging_events import log_system_event, log_error_event
-from ..utils.option_symbols import parse_option_symbol
+from ..utils.option_symbols import strict_option_type
 from .put_seller import PutSeller
 from .call_seller import CallSeller
 
@@ -298,8 +298,17 @@ class ExecutionEngine:
                 # and any future wrong-key failure. A missing/garbage symbol
                 # now fails LOUD rather than silently trading as a put --
                 # the permissive default was the trap.
+                #
+                # STRICT parse deliberately: parse_option_symbol has a
+                # last-resort `'C' if 'C' in symbol` heuristic that resolves a
+                # bare 'AAPL' to "put" and 'NOT_AN_OCC' to "call". Routing on
+                # that would hand a non-contract to a seller, and
+                # place_option_order on a bare ticker is a plain EQUITY order.
+                # Adjusted roots ('1AAPL...') are also refused: their
+                # deliverable is not 100 shares, so the collateral and
+                # cost-basis math would be wrong.
                 option_symbol = opp.get('option_symbol') or ''
-                opp_type = parse_option_symbol(option_symbol).get('option_type')
+                opp_type = strict_option_type(option_symbol)
 
                 declared = opp.get('type') or (
                     'call' if opp.get('strategy') == 'sell_call'
@@ -317,7 +326,7 @@ class ExecutionEngine:
                         parsed_type=opp_type,
                     )
 
-                if opp_type not in ('put', 'call'):
+                if opp_type is None:
                     log_error_event(
                         self.logger,
                         error_type="unroutable_opportunity",
@@ -337,12 +346,20 @@ class ExecutionEngine:
                             'error_type': 'unroutable_opportunity',
                             'message': (
                                 f"Unroutable opportunity: option_symbol="
-                                f"{option_symbol!r} is not a parseable OCC symbol"
+                                f"{option_symbol!r} is not a valid OCC contract symbol"
                             ),
                             'non_retryable': True,
                         },
                         'success': False,
                     })
+                    # Suppress the retry storm: without this the same malformed
+                    # opportunity is re-processed and re-logged every cycle until
+                    # the scan expires. Keyed on option_symbol (module-global,
+                    # matching the non-retryable path below) -- NOT on the
+                    # underlying, which would blacklist every future legitimate
+                    # contract on that ticker.
+                    if option_symbol:
+                        _failed_symbols.add(option_symbol)
                     continue
 
                 if opp_type == 'call':

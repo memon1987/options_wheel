@@ -35,6 +35,13 @@ _REASONS = {
     "position_size_validation_failed": "position sizing (stage 8)",
     "put_blocked_by_wheel_state": "wheel state (stage 5)",
     "covered_call_drawdown_pause": "drawdown pause (cost-basis floor)",
+    # Execution-stage failures (FC-048). Without these the tally cannot see an
+    # opportunity that was found and ranked but died at the router or in the
+    # wrong seller -- which is exactly how the covered-call misroute stayed
+    # invisible: every call was rejected here and nothing counted it.
+    "unroutable_opportunity": "unroutable opportunity (execution)",
+    "call_rejected_by_put_seller": "wrong_seller: call sent to put_seller (execution)",
+    "put_rejected_by_call_seller": "wrong_seller: put sent to call_seller (execution)",
 }
 
 
