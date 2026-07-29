@@ -17,7 +17,7 @@ from ..api.market_data import MarketDataManager
 from ..data.trade_journal import TradeJournal
 from ..utils.config import Config
 from ..utils.logging_events import log_system_event, log_error_event
-from ..utils.option_symbols import strict_option_type
+from ..utils.option_symbols import parse_option_symbol, strict_option_type
 from .put_seller import PutSeller
 from .call_seller import CallSeller
 
@@ -401,13 +401,19 @@ class ExecutionEngine:
                             if (pos.get('asset_class') == 'us_option'
                                     and float(pos.get('qty', 0)) < 0):  # short option
                                 opt_sym = pos.get('symbol', '')
-                                # Check if it's a call on the same underlying
-                                opt_underlying = ''
-                                for ch in opt_sym:
-                                    if ch.isdigit():
-                                        break
-                                    opt_underlying += ch
-                                if opt_underlying == underlying and 'C' in opt_sym:
+                                # FC-052: parse the contract once, strictly.
+                                # This was `'C' in opt_sym` over a hand-rolled
+                                # underlying (chars up to the first digit) --
+                                # the fifth instance of the OCC-substring family
+                                # (FC-041/043/045/048). A short PUT on any
+                                # ticker containing a "C" counted as a committed
+                                # call, over-reporting committed shares and
+                                # silently starving the call side. Latent today
+                                # (no configured symbol contains a C) but it
+                                # fires the moment one is added.
+                                parsed = parse_option_symbol(opt_sym)
+                                if (parsed.get('underlying') == underlying
+                                        and strict_option_type(opt_sym) == 'call'):
                                     committed_shares += abs(int(float(pos.get('qty', 0)))) * 100
 
                         available_shares = owned_shares - committed_shares

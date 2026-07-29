@@ -889,6 +889,39 @@ That is a **15x spread across four symbols**, and moneyness explains ~3% of the 
 
 ---
 
+### FC-052: oversell guard counted short PUTs as committed calls (5th OCC-substring instance)
+
+**Status:** Done — fixed in the same PR that filed it
+**Size estimate:** S
+**Owner:** zeshan + Claude
+**Plan file:** not needed (single-file, latent bug, no behavior change for the current universe)
+
+**Problem:** `ExecutionEngine.execute_batch`'s covered-call oversell guard decided "is this short option a call on my underlying?" with two heuristics stacked:
+
+```python
+opt_underlying = ''
+for ch in opt_sym:              # hand-rolled: chars up to the first digit
+    if ch.isdigit(): break
+    opt_underlying += ch
+if opt_underlying == underlying and 'C' in opt_sym:   # substring
+```
+
+A short **put** on any ticker containing a `C` matches `'C' in opt_sym`, so it was counted as a committed call. That over-reports committed shares, under-reports available shares, and **silently starves the call side** — refusing legitimate covered calls with no error, the same signature as the covered-call starvation investigated on 2026-07-18.
+
+**Latent, not firing:** no configured symbol contains a `C` (AAPL, MSFT, GOOGL, AMZN, NVDA, AMD, QQQ, SPY, IWM, UNH, F, PFE, KMI, VZ). It fires the moment one is added — and the failure mode is silence, not an error.
+
+The hand-rolled underlying parser is separately wrong on adjusted roots: `1AAPL250815C00190000` yields `''` (first char is a digit).
+
+**Fifth instance of the OCC-substring family** — FC-041 (naked-call guard), FC-043 (Stage-6 over-block), FC-045 (`/monitor` misroute), FC-048 (execution routing), and now this. FC-048 added the shared `strict_option_type()` primitive precisely so these stop recurring; this converts the last known site.
+
+**Fix:** parse the contract once with the canonical parsers — `parse_option_symbol` for the underlying, `strict_option_type` for the side.
+
+**Tests:** a short put on a C-containing ticker no longer consumes call capacity; a real short call still does (guard not over-corrected into overselling). Mutation-verified — reverting to the substring form fails the first test.
+
+**Links:** FC-041, FC-043, FC-045, FC-048, `docs/investigations/covered-call-starvation-2026-07-18.md`.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
