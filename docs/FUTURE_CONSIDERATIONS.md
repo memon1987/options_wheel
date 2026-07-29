@@ -600,7 +600,7 @@ Two defects:
 
 ### FC-042: Backtest engine follow-on — performance, fidelity, and the filter studies
 
-**Status:** Plan published
+**Status:** Done — all tracks closed (PRs #49/#50/#48/#52/#54/#55/#56). **Surfaced FC-048 + FC-049, both blocking.**
 **Size estimate:** L (tracks are individually S/M)
 **Owner:** zeshan + Claude
 **Plan file:** `docs/plans/fc-042.md`
