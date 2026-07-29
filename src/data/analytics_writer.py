@@ -10,13 +10,17 @@ Manages these tables in the ``options_wheel`` dataset:
   - wheel_cycles  (completed wheel cycles — dashboard now reads from
                    wheel_cycles_from_activities view; this remains as
                    a secondary audit)
-  - order_statuses (fill price tracking — dashboard reads from
-                    trades_with_outcomes; this remains as audit)
-
 Post-FC-012 (2026-04-24) removals:
   - write_scan_result / write_scan_results_batch (never called)
   - write_position_snapshot / write_position_snapshots_batch (migrated
     to equity_history_from_alpaca; per-symbol snapshots dropped)
+
+Post-FC-035 (2026-07-29) removals:
+  - write_order_status + the order_statuses table. Never populated: the
+    poll that fed it ran every /run cycle but its effectful branches
+    never fired (0 events, 0 rows, in ~490 production invocations).
+    Fills/expirations come from the activities ingestor ->
+    trades_from_activities, which is authoritative and idempotent.
 
 Design principles:
   - Graceful no-op if BigQuery is unavailable
@@ -96,28 +100,13 @@ if _HAS_BIGQUERY:
         # position_snapshots: removed in FC-012. PORTFOLIO rows migrated to
         # equity_history_from_alpaca; non-PORTFOLIO rows dropped entirely
         # (frontend never consumed /metrics/stock-snapshots).
-        "order_statuses": [
-            bigquery.SchemaField("timestamp", "TIMESTAMP"),
-            bigquery.SchemaField("order_id", "STRING"),
-            bigquery.SchemaField("client_order_id", "STRING"),
-            bigquery.SchemaField("symbol", "STRING"),
-            bigquery.SchemaField("underlying", "STRING"),
-            bigquery.SchemaField("side", "STRING"),
-            bigquery.SchemaField("order_type", "STRING"),
-            bigquery.SchemaField("status", "STRING", description="filled, expired, canceled, partial"),
-            bigquery.SchemaField("limit_price", "FLOAT"),
-            bigquery.SchemaField("filled_price", "FLOAT"),
-            bigquery.SchemaField("filled_qty", "INTEGER"),
-            bigquery.SchemaField("submitted_at", "TIMESTAMP"),
-            bigquery.SchemaField("filled_at", "TIMESTAMP"),
-        ],
     }
 
 
 class AnalyticsWriter:
     """Write structured analytics data to dedicated BigQuery tables.
 
-    Manages table creation and row insertion for 7 analytics tables
+    Manages table creation and row insertion for 3 analytics tables
     (trades table is handled by the existing TradeJournal).
 
     If BigQuery is unavailable, all write methods are silent no-ops.
@@ -285,34 +274,6 @@ class AnalyticsWriter:
             "duration_days": duration_days,
             "shares": shares,
         })
-
-    def write_order_status(self, *, order_id: str, symbol: str,
-                           status: str, side: str = "",
-                           order_type: str = "", underlying: str = "",
-                           client_order_id: str = "",
-                           limit_price: float = 0,
-                           filled_price: float = 0,
-                           filled_qty: int = 0,
-                           submitted_at: str = "",
-                           filled_at: str = "", **extra) -> None:
-        self._write("order_statuses", {
-            "order_id": order_id,
-            "client_order_id": client_order_id,
-            "symbol": symbol,
-            "underlying": underlying,
-            "side": side,
-            "order_type": order_type,
-            "status": status,
-            "limit_price": limit_price,
-            "filled_price": filled_price,
-            "filled_qty": filled_qty,
-            "submitted_at": submitted_at or None,
-            "filled_at": filled_at or None,
-        })
-
-    # ------------------------------------------------------------------
-    # Query helpers (for dashboard)
-    # ------------------------------------------------------------------
 
     def query(self, table_name: str, query_sql: str) -> List[dict]:
         """Run a query and return results as list of dicts."""

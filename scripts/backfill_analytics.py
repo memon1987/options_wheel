@@ -154,7 +154,7 @@ def main():
         print(f"  Wheel cycles backfilled: {len(rows)} cycles")
 
     print("\nBackfill complete.")
-    print("Note: order_statuses is forward-only; position_snapshots and scans removed in FC-012.")
+    print("Note: order_statuses removed in FC-035; position_snapshots and scans removed in FC-012.")
 
 
 if __name__ == "__main__":

@@ -424,12 +424,14 @@ This is not a data problem (bar coverage was 122/122 for all 14 symbols) and not
 
 ---
 
-### FC-035: `poll_order_statuses` closed-orders fetch has never worked (latent NameError)
+### FC-035: delete the dead `poll_order_statuses` path and the `order_statuses` table
 
-**Status:** Consideration
-**Size estimate:** S
-**Owner:** unassigned
-**Plan file:** not needed (single-file, isolated) — but it *does* change runtime behavior, so branch + PR
+**Status:** Plan published — executing
+**Size estimate:** M (multi-file deletion in live paths + a BigQuery table drop)
+**Owner:** zeshan + Claude
+**Plan file:** `docs/plans/fc-035.md`
+
+**Re-scoped 2026-07-29:** originally "fix a one-line `NameError`." Investigation showed the whole path should be **deleted, not revived** — it has never executed, nothing reads its output, and FC-012 already scheduled the exact `bq rm` this performs. Step 0 gate verified live: **0 rows**, **no views** in `options_wheel` or `options_wheel_logs` reference the table, **no scheduled queries**. PR #47 (which revived it) is closed unmerged. Original problem statement retained below for history.
 
 **Problem / opportunity:** `src/strategy/wheel_engine.py` (~line 698, in `poll_order_statuses`) calls:
 
