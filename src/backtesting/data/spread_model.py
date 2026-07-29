@@ -73,38 +73,123 @@ class SpreadModel:
         return max(0.0, mark - hs), mark + hs
 
     @classmethod
-    def calibrate(cls, samples: list[dict]) -> "SpreadModel":
+    def calibrate(cls, samples: list[dict], *, return_diagnostics: bool = False):
         """Fit a SpreadModel from real live-chain snapshots.
 
         Each sample is a dict with keys ``mark``, ``moneyness``, and observed
         ``half_spread`` (all in dollars/share). We fit ``base_frac`` and
-        ``otm_widening`` by a simple least-squares regression of observed
-        half-spread fraction on moneyness, keeping the structural floor/cheap
-        terms at defaults. Returns the default model unchanged when there are
-        too few samples to fit.
+        ``otm_widening`` by least-squares regression of observed half-spread
+        fraction on moneyness, keeping the structural floor/cheap terms at
+        defaults.
 
-        This is intentionally simple: the goal is a defensible, per-symbol
-        spread level, not a precise microstructure model.
+        Two classes of sample MUST be excluded or the fit is biased, because
+        the linear model is not the data-generating process for them:
+
+        * **Cheap-regime** (``mark < cheap_threshold``): ``half_spread`` adds
+          ``cheap_widening`` for these at prediction time. Leaving them in the
+          fit absorbs that term into the intercept, where it is then applied a
+          second time on evaluation — double-counting.
+        * **Floor-pinned** (``half_spread <= abs_floor``): these are a
+          microstructure constant, not a draw from a fractional process.
+          Dividing a constant by ``mark`` injects spurious mark-dependence,
+          and because they cluster deep OTM they corrupt the slope directly.
+
+        Measured on a real 450-contract chain sample, those exclusions were
+        111 rows (24.7%) and 116 rows (25.8%) respectively — 223 of 450 rows
+        survive. (Raw floor-pinned rows number 190, but 74 of those are also
+        cheap-regime and are counted under that exclusion first.) Including
+        them drove ``base_frac`` to 0.0129 against a 0.05 default — a ~4x
+        tightening of modeled spreads, i.e. an optimistic bias in the delta
+        band the strategy actually trades — and ``otm_widening`` to 0.64
+        against 0.10.
+
+        Args:
+            samples: observed contracts.
+            return_diagnostics: when True, return ``(model, diagnostics)``.
+                Callers intending to COMMIT fitted parameters must use this
+                and check ``diagnostics['usable']`` — a defaulted or clamped
+                result is otherwise indistinguishable from a genuine fit.
+
+        Returns:
+            The fitted model, or ``(model, diagnostics)``. Falls back to the
+            default model whenever the sample cannot support a fit.
         """
-        pts = [
-            (s["moneyness"], s["half_spread"] / s["mark"])
-            for s in samples
-            if s.get("mark", 0) > 0 and s.get("half_spread", 0) >= 0
-        ]
-        if len(pts) < 10:
-            return cls()
+        usable_pts = []
+        n_cheap = n_floor = 0
+        for s in samples:
+            mark = s.get("mark", 0)
+            hs = s.get("half_spread", 0)
+            if mark <= 0 or hs < 0:
+                continue
+            if mark < cls.cheap_threshold:
+                n_cheap += 1
+                continue
+            if hs <= cls.abs_floor + 1e-9:
+                n_floor += 1
+                continue
+            usable_pts.append((s["moneyness"], hs / mark))
 
-        n = len(pts)
-        sx = sum(x for x, _ in pts)
-        sy = sum(y for _, y in pts)
-        sxx = sum(x * x for x, _ in pts)
-        sxy = sum(x * y for x, y in pts)
+        diag = {
+            "n_input": len(samples),
+            "n_used": len(usable_pts),
+            "n_excluded_cheap": n_cheap,
+            "n_excluded_floor": n_floor,
+            "r_squared": None,
+            "moneyness_min": None,
+            "moneyness_max": None,
+            "clamp_hit": False,
+            "usable": False,
+            "reason": "",
+        }
+
+        def _result(model):
+            return (model, diag) if return_diagnostics else model
+
+        if len(usable_pts) < 10:
+            diag["reason"] = (f"only {len(usable_pts)} usable samples after "
+                              f"exclusions (need >= 10) — DEFAULTS RETURNED, "
+                              f"NOT A FIT")
+            return _result(cls())
+
+        n = len(usable_pts)
+        xs = [x for x, _ in usable_pts]
+        sx = sum(xs)
+        sy = sum(y for _, y in usable_pts)
+        sxx = sum(x * x for x, _ in usable_pts)
+        sxy = sum(x * y for x, y in usable_pts)
         denom = n * sxx - sx * sx
         if abs(denom) < 1e-12:
-            return cls()
+            diag["reason"] = ("moneyness has no variation — DEFAULTS RETURNED, "
+                              "NOT A FIT")
+            return _result(cls())
+
         slope = (n * sxy - sx * sy) / denom
         intercept = (sy - slope * sx) / n
-        return cls(
+
+        mean_y = sy / n
+        ss_tot = sum((y - mean_y) ** 2 for _, y in usable_pts)
+        ss_res = sum((y - (intercept + slope * x)) ** 2 for x, y in usable_pts)
+        diag["r_squared"] = (1 - ss_res / ss_tot) if ss_tot > 0 else None
+        diag["moneyness_min"] = min(xs)
+        diag["moneyness_max"] = max(xs)
+        diag["clamp_hit"] = intercept < 0.005 or slope < 0.0
+
+        if diag["clamp_hit"]:
+            diag["reason"] = (f"fit ran off the rails (raw intercept "
+                              f"{intercept:.4f}, slope {slope:.4f}); a clamp "
+                              f"was applied — NOT SAFE TO COMMIT")
+        elif diag["moneyness_min"] > 0.02:
+            diag["reason"] = (f"no observations near the money (min moneyness "
+                              f"{diag['moneyness_min']:.3f}); base_frac is "
+                              f"EXTRAPOLATED, not measured")
+        elif diag["r_squared"] is not None and diag["r_squared"] < 0.30:
+            diag["reason"] = (f"poor fit (R^2 = {diag['r_squared']:.2f}); "
+                              f"moneyness explains little of the spread")
+        else:
+            diag["usable"] = True
+            diag["reason"] = "fit passes basic validity checks"
+
+        return _result(cls(
             base_frac=max(0.005, intercept),
             otm_widening=max(0.0, slope),
-        )
+        ))

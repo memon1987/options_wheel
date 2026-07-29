@@ -87,6 +87,74 @@ class TestSpreadModel:
         assert bid == 0.0
         assert ask > 0.10
 
+    def test_calibrate_excludes_cheap_and_floor_pinned_samples(self):
+        """Both classes bias the fit; including them tightened base_frac ~4x
+        on a real 450-contract sample."""
+        clean = [
+            {"mark": 1.0, "moneyness": mny, "half_spread": (0.03 + 0.2 * mny)}
+            for mny in [0.0, 0.02, 0.04, 0.06, 0.08, 0.10,
+                        0.12, 0.14, 0.16, 0.18, 0.20]
+        ]
+        # cheap-regime rows (mark below cheap_threshold) carry cheap_widening,
+        # which half_spread() adds again at eval time.
+        cheap = [{"mark": 0.25, "moneyness": 0.30, "half_spread": 0.25}] * 20
+        # floor-pinned rows are a constant, not a fraction of mark.
+        floor = [{"mark": 2.0, "moneyness": 0.40, "half_spread": 0.02}] * 20
+
+        fitted, diag = SpreadModel.calibrate(clean + cheap + floor,
+                                             return_diagnostics=True)
+        assert diag["n_excluded_cheap"] == 20
+        assert diag["n_excluded_floor"] == 20
+        assert diag["n_used"] == len(clean)
+        # Recovers the clean generating parameters despite the contamination.
+        assert fitted.base_frac == pytest.approx(0.03, abs=1e-3)
+        assert fitted.otm_widening == pytest.approx(0.2, abs=1e-3)
+        assert diag["usable"] is True
+
+    def test_calibrate_flags_a_clamped_fit_as_unusable(self):
+        """A negative intercept was silently laundered into 0.005 and printed
+        under a CALIBRATED banner."""
+        # ratio = -0.02 + 0.5*moneyness at mark=2.0 -> every half_spread is
+        # comfortably above the $0.02 floor, so nothing is excluded and the
+        # negative intercept genuinely reaches the clamp.
+        samples = [
+            {"mark": 2.0, "moneyness": mny,
+             "half_spread": 2.0 * (-0.02 + 0.5 * mny)}
+            for mny in [0.10, 0.12, 0.14, 0.16, 0.18, 0.20,
+                        0.22, 0.24, 0.26, 0.28, 0.30]
+        ]
+        fitted, diag = SpreadModel.calibrate(samples, return_diagnostics=True)
+        assert diag["n_used"] == 11
+        assert diag["clamp_hit"] is True
+        assert diag["usable"] is False
+        assert "NOT SAFE TO COMMIT" in diag["reason"]
+        assert fitted.base_frac == 0.005  # clamp still applied, but declared
+
+    def test_calibrate_flags_extrapolated_base_frac(self):
+        """base_frac is the value at moneyness=0; with no near-ATM data it is
+        extrapolated, not measured."""
+        samples = [
+            {"mark": 1.0, "moneyness": mny, "half_spread": (0.03 + 0.2 * mny)}
+            for mny in [0.10, 0.11, 0.12, 0.13, 0.14, 0.15,
+                        0.16, 0.17, 0.18, 0.19, 0.20]
+        ]
+        _, diag = SpreadModel.calibrate(samples, return_diagnostics=True)
+        assert diag["usable"] is False
+        assert "EXTRAPOLATED" in diag["reason"]
+
+    def test_calibrate_declares_when_it_returned_defaults(self):
+        """n<10 silently returned defaults that looked like a fit."""
+        fitted, diag = SpreadModel.calibrate(
+            [{"mark": 1.0, "moneyness": 0.01, "half_spread": 0.03}] * 5,
+            return_diagnostics=True)
+        assert fitted == SpreadModel()
+        assert diag["usable"] is False
+        assert "NOT A FIT" in diag["reason"]
+
+    def test_calibrate_default_return_shape_is_unchanged(self):
+        """Existing callers get a bare model, not a tuple."""
+        assert isinstance(SpreadModel.calibrate([]), SpreadModel)
+
     def test_calibrate_fits_or_defaults(self):
         # Too few samples -> defaults.
         assert SpreadModel.calibrate([]) == SpreadModel()
