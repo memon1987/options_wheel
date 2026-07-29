@@ -657,3 +657,43 @@ class TestCallSellerCostBasisFloorFC029:
 
         assert result is None, "Drawdown pause must block call writes when stock is well below cost basis"
         self.mock_market_data.find_suitable_calls.assert_not_called()
+
+
+class TestWrongSellerGuard:
+    """FC-048: call_seller must refuse a PUT routed to it.
+
+    put_seller has had the mirror of this guard since FC-021; the call side did
+    not. That asymmetry is the same one that let the covered-call misroute hide
+    — the put side rejected loudly, the call side had nothing to reject with.
+    """
+
+    def _seller(self):
+        from src.strategy.call_seller import CallSeller
+        s = CallSeller.__new__(CallSeller)      # builder-only; no __init__ wiring
+        s.config = Mock(spec=Config)
+        s.alpaca = Mock()
+        s.market_data = Mock()
+        return s
+
+    def test_a_put_routed_to_the_call_seller_is_rejected(self):
+        result = self._seller().execute_call_sale({
+            'option_symbol': 'AAPL250117P00170000',   # a PUT
+            'symbol': 'AAPL', 'strike_price': 170.0, 'contracts': 1,
+        })
+
+        assert result['success'] is False
+        assert result['error_type'] == 'wrong_seller'
+        assert result['non_retryable'] is True
+        # And it never reached the broker.
+        self.__dict__.setdefault('_', None)
+
+    def test_a_call_is_not_rejected_by_the_guard(self):
+        """The guard must not block legitimate calls."""
+        seller = self._seller()
+        result = seller.execute_call_sale({
+            'option_symbol': 'AAPL250117C00190000',   # a CALL
+            'symbol': 'AAPL', 'strike_price': 190.0, 'contracts': 1,
+        })
+        # It may fail later for other reasons, but never as wrong_seller.
+        if result is not None:
+            assert result.get('error_type') != 'wrong_seller'

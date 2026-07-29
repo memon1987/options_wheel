@@ -82,6 +82,8 @@ class PutSeller:
             opportunity = {
                 'action_type': 'new_position',
                 'strategy': 'sell_put',
+                # FC-048: see call_seller -- both producers now set both keys.
+                'type': 'put',
                 'symbol': symbol,
                 'option_symbol': best_put['symbol'],
                 'strike_price': best_put['strike_price'],

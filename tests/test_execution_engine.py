@@ -6,6 +6,7 @@ from datetime import datetime
 
 from src.strategy.execution_engine import ExecutionEngine
 from src.strategy.put_seller import PutSeller
+from src.strategy.call_seller import CallSeller
 from src.utils.config import Config
 
 
@@ -91,8 +92,8 @@ class TestRankOpportunities:
     def test_sorts_by_roi_descending(self):
         """Test that opportunities are sorted by ROI highest first."""
         opportunities = [
-            {'symbol': 'AAPL', 'strike_price': 170.0, 'premium': 2.50, 'option_symbol': 'A'},
-            {'symbol': 'MSFT', 'strike_price': 380.0, 'premium': 5.00, 'option_symbol': 'B'},
+            {'symbol': 'AAPL', 'strike_price': 170.0, 'premium': 2.50, 'option_symbol': 'AAPL250117P00170000'},
+            {'symbol': 'MSFT', 'strike_price': 380.0, 'premium': 5.00, 'option_symbol': 'MSFT250117P00380000'},
         ]
 
         # AAPL: collateral=17000, premium=250, roi=250/17000=0.0147
@@ -111,8 +112,8 @@ class TestRankOpportunities:
     def test_skips_opportunities_that_fail_sizing(self):
         """Test that opportunities failing position sizing are excluded."""
         opportunities = [
-            {'symbol': 'AAPL', 'strike_price': 170.0, 'premium': 2.50, 'option_symbol': 'A'},
-            {'symbol': 'MSFT', 'strike_price': 380.0, 'premium': 5.00, 'option_symbol': 'B'},
+            {'symbol': 'AAPL', 'strike_price': 170.0, 'premium': 2.50, 'option_symbol': 'AAPL250117P00170000'},
+            {'symbol': 'MSFT', 'strike_price': 380.0, 'premium': 5.00, 'option_symbol': 'MSFT250117P00380000'},
         ]
 
         # First succeeds, second fails sizing
@@ -138,7 +139,7 @@ class TestRankOpportunities:
     def test_adds_mid_price_from_premium(self):
         """Test that premium is copied to mid_price for position sizing."""
         opportunities = [
-            {'symbol': 'AAPL', 'strike_price': 100.0, 'premium': 1.50, 'option_symbol': 'A'},
+            {'symbol': 'AAPL', 'strike_price': 100.0, 'premium': 1.50, 'option_symbol': 'AAPL250117P00170000'},
         ]
 
         self.mock_put_seller._calculate_position_size.return_value = {
@@ -167,13 +168,13 @@ class TestSelectBatch:
         """Test that batch selection stops when buying power exhausted."""
         ranked = [
             {
-                'opportunity': {'symbol': 'AAPL', 'option_symbol': 'A'},
+                'opportunity': {'symbol': 'AAPL', 'option_symbol': 'AAPL250117P00170000'},
                 'collateral': 17000.0,
                 'premium': 250.0,
                 'roi': 0.015,
             },
             {
-                'opportunity': {'symbol': 'MSFT', 'option_symbol': 'B'},
+                'opportunity': {'symbol': 'MSFT', 'option_symbol': 'MSFT250117P00380000'},
                 'collateral': 38000.0,
                 'premium': 500.0,
                 'roi': 0.013,
@@ -229,7 +230,7 @@ class TestSelectBatch:
         """Test when no opportunities fit within buying power."""
         ranked = [
             {
-                'opportunity': {'symbol': 'AAPL', 'option_symbol': 'A'},
+                'opportunity': {'symbol': 'AAPL', 'option_symbol': 'AAPL250117P00170000'},
                 'collateral': 17000.0,
                 'premium': 250.0,
                 'roi': 0.015,
@@ -245,19 +246,19 @@ class TestSelectBatch:
         """Test selecting opportunities across different underlyings."""
         ranked = [
             {
-                'opportunity': {'symbol': 'AAPL', 'option_symbol': 'A'},
+                'opportunity': {'symbol': 'AAPL', 'option_symbol': 'AAPL250117P00170000'},
                 'collateral': 10000.0,
                 'premium': 200.0,
                 'roi': 0.020,
             },
             {
-                'opportunity': {'symbol': 'MSFT', 'option_symbol': 'B'},
+                'opportunity': {'symbol': 'MSFT', 'option_symbol': 'MSFT250117P00380000'},
                 'collateral': 10000.0,
                 'premium': 180.0,
                 'roi': 0.018,
             },
             {
-                'opportunity': {'symbol': 'GOOGL', 'option_symbol': 'C'},
+                'opportunity': {'symbol': 'GOOGL', 'option_symbol': 'GOOGL250117P00150000'},
                 'collateral': 10000.0,
                 'premium': 150.0,
                 'roi': 0.015,
@@ -289,8 +290,8 @@ class TestExecuteBatch:
         }
 
         opportunities = [
-            {'symbol': 'AAPL', 'option_symbol': 'A', 'contracts': 1, 'premium': 2.5, 'strike_price': 170},
-            {'symbol': 'MSFT', 'option_symbol': 'B', 'contracts': 1, 'premium': 5.0, 'strike_price': 380},
+            {'symbol': 'AAPL', 'option_symbol': 'AAPL250117P00170000', 'contracts': 1, 'premium': 2.5, 'strike_price': 170},
+            {'symbol': 'MSFT', 'option_symbol': 'MSFT250117P00380000', 'contracts': 1, 'premium': 5.0, 'strike_price': 380},
         ]
 
         results, trades_count = self.engine.execute_batch(
@@ -310,9 +311,9 @@ class TestExecuteBatch:
         ]
 
         opportunities = [
-            {'symbol': 'AAPL', 'option_symbol': 'A', 'contracts': 1, 'premium': 2.5, 'strike_price': 170},
-            {'symbol': 'MSFT', 'option_symbol': 'B', 'contracts': 1, 'premium': 5.0, 'strike_price': 380},
-            {'symbol': 'GOOGL', 'option_symbol': 'C', 'contracts': 1, 'premium': 3.0, 'strike_price': 150},
+            {'symbol': 'AAPL', 'option_symbol': 'AAPL250117P00170000', 'contracts': 1, 'premium': 2.5, 'strike_price': 170},
+            {'symbol': 'MSFT', 'option_symbol': 'MSFT250117P00380000', 'contracts': 1, 'premium': 5.0, 'strike_price': 380},
+            {'symbol': 'GOOGL', 'option_symbol': 'GOOGL250117P00150000', 'contracts': 1, 'premium': 3.0, 'strike_price': 150},
         ]
 
         results, trades_count = self.engine.execute_batch(
@@ -333,8 +334,8 @@ class TestExecuteBatch:
         ]
 
         opportunities = [
-            {'symbol': 'AAPL', 'option_symbol': 'A', 'contracts': 1, 'premium': 2.5, 'strike_price': 170},
-            {'symbol': 'MSFT', 'option_symbol': 'B', 'contracts': 1, 'premium': 5.0, 'strike_price': 380},
+            {'symbol': 'AAPL', 'option_symbol': 'AAPL250117P00170000', 'contracts': 1, 'premium': 2.5, 'strike_price': 170},
+            {'symbol': 'MSFT', 'option_symbol': 'MSFT250117P00380000', 'contracts': 1, 'premium': 5.0, 'strike_price': 380},
         ]
 
         results, trades_count = self.engine.execute_batch(
@@ -365,8 +366,8 @@ class TestExecuteBatch:
         }
 
         opportunities = [
-            {'symbol': 'AAPL', 'option_symbol': 'A', 'contracts': 1, 'premium': 2.5, 'strike_price': 170},
-            {'symbol': 'MSFT', 'option_symbol': 'B', 'contracts': 1, 'premium': 5.0, 'strike_price': 380},
+            {'symbol': 'AAPL', 'option_symbol': 'AAPL250117P00170000', 'contracts': 1, 'premium': 2.5, 'strike_price': 170},
+            {'symbol': 'MSFT', 'option_symbol': 'MSFT250117P00380000', 'contracts': 1, 'premium': 5.0, 'strike_price': 380},
         ]
 
         results, trades_count = self.engine.execute_batch(
@@ -385,7 +386,7 @@ class TestExecuteBatch:
         }
 
         opportunities = [
-            {'symbol': 'AAPL', 'option_symbol': 'A', 'contracts': 1, 'premium': 2.5, 'strike_price': 170},
+            {'symbol': 'AAPL', 'option_symbol': 'AAPL250117P00170000', 'contracts': 1, 'premium': 2.5, 'strike_price': 170},
         ]
 
         self.engine.execute_batch(opportunities, self.mock_put_seller)
@@ -393,3 +394,192 @@ class TestExecuteBatch:
         self.mock_put_seller.execute_put_sale.assert_called_once_with(
             opportunities[0], skip_buying_power_check=False
         )
+
+
+PUT_SYM = "AAPL250117P00170000"
+CALL_SYM = "AAPL250117C00190000"
+
+
+class TestExecuteBatchRouting:
+    """FC-048: routing is derived from the OCC symbol, not from a dict key.
+
+    The bug: `opp.get('type', 'put')`. Only the scanner sets 'type'; the sellers
+    set 'strategy'. So every seller-produced covered call defaulted to "put",
+    went to put_seller, and was rejected — which is why every backtest modelled
+    a put-only wheel while looking healthy.
+    """
+
+    def setup_method(self):
+        from src.strategy.execution_engine import clear_failed_symbols
+        clear_failed_symbols()      # module-global; must not leak between tests
+        self.alpaca = Mock()
+        # Enough shares for the covered-call path's availability check.
+        self.alpaca.get_positions.return_value = [
+            {"symbol": "AAPL", "qty": "500", "asset_class": "us_equity", "side": "long"}
+        ]
+        self.engine = ExecutionEngine(self.alpaca, Mock(spec=Config))
+        self.put_seller = Mock(spec=PutSeller)
+        self.call_seller = Mock(spec=CallSeller)
+        self.put_seller.execute_put_sale.return_value = {"success": True, "order_id": "p1"}
+        self.call_seller.execute_call_sale.return_value = {"success": True, "order_id": "c1"}
+
+    def _run(self, opp):
+        return self.engine.execute_batch([opp], self.put_seller, call_seller=self.call_seller)
+
+    def test_seller_shaped_call_without_type_key_routes_to_call(self):
+        """THE FC-048 REGRESSION. Fails on the old code: defaults to 'put'."""
+        self._run({"symbol": "AAPL", "option_symbol": CALL_SYM, "strategy": "sell_call",
+                   "contracts": 1, "premium": 1.0, "strike_price": 190,
+                   "shares_covered": 100, "stock_cost_basis": 150.0})
+
+        self.call_seller.execute_call_sale.assert_called_once()
+        self.put_seller.execute_put_sale.assert_not_called()
+
+    def test_scanner_shaped_call_still_routes_to_call(self):
+        """Production /run executes scanner-shaped dicts — must not change."""
+        self._run({"symbol": "AAPL", "option_symbol": CALL_SYM, "type": "call",
+                   "contracts": 1, "premium": 1.0, "strike_price": 190,
+                   "shares_covered": 100, "stock_cost_basis": 150.0})
+
+        self.call_seller.execute_call_sale.assert_called_once()
+        self.put_seller.execute_put_sale.assert_not_called()
+
+    def test_scanner_shaped_put_routes_to_put_with_bp_check(self):
+        self._run({"symbol": "AAPL", "option_symbol": PUT_SYM, "type": "put",
+                   "contracts": 1, "premium": 2.5, "strike_price": 170})
+
+        self.put_seller.execute_put_sale.assert_called_once()
+        assert self.put_seller.execute_put_sale.call_args.kwargs[
+            "skip_buying_power_check"] is False
+        self.call_seller.execute_call_sale.assert_not_called()
+
+    def test_seller_shaped_put_routes_to_put(self):
+        self._run({"symbol": "AAPL", "option_symbol": PUT_SYM, "strategy": "sell_put",
+                   "contracts": 1, "premium": 2.5, "strike_price": 170})
+
+        self.put_seller.execute_put_sale.assert_called_once()
+        self.call_seller.execute_call_sale.assert_not_called()
+
+    def test_unroutable_symbol_fails_loud_and_trades_nothing(self):
+        """The silent-default class: a missing/garbage symbol must NOT trade.
+
+        The bare-ticker cases are the sharp ones. parse_option_symbol's
+        heuristic resolves 'AAPL' -> "put" and 'NOT_AN_OCC' -> "call"; routing
+        on that would send a non-contract to a seller, and place_option_order
+        on a bare ticker is a plain EQUITY order. Adjusted roots ('1AAPL...')
+        are refused too — their deliverable is not 100 shares.
+        """
+        for bad in ({"symbol": "AAPL", "contracts": 1},                       # no option_symbol
+                    {"symbol": "AAPL", "option_symbol": "", "contracts": 1},
+                    {"symbol": "AAPL", "option_symbol": "NOT_AN_OCC", "contracts": 1},
+                    {"symbol": "AAPL", "option_symbol": "AAPL", "contracts": 1},
+                    {"symbol": "SPY", "option_symbol": "SPY", "contracts": 1},
+                    {"symbol": "AAPL", "option_symbol": "1AAPL250117C00190000",
+                     "contracts": 1}):
+            self.put_seller.reset_mock(); self.call_seller.reset_mock()
+            results, count = self._run(bad)
+
+            assert count == 0
+            assert results[0]["success"] is False
+            assert results[0]["result"]["error_type"] == "unroutable_opportunity"
+            assert results[0]["result"]["non_retryable"] is True
+            self.put_seller.execute_put_sale.assert_not_called()
+            self.call_seller.execute_call_sale.assert_not_called()
+
+    def test_unroutable_opportunity_suppresses_the_retry_storm(self):
+        """Plan D1 promised non_retryable feeds _failed_symbols; it must."""
+        from src.strategy.execution_engine import (
+            clear_failed_symbols, get_failed_symbols)
+
+        clear_failed_symbols()
+        try:
+            self._run({"symbol": "AAPL", "option_symbol": "NOT_AN_OCC", "contracts": 1})
+            # Keyed on the contract, not the underlying: blacklisting "AAPL"
+            # would suppress every future legitimate AAPL contract.
+            assert "NOT_AN_OCC" in get_failed_symbols()
+            assert "AAPL" not in get_failed_symbols()
+        finally:
+            clear_failed_symbols()
+
+    def test_one_unroutable_opportunity_does_not_kill_the_batch(self):
+        results, count = self.engine.execute_batch(
+            [{"symbol": "AAPL", "option_symbol": "", "contracts": 1},
+             {"symbol": "AAPL", "option_symbol": PUT_SYM, "strategy": "sell_put",
+              "contracts": 1, "premium": 2.5, "strike_price": 170}],
+            self.put_seller, call_seller=self.call_seller)
+
+        assert len(results) == 2 and count == 1
+        self.put_seller.execute_put_sale.assert_called_once()
+
+    def test_contradictory_type_key_loses_to_the_occ_symbol(self):
+        """The contract is what place_option_order actually trades."""
+        self.engine.logger = Mock()
+        self._run({"symbol": "AAPL", "option_symbol": CALL_SYM, "type": "put",
+                   "contracts": 1, "premium": 1.0, "strike_price": 190,
+                   "shares_covered": 100, "stock_cost_basis": 150.0})
+
+        self.call_seller.execute_call_sale.assert_called_once()
+        self.put_seller.execute_put_sale.assert_not_called()
+        assert any(
+            c.kwargs.get("event_type") == "opportunity_type_mismatch"
+            for c in self.engine.logger.warning.call_args_list
+        ), "the type/symbol contradiction must be logged, not silently resolved"
+
+
+class TestProducerVocabulary:
+    """Both producers must set both keys (FC-048 D2).
+
+    Not load-bearing after the router change, but the sellers setting only
+    'strategy' while the scanner set only 'type' is the asymmetry that caused
+    the misroute. Asserted against the real emitted dicts, not the source text.
+    """
+
+    def test_call_seller_opportunity_declares_its_type(self):
+        """Assert the REAL emitted dict, not the source text.
+
+        The first version of this test stubbed the seller so loosely that
+        _resolve_cost_basis_floor found nothing, evaluate_covered_call_opportunity
+        returned None, and the test skipped on every run — coverage that never
+        executed. Patch the floor so the builder actually reaches its return.
+        """
+        from src.strategy.call_seller import CallSeller as CS
+
+        seller = CS.__new__(CS)          # builder-only; no __init__ wiring
+        seller.config = Mock(spec=Config)
+        seller.config.call_drawdown_pause_threshold = 0.05
+        seller.market_data = Mock()
+        seller.alpaca = Mock()
+        # Spot above the 150 basis so the FC-029 drawdown pause does not fire.
+        seller.alpaca.get_stock_quote.return_value = {"bid": 160.0, "ask": 160.10}
+        seller.wheel_state = None
+        seller.market_data.find_suitable_calls.return_value = [{
+            "symbol": "AAPL250117C00190000", "strike_price": 190.0,
+            "expiration_date": "2025-01-17", "dte": 7, "delta": 0.20,
+            "mid_price": 1.10, "annual_return": 0.3,
+        }]
+
+        with patch.object(CS, "_resolve_cost_basis_floor", return_value=150.0), \
+             patch.object(CS, "_calculate_call_position",
+                          return_value={"contracts": 1, "shares_covered": 100,
+                                        "max_profit": 110.0,
+                                        "current_stock_price": 160.05,
+                                        "total_return_if_called": 0.07}):
+            opp = seller.evaluate_covered_call_opportunity(
+                {"symbol": "AAPL", "qty": "100", "avg_entry_price": "150.0"})
+
+        assert opp is not None, (
+            "builder returned None — the stub is too loose again; this test "
+            "must ASSERT, never skip"
+        )
+        assert opp["type"] == "call"
+        assert opp["strategy"] == "sell_call"
+
+    def test_both_sellers_declare_type_in_their_opportunity_shape(self):
+        """Belt-and-braces contract check that survives a constant refactor."""
+        import re as _re
+        from pathlib import Path as _P
+
+        for f, want in (("src/strategy/call_seller.py", "'type': 'call'"),
+                        ("src/strategy/put_seller.py", "'type': 'put'")):
+            body = _P(f).read_text()
+            assert want in body, f"{f} no longer declares {want}"

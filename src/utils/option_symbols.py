@@ -224,6 +224,32 @@ class OptionSymbolGenerator:
             return False
 
 
+# Fully-anchored OCC contract symbol: ROOT + YYMMDD + C/P + STRIKE*1000.
+# Deliberately strict — no adjusted roots (leading digits), no dotted tickers.
+OCC_STRICT_RE = re.compile(r'^([A-Z]{1,6})(\d{6})([PC])(\d{8})$')
+
+
+def strict_option_type(option_symbol: str) -> Optional[str]:
+    """``'put'`` / ``'call'`` from a fully-anchored OCC symbol, else ``None``.
+
+    Use this — never ``parse_option_symbol`` — when the answer decides *which
+    order gets placed*. ``parse_option_symbol`` has a last-resort heuristic
+    (``'C' if 'C' in symbol``) for tolerating messy historical input, which is
+    the substring-matching family behind FC-041/FC-043/FC-045. It resolves a
+    bare ``'AAPL'`` to ``'put'`` and ``'NOT_AN_OCC'`` to ``'call'`` — routing on
+    that would hand a non-contract to a seller and place a plain equity order.
+
+    Returns None for anything that is not an exact OCC contract symbol, so the
+    caller must decide explicitly what to do rather than inheriting a guess.
+    """
+    if not isinstance(option_symbol, str):
+        return None
+    m = OCC_STRICT_RE.match(option_symbol.strip().upper())
+    if not m:
+        return None
+    return 'call' if m.group(3) == 'C' else 'put'
+
+
 def parse_option_symbol(option_symbol: str, underlying_hint: Optional[str] = None) -> Dict[str, Any]:
     """Parse an OCC-format option symbol into its components.
 
