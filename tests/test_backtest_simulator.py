@@ -129,6 +129,35 @@ def falling_then_flat():
     return days, closes, expirations
 
 
+@pytest.fixture
+def dip_then_recovering():
+    """Assigns a put, then RECOVERS so the call leg can actually run.
+
+    `falling_then_flat` cannot test the call side and never could: it assigns
+    at ~92 and leaves spot at 70, so the 5% drawdown pause and the cost-basis
+    floor block every covered call *even with correct routing*. That fixture
+    documents the call-refusal path; this one exercises the call-sale path.
+
+    Shape: warm-up flat at 100 -> slide to put the ~8%-OTM strike ITM ->
+    recover to just above cost basis and drift up, so that
+      * spot >= basis, so the drawdown pause does not fire, and
+      * strikes just above basis sit inside call_delta_range [0.15, 0.25], and
+      * a later expiry finishes above the sold strike, so the call assigns.
+    """
+    warmup = _weekdays(date(2024, 3, 25), 45)
+    days = _weekdays(date(2024, 6, 3), 45)
+    closes = {d: 100.0 for d in warmup}
+    for i, d in enumerate(days):
+        if i <= 8:
+            closes[d] = 100.0 - i * 3.0          # 100 -> 76, assigns ~92
+        elif i <= 20:
+            closes[d] = 76.0 + (i - 8) * 1.6     # recover 76 -> ~95
+        else:
+            closes[d] = 95.0 + (i - 20) * 0.9    # drift up through the strike
+    expirations = [d for d in days if d.weekday() == 4]
+    return days, closes, expirations
+
+
 def _simulator(symbol, closes, expirations, days, **kw):
     provider = ScriptedProvider(symbol, closes, expirations)
     builder = ChainBuilder(provider, risk_free_rate=0.04)
@@ -657,3 +686,71 @@ class TestStage4ExecutionGapGate:
                [(d.day, d.equity) for d in disabled.daily]
         assert shadow.rejections == disabled.rejections
         assert shadow.final_equity == disabled.final_equity
+
+
+class TestTheCallLegActuallyRuns:
+    """FC-048: every backtest before this modelled a put-only wheel.
+
+    Covered-call opportunities carried 'strategy': 'sell_call' but no 'type',
+    and ExecutionEngine routed on `opp.get('type', 'put')` — so every call was
+    handed to put_seller and rejected. No test caught it because the golden
+    fixture could not reach the call path at all.
+    """
+
+    def test_a_covered_call_is_sold_after_assignment(self, dip_then_recovering):
+        days, closes, exps = dip_then_recovering
+        result = _simulator("XYZ", closes, exps, days).run()
+
+        kinds = [e.kind for e in result.broker.ledger]
+        assert "put_assignment" in kinds, f"fixture never assigned; ledger={kinds}"
+        assert "sell_call_open" in kinds, (
+            f"assigned shares but NO covered call was sold — the FC-048 "
+            f"misroute, or a gate blocking the call leg. ledger={kinds}"
+        )
+        # The call must come after the assignment that created the shares.
+        assert kinds.index("sell_call_open") > kinds.index("put_assignment")
+
+    def test_no_call_is_sold_below_cost_basis(self, dip_then_recovering):
+        """Enabling the call leg must not enable selling below basis."""
+        days, closes, exps = dip_then_recovering
+        result = _simulator("XYZ", closes, exps, days).run()
+
+        assigns = [e for e in result.broker.ledger if e.kind == "put_assignment"]
+        calls = [e for e in result.broker.ledger if e.kind == "sell_call_open"]
+        if not (assigns and calls):
+            pytest.skip("covered by test_a_covered_call_is_sold_after_assignment")
+        basis = assigns[0].price
+        for c in calls:
+            strike = float(c.symbol[-8:]) / 1000.0
+            assert strike >= basis, (
+                f"covered call struck at {strike} below cost basis {basis}"
+            )
+
+    def test_no_opportunity_dies_at_the_router(self, dip_then_recovering):
+        """Guards a half-fix: calls found but still rejected at execution."""
+        days, closes, exps = dip_then_recovering
+        result = _simulator("XYZ", closes, exps, days).run()
+
+        bad = {k: v for k, v in result.rejections.items()
+               if "wrong_seller" in k or "unroutable" in k}
+        assert not bad, f"opportunities died at the router: {bad}"
+
+    def test_the_wheel_completes_a_full_cycle(self, dip_then_recovering):
+        """The FC-032-planned golden path, finally real.
+
+        put sold -> assigned -> covered call written -> called away. Before
+        FC-048 the ledger stopped at the assignment on every symbol, in every
+        window, in every backtest this project has ever run.
+        """
+        days, closes, exps = dip_then_recovering
+        result = _simulator("XYZ", closes, exps, days).run()
+
+        kinds = [e.kind for e in result.broker.ledger]
+        for expected in ("sell_put_open", "put_assignment",
+                         "sell_call_open", "call_assignment"):
+            assert expected in kinds, (
+                f"incomplete wheel: {expected!r} missing from ledger={kinds}"
+            )
+        # And in that order.
+        assert (kinds.index("sell_put_open") < kinds.index("put_assignment")
+                < kinds.index("sell_call_open") < kinds.index("call_assignment"))

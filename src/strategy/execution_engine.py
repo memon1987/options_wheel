@@ -17,6 +17,7 @@ from ..api.market_data import MarketDataManager
 from ..data.trade_journal import TradeJournal
 from ..utils.config import Config
 from ..utils.logging_events import log_system_event, log_error_event
+from ..utils.option_symbols import parse_option_symbol
 from .put_seller import PutSeller
 from .call_seller import CallSeller
 
@@ -283,7 +284,66 @@ class ExecutionEngine:
 
         for opp in selected_opportunities:
             try:
-                opp_type = opp.get('type', 'put')
+                # FC-048: route on the OCC symbol, not on a dict key.
+                #
+                # This previously read `opp.get('type', 'put')`. Only the
+                # scanner sets 'type'; the sellers set 'strategy' instead, so
+                # every seller-produced covered call defaulted to "put", was
+                # handed to put_seller, and was rejected by its wrong-seller
+                # guard. That is why every backtest modelled a put-only wheel.
+                #
+                # The OCC symbol is the one field every producer sets and the
+                # only one that cannot drift from the order actually placed, so
+                # routing on it removes both the missing-key failure (this bug)
+                # and any future wrong-key failure. A missing/garbage symbol
+                # now fails LOUD rather than silently trading as a put --
+                # the permissive default was the trap.
+                option_symbol = opp.get('option_symbol') or ''
+                opp_type = parse_option_symbol(option_symbol).get('option_type')
+
+                declared = opp.get('type') or (
+                    'call' if opp.get('strategy') == 'sell_call'
+                    else 'put' if opp.get('strategy') == 'sell_put' else None
+                )
+                if declared and opp_type in ('put', 'call') and declared != opp_type:
+                    # Trust the contract: it is what place_option_order trades.
+                    self.logger.warning(
+                        "Opportunity type contradicts its OCC symbol - routing by symbol",
+                        event_category="trade",
+                        event_type="opportunity_type_mismatch",
+                        symbol=opp.get('symbol'),
+                        option_symbol=option_symbol,
+                        declared_type=declared,
+                        parsed_type=opp_type,
+                    )
+
+                if opp_type not in ('put', 'call'):
+                    log_error_event(
+                        self.logger,
+                        error_type="unroutable_opportunity",
+                        error_message=(
+                            f"Cannot determine option type from option_symbol="
+                            f"{option_symbol!r}; refusing to execute"
+                        ),
+                        component="execution_engine",
+                        recoverable=False,
+                        symbol=opp.get('symbol'),
+                        option_symbol=option_symbol,
+                    )
+                    execution_results.append({
+                        'opportunity': opp,
+                        'result': {
+                            'success': False,
+                            'error_type': 'unroutable_opportunity',
+                            'message': (
+                                f"Unroutable opportunity: option_symbol="
+                                f"{option_symbol!r} is not a parseable OCC symbol"
+                            ),
+                            'non_retryable': True,
+                        },
+                        'success': False,
+                    })
+                    continue
 
                 if opp_type == 'call':
                     # --- Covered call path ---

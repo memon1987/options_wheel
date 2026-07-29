@@ -10,6 +10,7 @@ from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_trade_event, log_error_event, log_position_update
+from ..utils.option_symbols import parse_option_symbol
 
 logger = structlog.get_logger(__name__)
 
@@ -169,6 +170,12 @@ class CallSeller:
             opportunity = {
                 'action_type': 'new_position',
                 'strategy': 'sell_call',
+                # FC-048: the router keys off the OCC symbol, so this is
+                # documentation/telemetry rather than load-bearing -- but the
+                # sellers previously set only 'strategy' while the scanner set
+                # only 'type', and that vocabulary split is what caused the
+                # covered-call misroute. Both producers now speak both.
+                'type': 'call',
                 'symbol': symbol,
                 'option_symbol': best_call['symbol'],
                 'strike_price': best_call['strike_price'],
@@ -288,6 +295,25 @@ class CallSeller:
             Trade execution result
         """
         try:
+            # SAFETY (FC-048): Reject put options that were incorrectly routed
+            # here. Mirrors put_seller.execute_put_sale's guard -- the put side
+            # has had this protection since FC-021 and the call side did not,
+            # which is the same asymmetry that let the misroute go unnoticed.
+            option_symbol = opportunity.get('option_symbol', '')
+            parsed = parse_option_symbol(option_symbol)
+            if parsed.get('option_type') == 'put':
+                logger.warning("Put option incorrectly routed to call_seller - rejecting",
+                              event_category="risk",
+                              event_type="put_rejected_by_call_seller",
+                              symbol=option_symbol,
+                              underlying=parsed.get('underlying'))
+                return {
+                    'success': False,
+                    'error_type': 'wrong_seller',
+                    'message': f'Put option {option_symbol} cannot be executed by call_seller',
+                    'non_retryable': True
+                }
+
             # DEFENSIVE: Final validation before execution - prevent guaranteed losses
             strike_price = opportunity.get('strike_price', 0)
             stock_cost_basis = opportunity.get('stock_cost_basis', 0)
