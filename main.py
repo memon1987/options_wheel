@@ -95,6 +95,12 @@ def main():
         sys.exit(1)
     except Exception as e:
         logger.error("Application failed", event_category="error", event_type="application_failed", error=str(e))
+        # Also surface it on the console. structlog output is easy to miss or
+        # filter, so a failed command otherwise prints its banner and then
+        # nothing -- e.g. `--command backtest` over a stock split printed
+        # "Replaying ..." and exited 1, hiding a diagnostic that names the exact
+        # date to avoid. Console-only; control flow and exit code unchanged.
+        print(f"\n{type(e).__name__}: {e}", file=sys.stderr)
         sys.exit(1)
 
 
