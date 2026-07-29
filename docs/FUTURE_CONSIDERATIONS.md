@@ -859,6 +859,36 @@ Scanner-produced opportunities — the ones production executes — carry **`cos
 
 ---
 
+### FC-051: the spread model needs per-symbol calibration, not a pooled fit
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Context — FC-042 Track C3 is now closed on its measurement half.** The RTH sample that C3 was blocked on has been taken (2026-07-29 11:39 ET, market confirmed open via Alpaca's clock, `--require-rth`): **n=524 OTM puts across AAPL/AMD/IWM/NVDA, median real half-spread $0.0250 vs $0.0614 modeled — 2.46x wider, wider on 86% of contracts.** That **retires** the long-standing caveat: the earlier after-hours sample (2.12x) warned the gap might close intraday, leaving "the model is conservative" unproven. It does not close — intraday the model is *more* conservative, not less. The report footer now states the RTH figure.
+
+**What remains — the model's shape, not its level.** Fitting `SpreadModel` on that same RTH sample yields:
+
+| | value |
+|---|---|
+| R² | **0.027** |
+| samples used | 256 of 524 (121 excluded cheap, 147 at the $0.02 floor) |
+| pooled `base_frac` | 0.0251 (default 0.05) |
+| per-symbol `base_frac` | **AMD 0.0050 · IWM 0.0232 · NVDA 0.0159 · AAPL 0.0773** |
+
+That is a **15x spread across four symbols**, and moneyness explains ~3% of the variance. The tool's own verdict is `NOT USABLE — DO NOT COMMIT`, and no parameters were committed.
+
+**Why a pooled fit cannot work here:** a single `base_frac` averages a $290 ETF (IWM) against a $440 single name (AMD). Half-spread as a *fraction of mark* is not the same quantity across those. Two structural facts the fit surfaces: 28% of contracts sit at the **$0.02 exchange floor** — a constant, not a fraction — and 23% are "cheap" contracts where `cheap_widening` is already applied at eval, so fitting them double-counts it.
+
+**Fix direction:** calibrate per symbol (or per liquidity tier / price bucket), and model the $0.02 floor explicitly rather than letting it distort a proportional fit. Re-check R² per symbol; NVDA already scores `[OK]` alone while the other three do not.
+
+**Why it matters:** every backtest premium is a modeled bid/ask. The *level* is now known to be conservative, so verdicts are not being flattered — this is about narrowing an honest but coarse error bar, not correcting a bias. Lower priority than the FC-048 re-validation.
+
+**Links:** `docs/plans/fc-042.md` (Track C3), `tools/diagnostics/spread_model_check.py`, PR #48.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
