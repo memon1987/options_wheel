@@ -426,7 +426,7 @@ This is not a data problem (bar coverage was 122/122 for all 14 symbols) and not
 
 ### FC-035: delete the dead `poll_order_statuses` path and the `order_statuses` table
 
-**Status:** Plan published — executing
+**Status:** Done — code merged (PR #54, `ceaae16`); **`bq rm` still outstanding (owner)**
 **Size estimate:** M (multi-file deletion in live paths + a BigQuery table drop)
 **Owner:** zeshan + Claude
 **Plan file:** `docs/plans/fc-035.md`
