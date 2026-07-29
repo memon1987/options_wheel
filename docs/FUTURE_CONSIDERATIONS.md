@@ -654,6 +654,57 @@ is_call = 'C' in symbol
 
 ---
 
+### FC-046: `options_wheel_logs.trades_executed` view is unqueryable
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** every query against the live view fails:
+
+```
+Cannot read field of type FLOAT64 as STRING  Field: jsonPayload.symbols
+Cannot read repeated field of type STRING as optional STRING  Field: jsonPayload.symbols
+```
+
+The view selects across the `run_googleapis_com_stderr_*` day-sharded log tables and does `TO_JSON_STRING(jsonPayload)`. `jsonPayload.symbols` has been emitted with **three different shapes** over time (FLOAT64, STRING, REPEATED STRING), so the wildcard union cannot resolve a single type. Reproduced live 2026-07-29: `SELECT COUNT(*) FROM options_wheel_logs.trades_executed` errors.
+
+**Why it matters:** this view is treated in plan docs as a live ad-hoc analysis surface (FC-035's behavior contract reasoned carefully about not polluting it). It has in fact been broken — how long is unknown. Any analysis that assumed it works has been silently unavailable, and the schema-collision class is the same one recorded in the 2026-04-07 session memory ("never string-ify arrays").
+
+**Fix direction:** pin the wildcard union to a consistent projection (extract `symbols` with `JSON_VALUE`/`JSON_QUERY` rather than `TO_JSON_STRING` over the whole payload), or exclude the offending shards. Decide first whether the view is still wanted at all, given the dashboard reads `trades_from_activities`.
+
+**Found:** during FC-035's two-reviewer pass, by a reviewer verifying the deletion had no consumers.
+
+**Links:** `docs/plans/fc-035.md`, FC-012.
+
+---
+
+### FC-047: `log_system_event` never sets `event_type`, so system events are unqueryable by it
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `src/utils/logging_events.py` `log_system_event()` does:
+
+```python
+logger.info(event_type, event_category="system", status=status, ...)
+```
+
+`event_type` is passed as structlog's **positional message**, so it lands in `jsonPayload.event` and `jsonPayload.event_type` is **never set** for any system event. The function's own docstring advertises the opposite, showing `SELECT event_type ... GROUP BY event_type` — a query that returns NULL for every row it produces.
+
+**Confirmed live (2026-07-29):** `pre_trade_reconciliation_completed` has 492 rows, all under `jsonPayload.event`. Two independent FC-035 reviewers each hit this and had to correct their queries mid-review; one nearly concluded the pre-trade housekeeping block had never run.
+
+**Why it matters:** every consumer that filters system events on `event_type` silently matches nothing. This is a monitoring/observability trap of exactly the kind that hid FC-030's alerting problem (an alert filtering `severity>=WARNING` that matched nothing). Any future post-deploy verification keyed on `event_type` will look like a regression.
+
+**Fix direction:** pass `event_type=event_type` as a kwarg (and keep the message for readability). **Check for downstream breakage first** — some views may already compensate by reading `jsonPayload.event`, and setting both could double-count or change existing query results. Contrast with `log_risk_event` / `log_order_status_update`, which set the kwarg correctly; the inconsistency is the real defect.
+
+**Links:** `docs/plans/fc-035.md`, FC-030.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
