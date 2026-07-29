@@ -143,6 +143,13 @@ trade and one component emitted fabricated numbers. Do not reference them.
 The rebuilt engine (FC-032) runs **locally by design**: it replays live strategy
 code over historical Alpaca data and needs no cloud round-trip.
 
+**Read `docs/BACKTEST_ENGINE.md` before quoting any backtest number.** It states what
+the engine measures well, what it does not, and the six things that mislead readers who
+don't know them. Two worth knowing here: the headline "81% strike reproduction" is the
+**put leg only** (the call leg is 55.2%, and prices calls at 0.676 of live), and a symbol
+showing 0% days in position is a **filter** result — 8 of 14 configured symbols currently
+cannot trade at all, for reasons unrelated to symbol quality.
+
 ```bash
 python main.py --command backtest --symbol NVDA --start 2025-10-01 --end 2026-07-01
 python main.py --command screen            # whole universe -> options_wheel.backtest_runs
