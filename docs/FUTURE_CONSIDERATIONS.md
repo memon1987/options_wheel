@@ -972,6 +972,40 @@ elif 'C' in option_symbol: ...    # counts a CALL
 
 ---
 
+### FC-055: the $400 `max_stock_price` ceiling silently excludes 3 of 14 symbols (4 with MSFT)
+
+**Status:** Consideration — **high value, cheap to test**
+**Size estimate:** S to change, M to validate
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Finding:** a full post-FC-048 screen shows **6 of 14 symbols with 0% days in position** — they never opened *any* position. Three of them are blocked at **stage 1** by `max_stock_price: 400.00` (`config/settings.yaml:49`), verified against live quotes on 2026-07-29:
+
+| symbol | spot | over ceiling by |
+|---|---:|---:|
+| SPY | $736.47 | +84% |
+| QQQ | $670.92 | +68% |
+| AMD | $441.82 | +10% |
+| *MSFT* | *$395.39* | *within $5 — oscillating across the line* |
+
+**Why this matters more than it looks:**
+
+- **SPY and QQQ are the two most liquid options markets in existence.** They are excluded by a price constant, not by any risk judgement.
+- **AMD is the second-largest premium generator in the account's history** (FC-002 studied its gap-filtering at length — while it was also being excluded at stage 1 on price).
+- **MSFT's `unfit` verdict is a boundary artifact.** At $395 it drifts across the ceiling, producing 2% days-in-position and a "cannot consistently trade this symbol" BLOCK. That reads as a strategy failure and is a config threshold.
+
+**Combined with FC-034** (premium floor excludes F/PFE/KMI/VZ), the effective universe is **6 symbols, not 14**: AAPL, AMZN, GOOGL, IWM, NVDA, UNH. Every one of those six scored `marginal` with 61–93% days in position.
+
+**The likely root cause is drift, not design.** The ceiling has not moved as the market rose; `min_stock_price` was lowered to 10.00 specifically to admit Ford, but the upper bound was never revisited. A cash-secured put on a $700 SPY needs $70k of collateral against a $40k `max_exposure_per_ticker` — so a ceiling *is* needed; the question is whether $400 is the right expression of it, or whether **collateral-per-contract** is the quantity actually being constrained.
+
+**Test before changing:** the backtest engine can answer this directly now — raise the ceiling in a config override and re-screen SPY/QQQ/AMD. Do not change the live threshold on this entry alone; it needs its own plan + two reviewers, and the interaction with `max_exposure_per_ticker` and `max_position_size` must be worked out (a $736 SPY put is $73.6k of collateral against a $40k per-ticker cap — it may be excluded twice over, in which case raising the price ceiling alone changes nothing).
+
+**Found:** during FC-048 re-validation (`docs/investigations/fc-048-revalidation.md`), while checking whether the `insufficient` verdicts were a put-only artifact. They were not — this is.
+
+**Links:** `docs/investigations/fc-048-revalidation.md`, FC-034 (the low-price half of the same story), FC-032, FC-002.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
