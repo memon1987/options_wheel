@@ -535,30 +535,44 @@ class TestProducerVocabulary:
     """
 
     def test_call_seller_opportunity_declares_its_type(self):
+        """Assert the REAL emitted dict, not the source text.
+
+        The first version of this test stubbed the seller so loosely that
+        _resolve_cost_basis_floor found nothing, evaluate_covered_call_opportunity
+        returned None, and the test skipped on every run — coverage that never
+        executed. Patch the floor so the builder actually reaches its return.
+        """
         from src.strategy.call_seller import CallSeller as CS
 
-        seller = CS.__new__(CS)          # no __init__: we only need the builder
+        seller = CS.__new__(CS)          # builder-only; no __init__ wiring
         seller.config = Mock(spec=Config)
+        seller.config.call_drawdown_pause_threshold = 0.05
         seller.market_data = Mock()
         seller.alpaca = Mock()
-        best = {
+        # Spot above the 150 basis so the FC-029 drawdown pause does not fire.
+        seller.alpaca.get_stock_quote.return_value = {"bid": 160.0, "ask": 160.10}
+        seller.wheel_state = None
+        seller.market_data.find_suitable_calls.return_value = [{
             "symbol": "AAPL250117C00190000", "strike_price": 190.0,
             "expiration_date": "2025-01-17", "dte": 7, "delta": 0.20,
             "mid_price": 1.10, "annual_return": 0.3,
-        }
-        seller.market_data.find_suitable_calls.return_value = [best]
-        with patch.object(CS, "_validate_call_position",
+        }]
+
+        with patch.object(CS, "_resolve_cost_basis_floor", return_value=150.0), \
+             patch.object(CS, "_calculate_call_position",
                           return_value={"contracts": 1, "shares_covered": 100,
-                                        "max_profit": 110.0}, create=True):
-            opp = None
-            try:
-                opp = seller.evaluate_covered_call_opportunity(
-                    {"symbol": "AAPL", "qty": "100", "avg_entry_price": "150.0"})
-            except Exception:
-                pytest.skip("evaluate_covered_call_opportunity needs fuller wiring")
-        if opp is None:
-            pytest.skip("no opportunity produced under this stub")
-        assert opp["type"] == "call" and opp["strategy"] == "sell_call"
+                                        "max_profit": 110.0,
+                                        "current_stock_price": 160.05,
+                                        "total_return_if_called": 0.07}):
+            opp = seller.evaluate_covered_call_opportunity(
+                {"symbol": "AAPL", "qty": "100", "avg_entry_price": "150.0"})
+
+        assert opp is not None, (
+            "builder returned None — the stub is too loose again; this test "
+            "must ASSERT, never skip"
+        )
+        assert opp["type"] == "call"
+        assert opp["strategy"] == "sell_call"
 
     def test_both_sellers_declare_type_in_their_opportunity_shape(self):
         """Belt-and-braces contract check that survives a constant refactor."""
