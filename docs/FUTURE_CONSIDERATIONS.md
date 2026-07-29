@@ -1035,6 +1035,27 @@ The shortfall is **slightly worse where the sim can match the expiry**. Do not r
 
 **Links:** `docs/investigations/fc-032-call-parity.md`, `docs/investigations/fc-032-parity-check.md` (put side), FC-048 (made the call leg measurable at all), FC-051 (spread calibration).
 
+### FC-057: stage-1 rejections were invisible in every backtest report
+
+**Status:** Done — fixed in the same PR that filed it
+**Size estimate:** S
+**Owner:** zeshan + Claude
+**Plan file:** not needed (one map entry + tests; no behavior change)
+
+**Problem:** `RejectionTally._REASONS` mapped stages 2, 4, 5, 6, 7, 8 and the drawdown pause — but **not stage 1**. A symbol blocked on the price band or volume floor produced **no tally entry at all**, so a screen reported it as having simply done nothing: `insufficient`, 0% days in position, **no reason given**.
+
+**This is how the $400 `max_stock_price` hid.** SPY ($736), QQQ ($671) and AMD ($442) have been excluded at stage 1 for months. Their verdicts were read as *strategy* results — "the strategy can't trade this symbol" — when the truth was "a config constant excludes it before the chain is ever examined". FC-055 only surfaced because the FC-048 re-validation cross-checked spot prices by hand against `config/settings.yaml`; the engine's own report could not say it.
+
+The event was never missing. `market_data.py:148` emits `stock_rejected_filter` with the price and the band it missed. **Nothing counted it.**
+
+**Fix:** one entry in `_REASONS`. Verified end to end — a SPY replay now reports `The binding constraint was **price/volume band (stage 1)**` with 20 of 20 decision days attributed, where before it reported an unexplained `insufficient`.
+
+**Tests:** a parametrised contract asserting **every** stage that can block a day has a nameable reason — so the next stage added to the pipeline cannot be silently unreportable — plus a direct tally test and a guard that unmapped events are still ignored (the tally names known stages, it must not invent reasons). Mutation-verified.
+
+**The general lesson:** the engine's *observability* map is a correctness surface. A stage missing from it does not produce a wrong number — it produces a **missing explanation**, which is worse, because the reader supplies their own.
+
+**Links:** FC-055 (the exclusion this made invisible), `docs/investigations/fc-048-revalidation.md`, FC-015 (same family: a control that looks healthy while doing nothing).
+
 ---
 
 ## Completed
