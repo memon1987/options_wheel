@@ -822,6 +822,43 @@ never worked); worth a sweep for others.
 
 ---
 
+### FC-050: production's below-basis protection for covered calls is plausibly nil
+
+**Status:** Consideration — **potential live money bug, verify before acting**
+**Size estimate:** S to fix, but needs live verification first
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** the covered-call cost-basis floor — the guard that stops us writing a call below what we paid, i.e. locking in a guaranteed loss — appears to be **non-functional on the path production actually executes**. Two independent halves both fail, and they fail in the same direction.
+
+**Half 1 (confirmed by code inspection).** `execute_call_sale` gates its floor check on `stock_cost_basis` (`src/strategy/call_seller.py:319-325`):
+
+```python
+stock_cost_basis = opportunity.get('stock_cost_basis', 0)
+if stock_cost_basis > 0 and strike_price > 0:   # gate self-disables at 0
+```
+
+Scanner-produced opportunities — the ones production executes — carry **`cost_basis_per_share`**, not `stock_cost_basis` (`src/data/options_scanner.py:~350`). So the key lookup returns the `0` default and **the execute-time floor never runs in production**. Only `call_seller.evaluate_covered_call_opportunity` sets `stock_cost_basis`, and production never calls it (same scanner-vs-wheel_engine path split that caused FC-048).
+
+**Half 2 (rests on FC-029's prior validation; could NOT be re-confirmed today).** The scanner's own floor uses `float(position['cost_basis']) / shares` (`options_scanner.py:128`). FC-029 (2026-05-08) empirically established that **Alpaca returns `cost_basis = 0` for assigned positions** — which is why FC-029 R2 built the `wheel_state → BigQuery → Alpaca` resolution chain. If that still holds, the scanner passes `min_strike_price=0` and applies no floor either. *Not re-verified: the account currently holds zero equity positions, so there was nothing to observe. Confirm against a live assigned position before acting.*
+
+**Consequence if both hold:** covered calls can be written below cost basis in production on exactly the positions the floor exists to protect — assigned shares. That is the guaranteed-loss scenario `docs/CLAUDE.md` calls out as CRITICAL.
+
+**The deeper issue — FC-029 R2 may be dead code in production.** FC-029's headline fix (the cost-basis source-order chain) lives in `evaluate_covered_call_opportunity`. If production only ever runs the scanner path, that fix has never executed in production, for the same structural reason FC-048 existed. **Worth checking whether other FC-029 remediations landed on the unused path too.**
+
+**Verification before any fix:**
+1. Wait for (or create) an assigned equity position; read `cost_basis` and `avg_entry_price` from the live API.
+2. Query `trades_from_activities` for historical covered calls whose strike was below the assigning put's strike — direct evidence of whether this has already cost money.
+3. Confirm which path `/run` executes for calls end to end.
+
+**Fix direction:** make the scanner use the same FC-029 resolution chain, and have `execute_call_sale` read whichever key is actually present (or normalize the opportunity shape — the boundary-dataclass idea rejected as out-of-scope in `docs/plans/fc-048.md` would prevent this whole class).
+
+**Found:** by an FC-048 adversarial reviewer probing whether the newly-live call path could write below basis. In the backtest it cannot (both guards work there); production is the gap.
+
+**Links:** `docs/plans/fc-048.md`, FC-029 (R2 cost-basis chain), FC-038, `docs/CLAUDE.md` (Risk Management Philosophy).
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
