@@ -1,7 +1,7 @@
 """Overnight gap detection and risk management for options wheel strategy."""
 
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 import structlog
@@ -455,7 +455,29 @@ class GapDetector:
         try:
             # Get current market data
             current_quote = self.alpaca.get_stock_quote(symbol)
-            current_price = (current_quote['bid'] + current_quote['ask']) / 2
+            bid = current_quote.get('bid') or 0.0
+            ask = current_quote.get('ask') or 0.0
+
+            # Reject degenerate quotes explicitly (FC-036). A zero or one-sided
+            # IEX quote — routine on a halted/LULD symbol — makes the midpoint
+            # ~half of fair value, i.e. a fabricated 50-100% "gap". The armed
+            # gate blocked that only as an accident of the threshold; during
+            # Phase A's shadow (threshold 999) nothing would catch it and we
+            # would sell into a halted market. get_option_quote already guards
+            # this way (bid > 0 and ask > 0); this makes the stock path
+            # symmetric.
+            if bid <= 0 or ask <= 0:
+                logger.warning("Degenerate stock quote - blocking execution",
+                               event_category="data",
+                               event_type="bad_quote_blocked",
+                               symbol=symbol, bid=bid, ask=ask)
+                return {
+                    'can_execute': False,
+                    'reason': 'bad_quote',
+                    'current_gap_percent': 0.0
+                }
+
+            current_price = (bid + ask) / 2
 
             # Get previous trading day close
             previous_close = self._get_previous_close(symbol, execution_time)
@@ -526,33 +548,54 @@ class GapDetector:
     def _get_previous_close(self, symbol: str, current_time: datetime) -> Optional[float]:
         """Get previous trading day's closing price.
 
+        Contract: the close of the last trading day **strictly before**
+        ``current_time``'s **UTC** calendar date; ``None`` if no such bar is
+        available (the caller, ``can_execute_trade``, fails closed on None).
+
+        Dates are evaluated in UTC because Alpaca stamps daily bars at midnight
+        ET, whose UTC date equals the trading date. Aware inputs are converted;
+        naive inputs are assumed UTC (production passes ``clock.now()``, and
+        Cloud Run runs UTC).
+
         Args:
             symbol: Stock symbol
-            current_time: Current time for reference
+            current_time: Current time for reference (naive or tz-aware)
 
         Returns:
             Previous close price or None
         """
         try:
-            # Look back to find previous trading day
-            lookback_date = current_time - timedelta(days=3)  # Look back 3 days to ensure we get data
-
-            # Get recent stock data
-            df = self.alpaca.get_stock_bars(symbol, days=5)
+            # days=10, not 5: a *calendar*-day lookback of 5 can span 4+
+            # consecutive non-trading days (holiday clusters, emergency
+            # closures) and leave no prior-session bar, which fails closed and
+            # halts trading. 10 spans >=2 sessions for any US closure on record.
+            # Same single API call either way.
+            df = self.alpaca.get_stock_bars(symbol, days=10)
             if df.empty:
                 return None
 
-            # Ensure current_time is timezone-aware for comparison with df.index
-            if current_time.tzinfo is None:
-                import pytz
-                current_time = pytz.UTC.localize(current_time)
-
-            # Find the most recent close before current time
-            recent_data = df[df.index < current_time]
-            if recent_data.empty:
+            # Date-based, not timestamp-based (FC-036): Alpaca stamps daily bars
+            # at midnight ET (04:00/05:00 UTC), so a timestamp comparison admits
+            # the current session's OWN partial bar at any intraday decision
+            # time -- making this return today's close and turning the overnight
+            # gap check into a ~20-minute pre-market drift measurement.
+            # Mirrors _detect_current_gap's pattern (Stage 2).
+            # Evaluate the date in UTC, matching the frame's own stamps. Alpaca
+            # stamps midnight ET, whose UTC calendar date IS the trading date
+            # (04:00 EDT / 05:00 EST). Taking .date() in the CALLER's frame
+            # instead would reintroduce this very bug for any tz east of UTC:
+            # an Asia/Tokyo instant equal to 15:00 ET is already "tomorrow"
+            # there, so today's own bar would slip back in. Naive input is
+            # treated as UTC (production passes clock.now(); Cloud Run is UTC).
+            if current_time.tzinfo is not None:
+                current_time = current_time.astimezone(timezone.utc)
+            target_date = current_time.date()
+            df_dates = pd.Series([idx.date() for idx in df.index], index=df.index)
+            prior = df.loc[df_dates < target_date]
+            if prior.empty:
                 return None
 
-            return recent_data['close'].iloc[-1]
+            return prior['close'].iloc[-1]
 
         except Exception as e:
             logger.error("Failed to get previous close",

@@ -142,7 +142,11 @@ data:
         max_gap_frequency: 0.15
         earnings_avoidance_days: 7
         quality_gap_threshold: 2.0
-        execution_gap_threshold: 1.5
+        # FC-036 Phase A: keep in step with config/settings.yaml (999 = shadow,
+        # gate fixed but not armed). This embedded copy is stale/unused — Cloud
+        # Run is the live deploy path — but leaving 1.5 here would silently ARM
+        # the corrected gate for anyone deploying from this manifest.
+        execution_gap_threshold: 999
         execution_gap_lookback_hours: 16
         premarket_gap_threshold: 2.0
         market_open_delay_minutes: 15

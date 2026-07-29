@@ -579,3 +579,81 @@ class TestStrikeWindowCoversAssignedPositions:
             assert above_basis, (
                 f"{day}: no covered call at or above cost basis in the chain"
             )
+
+
+# RejectionTally.summary() keys by description (src/backtesting/engine/rejections.py),
+# not by the raw stage_4_blocked event name.
+STAGE_4_LABEL = "execution gap check (stage 4)"
+
+
+class TestStage4ExecutionGapGate:
+    """FC-036 plan tests 9 & 10 — the fixed gate, through the full engine loop.
+
+    Test 9 pins that an ARMED threshold actually blocks inside the day loop
+    (the RejectionTally wiring for stage_4_blocked was never exercised
+    end-to-end). Test 10 pins Phase A's safety property: at the shipped
+    shadow threshold the gate never fires, so behavior is unchanged.
+
+    Thresholds are injected explicitly rather than read from settings.yaml, so
+    these tests keep their meaning when Phase B arms the production default.
+    """
+
+    def _run(self, fixture, threshold):
+        days, closes, exps = fixture
+        provider = ScriptedProvider("XYZ", closes, exps)
+        builder = ChainBuilder(provider, risk_free_rate=0.04)
+        config = Config()
+        # execution_gap_threshold is a read-only property over _config; inject
+        # through the underlying dict so the arm is explicit and independent of
+        # settings.yaml (which is at Phase A's shadow value).
+        config._config["risk"]["gap_risk_controls"]["execution_gap_threshold"] = threshold
+        sim = Simulator(
+            config, provider, builder, ["XYZ"], days[0], days[-1],
+            starting_cash=50_000.0, max_dte=7,
+        )
+        return sim.run()
+
+    def test_armed_threshold_blocks_on_gap_days(self, falling_then_flat):
+        """The slide is -3%/day; a 1.0% gate must reject those decision days."""
+        result = self._run(falling_then_flat, 1.0)
+
+        assert result.rejections.get(STAGE_4_LABEL, 0) > 0, (
+            f"an armed gate must record stage-4 rejections on the slide; "
+            f"got rejections={result.rejections!r}"
+        )
+
+    def test_shadow_blocks_only_on_fail_closed_not_on_gap_size(self, falling_then_flat):
+        """Phase A property, stated precisely.
+
+        The shadow threshold suppresses every *gap-magnitude* block, but stage 4
+        still blocks on missing data / degenerate quotes — that path is
+        fail-closed by design and fires at ANY threshold. So "999 blocks
+        nothing" is false; the true property is that shadow blocks equal the
+        arming-independent floor and are strictly fewer than an armed gate's.
+        """
+        shadow = self._run(falling_then_flat, 999)
+        armed = self._run(falling_then_flat, 1.0)
+        floor = self._run(falling_then_flat, 10_000)
+
+        shadow_blocks = shadow.rejections.get(STAGE_4_LABEL, 0)
+        assert shadow_blocks == floor.rejections.get(STAGE_4_LABEL, 0), (
+            "shadow must add no gap-magnitude blocks over an effectively "
+            f"disabled gate; got {shadow.rejections!r}"
+        )
+        assert shadow_blocks < armed.rejections.get(STAGE_4_LABEL, 0), (
+            "an armed gate must block strictly more than shadow"
+        )
+
+    def test_shadow_matches_the_unarmed_baseline_ledger(self, falling_then_flat):
+        """At 999 the ledger is identical to an effectively-disabled gate.
+
+        This is the property that makes Phase A safe to ship ahead of the
+        study: correcting the math changes nothing until it is armed.
+        """
+        shadow = self._run(falling_then_flat, 999)
+        disabled = self._run(falling_then_flat, 10_000)
+
+        assert [(d.day, d.equity) for d in shadow.daily] == \
+               [(d.day, d.equity) for d in disabled.daily]
+        assert shadow.rejections == disabled.rejections
+        assert shadow.final_equity == disabled.final_equity

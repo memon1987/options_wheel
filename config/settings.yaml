@@ -147,7 +147,7 @@ risk:
     quality_gap_threshold: 2.0    # Threshold for counting "significant gaps" in stock filtering
 
     # Real-time execution controls (hard filter - more conservative)
-    execution_gap_threshold: 1.5  # HARD STOP: Don't execute trades if overnight gap exceeds this
+    execution_gap_threshold: 999  # FC-036 Phase A shadow — gate fixed but NOT armed; Phase B sets the study threshold. See docs/plans/fc-036.md
     execution_gap_lookback_hours: 16 # Check gap from previous close (market close to open)
 
     # Pre-market gap thresholds

@@ -83,10 +83,12 @@ class TestNoLookahead:
         assert list(df.index.date) == [D1, D2]
 
     def test_stock_bars_index_is_tz_aware_utc_like_live(self, setup):
-        """GapDetector does df[df.index < utc_now]; a naive index raises and it
+        """Index must match live's dtype/stamp so dates derive identically.
 
-        swallows the error into "no previous close", silently blocking every
-        trade. Live returns datetime64[ns, UTC] stamped 04:00.
+        Live returns datetime64[ns, UTC] stamped 04:00 (midnight ET). Since
+        FC-036 GapDetector selects the previous close by calendar date
+        (``idx.date()``) rather than by timestamp, so what matters is that
+        each bar's index date equals its trading date under both stamps.
         """
         import pandas as pd
 
@@ -95,9 +97,9 @@ class TestNoLookahead:
             df = client.get_stock_bars("XYZ", days=30)
         assert str(df.index.dtype) == "datetime64[ns, UTC]"
         assert df.index[0].hour == 4
-        # The comparison GapDetector actually performs must not raise.
-        utc_now = pd.Timestamp(datetime.combine(D2, time(16, 0)), tz="UTC")
-        assert len(df[df.index < utc_now]) == 2
+        # The date-based selection GapDetector performs must exclude D2 itself.
+        df_dates = pd.Series([idx.date() for idx in df.index], index=df.index)
+        assert list(df.loc[df_dates < D2].index.date) == [D1]
 
     def test_quote_is_the_simulated_days_close(self, setup):
         _, client = setup
