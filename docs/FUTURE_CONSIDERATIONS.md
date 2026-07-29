@@ -74,12 +74,47 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 
 **Updated 2026-07-18 (FC-032 engine walkthrough):** the binding constraint is broader than AMD and broader than gap *frequency*. NVDA was blocked on 18 of 20 decision days in Jun–Jul 2026 by the **40% realized-vol cap** (`max_historical_vol`) — its 30-day vol sat at 40–42%, so trading was noise around one hard line; the single day vol dipped to ~40% it traded. Validated against live: production also sold zero NVDA puts that window. Structural critique: the filter double-counts risk that delta-band strike selection already prices (IV rises → strikes auto-walk OTM → richer premium), is a binary cliff with no graduated response, and embargoes the top premium generators exactly when compensation is highest. **The A/B study to answer this empirically is Track B1 of `docs/plans/fc-042.md`** (filter off / vol-cap sweep / vol-relative percentile / half-size-instead-of-ban); any threshold change then gates on this FC's own plan + two reviewers. Note stage-4's execution gap check is dead (FC-036), so this filter is currently the *only* functioning gap control — do not simply disable it.
 
-**Open questions:**
-- What's the distribution of AMD's actual overnight gaps vs the current filter?
-- Do we support per-symbol gap thresholds, or keep one global?
-- How do we avoid over-fitting to AMD's recent history?
+**Updated 2026-07-29 — B1 study published, and it reframes this entry. See
+`docs/investigations/fc-002-gap-filter-ab.md`.** Four corrections, in order of consequence:
 
-**Links:** `PERFORMANCE_EVAL_CATALOG.md` EVAL-010, `docs/AMD_GAP_RISK_ANALYSIS_2025.md`.
+1. **The filter is not wired into the live trading path and has never gated a live trade**
+   (filed as **FC-048**). Every block rate quoted above — this entry's and FC-036's —
+   describes the *backtest engine*. Whether to gate at all is now the prior question;
+   tuning a threshold nothing reads is a no-op.
+2. **"47% of scans" is stale.** Reconstructed over the same bars, AMD is blocked on **94.4%**
+   of sessions 2024-02→2026-07 and **100% of the 201 sessions in the live-fills window** —
+   all by the gap-**frequency** leg, not the vol cap. AMD's median 34-session vol there is
+   0.735.
+3. **The vol-cap diagnosis is half right.** Confirmed for NVDA in Jun–Jul 2026 (35 of 38
+   sessions blocked, all by the vol cap, vol 0.387–0.459 against a 0.400 line). But over the
+   full window NVDA's two legs bind almost equally (52.9% vol-alone vs 51.3% frequency-alone),
+   and on AMD frequency is the binding leg. A vol-only sweep would leave AMD untradeable.
+4. **`vol_lookback_days: 252` is dead config** — nothing reads it. Both legs are computed
+   over `gap_lookback_days + 20` = 50 **calendar** days ≈ 34 sessions.
+
+**On the evidence, the filter is anti-selective in this window:** of 327 real entries, the
+123 it would have blocked earned **$70.66/entry** against **$55.94** for the 204 it would
+have allowed ($8,691 forgone, 43% of net realized); on 2,329 synthetic daily entries blocked
+days out-earn allowed days on 4 of 4 symbols, both IV models, ±20% premium. Caveats stated
+prominently in the study: one bull-market regime, no vol shock, and — per **FC-048** — the
+study's *engine* arms are put-only and are therefore supporting evidence at most. The real-fills
+and overlay layers, which carry the conclusion, are unaffected by FC-048. **Recommendation:
+do not re-tune thresholds; resolve FC-049 first.** The one arm worth carrying forward is
+graduated response (delta band → [0.10, 0.15] instead of a ban), **contingent on a re-run
+after FC-048 is fixed** — its support is engine-only, and its "half size" variant is
+impossible at `put_seller.py`'s hard-coded `contracts = 1`.
+
+**Open questions:**
+- ~~What's the distribution of AMD's actual overnight gaps vs the current filter?~~ Answered.
+- Do we support per-symbol gap thresholds, or keep one global? *Still open — and now
+  secondary to FC-048.*
+- How do we avoid over-fitting to AMD's recent history? *Partly addressed: the study's
+  pre-registration requires any proposal to hold its sign on 3 of 4 symbols.*
+- **New:** should the gap-frequency leg exist at all? A >2% overnight move on a 40-vol name
+  is a typical day, not a tail, and that leg is what makes AMD permanently untradeable.
+
+**Links:** `docs/investigations/fc-002-gap-filter-ab.md`, `tools/diagnostics/fc002_gap_filter_ab.py`,
+FC-048, FC-036, `PERFORMANCE_EVAL_CATALOG.md` EVAL-010, `docs/analysis/AMD_GAP_RISK_ANALYSIS_2025.md`.
 
 ---
 
@@ -739,6 +774,51 @@ The backtest replays `run_strategy_cycle()`, which uses the second producer. So 
 **Found:** by the FC-034 (B2) premium-floor study while investigating why enabled symbols showed no call activity.
 
 **Links:** `docs/plans/fc-042.md`, `docs/plans/fc-032.md`, `docs/investigations/fc-034-premium-floor-ab.md`, FC-015 (same family: a gate that has never fired while looking healthy).
+
+---
+
+### FC-049: The stage-2 gap-risk filter is not wired into the live trading path
+
+*(Renumbered from FC-048 at merge: FC-048 was concurrently allocated on main to the covered-call misroute found by the B2 study. Independent findings — but the same species: a control that looks active and is not.)*
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `GapDetector.filter_stocks_by_gap_risk` is called from exactly one place —
+`WheelEngine._find_new_opportunities`. The deployed Cloud Run trading path is
+`/scan` → `OptionsScanner` → `OpportunityStore` → `/run`, and `src/data/options_scanner.py`
+never constructs a `GapDetector`. Commit `842dcce` (2025-10-03, "Implement Cloud Storage
+scan-to-execution architecture") removed `wheel_engine.run_strategy_cycle()` from `/run`;
+the live account's first fill is **2025-10-06**. **No live trade has ever been evaluated by
+stage 2.** The server does build a `WheelEngine`, but only for `reconcile_positions()` and
+`run_rolling_cycle()` — neither reaches `_find_new_opportunities`.
+
+**Confirmed four ways (2026-07-29)**, all reproducible via
+`tools/diagnostics/fc002_gap_filter_ab.py verify`:
+1. Source inspection: no module on the live scan path references `GapDetector`.
+2. `git log -S "run_strategy_cycle" -- deploy/cloud_run_server.py` → `842dcce`, three days
+   before the first fill.
+3. Cloud Logging (40d): all 18 request_ids emitting `stage_2_complete` /
+   `stock_passed_gap_filter` / `stock_filtered_by_gap_risk` are **backtest** requests.
+4. On 2025-10-06, `docs/analysis/AMD_GAP_RISK_ANALYSIS_2025.md` records the filter returning
+   "Suitable for Trading: NO" for AMD; BigQuery shows `AMD251010P00192500` sold short that
+   same day for $223.
+
+**Why it matters:** this is the mirror of FC-036 (a control that ran but measured the wrong
+thing) — a control that measures correctly and never runs. It also invalidates the framing
+of **FC-002**, whose block rates describe the backtest engine, not production. Reconstructed
+over the same bars, the filter would have refused **123 of 327** real entries.
+
+**Decision required before any threshold work:** wire it in, or delete it. What it must not
+remain is a control that exists in `config/settings.yaml`, in the backtest, and in the FC
+index, but not in the thing that trades. **Wiring the current rule in unchanged would be the
+largest behaviour change in the project's history and, on the evidence, a costly one** — see
+the study. Same class of latent defect as FC-035 (dead poll) and FC-039 (state persistence
+never worked); worth a sweep for others.
+
+**Links:** `docs/investigations/fc-002-gap-filter-ab.md`, FC-002, FC-036, FC-039.
 
 ---
 
