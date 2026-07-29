@@ -212,7 +212,12 @@ class TestGateBehaviorInPercentUnits:
         assert result['can_execute'] is False
 
     def test_shadow_threshold_never_blocks(self):
-        """Phase A safety property: at 999 the fixed gate blocks nothing."""
+        """Phase A: at 999 no GAP-MAGNITUDE block fires.
+
+        Not "blocks nothing" — stage 4 still fails closed on missing data or a
+        degenerate quote at any threshold. This scenario has a healthy quote
+        and full data, so the gate passes.
+        """
         result = self._setup(150.00, threshold=999)   # a 50% gap
         assert result['can_execute'] is True
 
