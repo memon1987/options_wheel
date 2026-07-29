@@ -6,6 +6,14 @@ One row per **symbol per screening run** (FC-032 Phase 5). Written by
 
 Day-partitioned on `timestamp`.
 
+> **PROVENANCE — rows written before 2026-07-29 describe a put-only engine.**
+> FC-048 found that covered calls were misrouted and rejected, so every backtest
+> before merge commit `ea5cfa5` modelled the put half of the wheel only: assigned
+> shares were never called away, no wheel cycle ever completed, and call premium was
+> never earned. **Do not compare rows across that boundary.** Older rows are left in
+> place deliberately — provenance is the `timestamp` plus `config_hash`, and deleting
+> history would lose the audit trail. See `docs/investigations/fc-048-revalidation.md`.
+
 ## What this table is for
 
 Answering "which symbols we currently trade have stopped being a fit?" — and
