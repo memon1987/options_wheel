@@ -707,6 +707,39 @@ logger.info(event_type, event_category="system", status=status, ...)
 
 ---
 
+### FC-048: every backtest runs only half a wheel — covered calls are misrouted to the put path
+
+**Status:** Consideration — **high priority, affects the credibility of every backtest verdict**
+**Size estimate:** S to fix, M to re-validate downstream conclusions
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `ExecutionEngine.execute_batch` routes on `opp.get('type', 'put')` (`src/strategy/execution_engine.py:286`) — defaulting to **put**. There are two producers of opportunities and only one of them sets that key:
+
+| producer | sets `type`? | routes to |
+|---|---|---|
+| `options_scanner.py:340` (production `/scan` path) | **yes** (`'type': 'call'`) | call path — correct |
+| `call_seller.evaluate_covered_call_opportunity` (used by `wheel_engine._find_new_opportunities` and `_manage_existing_positions`) | **no** — emits `'strategy': 'sell_call'` instead | **put path — misrouted** |
+
+The backtest replays `run_strategy_cycle()`, which uses the second producer. So **every covered-call opportunity in every backtest is handed to `put_seller`**, which rejects it. Verified three ways: the code trace above; a direct routing simulation (engine-shaped dict → `'put'`, scanner-shaped dict → `'call'`); and empirically — a 2-year NVDA replay reports **30 puts sold, 0 calls**, and a B2 study run found **293 call opportunities on AAPL, 0 sold**.
+
+**Production is NOT affected.** It executes from the scanner path, which types calls correctly; 84 real covered calls appear in `trades_from_activities`. This is a backtest-fidelity defect, not a live trading bug.
+
+**Why it went unnoticed:** the golden test is named `test_the_wheel_actually_turns`, but it only asserts put-sold → assignment → shares-held. **No test has ever asserted that a covered call is sold in replay.** The suite covers exactly the half that works.
+
+**What it means for existing conclusions:**
+- **Every backtest to date models a put-only strategy.** Assigned shares are never called away, so cycles never complete, call premium is never earned, and returns are understated on any symbol that gets assigned.
+- This plausibly explains an FC-032 Phase 5 finding previously blamed on window length: **7 of 14 symbols — including SPY and QQQ — were flagged for demotion purely for not closing a cycle.** A cycle cannot close without the call leg.
+- Affects the engine-A/B layers of `fc-036-gap-gate-study.md` and the Track B studies. It does **not** overturn their headline conclusions, both of which rest on real-fills layers rather than the engine (FC-036's DO-NOT-ARM; FC-034's DEMOTE) — but the engine tables in those docs should be read as put-only.
+
+**Fix direction:** set `'type': 'call'` in `evaluate_covered_call_opportunity` (and audit the put side for symmetry, per the repo's wheel-symmetry rule). Then add the test that was missing: a replay assertion that a covered call is sold after assignment. Re-run the affected verdicts afterwards — the fix is small, but re-validating what it changes is the real work.
+
+**Found:** by the FC-034 (B2) premium-floor study while investigating why enabled symbols showed no call activity.
+
+**Links:** `docs/plans/fc-042.md`, `docs/plans/fc-032.md`, `docs/investigations/fc-034-premium-floor-ab.md`, FC-015 (same family: a gate that has never fired while looking healthy).
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
