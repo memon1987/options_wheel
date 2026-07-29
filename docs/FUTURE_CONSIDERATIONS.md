@@ -920,6 +920,56 @@ The hand-rolled underlying parser is separately wrong on adjusted roots: `1AAPL2
 
 **Links:** FC-041, FC-043, FC-045, FC-048, `docs/investigations/covered-call-starvation-2026-07-18.md`.
 
+### FC-053: the `/monitor` unknown-option-type skip is silent in production
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-045 made `/monitor` classify positions by a strict OCC parse. A position the parser rejects now takes the pre-existing `else: continue` branch — **skipped every cycle, never profit-taken**. With both stop-losses disabled (FC-010) it simply rides to expiry or assignment.
+
+Skipping beats guessing (a mis-classified position would run the wrong seller's logic), so the design is right. The problem is that **nobody would notice.** The branch logs `logger.warning("Unknown option type", event_type="unknown_option_type")` and:
+
+- Only two alert policies exist in `gen-lang-client-0607444019` — Cloud Build failure and drawdown pause. Neither matches this event.
+- Cloud Run plain-text logs land at severity `DEFAULT` (recorded in the 2026-07-18 ops session), so even a `severity>=WARNING` filter would match nothing.
+
+**When it fires:** adjusted contracts after a corporate action (`AAPL1250117C…`), which Alpaca does produce, and any symbol form the anchored regex rejects. **Zero live positions are affected today** — verified: the account's two open option positions both parse.
+
+**Fix direction:** escalate to `log_error_event` (which sets `event_type`, unlike `log_system_event` — see FC-047) and/or return a `skipped` count in the `/monitor` response so a scheduler check can see it. Consider whether an adjusted contract should be *closeable* rather than merely skipped — an unmanaged short option is a real risk, just a rarer one than a mis-managed one.
+
+**Found:** by the FC-045 reviewer, tracing what the newly-reachable branch does in production.
+
+**Links:** FC-045, FC-047, FC-010.
+
+---
+
+### FC-054: `wheel_engine` state reconciliation counts calls as puts (6th OCC-substring site)
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `src/strategy/wheel_engine.py:923-925` uses the same defect the whole family is named for:
+
+```python
+if 'P' in option_symbol: ...      # counts a PUT
+elif 'C' in option_symbol: ...    # counts a CALL
+```
+
+`option_symbol` is a full OCC symbol, so the ticker's own letters decide. **AAPL, SPY and PFE calls are counted as puts** in state reconciliation today — the same three symbols FC-045 fixed in `/monitor`, in a different file.
+
+**Sixth known instance:** FC-041 (naked-call guard) · FC-043 (Stage-6 over-block) · FC-045 (`/monitor`) · FC-048 (execution routing) · FC-052 (oversell guard) · this. The shared `strict_option_type()` primitive exists (added in FC-048); this site has not been converted.
+
+**Impact:** reconciliation miscounts, so wheel-state phase decisions and any telemetry derived from those counts are wrong for the three affected symbols. Needs tracing to say whether it changes a trading decision or only a count — do that before sizing the fix.
+
+**Do the sweep, not another one-off.** Six occurrences argue for a repo-wide grep gate (a test asserting no `'P' in`/`'C' in` over an OCC symbol variable outside the canonical parser) rather than a seventh individual fix. FC-041's open question already calls for this sweep; this entry is the concrete evidence it is still needed.
+
+**Found:** by the FC-045 reviewer, checking whether the family survived elsewhere.
+
+**Links:** FC-041, FC-043, FC-045, FC-048, FC-052, `src/utils/option_symbols.py`.
+
 ---
 
 ## Completed
