@@ -420,7 +420,9 @@ This is not a data problem (bar coverage was 122/122 for all 14 symbols) and not
 - Or simply demote F/PFE/KMI/VZ from the universe and leave the floor alone. Cheapest fix, but leaves the threshold mis-shaped for any future low-priced candidate.
 - Does `min_call_premium: 0.30` have the same defect on the call side? (Almost certainly — same shape, and calls are only sold post-assignment so the blast radius differs.)
 
-**Links:** `docs/investigations/fc-032-coverage-gate.md` (the measurement + production validation), FC-032, FC-001 (symbol universe optimization). **A/B study = Track B2 of `docs/plans/fc-042.md`.**
+**A/B study complete (2026-07-29) — recommendation is DEMOTE.** `docs/investigations/fc-034-premium-floor-ab.md`. Three arms (flat $0.50 / 0.40%-of-strike / 8% annualized return-on-collateral) over 275 decision days plus a read-only join against the 330 real sell-to-open fills. The pre-registered rules return DEMOTE: the cohort's *richest* in-band put pays a median $0.03–$0.08 a share (controls: $0.51–$0.53), so no floor admits them without admitting $3-per-contract trades; a 0.40%-of-strike floor would have retroactively blocked **47 of 330 real fills and $2,235 of realized option P&L**; and an 8%-annualized floor only helps the cohort by taking AAPL from 50% to 94% of usable days. The threshold shape is not the defect — the premium is not there. **Open question 4 (the call-side floor) is still open**: no covered call executed in any replay (see the study's New findings §1). Change still requires its own plan + two reviewers.
+
+**Links:** `docs/investigations/fc-034-premium-floor-ab.md` (the A/B study), `docs/investigations/fc-032-coverage-gate.md` (the measurement + production validation), FC-032, FC-001 (symbol universe optimization). **A/B study = Track B2 of `docs/plans/fc-042.md`.**
 
 ---
 
