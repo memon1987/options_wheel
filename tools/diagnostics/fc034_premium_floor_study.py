@@ -81,22 +81,28 @@ WINDOW_END = date(2026, 7, 24)
 # The four names FC-032's coverage gate found structurally untradeable...
 EXCLUDED_COHORT = ("F", "PFE", "KMI", "VZ")
 
-# ...and the two controls. Justification (measured, see write-up §Controls):
+# ...and the two engine controls. Justification (all figures measured):
 #   * Both appear in the 330 real sell-to-open fills, so they demonstrably work
-#     in production: IWM 27 puts + 8 calls, AAPL 8 puts + 3 calls.
+#     in production: AAPL 8 puts + 3 calls, AMZN 26 puts + 18 calls ($13,306).
 #   * Both stay inside the stage-1 price band [min_stock_price 10,
-#     max_stock_price 400] for the ENTIRE window. SPY (454.76-759.57) and QQQ
-#     (385.05-746.16) never do — they are excluded by the *price cap*, not by
-#     the premium floor, so they cannot function as controls for this question.
-#     AMD (78-581), MSFT (353-542), UNH (238-625) and GOOGL (129-403) all breach
-#     400 for part of the window, which would confound arm comparison with
-#     stage-1 dropouts.
+#     max_stock_price 400] for the ENTIRE window (AAPL 165.00-340.08, AMZN
+#     144.52-274.99). SPY (454.76-759.57) and QQQ (385.05-746.16) never do —
+#     they are excluded by the *price cap*, not by the premium floor, so they
+#     cannot function as controls for this question. AMD (78-581), MSFT
+#     (353-542), UNH (238-625) and GOOGL (129-403) all breach 400 for part of
+#     the window, which would confound arm comparison with stage-1 dropouts.
 #   * Neither split in 2023-12-01..2026-07-28 (detect_split → None). NVDA did
 #     (10:1 on 2024-06-10), which would force a truncated, non-comparable window.
-#   * They bracket the premium regime the re-shape must not damage: a $165-340
-#     single name and a $175-300 ETF. IWM is the closest liquid name to the
-#     $12-48 excluded cohort, so it is the most sensitive control available.
-CONTROLS = ("AAPL", "IWM")
+#
+# IWM was the first choice (a $175-300 ETF is the closest liquid name to the
+# $12-48 cohort) and was dropped from the ENGINE layer on cost, not on merit:
+# its $1 strike ladder gives it a 1042-contract universe on a sample day
+# against AAPL's 408 and AMZN's 372, and each IWM chain build took ~13 min under
+# the trading API's contract-discovery throttle — roughly 40x AAPL. It remains a
+# control in the `fills` layer, where it carries the study's strongest control
+# evidence (22 of its 35 real fills fail arm B) from real money rather than
+# simulation.
+CONTROLS = ("AAPL", "AMZN")
 
 STUDY_SYMBOLS = EXCLUDED_COHORT + CONTROLS
 
@@ -556,9 +562,6 @@ class _FloorShape:
         MarketDataManager._check_call_criteria_detailed = self._orig_call
 
 
-from src.utils import clock as _clock  # noqa: E402  (after sys.path setup)
-
-
 class _StageTally:
     """Counts, per decision day, the stages that actually stopped this symbol.
 
@@ -603,14 +606,26 @@ class _StageTally:
         self._breakdown: Dict[str, int] = {k: 0 for k in self._BREAKDOWN}
         self._breakdown_days: Dict[str, set] = {k: set() for k in self._BREAKDOWN}
         self._prev_config = None
+        self.events_seen = 0
+        self.frozen_events = 0
+        self.errors = 0
+        self.last_error = None
 
     def processor(self, logger, name, event_dict):
-        # `clock` is imported at call time but resolved from sys.modules, and
-        # this runs on every structlog event in the replay — keep it trivial.
+        # A diagnostic must not break the run it observes, so this swallows —
+        # but silent swallowing is how this class shipped broken once already
+        # (`clock.now()` against an import bound as `_clock`: NameError on every
+        # event, every tally empty, and nothing said so). `errors` and
+        # `events_seen` are reported next to the counts so an inert tally is
+        # visible in the output instead of reading as "nothing happened".
         try:
+            from src.utils import clock as _clock
+
+            self.events_seen += 1
             if not _clock.is_frozen():
                 return event_dict
-            day = clock.now().date()
+            self.frozen_events += 1
+            day = _clock.now().date()
             et = event_dict.get("event_type", "")
             bucket = self._DAY_EVENTS.get(et)
             if bucket:
@@ -621,8 +636,9 @@ class _StageTally:
                     if isinstance(v, int) and v > 0:
                         self._breakdown[k] += v
                         self._breakdown_days[k].add(day)
-        except Exception:  # noqa: BLE001 - diagnostics must never break a run
-            pass
+        except Exception as exc:  # noqa: BLE001 - must never break a run
+            self.errors += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"
         return event_dict
 
     def __enter__(self) -> "_StageTally":
@@ -653,6 +669,12 @@ class _StageTally:
             "days_by_stage": dict(per.most_common()),
             "stage7_rejected_contracts": dict(self._breakdown),
             "stage7_rejected_days": {k: len(v) for k, v in self._breakdown_days.items()},
+            # Health of the tally itself. errors > 0 or events_seen == 0 means
+            # the numbers above are not evidence of anything.
+            "events_seen": self.events_seen,
+            "frozen_events": self.frozen_events,
+            "errors": self.errors,
+            "last_error": self.last_error,
         }
 
 
@@ -711,7 +733,8 @@ def _arm_row(symbol: str, arm: Arm, report, runtime_s: float, patched: int) -> d
 
 
 def run_engine(symbol: str, start: date, end: date, out: Path,
-               arms: Sequence[Arm] = ARMS, starting_cash: float = 100_000.0) -> dict:
+               arms: Sequence[Arm] = ARMS, starting_cash: float = 100_000.0,
+               sensitivity: bool = False) -> dict:
     from src.backtesting.engine.rejections import _REASONS
     from src.backtesting.evaluate import evaluate_symbol
 
@@ -728,18 +751,26 @@ def run_engine(symbol: str, start: date, end: date, out: Path,
         config = _fresh_config(arm)
         t0 = datetime.now()
         with _FloorShape(arm) as shape, _StageTally() as stages:
-            report, _ = evaluate_symbol(
+            report, sens = evaluate_symbol(
                 symbol, start, end,
                 config=config,
                 starting_cash=starting_cash,
                 # The bid-fill sensitivity pass replays the identical window a
                 # second time under a different fill assumption. Different
                 # question, double the runtime; not this study's contract.
-                run_sensitivity=False,
+                # Off by default: the bid-fill pass replays the identical
+                # window a second time and doubles runtime. Turned ON via
+                # --sensitivity for the arms whose conclusion depends on it —
+                # the cohort's enabled trades sit at a 3-8c mid, where the
+                # modelled spread is a large fraction of the premium and a
+                # mid-minus-haircut fill is the least trustworthy assumption in
+                # the study.
+                run_sensitivity=sensitivity,
             )
         row = _arm_row(symbol, arm, report,
                        (datetime.now() - t0).total_seconds(), shape.applied)
         row["stage_tally"] = stages.summary()
+        row["fill_sensitivity"] = sens
         rows[arm.key] = row
         print(f"  {symbol} arm {arm.key} ({arm.label}): "
               f"puts {row['puts_sold']} calls {row['calls_sold']} | "
@@ -1130,6 +1161,8 @@ def main() -> int:
     p.add_argument("--out", default=None)
     p.add_argument("--shard", type=int, default=0, help="prefetch: this shard index")
     p.add_argument("--shards", type=int, default=1, help="prefetch: total shards")
+    p.add_argument("--sensitivity", action="store_true",
+                   help="engine: also replay each arm at the bid")
     args = p.parse_args()
 
     out = Path(args.out) if args.out else _default_out()
@@ -1143,7 +1176,10 @@ def main() -> int:
     elif args.layer in ("chain", "engine"):
         if not args.symbol:
             p.error(f"{args.layer} needs --symbol")
-        (run_chain if args.layer == "chain" else run_engine)(args.symbol, start, end, out)
+        if args.layer == "chain":
+            run_chain(args.symbol, start, end, out)
+        else:
+            run_engine(args.symbol, start, end, out, sensitivity=args.sensitivity)
     elif args.layer == "fills":
         run_fills(out)
     else:
