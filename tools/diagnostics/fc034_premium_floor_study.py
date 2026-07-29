@@ -39,6 +39,9 @@ LAYERS
 
 USAGE
 -----
+    # optional: parallel cold-cache warm (see run_prefetch)
+    python tools/diagnostics/fc034_premium_floor_study.py prefetch --symbol F \
+        --shard 0 --shards 6
     python tools/diagnostics/fc034_premium_floor_study.py chain --symbol F
     python tools/diagnostics/fc034_premium_floor_study.py engine --symbol F
     python tools/diagnostics/fc034_premium_floor_study.py fills
@@ -252,12 +255,28 @@ def _read(out: Path, name: str):
     return json.loads(path.read_text())
 
 
-def _install_rate_limit_retry(max_tries: int = 8) -> None:
-    """Wrap the provider's data endpoints with 429 backoff.
+# Alpaca signals throttling with more than one wording, and the two SDK paths
+# this harness drives do NOT agree. The market-data client raises a
+# "too many requests" error; the *trading* client (which serves
+# `get_option_contracts`, i.e. contract discovery) raises
+# `APIError: {"code":42910000,"message":"rate limit exceeded"}`. Matching only
+# the first phrase — as tools/diagnostics/fc036_gap_gate_study.py does — leaves
+# contract discovery unprotected, and a sharded prefetch dies on it within
+# minutes. Match on any of them.
+_THROTTLE_MARKERS = ("too many requests", "rate limit", "42910000", "429")
 
-    Analysis-side only. Alpaca's Basic plan caps at 200 req/min and a full
-    2.5-year chain build issues thousands of requests; parallel study processes
-    trip it. Borrowed verbatim in shape from tools/diagnostics/fc036_gap_gate_study.py.
+
+def _is_throttle(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(m in text for m in _THROTTLE_MARKERS)
+
+
+def _install_rate_limit_retry(max_tries: int = 10) -> None:
+    """Wrap the provider's data endpoints with throttle backoff.
+
+    Analysis-side only — production code is never touched. Alpaca's Basic plan
+    caps at 200 req/min and a full 2.5-year chain build issues thousands of
+    requests; parallel study processes trip it.
     """
     import time as _time
 
@@ -274,8 +293,8 @@ def _install_rate_limit_retry(max_tries: int = 8) -> None:
             for attempt in range(max_tries):
                 try:
                     return original(self, *a, **kw)
-                except Exception as exc:  # noqa: BLE001 - only 429s are retried
-                    if "too many requests" not in str(exc).lower() or attempt == max_tries - 1:
+                except Exception as exc:  # noqa: BLE001 - only throttles retried
+                    if not _is_throttle(exc) or attempt == max_tries - 1:
                         raise
                     _time.sleep(delay)
                     delay = min(delay * 2, 60.0)
@@ -317,6 +336,43 @@ def _decision_context(symbol: str, start: date, end: date):
     ceiling, floor = sim._strike_anchors(bars)
     closes = {b.bar_date: b.close for b in bars}
     return builder, days, closes, ceiling, floor, sim.max_dte
+
+
+def run_prefetch(symbol: str, start: date, end: date, shard: int, shards: int) -> dict:
+    """Warm the parquet chain cache for one date shard of one symbol.
+
+    The cold pass dominates this study's wall clock and is *latency* bound, not
+    rate-limit bound: one process issues its contract-discovery and bars calls
+    serially, at ~3 chains/min, against a 200 req/min allowance. Sharding the
+    date range across processes turns a ~5-hour serial build into well under an
+    hour without going near the limit.
+
+    Safe to shard because a cache entry is keyed per ``(symbol, as_of)`` and
+    ``ChainStore.put`` writes atomically (temp file + ``os.replace``), so
+    disjoint date shards never contend. The anchors are taken from the real
+    `Simulator`, so these files are byte-identical to what the engine layer
+    would have built and are hits for it, not near-misses.
+
+    Run as: --shard i --shards N for i in 0..N-1.
+    """
+    _install_rate_limit_retry()
+    builder, days, closes, ceiling, low, max_dte = _decision_context(symbol, start, end)
+    mine = [d for i, d in enumerate(days) if i % shards == shard]
+    t0 = datetime.now()
+    built = 0
+    for day in mine:
+        close = closes.get(day)
+        if close is None:
+            continue
+        builder.build(symbol, day, max_dte,
+                      underlying_price=close, cost_basis=ceiling, low_anchor=low)
+        built += 1
+        if built % 25 == 0:
+            print(f"  {symbol} shard {shard}/{shards}: {built}/{len(mine)} "
+                  f"({(datetime.now()-t0).total_seconds():.0f}s)", flush=True)
+    print(f"  {symbol} shard {shard}/{shards}: {built} chains in "
+          f"{(datetime.now()-t0).total_seconds():.0f}s")
+    return {"symbol": symbol, "shard": shard, "shards": shards, "built": built}
 
 
 def run_chain(symbol: str, start: date, end: date, out: Path) -> dict:
@@ -500,6 +556,106 @@ class _FloorShape:
         MarketDataManager._check_call_criteria_detailed = self._orig_call
 
 
+from src.utils import clock as _clock  # noqa: E402  (after sys.path setup)
+
+
+class _StageTally:
+    """Counts, per decision day, the stages that actually stopped this symbol.
+
+    `SimulationResult.rejections` cannot answer this study's central question on
+    its own. Its `_REASONS` map has no entry for `stock_rejected_filter`, so a
+    day on which stage 1 dropped the symbol on the **price band**
+    (`min_stock_price 10` / `max_stock_price 400`) is recorded as no rejection
+    at all — the day simply vanishes. Measured on a 2-month F replay: 39
+    decision days, 13 mapped stage-7 blocks, 0 candidates, and **26 days with no
+    recorded reason whatsoever**. Attributing those matters here, because
+    "the premium floor is not what blocks this symbol" is exactly the finding
+    that decides demote vs re-shape.
+
+    Also captures stage 7's own rejection *breakdown* fields, which the live
+    logger already emits (`rejected_premium_too_low`,
+    `rejected_delta_out_of_range`, ...) and which nothing downstream reads.
+
+    Harness-local, read-only, and never raises into the run.
+    """
+
+    _DAY_EVENTS = {
+        "stock_rejected_filter": "stage 1: price/volume band",
+        "stock_filtered_by_gap_risk": "stage 2: gap-risk filter",
+        "rejected_high_gap_frequency": "stage 2: gap-risk filter",
+        "stage_4_blocked": "stage 4: execution gap check",
+        "stage_5_blocked": "stage 5: wheel state",
+        "put_blocked_by_wheel_state": "stage 5: wheel state",
+        "stage_6_blocked": "stage 6: already holding",
+        "stage_7_complete_not_found": "stage 7: no put met criteria",
+        "stage_7_complete_found": "stage 7: candidate found",
+        "stage_8_blocked": "stage 8: position sizing",
+        "position_size_validation_failed": "stage 8: position sizing",
+        "covered_call_drawdown_pause": "drawdown pause",
+        "no_suitable_puts": "stage 7: no suitable puts",
+    }
+
+    _BREAKDOWN = ("rejected_premium_too_low", "rejected_delta_out_of_range",
+                  "rejected_dte_too_high", "rejected_no_liquidity")
+
+    def __init__(self) -> None:
+        self._seen: set = set()
+        self._breakdown: Dict[str, int] = {k: 0 for k in self._BREAKDOWN}
+        self._breakdown_days: Dict[str, set] = {k: set() for k in self._BREAKDOWN}
+        self._prev_config = None
+
+    def processor(self, logger, name, event_dict):
+        # `clock` is imported at call time but resolved from sys.modules, and
+        # this runs on every structlog event in the replay — keep it trivial.
+        try:
+            if not _clock.is_frozen():
+                return event_dict
+            day = clock.now().date()
+            et = event_dict.get("event_type", "")
+            bucket = self._DAY_EVENTS.get(et)
+            if bucket:
+                self._seen.add((day, bucket))
+            if et in ("stage_7_complete_found", "stage_7_complete_not_found"):
+                for k in self._BREAKDOWN:
+                    v = event_dict.get(k)
+                    if isinstance(v, int) and v > 0:
+                        self._breakdown[k] += v
+                        self._breakdown_days[k].add(day)
+        except Exception:  # noqa: BLE001 - diagnostics must never break a run
+            pass
+        return event_dict
+
+    def __enter__(self) -> "_StageTally":
+        import structlog
+
+        try:
+            self._prev_config = structlog.get_config()
+            structlog.configure(
+                processors=[self.processor] + list(self._prev_config.get("processors", [])))
+        except Exception:  # noqa: BLE001
+            self._prev_config = None
+        return self
+
+    def __exit__(self, *exc) -> None:
+        import structlog
+
+        if self._prev_config is not None:
+            try:
+                structlog.configure(**self._prev_config)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def summary(self) -> dict:
+        from collections import Counter
+
+        per = Counter(bucket for _d, bucket in self._seen)
+        return {
+            "days_by_stage": dict(per.most_common()),
+            "stage7_rejected_contracts": dict(self._breakdown),
+            "stage7_rejected_days": {k: len(v) for k, v in self._breakdown_days.items()},
+        }
+
+
 def _arm_row(symbol: str, arm: Arm, report, runtime_s: float, patched: int) -> dict:
     dq = report.data_quality or {}
     rejections = dq.get("blocked_days_by_reason", {}) or {}
@@ -571,7 +727,7 @@ def run_engine(symbol: str, start: date, end: date, out: Path,
     for arm in arms:
         config = _fresh_config(arm)
         t0 = datetime.now()
-        with _FloorShape(arm) as shape:
+        with _FloorShape(arm) as shape, _StageTally() as stages:
             report, _ = evaluate_symbol(
                 symbol, start, end,
                 config=config,
@@ -583,6 +739,7 @@ def run_engine(symbol: str, start: date, end: date, out: Path,
             )
         row = _arm_row(symbol, arm, report,
                        (datetime.now() - t0).total_seconds(), shape.applied)
+        row["stage_tally"] = stages.summary()
         rows[arm.key] = row
         print(f"  {symbol} arm {arm.key} ({arm.label}): "
               f"puts {row['puts_sold']} calls {row['calls_sold']} | "
@@ -965,19 +1122,25 @@ def _apply_rules(engine: dict, fills: Optional[dict]) -> dict:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("layer", choices=("chain", "engine", "fills", "report"))
+    p.add_argument("layer", choices=("prefetch", "chain", "engine", "fills", "report"))
     p.add_argument("--symbol", help="single symbol (chain/engine)")
     p.add_argument("--symbols", help="comma-separated (report)")
     p.add_argument("--start", default=WINDOW_START.isoformat())
     p.add_argument("--end", default=WINDOW_END.isoformat())
     p.add_argument("--out", default=None)
+    p.add_argument("--shard", type=int, default=0, help="prefetch: this shard index")
+    p.add_argument("--shards", type=int, default=1, help="prefetch: total shards")
     args = p.parse_args()
 
     out = Path(args.out) if args.out else _default_out()
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)
 
-    if args.layer in ("chain", "engine"):
+    if args.layer == "prefetch":
+        if not args.symbol:
+            p.error("prefetch needs --symbol")
+        run_prefetch(args.symbol, start, end, args.shard, args.shards)
+    elif args.layer in ("chain", "engine"):
         if not args.symbol:
             p.error(f"{args.layer} needs --symbol")
         (run_chain if args.layer == "chain" else run_engine)(args.symbol, start, end, out)
