@@ -16,10 +16,11 @@ Post-FC-012 (2026-04-24) removals:
     to equity_history_from_alpaca; per-symbol snapshots dropped)
 
 Post-FC-035 (2026-07-29) removals:
-  - write_order_status + the order_statuses table (never populated: the
-    poll that fed it never executed. Fills/expirations come from the
-    activities ingestor -> trades_from_activities, which is
-    authoritative and idempotent).
+  - write_order_status + the order_statuses table. Never populated: the
+    poll that fed it ran every /run cycle but its effectful branches
+    never fired (0 events, 0 rows, in ~490 production invocations).
+    Fills/expirations come from the activities ingestor ->
+    trades_from_activities, which is authoritative and idempotent.
 
 Design principles:
   - Graceful no-op if BigQuery is unavailable

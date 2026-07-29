@@ -221,8 +221,10 @@ idempotent. Trace a change through these five layers:
 6. **Verify**: premium calculations and other aggregates are unaffected
 
 **Do not add a bot-side order-status poller.** One existed
-(`poll_order_statuses`) and was deleted in FC-035: it never executed in
-production, nothing read its output, and it would have been a second,
+(`poll_order_statuses`) and was deleted in FC-035. It *ran* on every `/run`
+cycle for ~4 months, but produced nothing — 0 events and 0 rows across ~490
+invocations — because it only ever inspected open orders, which are never in
+a final state. Nothing read its output, and it would have been a second,
 non-idempotent writer of facts the activities feed already carries. See
 `docs/plans/fc-035.md`.
 

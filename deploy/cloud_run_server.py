@@ -310,7 +310,8 @@ def trigger_strategy():
             # --- Pre-trade housekeeping ---
             # Reconcile positions so wheel state matches Alpaca reality before
             # new trades. (The order-status poll that used to run here was
-            # deleted in FC-035: it had never executed, and the authoritative
+            # deleted in FC-035: it ran every cycle for ~4 months but never
+            # produced a single event or row, and the authoritative
             # fill/expiration record comes from the activities ingestor.)
             try:
                 engine = WheelEngine(config)
