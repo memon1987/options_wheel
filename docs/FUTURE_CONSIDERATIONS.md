@@ -1006,6 +1006,37 @@ elif 'C' in option_symbol: ...    # counts a CALL
 
 ---
 
+### FC-056: the engine prices covered calls ~32% below live on identical contracts
+
+**Status:** Consideration
+**Size estimate:** M (investigation first — cause unknown)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Finding:** the first call-side parity measurement (`docs/investigations/fc-032-call-parity.md`, 80 real decisions) shows the replay marks a covered call at **67.6% of the premium live actually received on the *identical* contract**. The put leg's equivalent figure is ~93% (a ~7% shortfall). **The call leg's pricing error is roughly 5x the put leg's.**
+
+**A hypothesis already tested and DISCONFIRMED.** The obvious cause was DTE mix — 28% of live call fills are at DTE 8 while the sim caps at `call_target_dte: 7`, so it would pick shorter, cheaper contracts. Splitting exact-strike matches:
+
+| | n | median sim/live |
+|---|---:|---:|
+| live DTE ≤ 7 (sim can match the expiry) | 8 | **0.644** |
+| live DTE > 7 (sim capped shorter) | 6 | 0.723 |
+
+The shortfall is **slightly worse where the sim can match the expiry**. Do not re-propose DTE as the cause without new evidence.
+
+**Candidate directions, none verified:**
+- **Thin call bars.** Daily option bars are trade aggregates; the close is the last print. Covered calls at 0.15–0.25 delta may trade far less than the equivalent puts, making the close staler and more likely to be an early-session print.
+- **Intraday drift with a sign.** Live sold these at ~9:35/12:00/15:00; the bar close reflects a different underlying level. For calls, a systematic intraday drift would bias one way — measurable against intraday bars.
+- **Spread model interaction.** Modeled half-spread is 2.46x real (FC-051 measurement); the 0.25 fill haircut then over-charges. But on a $3.10 median call this is pennies, not 32% — it cannot be the main term.
+
+**Also unexplained: selection.** Strike reproduction is **55.2%** on calls vs 81% on puts, and is concentrated — GOOGL 15/18 and NVDA 9/19 reproduce well, while **AMD 0/9 and AMZN 1/17 barely reproduce at all**. Worth checking whether those two share a chain-liquidity or strike-spacing property.
+
+**Why it matters, and why it is not urgent:** the error is **conservative** — the engine understates call premium, so it understates wheel returns. Every known bias now points the same way (put leg ~7% low, spread model 2.46x wide, call leg ~32% low), which makes reported returns a **floor**. That is the safe direction for a screening tool. But an absolute call-leg return should not be quoted as accurate, and a `marginal` verdict driven by the call leg is probably better in reality than reported.
+
+**Links:** `docs/investigations/fc-032-call-parity.md`, `docs/investigations/fc-032-parity-check.md` (put side), FC-048 (made the call leg measurable at all), FC-051 (spread calibration).
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
