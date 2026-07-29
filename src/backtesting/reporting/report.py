@@ -23,12 +23,23 @@ from ..metrics.fitness import FitnessReport
 # Biases we know about and have chosen not to model. Printed on every report:
 # an unlisted caveat is one the reader will assume does not exist.
 KNOWN_BIASES = [
-    ("Premium understated ~7-20%", (
+    ("Premium understated — and much more on the CALL leg", (
         "Option marks come from daily bar closes (trade prints), while the live "
-        "bot fills intraday against real quotes. Measured against 202 real "
-        "decisions: identical contracts price ~7% below live's fill, rising to "
-        "~20% once contract selection differs. Conservative — the strategy's "
-        "true premium capture is higher than reported.")),
+        "bot fills intraday against real quotes. The two legs are NOT equally "
+        "faithful, and the call leg is the weaker one: "
+        "PUTS, over 204 real decisions — identical contracts price ~7% below "
+        "live's fill, rising to ~20% once selection differs; 81% strike "
+        "reproduction. "
+        "CALLS, over 80 real decisions — identical contracts price at only "
+        "0.676 of live (a ~32% shortfall, roughly 5x the put leg's error), with "
+        "55.2% strike reproduction. Delta-band accuracy is 100% on both legs, "
+        "so the engine always picks a correct-RISK contract; it is the price, "
+        "and on calls the strike, that drift. The call figure was unmeasurable "
+        "until FC-048 — before that the engine could not produce a covered call "
+        "at all. Cause of the call gap is unknown (DTE mix was tested and "
+        "disconfirmed); see FC-056 and docs/investigations/fc-032-call-parity.md. "
+        "Direction is conservative on both legs: reported returns are a FLOOR, "
+        "not a forecast. Do not quote an absolute call-leg return as accurate.")),
     ("Bid/ask is modeled, not calibrated", (
         "Alpaca sells no historical option quotes at any price, so spreads come "
         "from a parametric model running on its DEFAULT parameters — "
@@ -73,7 +84,7 @@ KNOWN_BIASES = [
         "the wheel's land in cash on the ex-date where they can back the next "
         "put. That asymmetry favours the wheel whenever the stock rises, and is "
         "small relative to the stream itself.")),
-    ("Ex-dividend early assignment is modeled; other early assignment is not", (
+    ("Ex-dividend early assignment is modeled but has NEVER FIRED in a real replay", (
         "A short ITM call whose remaining extrinsic value is below the next "
         "day's dividend is assigned the evening before the ex-date, which is "
         "the dominant real-world early-assignment trigger (FC-042 Track C). "
@@ -83,7 +94,16 @@ KNOWN_BIASES = [
         "the data-quality block above, which is the count of times that "
         "happened, and is optimistic when non-zero. Second, early assignment "
         "for reasons other than a dividend (deep-ITM pin risk, hard-to-borrow "
-        "recalls) is still unmodeled — rare, and also optimistic.")),
+        "recalls) is still unmodeled — rare, and also optimistic. "
+        "THIRD, AND READ THIS ONE: the path has never executed on real data. It "
+        "requires a dividend payer holding an ITM short call, and the payers in "
+        "this universe (F, PFE, KMI, VZ) are precisely the symbols that cannot "
+        "clear the premium floor to open a position at all (FC-034), while the "
+        "symbols that do trade pay little or nothing. Before FC-048 no replay "
+        "produced a covered call whatsoever, so `early_assignments` has read 0 "
+        "in every run this engine has ever done. The logic is validated by unit "
+        "tests against hand-built broker state, NOT by any historical replay. "
+        "Treat it as untested-in-anger.")),
     ("One decision per day, with zero decision-to-fill latency", (
         "The live bot scans three times daily; the replay decides once at the "
         "close. Production also splits scanning from execution across separate "
