@@ -95,10 +95,13 @@ Copy this when adding a new consideration. Keep it short — detail belongs in t
 **On the evidence, the filter is anti-selective in this window:** of 327 real entries, the
 123 it would have blocked earned **$70.66/entry** against **$55.94** for the 204 it would
 have allowed ($8,691 forgone, 43% of net realized); on 2,329 synthetic daily entries blocked
-days out-earn allowed days on 4 of 4 symbols, both IV models, ±20% premium. Caveat stated
-prominently in the study: one bull-market regime, no vol shock. **Recommendation: do not
-re-tune thresholds; resolve FC-048 first.** The only arm worth carrying forward is graduated
-response (delta band → [0.10, 0.15] instead of a ban) — note its "half size" variant is
+days out-earn allowed days on 4 of 4 symbols, both IV models, ±20% premium. Caveats stated
+prominently in the study: one bull-market regime, no vol shock, and — per **FC-048** — the
+study's *engine* arms are put-only and are therefore supporting evidence at most. The real-fills
+and overlay layers, which carry the conclusion, are unaffected by FC-048. **Recommendation:
+do not re-tune thresholds; resolve FC-049 first.** The one arm worth carrying forward is
+graduated response (delta band → [0.10, 0.15] instead of a ban), **contingent on a re-run
+after FC-048 is fixed** — its support is engine-only, and its "half size" variant is
 impossible at `put_seller.py`'s hard-coded `contracts = 1`.
 
 **Open questions:**

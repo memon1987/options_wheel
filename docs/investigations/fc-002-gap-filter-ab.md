@@ -12,6 +12,59 @@ and is not re-examined here.
 **This document is evidence, not a change.** No live threshold moves on this study. Any
 change to `gap_risk_controls` gates on FC-002's own plan plus two adversarial reviews.
 
+> ### ⚠️ Read this before Layer 2: the engine arms are put-only
+>
+> **FC-048** (`c37f777` on main, filed independently while this study was running):
+> `ExecutionEngine.execute_batch` routes on `opp.get('type', 'put')`
+> (`src/strategy/execution_engine.py:286`). The live `/scan` path sets `'type': 'call'`
+> (`options_scanner.py:340`); the path the **backtest replays** —
+> `call_seller.evaluate_covered_call_opportunity` via `wheel_engine.run_strategy_cycle()` —
+> sets `'strategy': 'sell_call'` and no `'type'` key at all. Every covered-call opportunity
+> in replay is therefore handed to `put_seller` and rejected. Verified here independently by
+> code trace and by this study's own output: **`calls_sold = 0` and realized `stock_pnl = $0`
+> in all 36 arms across all four symbols.** Production is unaffected (84 real calls in
+> `trades_from_activities`).
+>
+> **What it invalidates:** [Layer 2](#layer-2--the-engine-ab) only. Its returns, RoC, max
+> drawdown, worst cycle and days-in-position are measured with no call premium and with no
+> cycle ever completing — once assigned, shares are held to the end of the window.
+>
+> **What it does not touch:** [Finding 0](#finding-0--the-filter-is-not-in-the-live-path)
+> (source, git history, production logs, one BigQuery fill), [Layer 1](#layer-1--what-the-filter-does-and-which-leg-does-it)
+> (daily bars, no engine), [Layer 3](#layer-3--the-real-fills) (real fills) and the
+> [Overlay](#overlay--2329-synthetic-entries-because-the-engines-sample-is-too-small)
+> (daily bars, no engine). **Those four carry the conclusion.**
+>
+> **Direction of the bias — measured, not assumed, and it is the opposite of the intuitive
+> guess.** The intuitive reading is that looser arms are penalised, because they take more
+> assignments and then forfeit the call premium on those shares. In *this* window the
+> opposite dominates: shares that are never called away retain their full upside in a strong
+> bull market, and that outweighs the forgone call premium several times over. Decomposing
+> NVDA's own arms:
+>
+> | NVDA arm | option P&L | unrealized stock P&L | stock as % of P&L | puts | days in position |
+> |---|---:|---:|---:|---:|---:|
+> | (a) as-is | $2,498 | $2,934 | 54% | 30 | 236 |
+> | (b) off | **$1,709** | **$6,484** | **79%** | 21 | 466 |
+>
+> **Arm (b)'s option income is *lower* than arm (a)'s — its entire apparent advantage is
+> retained stock appreciation from being assigned earlier and holding longer.** The same
+> pattern is more extreme elsewhere: AMD's arms are 99.5% unrealized stock ($34,945 against
+> $181 of option P&L), GOOGL's 99.7%, IWM's 98.2%. So Layer 2 **flatters the loosening arms**,
+> and the engine evidence for loosening is overstated, not understated. That cuts against
+> this study's own direction of travel, which is why it is stated here rather than in a
+> footnote.
+>
+> **Does the recommendation flip?** Items 1 and 2 below do not — they rest on Finding 0 and
+> on the real-fills/overlay layers. **Item 3 (carry forward arm (e), graduated response) is
+> contingent and is flagged as such**: its only support is Layer 2, and 78% of its apparent
+> AMD gain is retained stock upside ($34,945 → $37,195 unrealized, against $181 → $688 of
+> option P&L) that a working call path would partly have called away. **Arm (e) must be
+> re-run after FC-048 is fixed before anyone acts on it.** The harness makes that a
+> four-command job.
+>
+> *(This branch is not rebased onto `c37f777`; the finding is incorporated by reference.)*
+
 ---
 
 ## Verdict
@@ -30,8 +83,9 @@ three days later. Every one of the 330 live sell-to-open fills was placed by a p
 never evaluates stage 2. Every block rate FC-002 quotes, and every stage-2 rate in the
 FC-036 study, describes the **backtest engine**, not production.
 
-**2. Even taken as a question about the engine, the filter's premise does not hold in this
-window — it blocks the better days, not the worse ones.** Against the 330 real fills, the
+**2. Setting the wiring aside, the filter's premise does not hold in this window — it blocks
+the better days, not the worse ones.** This rests on real fills and on a daily-bar overlay,
+**neither of which involves the engine**, so neither is touched by FC-048. Against the 330 real fills, the
 123 entries the status-quo rule would have refused earned **$8,691** of realized P&L at
 **$70.66/entry** against **$55.94/entry** for the 204 it would have allowed. Against 2,329
 synthetic daily entries priced from bars and a fill-calibrated IV model, the days it blocks
@@ -41,13 +95,13 @@ on all four symbols, under both IV models, and under ±20% premium scaling.
 | pre-registered rule | fires? | evidence |
 |---|---|---|
 | **R1** — the premise holds in real money | **partly, on one fragile metric only** | P&L per entry is **higher** in the top vol decile ($77.95 vs $59.50) — the ≥25%-lower clause does not fire. Assignment rate 11.43% vs 8.56% = 1.34× — below the 1.5× bar. The **worst-decile-mean clause does fire** (−$940 vs −$413, 2.3×) — but that statistic is the mean of the **3 worst of 35** trades and is entirely one trade (AMD 2025-11-17, −$2,428). On mean-of-worst-5 it reverses (−$547 vs −$1,200); on loss rate it reverses (5.7% vs 6.8%). See [R1, in full](#r1--does-elevated-vol-predict-bad-outcomes-in-real-money). |
-| **R2** — loosening buys return by taking risk | **no** | NVDA off vs as-is: ROC 33.64% → 66.07%, max DD −3.97% → −5.17%. ROC nearly doubles (+96%) while drawdown worsens 30%; worst cycle is unchanged (+$50.27 → +$49.28) and **no arm on any symbol had a losing cycle**. AMD's worst cycle moves +$76.88 → +$59.13 — still positive. |
+| **R2** — loosening buys return by taking risk | **no — but this rule is now unreliable and is not load-bearing** | NVDA off vs as-is: ROC 33.64% → 66.07%, max DD −3.97% → −5.17%; worst cycle flat (+$50.27 → +$49.28) and **no arm on any symbol had a losing cycle**. **However, R2 is evaluated purely on Layer 2, which FC-048 makes put-only, and the direction of that bias flatters the loosening arms** (arm (b)'s option income is *lower* than arm (a)'s; its gain is retained stock). Treat R2 as unresolved pending an FC-048 re-run. The verdict does not depend on it: R3 and R4 are measured without the engine. |
 | **R3** — the filter is genuinely selective | **no, and it inverts** | Blocked days out-earn allowed days on **4 of 4** symbols, under both IV models and at −20% premium. AMD's allowed days are the only negative bucket in the entire overlay: **−$168.89/entry, 28.6% assignment**. |
 | **R4** — the filter is not binding | **no** | It is severely binding *in replay*: NVDA 63.4% of sessions, AMD 94.4%, and 100% of AMD's 201 sessions in the live-fills window. |
 
 **Recommendation.** Three items, in dependency order. None of them is a threshold change.
 
-1. **File the wiring gap as its own FC and decide the intent first.** Either the live path
+1. **Decide the intent first — filed as FC-049.** Either the live path
    should run the filter or the filter should be deleted; what it must not stay is a
    control that exists in config, in the backtest, and in the FC index, but not in the
    thing that trades. Deciding *whether* to gate is a strictly larger question than *where*
@@ -63,12 +117,17 @@ on all four symbols, under both IV models, and under ±20% premium scaling.
    more damaging half (it alone blocks 51.3% of NVDA and 77.6% of AMD sessions and is what
    blocks 100% of AMD's live window), and it is the leg with the least theoretical
    justification: a >2% overnight move on a 40-vol name is a **typical** day, not a tail.
-3. **The only arm worth carrying forward is (e), graduated response — and only as a
-   half-measure.** It is the one arm that improves the engine on the symbol with a real
-   sample without removing the control: AMD ROC 210.41% → 229.33% with 9 puts instead of 2.
-   But note that its *stated* first option, "half size", **cannot be implemented**:
-   `put_seller.py:182` hard-codes `contracts = 1`, and there is no half contract. Only the
-   delta-band variant is testable, and it is what was tested.
+3. **The one arm worth carrying forward is (e), graduated response — contingent, and not
+   actionable until FC-048 is fixed.** It is the one arm that improves the engine without
+   removing the control (AMD ROC 210.41% → 229.33%, 9 puts instead of 2). But **its only
+   support is Layer 2, which is put-only**, and 78% of that AMD gain is retained stock
+   upside a working call path would partly have called away. Re-run it after FC-048 before
+   acting. Two further limits: its *stated* first option, "half size", **cannot be
+   implemented** — `put_seller.py:182` hard-codes `contracts = 1` and there is no half
+   contract — so only the delta-band variant was testable; and the graduated response is the
+   one arm whose merit the real-fills layer **cannot** adjudicate, because it changes what is
+   traded rather than whether, and the book contains no [0.10, 0.15]-delta fills to compare
+   against.
 
 **What would change this answer:** a vol regime this window does not contain. 2024-02 →
 2026-07 is one long bull market in which realized vol and premium rose together and every
@@ -303,6 +362,13 @@ outside their limits ever since.
 ---
 
 ## Layer 2 — the engine A/B
+
+> **Two independent reasons to treat this layer as supporting evidence only.** First,
+> **FC-048: these arms are put-only** — `calls_sold = 0` and realized `stock_pnl = $0` in
+> every one of the 36 arms below, because replay misroutes covered calls to `put_seller`.
+> Cycles never complete; assigned shares are held to the end of the window. The bias
+> **flatters the loosening arms** (see the [banner](#-read-this-before-layer-2-the-engine-arms-are-put-only)).
+> Second, the minimum-entries criterion. Both were known before the tables were read.
 
 **Read the minimum-entries criterion first: only NVDA is evidence.** GOOGL opens **one** put
 in 2.5 years and holds shares for 616 of 621 days; every GOOGL arm is byte-identical, and
@@ -541,22 +607,33 @@ $119,778 of P&L ($122.97/entry), 1,355 allowed entries carrying $37,992 ($28.04/
 6. **Replay premium is understated ~20%** (median sim/live 0.797,
    [fc-032-parity-check.md](fc-032-parity-check.md)). Layer-2 dollar figures inherit that.
    It is roughly proportional across arms, so differences are more reliable than levels.
-7. **The engine barely trades, and that is a confound, not a result.** 1 put on GOOGL, 2–9
-   on AMD, 3–8 on IWM over 2.5 years. Only NVDA clears the 10-entry bar. The cause is
-   upstream of this filter (stage-6 "already holding", the cost-basis drawdown pause, and
-   the covered-call starvation documented in FC-038) and is not addressed here.
-8. **Reconstruction precision is ±~0.005 of annualized vol at the frame edge**, which is
+7. **The engine barely trades, and FC-048 is a large part of why.** 1 put on GOOGL, 2–9 on
+   AMD, 3–8 on IWM over 2.5 years; only NVDA clears the 10-entry bar. The original draft of
+   this footer attributed that to stage-6 "already holding", the cost-basis drawdown pause,
+   and FC-038's covered-call starvation. Those contribute, but the dominant mechanism is
+   simpler and was visible in this study's own output before FC-048 was filed:
+   **`calls_sold = 0` in all 36 arms**. Once a symbol is assigned it can never be called
+   away, so stage 6 blocks every subsequent put for the rest of the window — GOOGL holds
+   shares on 616 of 621 days after its single put. Recorded here as a miss: the evidence was
+   in my own table and I read it as "the engine barely trades" without asking why.
+8. **Layer 2's headline returns are not wheel income.** With the call leg dead, arms are
+   dominated by unrealized stock appreciation: AMD 99.5% ($34,945 of $35,126), GOOGL 99.7%,
+   IWM 98.2%, NVDA 54–79%. Return-on-collateral differences between arms are therefore
+   largely differences in *when the symbol got assigned into a rising stock*, not in option
+   selling. This is the single strongest reason the recommendation leans on Layers 1/3 and
+   the overlay.
+9. **Reconstruction precision is ±~0.005 of annualized vol at the frame edge**, which is
    enough to flip a verdict when vol sits on the 0.40 line — as the NVDA 2026-06-02
    disagreement shows. Block rates for NVDA, whose median vol is 0.407, carry that
    uncertainty; AMD's (median 0.491, median gap frequency 0.343) do not.
-9. **Cloud Logging retention is 40 days.** Finding 0(c) is a 40-day observation. It is
+10. **Cloud Logging retention is 40 days.** Finding 0(c) is a 40-day observation. It is
    corroborated by 0(a) source inspection, 0(b) git history and 0(d) a 2025-10-06 fill, none
    of which depend on retention.
-10. **Arm (e)'s delta shift lands one scan late for covered calls.** `_manage_existing_positions`
+11. **Arm (e)'s delta shift lands one scan late for covered calls.** `_manage_existing_positions`
     (which sells covered calls) runs *before* `_find_new_opportunities` (which evaluates
     stage 2), so on any given day the call side uses the previous day's delta band. Puts are
     unaffected. Small, and it biases arm (e) toward the status quo.
-11. **Arm (e)'s "half size" variant was not tested because it cannot exist.**
+12. **Arm (e)'s "half size" variant was not tested because it cannot exist.**
     `src/strategy/put_seller.py:182` hard-codes `contracts = 1`. There is no half contract.
     Only the delta-band variant of the plan's arm (e) is testable at current sizing.
 
