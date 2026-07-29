@@ -25,6 +25,13 @@ from ...utils import clock
 # Live event_type -> the human-facing reason a day produced no trade. Ordered
 # roughly by how early the stage sits in the pipeline.
 _REASONS = {
+    # FC-057: stage 1 was invisible. A symbol blocked on the price band or
+    # volume floor produced NO tally entry at all, so a screen reported it as
+    # simply having done nothing -- "insufficient", "0% days in position", no
+    # reason given. That is how a $400 max_stock_price silently excluded SPY,
+    # QQQ and AMD for months while their verdicts were read as strategy
+    # results. The event was always emitted with full detail; nothing counted it.
+    "stock_rejected_filter": "price/volume band (stage 1)",
     "stock_filtered_by_gap_risk": "gap-risk filter (stage 2)",
     "rejected_high_gap_frequency": "gap-risk filter (stage 2)",
     "stage_4_blocked": "execution gap check (stage 4)",
