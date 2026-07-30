@@ -1,6 +1,5 @@
 """Call selling module for options wheel strategy."""
 
-import os
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 import structlog
@@ -11,6 +10,7 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_trade_event, log_error_event, log_position_update
 from ..utils.option_symbols import parse_option_symbol
+from .cost_basis import CostBasisResolver, opportunity_floor_per_share
 
 logger = structlog.get_logger(__name__)
 
@@ -39,12 +39,22 @@ class CallSeller:
         self.market_data = market_data
         self.config = config
         self.wheel_state = wheel_state_manager
+        # Construction-time snapshot, kept for assertions only: the resolver below
+        # took its own copy, so mutating this attribute afterwards changes nothing.
         self.allow_bigquery_cost_basis = allow_bigquery_cost_basis
         self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
-        # FC-029: cache the BigQuery client (constructed lazily on first cost-basis
-        # lookup) so cold-start cycles don't pay the Client() construction cost
-        # twice within a single evaluate_covered_call_opportunity call.
-        self._bq_client = None
+        # FC-050: the FC-029 resolution chain now lives in cost_basis.py so the
+        # scanner shares it. The lookup is injected as a late-bound call through
+        # this instance's wrapper (rather than the resolver's own method) so
+        # patching CallSeller._lookup_last_opasn_put_strike still intercepts the
+        # chain — the test suite's hermeticity guard depends on that.
+        self._cost_basis_resolver = CostBasisResolver(
+            alpaca_client,
+            config,
+            wheel_state=wheel_state_manager,
+            allow_bigquery=allow_bigquery_cost_basis,
+            opasn_lookup=lambda symbol: self._lookup_last_opasn_put_strike(symbol),
+        )
         
     def evaluate_covered_call_opportunity(self, stock_position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Evaluate covered call opportunity for an assigned stock position.
@@ -314,31 +324,66 @@ class CallSeller:
                     'non_retryable': True
                 }
 
-            # DEFENSIVE: Final validation before execution - prevent guaranteed losses
+            # DEFENSIVE: Final validation before execution - prevent guaranteed losses.
+            # FC-050: the floor is read through opportunity_floor_per_share, which
+            # understands both producers' shapes. Reading only the wheel-engine keys
+            # meant this check never fired on scanner-produced opportunities — the
+            # only kind production executes.
             strike_price = opportunity.get('strike_price', 0)
-            stock_cost_basis = opportunity.get('stock_cost_basis', 0)
-            shares_covered = opportunity.get('shares_covered', 100)
+            cost_basis_per_share = opportunity_floor_per_share(opportunity)
 
-            if stock_cost_basis > 0 and strike_price > 0:
-                cost_basis_per_share = stock_cost_basis / shares_covered
-                if strike_price < cost_basis_per_share:
-                    log_error_event(
-                        logger,
-                        error_type="call_below_cost_basis_blocked",
-                        error_message=f"Strike ${strike_price} below cost basis ${cost_basis_per_share:.2f}/share - guaranteed loss prevented",
-                        component="call_seller",
-                        recoverable=True,
-                        symbol=opportunity.get('symbol', ''),
-                        option_symbol=opportunity.get('option_symbol', ''),
-                        strike_price=strike_price,
-                        cost_basis_per_share=cost_basis_per_share,
-                        loss_per_share=cost_basis_per_share - strike_price
-                    )
-                    return {
-                        'success': False,
-                        'error': 'strike_below_cost_basis',
-                        'message': f'Strike ${strike_price} below cost basis ${cost_basis_per_share:.2f}/share'
-                    }
+            # FC-050: no resolvable floor is a blocking condition, not a reason to
+            # skip the check. Post-FC-050 every scanner opportunity carries a
+            # positive cost_basis_per_share and the wheel engine always sets
+            # stock_cost_basis, so this means a malformed opportunity — the exact
+            # case that must not reach the broker. Mirrors the FC-029
+            # cost_basis_floor_unresolved block on the evaluation path.
+            if cost_basis_per_share <= 0:
+                log_error_event(
+                    logger,
+                    error_type="cost_basis_floor_unresolved_at_execution",
+                    error_message=(
+                        f"No cost-basis floor on opportunity for "
+                        f"{opportunity.get('option_symbol', 'unknown')} "
+                        f"({opportunity.get('symbol', 'unknown')}) - blocking call write"
+                    ),
+                    component="call_seller",
+                    recoverable=True,
+                    symbol=opportunity.get('symbol', ''),
+                    option_symbol=opportunity.get('option_symbol', ''),
+                    strike_price=strike_price,
+                )
+                return {
+                    'success': False,
+                    'error_type': 'cost_basis_floor_unresolved_at_execution',
+                    'message': (
+                        f"No cost-basis floor on opportunity for "
+                        f"{opportunity.get('option_symbol', 'unknown')} - call not written"
+                    ),
+                    'non_retryable': False
+                }
+
+            # A missing/zero strike also lands here rather than skipping the
+            # check: with a real floor in hand, "no strike" is malformed input,
+            # not a reason to trade unprotected.
+            if strike_price < cost_basis_per_share:
+                log_error_event(
+                    logger,
+                    error_type="call_below_cost_basis_blocked",
+                    error_message=f"Strike ${strike_price} below cost basis ${cost_basis_per_share:.2f}/share - guaranteed loss prevented",
+                    component="call_seller",
+                    recoverable=True,
+                    symbol=opportunity.get('symbol', ''),
+                    option_symbol=opportunity.get('option_symbol', ''),
+                    strike_price=strike_price,
+                    cost_basis_per_share=cost_basis_per_share,
+                    loss_per_share=cost_basis_per_share - strike_price
+                )
+                return {
+                    'success': False,
+                    'error': 'strike_below_cost_basis',
+                    'message': f'Strike ${strike_price} below cost basis ${cost_basis_per_share:.2f}/share'
+                }
 
             option_symbol = opportunity['option_symbol']
             contracts = opportunity['contracts']
@@ -466,130 +511,29 @@ class CallSeller:
     ) -> float:
         """Resolve the per-share cost basis for covered-call strike floor.
 
-        FC-029 (R2): cost basis = strike of the assigning put. Sources, in order:
-
-        1. ``wheel_state.symbol_states[symbol]['stock_cost_basis']`` — populated
-           at OPASN time from the put strike, persisted to GCS.
-        2. Most recent OPASN-put strike for ``symbol`` from
-           ``options_wheel.trades_from_activities`` (handles silent assignments,
-           cold starts, and synthetic-row corrections like FC-021/FC-025). When
-           this path resolves, the result is back-filled into wheel_state so
-           subsequent reads in the same cycle hit the fast path.
-        3. Alpaca's reported ``cost_basis`` field — known-broken for assigned
-           positions in paper trading (returns 0), but works for non-wheel
-           positions like manual buys. Last-resort fallback.
-
-        Returns 0 only if no source resolves; the caller treats that as
-        "no floor" (preserves prior behavior so this change can never make
-        the floor more permissive than before).
+        FC-050: delegates to the shared :class:`CostBasisResolver`, which the
+        scanner uses too. Kept as a method so callers and tests that patch this
+        entry point keep working; the FC-029 source order, the wheel_state
+        back-fill and the BigQuery gating are unchanged.
 
         Args:
             symbol: Underlying ticker (e.g. ``"AMD"``).
             stock_position: Alpaca position dict (provides the Alpaca fallback).
             shares_owned: Current share count for fallback per-share division.
+
+        Returns:
+            Per-share cost basis, or 0 if no source resolves one.
         """
-        # 1. wheel_state — canonical, in-memory + GCS persisted
-        if self.wheel_state:
-            try:
-                state = self.wheel_state.get_position_summary(symbol)
-                cb = float(state.get('stock_cost_basis', 0) or 0)
-                if cb > 0:
-                    return cb
-            except Exception as e:
-                logger.warning(
-                    "wheel_state cost-basis read failed; trying BQ fallback",
-                    event_category="risk",
-                    event_type="cost_basis_state_read_failed",
-                    symbol=symbol, error=str(e),
-                )
-
-        # 2. BQ — last OPASN-put strike for this symbol
-        cb = self._lookup_last_opasn_put_strike(symbol)
-        if cb > 0:
-            if self.wheel_state:
-                try:
-                    self.wheel_state.set_stock_cost_basis(symbol, cb)
-                except Exception as e:
-                    logger.warning(
-                        "wheel_state cost-basis backfill failed",
-                        event_category="risk",
-                        event_type="cost_basis_state_backfill_failed",
-                        symbol=symbol, error=str(e),
-                    )
-            return cb
-
-        # 3. Alpaca — last resort. Broken for assigned paper positions but
-        #    correct for manual buys (qty * avg_entry_price).
-        try:
-            alpaca_cb = float(stock_position.get('cost_basis', 0) or 0)
-            return alpaca_cb / max(shares_owned, 1)
-        except Exception:
-            return 0.0
+        return self._cost_basis_resolver.resolve(symbol, stock_position, shares_owned)
 
     def _lookup_last_opasn_put_strike(self, symbol: str, lookback_days: int = 90) -> float:
         """Return strike of the most recent OPASN-put for ``symbol``.
 
-        FC-029 review fixes:
-          - HIGH 1: pass ``project=`` to ``bigquery.Client()`` so the lookup
-            targets the right GCP project even when env vars are unset/wrong.
-            Matches codebase pattern in `data/*_ingestor.py`.
-          - HIGH 3: cache the client on ``self._bq_client`` so repeated calls
-            within one evaluation don't pay the Client() construction cost.
-          - HIGH 4: age-bound to ``lookback_days`` (default 90) so stale OPASN
-            history doesn't get applied to long-after-the-fact manual buys
-            on a previously-traded symbol.
-
-        Returns 0 if no assigning put found within ``lookback_days``, BQ
-        unavailable, or any error. Logged at WARNING when the lookup fails so
-        missed floors are observable.
+        FC-050: delegates to the shared :class:`CostBasisResolver`. This wrapper
+        is also the single interception point for the resolution chain used by
+        this seller (see ``opasn_lookup`` in ``__init__``).
         """
-        if not self.allow_bigquery_cost_basis:
-            # Backtest mode. Returning 0.0 is the same "no floor from this
-            # source" signal the fallback already emits on miss, so the caller's
-            # resolution chain is unchanged.
-            logger.debug("BigQuery cost-basis fallback disabled",
-                         event_category="data",
-                         event_type="cost_basis_bq_disabled",
-                         symbol=symbol)
-            return 0.0
-
-        try:
-            from google.cloud import bigquery
-            if self._bq_client is None:
-                project_id = (
-                    os.environ.get('GCP_PROJECT')
-                    or os.environ.get('GOOGLE_CLOUD_PROJECT')
-                    or os.environ.get('GCP_PROJECT_ID')
-                )
-                self._bq_client = bigquery.Client(project=project_id) if project_id else bigquery.Client()
-            query = """
-            SELECT strike_price
-            FROM `options_wheel.trades_from_activities`
-            WHERE underlying = @symbol
-              AND activity_type = 'OPASN'
-              AND option_type = 'put'
-              AND transaction_time <= CURRENT_TIMESTAMP()
-              AND transaction_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @lookback_days DAY)
-            ORDER BY transaction_time DESC
-            LIMIT 1
-            """
-            job_config = bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter('symbol', 'STRING', symbol),
-                bigquery.ScalarQueryParameter('lookback_days', 'INT64', lookback_days),
-            ])
-            job = self._bq_client.query(query, job_config=job_config)
-            for row in job.result(timeout=10):
-                strike = row.get('strike_price')
-                return float(strike) if strike is not None else 0.0
-            return 0.0
-        except Exception as e:
-            logger.warning(
-                "OPASN-strike lookup failed; falling back to Alpaca cost_basis",
-                event_category="risk",
-                event_type="opasn_strike_lookup_failed",
-                symbol=symbol, error=str(e),
-            )
-            return 0.0
+        return self._cost_basis_resolver._lookup_last_opasn_put_strike(symbol, lookback_days)
 
     def _parse_dte_from_option_symbol(self, option_symbol: str) -> int:
         """

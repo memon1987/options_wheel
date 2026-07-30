@@ -697,3 +697,154 @@ class TestWrongSellerGuard:
         # It may fail later for other reasons, but never as wrong_seller.
         if result is not None:
             assert result.get('error_type') != 'wrong_seller'
+
+
+class TestExecuteTimeCostBasisFloorFC050:
+    """FC-050: the execute-time below-basis floor on the path production runs.
+
+    ``execute_call_sale`` used to read only ``stock_cost_basis`` /
+    ``shares_covered`` — keys that only the wheel-engine path sets. Every
+    opportunity production actually executes comes from the scanner and carries
+    ``cost_basis_per_share`` / ``max_contracts`` instead, so the guard silently
+    never ran. The below-basis tests here fail against pre-FC-050 code.
+    """
+
+    def _seller(self):
+        self.mock_alpaca = Mock()
+        seller = CallSeller(self.mock_alpaca, Mock(), Mock(spec=Config))
+        seller._lookup_last_opasn_put_strike = Mock(return_value=0.0)
+        return seller
+
+    def _scanner_opportunity(self, strike, cost_basis_per_share=303.50):
+        """The shape OptionsScanner._create_call_opportunity emits."""
+        return {
+            'type': 'call',
+            'symbol': 'AAPL',
+            'option_symbol': f'AAPL260821C{int(strike * 1000):08d}',
+            'strike_price': strike,
+            'premium': 1.80,
+            'dte': 7,
+            'shares_owned': 100,
+            'max_contracts': 1,
+            'contracts': 1,
+            'cost_basis_per_share': cost_basis_per_share,
+        }
+
+    def test_a_scanner_opportunity_below_basis_is_blocked(self):
+        """THE regression: $290 strike on shares that cost $303.50."""
+        seller = self._seller()
+
+        result = seller.execute_call_sale(self._scanner_opportunity(290.0))
+
+        assert result['success'] is False
+        assert result['error'] == 'strike_below_cost_basis'
+        assert '303.50' in result['message']
+        self.mock_alpaca.place_option_order.assert_not_called()
+
+    def test_a_scanner_opportunity_above_basis_still_trades(self):
+        """The restored guard must not cost us the calls we may write."""
+        seller = self._seller()
+        self.mock_alpaca.place_option_order.return_value = {
+            'success': True, 'order_id': 'order-fc050',
+        }
+
+        result = seller.execute_call_sale(self._scanner_opportunity(310.0))
+
+        assert result['success'] is True
+        self.mock_alpaca.place_option_order.assert_called_once()
+
+    def test_a_strike_exactly_at_basis_is_allowed(self):
+        """Called away at cost is flat on the shares plus the premium — the
+        guard blocks losses, not break-even."""
+        seller = self._seller()
+        self.mock_alpaca.place_option_order.return_value = {
+            'success': True, 'order_id': 'order-flat',
+        }
+
+        result = seller.execute_call_sale(self._scanner_opportunity(303.50))
+
+        assert result['success'] is True
+
+    def test_a_multi_contract_wheel_engine_opportunity_divides_by_contracts(self):
+        """FC-038 made multi-contract covered calls reachable. A total basis of
+        $32,000 over 2 contracts is $160/share — dividing by a bare 100 would
+        read $320 and block a perfectly good $170 strike."""
+        seller = self._seller()
+        self.mock_alpaca.place_option_order.return_value = {
+            'success': True, 'order_id': 'order-multi',
+        }
+
+        result = seller.execute_call_sale({
+            'option_symbol': 'AAPL250117C00170000',
+            'symbol': 'AAPL',
+            'strike_price': 170.0,
+            'premium': 1.80,
+            'contracts': 2,
+            'stock_cost_basis': 32000.0,   # 200 shares at $160
+            'dte': 7,
+        })
+
+        assert result['success'] is True
+
+    def test_a_multi_contract_opportunity_below_the_true_basis_is_blocked(self):
+        seller = self._seller()
+
+        result = seller.execute_call_sale({
+            'option_symbol': 'AAPL250117C00150000',
+            'symbol': 'AAPL',
+            'strike_price': 150.0,
+            'premium': 3.00,
+            'contracts': 2,
+            'stock_cost_basis': 32000.0,   # $160/share, not $320
+            'dte': 7,
+        })
+
+        assert result['success'] is False
+        assert result['error'] == 'strike_below_cost_basis'
+        assert '160.00' in result['message']
+        self.mock_alpaca.place_option_order.assert_not_called()
+
+    def test_an_opportunity_with_no_resolvable_floor_is_blocked(self):
+        """Fail closed: post-FC-050 both producers carry a floor, so none means
+        a malformed opportunity — never 'skip the check and trade'."""
+        seller = self._seller()
+
+        result = seller.execute_call_sale({
+            'option_symbol': 'AAPL250117C00185000',
+            'symbol': 'AAPL',
+            'strike_price': 185.0,
+            'premium': 1.80,
+            'contracts': 1,
+        })
+
+        assert result['success'] is False
+        assert result['error_type'] == 'cost_basis_floor_unresolved_at_execution'
+        assert result['non_retryable'] is False
+        self.mock_alpaca.place_option_order.assert_not_called()
+
+    def test_a_zero_cost_basis_per_share_is_blocked_not_ignored(self):
+        """Alpaca reports 0 for freshly assigned positions (FC-029)."""
+        seller = self._seller()
+
+        result = seller.execute_call_sale(
+            self._scanner_opportunity(310.0, cost_basis_per_share=0.0))
+
+        assert result['success'] is False
+        assert result['error_type'] == 'cost_basis_floor_unresolved_at_execution'
+        self.mock_alpaca.place_option_order.assert_not_called()
+
+    def test_a_misrouted_put_is_still_rejected_before_the_floor_check(self):
+        """The FC-045/FC-048 guard stays ahead of the floor: a put must be
+        rejected as wrong_seller, not as an unresolved floor."""
+        seller = self._seller()
+
+        result = seller.execute_call_sale({
+            'option_symbol': 'AAPL250117P00170000',
+            'symbol': 'AAPL',
+            'strike_price': 170.0,
+            'contracts': 1,
+        })
+
+        assert result['error_type'] == 'wrong_seller'
+        assert result['non_retryable'] is True
+        self.mock_alpaca.place_option_order.assert_not_called()

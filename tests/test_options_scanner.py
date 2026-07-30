@@ -396,6 +396,114 @@ class TestCallScanFailsClosedOnUnresolvedCostBasis:
         assert [r['symbol'] for r in results] == ['MSFT']
 
 
+class TestCallScanResolvesCostBasisViaTheFC029Chain:
+    """FC-050: the scanner's floor comes from the shared resolution chain.
+
+    Alpaca reports ``cost_basis = 0`` for freshly assigned positions — exactly
+    the moment the wheel next writes a call. Before FC-050 the scanner read
+    that field directly, so the symbol was skipped (FC-038) even though the
+    assigning put's strike was sitting in BigQuery.
+    """
+
+    def setup_method(self):
+        self.mock_alpaca = Mock()
+        self.mock_market_data = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.call_target_dte = 7
+        self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                                      self.mock_config)
+        self.mock_market_data.get_stock_metrics.return_value = {'current_price': 310.0}
+        self.mock_market_data.find_suitable_calls.return_value = [{
+            'symbol': 'AAPL260821C00320000', 'strike_price': 320.0,
+            'expiration_date': '2026-08-21', 'dte': 7, 'delta': 0.20,
+            'mid_price': 1.80, 'bid': 1.75, 'ask': 1.85, 'volume': 2000,
+            'open_interest': 8000, 'implied_volatility': 0.22,
+        }]
+        # An assigned position: shares held, broker cost basis lost.
+        self.mock_alpaca.get_positions.return_value = [{
+            'symbol': 'AAPL', 'qty': '100', 'cost_basis': '0',
+            'asset_class': 'us_equity', 'side': 'long',
+        }]
+
+    def _with_opasn_strike(self, strike):
+        """Inject the BigQuery source explicitly (the suite stubs the real one)."""
+        return patch.object(self.scanner.cost_basis_resolver,
+                            '_lookup_last_opasn_put_strike', return_value=strike)
+
+    def test_a_bigquery_resolved_basis_produces_opportunities(self):
+        with self._with_opasn_strike(303.50):
+            results = self.scanner.scan_for_call_opportunities()
+
+        assert len(results) == 1
+        # The chain's number filtered the chain scan...
+        self.mock_market_data.find_suitable_calls.assert_called_once_with(
+            'AAPL', min_strike_price=303.50)
+        # ...and is the same number carried on the opportunity, which is what
+        # call_seller now enforces at execution.
+        assert results[0]['cost_basis_per_share'] == 303.50
+        assert results[0]['assignment_above_cost_basis'] is True
+        # (320 - 303.50) * 100 + 1.80 * 100 = 1830.0
+        assert results[0]['total_return_if_assigned'] == pytest.approx(1830.0)
+
+    def test_a_fallback_source_is_logged_for_provenance(self):
+        with self._with_opasn_strike(303.50):
+            with patch('src.data.options_scanner.logger') as mock_logger:
+                self.scanner.scan_for_call_opportunities()
+
+        events = [c.kwargs for c in mock_logger.info.call_args_list
+                  if c.kwargs.get("event_type") == "cost_basis_resolved_via_fallback"]
+        assert len(events) == 1
+        assert events[0]["symbol"] == "AAPL"
+        assert events[0]["source"] == "bigquery"
+        assert events[0]["resolved_basis"] == 303.50
+        # Alpaca had nothing to say here, so there is nothing to compare.
+        assert events[0]["alpaca_cost_basis_per_share"] == 0.0
+        assert events[0]["basis_delta"] is None
+
+    def test_a_bigquery_broker_divergence_is_visible_in_the_event(self):
+        """This event fires on every scan while wheel-state persistence is dead
+        (FC-039), so the broker comparison is what makes it signal rather than
+        noise: BQ and Alpaca disagreeing means one of them is wrong."""
+        self.mock_alpaca.get_positions.return_value = [{
+            'symbol': 'AAPL', 'qty': '100', 'cost_basis': '29000.0',   # $290/share
+            'asset_class': 'us_equity', 'side': 'long',
+        }]
+
+        with self._with_opasn_strike(303.50):
+            with patch('src.data.options_scanner.logger') as mock_logger:
+                self.scanner.scan_for_call_opportunities()
+
+        events = [c.kwargs for c in mock_logger.info.call_args_list
+                  if c.kwargs.get("event_type") == "cost_basis_resolved_via_fallback"]
+        assert len(events) == 1
+        assert events[0]["source"] == "bigquery"
+        assert events[0]["resolved_basis"] == 303.50
+        assert events[0]["alpaca_cost_basis_per_share"] == 290.0
+        assert events[0]["basis_delta"] == pytest.approx(13.50)
+
+    def test_an_alpaca_sourced_basis_logs_no_fallback_event(self):
+        self.mock_alpaca.get_positions.return_value = [{
+            'symbol': 'AAPL', 'qty': '100', 'cost_basis': '30350.0',
+            'asset_class': 'us_equity', 'side': 'long',
+        }]
+
+        with self._with_opasn_strike(0.0):
+            with patch('src.data.options_scanner.logger') as mock_logger:
+                results = self.scanner.scan_for_call_opportunities()
+
+        assert len(results) == 1
+        assert not [c for c in mock_logger.info.call_args_list
+                    if c.kwargs.get("event_type") == "cost_basis_resolved_via_fallback"]
+
+    def test_nothing_resolves_still_emits_no_opportunities(self):
+        """FC-038's fail-closed skip survives, now on the resolved value."""
+        with self._with_opasn_strike(0.0):
+            results = self.scanner.scan_for_call_opportunities()
+
+        assert results == []
+        self.mock_market_data.find_suitable_calls.assert_not_called()
+
+
 class TestOptionsScannerScanAll:
     """Test OptionsScanner.scan_all_opportunities."""
 
