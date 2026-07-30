@@ -518,25 +518,6 @@ Note this is *not* true of the Stage-2 gap-risk analysis (`_detect_current_gap`,
 
 ---
 
-### FC-038: Covered calls charged phantom cash collateral in execution selection — call starvation
-
-**Status:** Plan published — **execution is the top priority: shares have sat uncovered since 2026-07-15**
-**Size estimate:** M (production trading logic → two-reviewer, high-stakes calibration)
-**Owner:** Claude / zeshan
-**Plan file:** `docs/plans/fc-038.md`
-
-> **Numbering note (2026-07-30):** this entry was filed 2026-07-18 and lost in a three-session index collision; restored here. Some same-day references to "FC-038" in the FC-039 and FC-041 entries refer to a *different* project — the covered-call **extensibility** proposal from a concurrent session — which lost the number and must refile under a fresh one (its two-reviewer pass returned REQUEST_CHANGES and its review doc never landed on `main`).
-
-**Problem / opportunity:** The production `/run` pipeline treats covered calls as if they required full cash collateral, in **two** places: `put_seller._calculate_position_size` (invoked for *all* opportunity types by `ExecutionEngine.rank_opportunities`) silently drops any call whose `strike × 100` exceeds buying power, and `select_batch` charges `strike × 100` phantom collateral against the BP budget for calls that survive. Covered calls need zero cash — the shares are the cover. Verified 2026-07-18 with an exact reproduction of the 07-17 14:15 run (BP $67,142.50; AAPL's top-scored calls dropped for phantom $34k; GOOGL charged $37k it didn't need) and adversarially reviewed; see the investigation doc. Still unfixed as of 2026-07-30: AAPL's 100 shares (basis $303.50, ~$332) have been uncovered for **11 trading days** at ~$75–$190/day of scanned premium foregone. A second wasted-slot bug compounds it: share-committed underlyings win selection, charge phantom BP, then fail `execute_batch`'s available-shares check — every cycle. Selection drops are entirely unlogged.
-
-**Fix (per plan):** two-pool budgeting — calls consume a per-underlying available-shares budget (owned − committed, via the canonical `parse_option_symbol`/`strict_option_type` primitives from FC-048/FC-052), puts consume the cash/BP budget; shares-based call sizing replaces the put-sizing BP gate; every ranking/selection drop logs a reason. Safety pre-check done 2026-07-30: live `cost_basis` verified correct and non-zero on all four held positions, so the scanner's cost-basis floor (the operative below-basis protection, given FC-050 Half 1) is functional — underwater GOOGL/NVDA stay excluded post-fix. FC-050's execute-time-floor fix follows immediately as its own PR.
-
-**Open questions:** see plan file.
-
-**Links:** `docs/plans/fc-038.md`, `docs/investigations/covered-call-starvation-2026-07-18.md` (investigation + adversarial review), FC-050 (execute-time floor — sequenced immediately after), FC-052 (oversell-guard parser this reuses), FC-045 (`/monitor` call-close misroute — adjacent, separate), FC-014 (RiskManager dead code), `src/strategy/execution_engine.py`, `src/strategy/put_seller.py:154`.
-
----
-
 ### FC-039: Wheel state persistence has never worked in production
 
 **Status:** Consideration
@@ -1410,3 +1391,10 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - Notes: Scope was alerting only — the observability half shipped in FC-031. `POST /api/v2/bot-health/pause-alert-check` runs weekdays 17:45 ET and logs a single `DRAWDOWN_PAUSE_ALERT` line when any symbol is paused >= 7 trading days (threshold declared in `cloudbuild.yaml`); a Cloud Monitoring log-based policy emails the operator via the project's **first notification channel**. Built as a strict consumer of FC-031's `get_drawdown_pauses` — one implementation of pause state, not two. Degraded paths are loud: a live-positions outage logs `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED` rather than reporting "nothing paused". **Cloud Build failure alerting shipped on the same channel** and was prioritized ahead of the pause alert — FC-031 had sat undeployed 11 days behind an unnoticed red build; the new alert then caught three real failures the same session. **The mandatory fire drill caught a fatal defect:** the policy's `severity>=WARNING` clause matched zero entries, because Cloud Run only assigns severity to structured JSON logs while Python's `logging.warning()` writes plain text — the alert would have been silent forever, discoverable only as a missing notification. Pure logic lives in `services/pause_alert.py` (the bot CI image has no FastAPI); a module-level `pytest.importorskip` was rejected after verifying it silently skips the pure tests too.
 - Note on duplicate PRs: two parallel sessions independently found and fixed the same severity-filter defect (#41 and #42). The same collision duplicated this file's entire Completed section, repaired in `fix/dedupe-fc-ledger`. No code conflict resulted; the fixes were equivalent.
 - **Operator action outstanding:** confirm the alert email lands (Cloud Monitoring channels may need one-time verification).
+
+### FC-038: Covered calls charged phantom cash collateral in execution selection — call starvation
+- Plan: `docs/plans/fc-038.md`
+- Investigation: `docs/investigations/covered-call-starvation-2026-07-18.md`
+- PR: https://github.com/memon1987/options_wheel/pull/73 (merged 2026-07-30, `0545aff`; implementation `87791c5` + review fixes `3999a8b`)
+- Date: 2026-07-30 (investigated 2026-07-18; entry lost 12 days in a three-session index collision — the covered-call *extensibility* proposal that also claimed FC-038 must refile)
+- Notes: `/run` treated covered calls as cash-collateralized in two places — `put_seller._calculate_position_size` (BP-gated sizing applied to all types) and `select_batch` (`strike×100` phantom charge) — starving the call side while ~50–90 opportunities/day converted to 1–3 trades; AAPL sat uncovered 07-15→07-30 despite top-scored calls in every scan. Fix: **two-pool selection** — calls consume a per-underlying available-shares ledger (canonical OCC parsers, calls-first, `attractiveness_score`-ranked), puts keep the cash/BP pool; shares-based call sizing; every ranking/selection drop logs a structured reason (5-reason enum incl. `positions_unavailable` outage marker); scanner now **fails closed** on unresolved cost basis (`call_scan_skipped_cost_basis_unresolved`); single positions snapshot per cycle threaded from `/run` (and mirrored in the backtest simulator). Golden-replay test pins the 07-17 incident blob verbatim (mutation-checked: pre-fix behavior fails 12 tests). Two adversarial reviews (trader + reliability) → REQUEST_CHANGES ×2 → 4 fixes in code, open-order ledger blindness deferred to **FC-061** (broker share-lock verified live as interim control), 6 items accepted in writing; confirmation pass CONFIRMED-CLEAN. Suite 744 passed. **Production-verified 15:15 ET same day:** AAPL 8/3 347.5C sold/filled @ $1.66 (basis $303.50), AMZN dropped `insufficient_available_shares`, GOOGL/NVDA excluded by the floor, put pool unaffected. Follow-ups queued: FC-050 (dead execute-time floor — next PR), FC-061, FC-039/roller.

@@ -73,4 +73,4 @@ _List active plans here as they are added._
 - [fc-030.md](fc-030.md) — FC-030: Drawdown-pause alerting (operator notification for extended pauses), status: done
 - [fc-031.md](fc-031.md) — FC-031: Dashboard metrics overhaul (vetted portfolio metrics + bot execution health), status: done
 - [fc-032.md](fc-032.md) — FC-032: Backtesting engine overhaul (symbol wheel-fitness evaluation), status: draft
-- [fc-038.md](fc-038.md) — FC-038: Two-pool execution selection (covered-call phantom-collateral fix), status: draft
+- [fc-038.md](fc-038.md) — FC-038: Two-pool execution selection (covered-call phantom-collateral fix), status: done
