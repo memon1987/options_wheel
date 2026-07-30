@@ -1276,6 +1276,26 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ---
 
+### FC-061: share ledger is blind to open (unfilled) short-call orders — `qty_available` is the broker-truth alternative
+
+**Status:** Consideration
+**Size estimate:** S–M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** FC-038's `_available_shares` ledger counts **filled** short-call positions only. A covered-call sell that rests unfilled across cycles (DAY limit at 5% under mid; resting-order examples in the 07-18 investigation) doesn't commit shares in the ledger, so the next cycle can select and submit a second call against the same 100 shares. The scanner is equally blind, and the deterministic `client_order_id` only dedupes identical (symbol, qty, side, price) same-day — premium drift or a different strike defeats it. **Verified interim control (2026-07-30, live probe):** Alpaca locks shares backing short calls *and* open orders — AMZN showed `qty=100, qty_available=0` — so the second order is rejected at placement; the failure mode today is a wasted selection slot plus failure-loop noise (possible same-day `_failed_symbols` blacklisting of the best contract), **not** a naked call. Raised independently by both FC-038 PR reviewers (trader R2 / reliability #3).
+
+**The candidate fix and why it wasn't rushed into FC-038:** Alpaca's equity `qty_available` is broker-authoritative and already nets out both filled short calls and open-order holds — one field closes the gap. But a naive swap has real hazards: it double-counts if combined with the existing committed-shares subtraction (use it as a *clamp* or a *replacement*, not an addition); `AlpacaClient.get_positions` currently strips the field; the backtest adapter (`BacktestAlpacaClient.get_positions`) doesn't emit it, so the engine needs a fallback or the adapter needs to model holds; and its semantics also reflect pending equity sell orders (probably desirable, but a behavior change to reason through). Note FC-043 is why order-list-based guards were previously killed — `qty_available` sidesteps the broken `get_orders` filter entirely.
+
+**Open questions:**
+- Clamp (`min(parsed_available, qty_available)`) vs replacement? Clamp preserves offline testability and backtest parity.
+- Backfill `qty_available` into `get_positions`' normalized dict for all consumers, or fetch point-wise in the helper?
+- Should the scanner also consult it and stop emitting call opportunities for fully-held lots?
+
+**Links:** FC-038 (PR #73 review disposition), FC-043 (`get_orders` filter — why order-based guards died), FC-052 (parser primitives the current ledger uses), `src/strategy/execution_engine.py` (`_available_shares`), `src/api/alpaca_client.py:244-259`.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
