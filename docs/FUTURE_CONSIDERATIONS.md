@@ -1092,6 +1092,43 @@ Counted across `src/` + `deploy/` + `cloudbuild.yaml`: **`GCP_PROJECT` appears 1
 
 ---
 
+### FC-059: Cloud Run **Job** logs never reach Cloud Logging (the screen is unobservable)
+
+**Status:** Done — fixed in the same PR that filed it
+**Size estimate:** S (one predicate; the consequence is large)
+**Owner:** zeshan + Claude
+**Plan file:** not needed (one function + tests)
+
+**Found by watching the first real Cloud Run Job execution produce ZERO application logs in 19 minutes.** The job was healthy; it was invisible.
+
+`src/utils/logger.py` decided where to write with:
+
+```python
+def _is_cloud_run() -> bool:
+    return os.environ.get("K_SERVICE") is not None
+```
+
+Cloud Run **Services** set `K_SERVICE`. Cloud Run **Jobs** set **`CLOUD_RUN_JOB`** and **`CLOUD_RUN_EXECUTION`** — and *not* `K_SERVICE`. So inside a Job:
+
+1. `_is_cloud_run()` → `False`
+2. `log_to_file` → `True` (the local-dev default)
+3. `logging.FileHandler("logs/options_wheel.log")` — a file inside the container
+4. Cloud Run's filesystem is **ephemeral**; the file dies with the task
+
+**Consequence:** the monthly backtest screen — the thing Track D exists to schedule — produces **no observable output at all**. A failure surfaces to the operator as "task failed" with no reason, no traceback, and no indication of which symbol it died on. For a job that runs 12 times a year and writes to a canonical BigQuery table, that is close to the worst possible observability posture.
+
+**This would have shipped invisibly.** The Job was created, started, pulled its image and ran. Every signal said healthy. Only the *absence* of logs revealed it, and only because the run was being watched live — a scheduled 03:00 execution would have failed silently forever.
+
+**Fix:** check all three variables. Verified across all four shapes (local, Service, Job via `CLOUD_RUN_JOB`, Job via `CLOUD_RUN_EXECUTION`); local dev still logs to a file, which is wanted. Mutation-verified: reverting to `K_SERVICE`-only fails 3 tests.
+
+**Same family as this session's recurring theme** — FC-015, FC-036, FC-048, FC-057, FC-058: code that looks healthy while doing nothing, and failure modes that are silent rather than loud. Here the silence *was* the symptom.
+
+**Note for Track D:** the currently-running execution predates this fix (image SHA `2c1773c`), so it will stay silent. The scheduler must not be re-pointed until a Job runs on an image containing this fix — otherwise the monthly schedule is undiagnosable from day one.
+
+**Links:** `docs/BACKTEST_ENGINE.md` (Track D), FC-058, FC-047 (the other logging-visibility defect), the 2026-07-18 ops session (Cloud Run plain-text logs land at severity DEFAULT).
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._

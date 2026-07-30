@@ -8,9 +8,18 @@ from pathlib import Path
 from typing import Any, Dict
 
 
+# Cloud Run sets different variables for the two runtime shapes, and only
+# Services set K_SERVICE. A Cloud Run *Job* sets CLOUD_RUN_JOB and
+# CLOUD_RUN_EXECUTION instead — so checking K_SERVICE alone reports False in a
+# Job, which sends logs to a FILE inside a container whose filesystem is
+# destroyed on exit. The monthly backtest screen runs as a Job: without this,
+# it produces no observable output at all and a failure is undiagnosable.
+_CLOUD_RUN_ENV_VARS = ("K_SERVICE", "CLOUD_RUN_JOB", "CLOUD_RUN_EXECUTION")
+
+
 def _is_cloud_run() -> bool:
-    """Detect if running in Cloud Run via the K_SERVICE env var."""
-    return os.environ.get("K_SERVICE") is not None
+    """Detect Cloud Run — Services (K_SERVICE) and Jobs (CLOUD_RUN_JOB)."""
+    return any(os.environ.get(v) for v in _CLOUD_RUN_ENV_VARS)
 
 
 def setup_logging(log_level: str = "INFO", log_to_file: bool = None, log_file: str = "logs/options_wheel.log") -> None:
