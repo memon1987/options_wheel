@@ -116,12 +116,31 @@ The engine runs locally today. `/backtest/screen` is **disabled by default** (50
 synchronous HTTP request finishes a full universe against a 300s timeout. The intended
 path is a **Cloud Run Job**.
 
+**Two blockers must be settled first — see FC-058.** The naive `jobs create` below will
+produce a Job that either cannot be pulled or cannot authenticate to Alpaca.
+
+1. **Image path.** The service is built to **Artifact Registry**, not GCR:
+   `us-central1-docker.pkg.dev/<PROJECT>/options-wheel/options-wheel-strategy:<SHA>`
+   (`cloudbuild.yaml:68`). Pin a concrete SHA — `:latest` is not published.
+2. **Credentials.** `cloudbuild.yaml:75` sets only
+   `ALPACA_PAPER_TRADING=true,GCP_PROJECT=<PROJECT>`. Alpaca keys are **not** in
+   `cloudbuild.yaml`, and the Secret Manager fallback (`src/utils/config.py:33`) reads
+   `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT_ID` — **neither of which is set** — so it
+   resolves `projects/None/...`, throws, and is swallowed by a bare `except`. The live
+   service therefore almost certainly carries `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` as
+   env vars applied **out of band**. A fresh Job inherits nothing. Read the live service's
+   env set and mirror it, or wire `--set-secrets`.
+
 ```bash
-# 1. Create the Job (the only honest execution path for a full screen)
+# 0. Read what the live service actually has (do this FIRST)
+gcloud run services describe options-wheel-strategy --region us-central1 \
+  --format="yaml(spec.template.spec.containers[0].image, spec.template.spec.containers[0].env)"
+
+# 1. Create the Job, mirroring the image + env you just read
 gcloud run jobs create backtest-screen \
-  --image gcr.io/gen-lang-client-0607444019/options-wheel-strategy \
+  --image us-central1-docker.pkg.dev/gen-lang-client-0607444019/options-wheel/options-wheel-strategy:<SHA> \
   --region us-central1 --task-timeout 3600s \
-  --set-env-vars GCP_PROJECT=gen-lang-client-0607444019 \
+  --set-env-vars ALPACA_PAPER_TRADING=true,GCP_PROJECT=gen-lang-client-0607444019,<...creds...> \
   --command python --args "main.py,--command,screen"
 
 gcloud run jobs execute backtest-screen --region us-central1   # verify once by hand
