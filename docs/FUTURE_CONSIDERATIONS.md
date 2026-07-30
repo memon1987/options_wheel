@@ -1094,7 +1094,7 @@ Counted across `src/` + `deploy/` + `cloudbuild.yaml`: **`GCP_PROJECT` appears 1
 
 ### FC-059: Cloud Run **Job** logs never reach Cloud Logging (the screen is unobservable)
 
-**Status:** Done — fixed in the same PR that filed it
+**Status:** Done — fixed, and **verified in production**: the same Job emitted 0 log entries in 64 minutes on the old image and 14 in the first 3 minutes on the fixed one. Per-symbol progress is now visible, which is how the 1h47m runtime and the ~5.5 min/symbol pacing were measured at all.
 **Size estimate:** S (one predicate; the consequence is large)
 **Owner:** zeshan + Claude
 **Plan file:** not needed (one function + tests)
