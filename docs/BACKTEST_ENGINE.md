@@ -1,6 +1,8 @@
 # The backtest engine — what it measures, and what not to trust
 
-**Status:** complete as a **measurement tool**. Not wired to any automated action.
+**Status:** complete as a **measurement tool**, and **live in production** — a monthly Cloud
+Run Job writes to `options_wheel.backtest_runs`. Not wired to any automated *action*:
+`demote` is a column, not a trigger.
 **Last updated:** 2026-07-29
 
 Programmatic demotion is deliberately **out of scope** — a later motion, once the engine
@@ -109,58 +111,70 @@ than it is; it refuses to emit a conclusion when the market is closed.
 
 ---
 
-## Remaining owner step: Track D (deploy)
+## Track D — DONE (2026-07-30). The screen is live.
 
-The engine runs locally today. `/backtest/screen` is **disabled by default** (503 unless
-`ENABLE_SCREEN_ENDPOINT=true`) and should stay that way — at minutes-per-symbol, no
-synchronous HTTP request finishes a full universe against a 300s timeout. The intended
-path is a **Cloud Run Job**.
+The engine runs monthly as a **Cloud Run Job**. `/backtest/screen` remains disabled
+(503) and should stay that way — a full screen takes **1h47m**, so no synchronous HTTP
+request can serve it.
 
-**Two blockers must be settled first — see FC-058.** The naive `jobs create` below will
-produce a Job that either cannot be pulled or cannot authenticate to Alpaca.
+### What is deployed
 
-1. **Image path.** The service is built to **Artifact Registry**, not GCR:
-   `us-central1-docker.pkg.dev/<PROJECT>/options-wheel/options-wheel-strategy:<SHA>`
-   (`cloudbuild.yaml:68`). Pin a concrete SHA — `:latest` is not published.
-2. **Credentials.** `cloudbuild.yaml:75` sets only
-   `ALPACA_PAPER_TRADING=true,GCP_PROJECT=<PROJECT>`. Alpaca keys are **not** in
-   `cloudbuild.yaml`, and the Secret Manager fallback (`src/utils/config.py:33`) reads
-   `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT_ID` — **neither of which is set** — so it
-   resolves `projects/None/...`, throws, and is swallowed by a bare `except`. The live
-   service therefore almost certainly carries `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` as
-   env vars applied **out of band**. A fresh Job inherits nothing. Read the live service's
-   env set and mirror it, or wire `--set-secrets`.
+| | |
+|---|---|
+| Job | `backtest-screen` (us-central1) |
+| Image | `us-central1-docker.pkg.dev/<PROJECT>/options-wheel/options-wheel-strategy:<SHA>` — **Artifact Registry**, SHA-pinned |
+| Resources | 1 vCPU, 1 GiB, `--task-timeout 10800s`, `--max-retries 0` |
+| Credentials | `--set-secrets` → `alpaca-api-key`, `alpaca-secret-key`, `finnhub-api-key` |
+| Schedule | `monthly-performance-review`, **ENABLED**, `0 6 1 * *` UTC (= 02:00 ET) |
+| Trigger | Scheduler → **OAuth** → `run.googleapis.com/...jobs/backtest-screen:run` |
+
+### Verified end to end, 2026-07-30
+
+- Execution `backtest-screen-s5dp7` **succeeded in 1h47m39s**
+- Wrote **14 rows** to `options_wheel.backtest_runs` (`run_kind='full'`, window 2025-07-30 → 2026-07-29)
+- **Verdicts identical to a local run** of the same window — same code, two environments,
+  same answer on all 14 symbols (6 `marginal`, 6 `insufficient`, 2 `unfit`)
+- Scheduler trigger test-fired and confirmed to create an execution (then cancelled)
+
+### Corrections to what this doc previously said
+
+Three things here were wrong before Track D was attempted, and each would have broken the
+deploy. Recorded because the same mistakes are easy to repeat:
+
+1. **Registry.** It said `gcr.io/...`. It is **Artifact Registry**. `jobs create` would have
+   failed on image pull.
+2. **`:latest`.** It said no `latest` tag is published. **One is** — the build tags both the
+   SHA and `latest`. SHA-pinning is still correct for a Job (reproducibility), but the claim
+   was false.
+3. **Timeout.** It said `3600s`. The real run takes **1h47m**, so an hour would have timed
+   out. Now `10800s`.
+
+### Operating notes
+
+- **~5.5 min/symbol**, and the cache never warms — Cloud Run's filesystem is ephemeral, so
+  every run is cold. Roughly 16 of those minutes are spent building chains for F, PFE and VZ
+  only to discover no put clears the `$0.50` floor: they pass the price band, so the engine
+  cannot know until it looks. That is a concrete cost of FC-034 remaining unactioned.
+- **Schedule is 02:00 ET deliberately.** A ~2h run must not overlap the trading session; the
+  previous `0 12 1 * *` (08:00 ET) would have finished ~09:47 ET, on top of the open and
+  contending with the live bot for the same Alpaca quota.
+- **`--max-retries 0` is deliberate.** The default of 3 would mean a failing screen hammering
+  contract discovery three times.
+- **The job name is now a misnomer** — `monthly-performance-review` runs a screen. Left as-is
+  because renaming means delete-and-recreate, losing history.
+
+### If it fails
+
+Logs work now (FC-059 — Cloud Run **Jobs** set `CLOUD_RUN_JOB`, not `K_SERVICE`, so log
+output previously went to a file inside an ephemeral container and vanished):
 
 ```bash
-# 0. Read what the live service actually has (do this FIRST)
-gcloud run services describe options-wheel-strategy --region us-central1 \
-  --format="yaml(spec.template.spec.containers[0].image, spec.template.spec.containers[0].env)"
-
-# 1. Create the Job, mirroring the image + env you just read
-gcloud run jobs create backtest-screen \
-  --image us-central1-docker.pkg.dev/gen-lang-client-0607444019/options-wheel/options-wheel-strategy:<SHA> \
-  --region us-central1 --task-timeout 3600s \
-  --set-env-vars ALPACA_PAPER_TRADING=true,GCP_PROJECT=gen-lang-client-0607444019,<...creds...> \
-  --command python --args "main.py,--command,screen"
-
-gcloud run jobs execute backtest-screen --region us-central1   # verify once by hand
-
-# 2. Re-point the paused monthly job at the Job's :run endpoint
-#    (currently targets /backtest/performance-comparison, deleted in FC-032)
-gcloud scheduler jobs resume monthly-performance-review --location us-central1
-
-# 3. Delete the three jobs whose endpoints no longer exist and have no replacement
-gcloud scheduler jobs delete daily-quick-backtest        --location us-central1
-gcloud scheduler jobs delete weekly-comprehensive-backtest --location us-central1
-gcloud scheduler jobs delete daily-cache-maintenance     --location us-central1
+gcloud run jobs executions list --job backtest-screen --region us-central1
+gcloud logging read 'resource.labels.job_name="backtest-screen"' --limit 50 --freshness=3h
 ```
 
-All four are **PAUSED** today and target endpoints deleted in FC-032, so nothing is
-currently failing — but they are live 404s waiting to be resumed by someone who doesn't
-know that.
-
-**Do not set `ENABLE_SCREEN_ENDPOINT=true`** unless you specifically want the HTTP path;
-the Job is the supported route.
+A failure writes **zero** rows — persistence is a single batch after the loop — so a partial
+run cannot corrupt `backtest_runs`.
 
 ### Before the first *persisted* screen
 
