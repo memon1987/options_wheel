@@ -11,6 +11,7 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_performance_metric, log_error_event
 from ..utils.positions import get_stock_positions
+from ..strategy.cost_basis import CostBasisResolver, SOURCE_ALPACA
 
 logger = structlog.get_logger(__name__)
 
@@ -29,7 +30,14 @@ class OptionsScanner:
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
-        
+        # FC-050: the covered-call floor comes from the FC-029 resolution chain,
+        # not from Alpaca's cost_basis alone (which reports 0 for freshly
+        # assigned positions). wheel_state is None here — the scanner has no
+        # state manager, so the chain starts at the BigQuery OPASN lookup.
+        self.cost_basis_resolver = CostBasisResolver(
+            alpaca_client, config, wheel_state=None, allow_bigquery=True
+        )
+
     def scan_for_put_opportunities(self, max_results: int = 10) -> List[Dict[str, Any]]:
         """Scan for cash-secured put opportunities across all configured stocks.
         
@@ -123,21 +131,23 @@ class OptionsScanner:
                 if shares < 100:
                     continue
 
-                # CRITICAL: Calculate cost basis per share for protection
-                # This ensures we never sell calls below cost basis (guaranteed loss)
+                # CRITICAL: Resolve cost basis per share for protection.
+                # This ensures we never sell calls below cost basis (guaranteed loss).
+                # FC-050: resolved through the FC-029 chain (wheel_state → BQ
+                # OPASN strike → Alpaca) rather than reading Alpaca directly.
                 try:
                     raw_cost_basis = float(position.get('cost_basis') or 0)
                 except (TypeError, ValueError):
                     raw_cost_basis = 0.0
-                cost_basis_per_share = raw_cost_basis / shares
+                cost_basis_per_share, cost_basis_source = (
+                    self.cost_basis_resolver.resolve_with_source(symbol, position, shares)
+                )
 
                 # FAIL CLOSED on an unresolved cost basis. This floor is the
-                # operative below-basis protection: find_suitable_calls warns
-                # and continues when min_strike_price <= 0, and the
-                # execute-time floor in call_seller is dead (FC-050). Alpaca
-                # returns cost_basis 0 for freshly assigned positions
-                # (FC-029), so "no basis" must mean "no calls", never "any
-                # strike".
+                # first of the two below-basis protections: find_suitable_calls
+                # warns and continues when min_strike_price <= 0, so "no basis"
+                # must mean "no calls", never "any strike". (FC-050 restored the
+                # second one, the execute-time floor in call_seller.)
                 if cost_basis_per_share <= 0:
                     logger.warning("Skipping call scan - cost basis unresolved",
                                    event_category="trade",
@@ -146,6 +156,18 @@ class OptionsScanner:
                                    shares=shares,
                                    cost_basis=raw_cost_basis)
                     continue
+
+                # FC-050: make a non-broker floor visible. A BQ-sourced basis is
+                # correct but has weaker provenance than the broker's own number,
+                # so an investigator should be able to see which one guarded a
+                # given call.
+                if cost_basis_source != SOURCE_ALPACA:
+                    logger.info("Cost basis resolved from fallback source",
+                                event_category="risk",
+                                event_type="cost_basis_resolved_via_fallback",
+                                symbol=symbol,
+                                source=cost_basis_source,
+                                resolved_basis=cost_basis_per_share)
 
                 # Get call opportunities filtered by cost basis
                 calls = self.market_data.find_suitable_calls(
@@ -159,7 +181,9 @@ class OptionsScanner:
                             calls_found=len(calls))
                 
                 for call in calls[:3]:  # Top 3 calls per position
-                    opportunity = self._create_call_opportunity(call, position)
+                    opportunity = self._create_call_opportunity(
+                        call, position, cost_basis_per_share
+                    )
                     if opportunity:
                         opportunities.append(opportunity)
             
@@ -295,21 +319,25 @@ class OptionsScanner:
             )
             return None
     
-    def _create_call_opportunity(self, call_option: Dict[str, Any], stock_position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _create_call_opportunity(self, call_option: Dict[str, Any], stock_position: Dict[str, Any],
+                                 cost_basis_per_share: float) -> Optional[Dict[str, Any]]:
         """Create a call opportunity record with scoring.
-        
+
         Args:
             call_option: Call option data
             stock_position: Stock position information
-            
+            cost_basis_per_share: Per-share cost basis already resolved by the
+                caller (FC-050). Passed in rather than recomputed so the floor
+                that filtered the chain, the one carried on the opportunity and
+                the one enforced at execution are the same number.
+
         Returns:
             Call opportunity with scoring
         """
         try:
             symbol = stock_position['symbol']
             shares_owned = int(float(stock_position['qty']))
-            cost_basis_per_share = float(stock_position['cost_basis']) / shares_owned if shares_owned > 0 else 0
-            
+
             # Get current stock price
             stock_metrics = self.market_data.get_stock_metrics(symbol)
             current_price = stock_metrics.get('current_price', 0)

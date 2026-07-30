@@ -30,9 +30,13 @@ def _reset_time_seam():
 def _no_production_bigquery(monkeypatch, request):
     """No test may query production BigQuery, whatever credentials are present.
 
-    CallSeller's cost-basis floor falls back to a BigQuery OPASN lookup
-    (`_lookup_last_opasn_put_strike`), which builds its own client from ambient
-    env/ADC. Three tests in test_call_seller.py were passing only because
+    The cost-basis floor falls back to a BigQuery OPASN lookup
+    (`CostBasisResolver._lookup_last_opasn_put_strike`), which builds its own
+    client from ambient env/ADC. Since FC-050 that chain has two entry points —
+    CallSeller (which delegates through its own wrapper) and OptionsScanner
+    (which owns a resolver directly) — so both are stubbed here.
+
+    Three tests in test_call_seller.py were passing only because
     BigQuery auth happened to be broken on the machine: once `gcloud auth login`
     succeeded, the lookup started returning a *real* AAPL assignment strike
     ($305) in place of the fixture's $160 cost basis, and the drawdown pause
@@ -52,9 +56,14 @@ def _no_production_bigquery(monkeypatch, request):
         return
 
     from src.strategy.call_seller import CallSeller
+    from src.strategy.cost_basis import CostBasisResolver
 
     monkeypatch.setattr(
         CallSeller, "_lookup_last_opasn_put_strike",
+        lambda self, symbol, lookback_days=90: 0.0,
+    )
+    monkeypatch.setattr(
+        CostBasisResolver, "_lookup_last_opasn_put_strike",
         lambda self, symbol, lookback_days=90: 0.0,
     )
     yield
