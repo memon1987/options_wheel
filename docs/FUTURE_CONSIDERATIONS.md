@@ -1058,6 +1058,40 @@ The event was never missing. `market_data.py:148` emits `stock_rejected_filter` 
 
 ---
 
+### FC-058: Track D blockers — wrong image registry, and the Secret Manager fallback is probably dead
+
+**Status:** Consideration — **blocks Track D (deploying the screen Job)**
+**Size estimate:** S once verified; verification needs `gcloud auth`
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Found while attempting Track D.** Two things would each independently break a Cloud Run Job created from the runbook as originally written.
+
+**1. Wrong image registry (my error, now corrected in the runbook).** The handoff doc said `gcr.io/gen-lang-client-0607444019/options-wheel-strategy`. The service is actually built and pushed to **Artifact Registry**: `us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA` (`cloudbuild.yaml:68`). There is also no `:latest` tag published — images are SHA-pinned, so a Job must name a concrete SHA.
+
+**2. The Secret Manager fallback almost certainly never resolves.** `src/utils/config.py:33`:
+
+```python
+project_id = os.getenv('GOOGLE_CLOUD_PROJECT', os.getenv('GCP_PROJECT_ID'))
+```
+
+`cloudbuild.yaml:75` sets **`GCP_PROJECT`** — neither name the fallback reads. Cloud Run does not inject `GOOGLE_CLOUD_PROJECT` by default. So `project_id` is `None`, the request name becomes `projects/None/secrets/...`, the call throws, and `except Exception: pass` swallows it and returns `""`.
+
+Counted across `src/` + `deploy/` + `cloudbuild.yaml`: **`GCP_PROJECT` appears 11 times, `GOOGLE_CLOUD_PROJECT` 9, `GCP_PROJECT_ID` 4** — but the Secret Manager path is the *only* place reading the latter two. The naming is inconsistent and this is where it bites.
+
+**Implication:** since the live bot does trade, `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` are almost certainly present on the service as env vars **applied out of band** (consistent with the 2026-07-18 ops gotcha that `--set-env-vars` wipes the whole env set — a symptom of exactly this pattern). **A fresh Cloud Run Job inherits none of it** and would fail to authenticate.
+
+**Verify before acting (needs `gcloud auth login`):**
+1. `gcloud run services describe options-wheel-strategy --region us-central1 --format="yaml(spec.template.spec.containers[0].env)"` — is `ALPACA_API_KEY` a literal env var, a `secretKeyRef`, or absent?
+2. If absent, the Secret Manager path *is* working somehow — find out how, because the code path above says it should not.
+3. Check whether any secret is reachable: `gcloud secrets versions access latest --secret=alpaca-api-key`.
+
+**Fix direction:** settle on **one** project env-var name and use it everywhere (`GCP_PROJECT` is the majority and what cloudbuild sets — the fallback should read it). Then wire the Job with `--set-secrets` rather than copying literal keys, so credentials are not duplicated across two deploy surfaces. Also consider whether that bare `except Exception: pass` should log — a silently empty credential is the worst possible failure mode, and it is why this went unnoticed.
+
+**Links:** `docs/BACKTEST_ENGINE.md` (Track D runbook, corrected), `cloudbuild.yaml:68,75`, `src/utils/config.py:20-40`, FC-031 ops session (the `--set-env-vars` wipe gotcha).
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
