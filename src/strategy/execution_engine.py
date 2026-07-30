@@ -23,6 +23,21 @@ from .call_seller import CallSeller
 
 logger = structlog.get_logger(__name__)
 
+# Machine-queryable drop reasons emitted on the `selection_dropped` event.
+# The four are exhaustive: every opportunity that enters ranking either ends up
+# selected or carries exactly one of these.
+DROP_INSUFFICIENT_SHARES = "insufficient_available_shares"
+DROP_INSUFFICIENT_BP = "insufficient_buying_power"
+DROP_DUPLICATE_UNDERLYING = "duplicate_underlying"
+DROP_SIZING_FAILED = "sizing_failed"
+
+DROP_REASONS = (
+    DROP_INSUFFICIENT_SHARES,
+    DROP_INSUFFICIENT_BP,
+    DROP_DUPLICATE_UNDERLYING,
+    DROP_SIZING_FAILED,
+)
+
 # Module-level set tracking option symbols that failed with non-retryable errors today.
 # This prevents the same rejected opportunity from being retried every /run cycle.
 # Cleared on service restart (daily Cloud Run cold start).
@@ -61,6 +76,149 @@ class ExecutionEngine:
         self.config = config
         self.logger = log or logger
         self.trade_journal = trade_journal or TradeJournal()
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _declared_type(opportunity: Dict[str, Any]) -> Optional[str]:
+        """``'put'``/``'call'`` from the producer's own keys, else ``None``.
+
+        The scanner sets ``type``; the sellers set ``strategy`` (FC-048).
+        """
+        declared = opportunity.get('type')
+        if declared in ('put', 'call'):
+            return declared
+        strategy = opportunity.get('strategy')
+        if strategy == 'sell_call':
+            return 'call'
+        if strategy == 'sell_put':
+            return 'put'
+        return None
+
+    @classmethod
+    def _opportunity_type(cls, opportunity: Dict[str, Any]) -> str:
+        """Classify an opportunity the same way ``execute_batch`` routes it.
+
+        The OCC symbol wins over any declared key — it is what
+        ``place_option_order`` actually trades. Unparseable symbols fall back to
+        the declared key and finally to ``'put'``; ``execute_batch`` refuses
+        them outright, so nothing untradeable escapes on this path.
+        """
+        return (
+            strict_option_type(opportunity.get('option_symbol') or '')
+            or cls._declared_type(opportunity)
+            or 'put'
+        )
+
+    @staticmethod
+    def _available_shares(
+        underlying: Optional[str],
+        positions: List[Dict[str, Any]],
+    ) -> Tuple[int, int, int]:
+        """Shares of ``underlying`` free to back a *new* covered call.
+
+        Returns ``(available, owned, committed)``.  ``committed`` counts only
+        genuine short CALL contracts on this underlying, parsed with the
+        canonical primitives — ``'C' in symbol`` was the fifth member of the
+        OCC-substring bug family (FC-041/043/045/048/052).
+
+        Single implementation shared by call sizing, batch selection and the
+        execution-time oversell guard.
+        """
+        if not underlying:
+            return 0, 0, 0
+
+        owned = 0
+        committed = 0
+        for pos in positions or []:
+            try:
+                asset_class = pos.get('asset_class')
+                if asset_class == 'us_equity':
+                    if pos.get('symbol') == underlying:
+                        owned += int(float(pos.get('qty') or 0))
+                elif asset_class == 'us_option':
+                    qty = float(pos.get('qty') or 0)
+                    if qty >= 0:  # only SHORT calls commit shares
+                        continue
+                    opt_sym = pos.get('symbol') or ''
+                    if (parse_option_symbol(opt_sym).get('underlying') == underlying
+                            and strict_option_type(opt_sym) == 'call'):
+                        committed += abs(int(qty)) * 100
+            except (TypeError, ValueError):
+                # A malformed position must never inflate availability.
+                continue
+
+        return owned - committed, owned, committed
+
+    def _positions_snapshot(
+        self,
+        positions: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return the caller's snapshot, or fetch one. Fails closed on error."""
+        if positions is not None:
+            return positions
+        try:
+            return self.alpaca_client.get_positions() or []
+        except Exception as e:
+            self.logger.warning(
+                "Could not fetch positions — treating share availability as zero",
+                event_category="system",
+                event_type="positions_snapshot_failed",
+                error=str(e),
+            )
+            return []
+
+    @classmethod
+    def _call_rank_score(cls, item: Dict[str, Any]) -> float:
+        """Ranking key for the call pool.
+
+        Covered calls have zero collateral, so the put pool's
+        ``premium / collateral`` ROI collapses to 0 and would sort every call
+        last. Rank them by the scanner's ``attractiveness_score`` instead,
+        falling back to premium yield on the notional it covers.
+        """
+        opp = item.get('opportunity', {})
+        score = opp.get('attractiveness_score')
+        try:
+            if score is not None:
+                return float(score)
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            strike = float(opp.get('strike_price') or 0)
+            premium = float(opp.get('premium') or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return premium / (strike * 100) if strike > 0 else 0.0
+
+    def _log_drop(
+        self,
+        opportunity: Dict[str, Any],
+        reason: str,
+        stage: str,
+        **fields: Any,
+    ) -> None:
+        """Record why an opportunity will not be traded this cycle.
+
+        The 2026-07-18 starvation outage was invisible for four days precisely
+        because drops were silent (see docs/investigations/).
+        """
+        self.logger.info(
+            "Opportunity dropped before execution",
+            event_category="filtering",
+            event_type="selection_dropped",
+            stage=stage,
+            reason=reason,
+            symbol=opportunity.get('symbol'),
+            option_symbol=opportunity.get('option_symbol'),
+            opportunity_type=self._opportunity_type(opportunity),
+            strike_price=opportunity.get('strike_price'),
+            premium=opportunity.get('premium'),
+            **fields,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -143,62 +301,146 @@ class ExecutionEngine:
         opportunities: List[Dict[str, Any]],
         put_seller: PutSeller,
         available_buying_power: float,
+        positions: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        """Calculate ROI for each opportunity and return sorted list.
+        """Size every opportunity and return it ranked, by type.
 
-        Each entry in the returned list is a dict with keys:
-        ``opportunity``, ``collateral``, ``premium``, ``roi``.
+        Sizing is type-aware (FC-038):
+
+        - **Puts** are cash-secured, so they are sized against buying power by
+          ``put_seller._calculate_position_size`` — unchanged.
+        - **Calls** are covered by shares, not cash. They are sized as
+          ``available_shares // 100`` and never touch buying power. Routing
+          calls through the put sizer was the starvation bug: its BP cap
+          (``buying_power // (strike * 100)``) silently dropped every call
+          whenever cash was low, however well the call scored.
+
+        Each entry in the returned list is a dict with keys ``opportunity``,
+        ``collateral``, ``premium``, ``roi``, ``type``. Calls sort first (they
+        consume no cash) by ``attractiveness_score``; puts follow by ROI.
 
         Args:
             opportunities: Opportunities to rank.
-            put_seller: PutSeller instance (used for position sizing).
-            available_buying_power: Current buying power for sizing.
+            put_seller: PutSeller instance (used for put position sizing).
+            available_buying_power: Current buying power for put sizing.
+            positions: Optional positions snapshot; fetched when omitted and
+                at least one call opportunity is present.
 
         Returns:
-            List of metric dicts sorted by ROI descending.
+            List of metric dicts, calls first then puts.
         """
+        typed = [(opp, self._opportunity_type(opp)) for opp in opportunities]
+
+        if positions is None:
+            positions = (
+                self._positions_snapshot()
+                if any(t == 'call' for _, t in typed)
+                else []
+            )
+
         opportunities_with_metrics: List[Dict[str, Any]] = []
 
-        for opp in opportunities:
+        for opp, opp_type in typed:
             # Transform scanner format to position sizing format
             if 'premium' in opp and 'mid_price' not in opp:
                 opp['mid_price'] = opp['premium']
 
-            # Calculate position size
-            position_size = put_seller._calculate_position_size(
-                opp, override_buying_power=available_buying_power
-            )
-            if not position_size:
-                continue
+            if opp_type == 'call':
+                available, owned, committed = self._available_shares(
+                    opp.get('symbol'), positions
+                )
+                contracts = available // 100
+                if contracts <= 0:
+                    self._log_drop(
+                        opp,
+                        DROP_INSUFFICIENT_SHARES,
+                        stage="ranking",
+                        owned_shares=owned,
+                        committed_to_calls=committed,
+                        available_shares=available,
+                    )
+                    continue
 
-            opp['contracts'] = position_size['contracts']
-            collateral = opp['strike_price'] * 100 * opp['contracts']
-            premium_collected = opp['premium'] * 100 * opp['contracts']
-            roi = premium_collected / collateral if collateral > 0 else 0
+                opp['contracts'] = contracts
+                collateral = 0.0  # covered by shares; no cash is reserved
+                premium_collected = opp['premium'] * 100 * contracts
+                roi = 0.0  # meaningless against zero collateral — see _call_rank_score
+            else:
+                position_size = put_seller._calculate_position_size(
+                    opp, override_buying_power=available_buying_power
+                )
+                if not position_size:
+                    self._log_drop(
+                        opp,
+                        DROP_SIZING_FAILED,
+                        stage="ranking",
+                        buying_power=available_buying_power,
+                    )
+                    continue
+
+                opp['contracts'] = position_size['contracts']
+                collateral = opp['strike_price'] * 100 * opp['contracts']
+                premium_collected = opp['premium'] * 100 * opp['contracts']
+                roi = premium_collected / collateral if collateral > 0 else 0
 
             opportunities_with_metrics.append({
                 'opportunity': opp,
                 'collateral': collateral,
                 'premium': premium_collected,
                 'roi': roi,
+                'type': opp_type,
             })
 
-        # Sort by ROI (highest first)
-        opportunities_with_metrics.sort(key=lambda x: x['roi'], reverse=True)
-        return opportunities_with_metrics
+        return self._sort_pools(opportunities_with_metrics)
+
+    @classmethod
+    def _sort_pools(
+        cls,
+        items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Calls (by attractiveness) ahead of puts (by ROI).
+
+        Calls consume no cash, so putting them first cannot starve the put
+        pool; it just removes any order-dependence between the two.
+        """
+        calls = [i for i in items if cls._item_type(i) == 'call']
+        puts = [i for i in items if cls._item_type(i) != 'call']
+        calls.sort(key=cls._call_rank_score, reverse=True)
+        puts.sort(key=lambda i: i.get('roi', 0), reverse=True)
+        return calls + puts
+
+    @classmethod
+    def _item_type(cls, item: Dict[str, Any]) -> str:
+        """Type of a ranked metric dict, tolerating hand-built input."""
+        declared = item.get('type')
+        if declared in ('put', 'call'):
+            return declared
+        return cls._opportunity_type(item.get('opportunity', {}))
 
     def select_batch(
         self,
         ranked_opportunities: List[Dict[str, Any]],
         available_buying_power: float,
+        positions: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[List[Dict[str, Any]], float]:
-        """Greedily select opportunities that fit within buying power.
+        """Select opportunities from two independent budgets (FC-038).
 
-        Only one position per underlying stock is allowed (risk management rule).
+        Covered calls are backed by shares, puts by cash, so they are selected
+        against separate ledgers: calls draw down a per-underlying available-
+        shares budget, puts draw down buying power. Charging calls
+        ``strike x 100`` of phantom collateral is what let one call exhaust the
+        cash budget and starve every other opportunity in the batch.
+
+        Calls are selected first — they cost no cash, so they cannot displace a
+        put. Only one position per underlying is allowed, across both pools
+        (risk management rule). Share-committed underlyings are dropped here
+        rather than discovered at execution time, so they no longer burn a slot.
 
         Args:
-            ranked_opportunities: Opportunities sorted by ROI (from ``rank_opportunities``).
-            available_buying_power: Starting buying power.
+            ranked_opportunities: Ranked metric dicts (from ``rank_opportunities``).
+            available_buying_power: Starting buying power (puts only).
+            positions: Optional positions snapshot; fetched when omitted and
+                at least one call opportunity is present.
 
         Returns:
             A tuple of (selected_opportunities, remaining_buying_power).
@@ -206,38 +448,94 @@ class ExecutionEngine:
         selected: List[Dict[str, Any]] = []
         selected_underlyings: Set[str] = set()
         remaining_bp = available_buying_power
+        drop_counts: Dict[str, int] = {reason: 0 for reason in DROP_REASONS}
+        selected_counts: Dict[str, int] = {'call': 0, 'put': 0}
 
-        for item in ranked_opportunities:
-            underlying = item['opportunity'].get('symbol')
+        def drop(item: Dict[str, Any], reason: str, **fields: Any) -> None:
+            drop_counts[reason] += 1
+            self._log_drop(item['opportunity'], reason, stage="selection", **fields)
 
-            # Skip if we already have a position for this underlying
+        def select(item: Dict[str, Any], underlying: Optional[str], **fields: Any) -> None:
+            selected.append(item['opportunity'])
+            selected_underlyings.add(underlying)
+            selected_counts['call' if self._item_type(item) == 'call' else 'put'] += 1
+            self.logger.info(
+                "Selected opportunity for batch execution",
+                event_category="system",
+                event_type="opportunity_selected",
+                symbol=underlying,
+                option_symbol=item['opportunity'].get('option_symbol'),
+                opportunity_type=self._item_type(item),
+                collateral=item.get('collateral', 0),
+                premium=item.get('premium'),
+                **fields,
+            )
+
+        ordered = self._sort_pools(ranked_opportunities)
+        calls = [i for i in ordered if self._item_type(i) == 'call']
+        puts = [i for i in ordered if self._item_type(i) != 'call']
+
+        if positions is None:
+            positions = self._positions_snapshot() if calls else []
+
+        # --- Pool 1: covered calls, against a per-underlying share ledger ---
+        share_ledger: Dict[str, int] = {}
+        for item in calls:
+            opp = item['opportunity']
+            underlying = opp.get('symbol')
+
             if underlying in selected_underlyings:
-                self.logger.info(
-                    "Skipping duplicate underlying in batch selection",
-                    event_category="filtering",
-                    event_type="duplicate_underlying_skipped",
-                    symbol=underlying,
-                    collateral=item['collateral'],
-                    premium=item['premium'],
-                    roi=f"{item['roi']:.4f}",
-                    reason="already_selected_for_execution",
+                drop(item, DROP_DUPLICATE_UNDERLYING)
+                continue
+
+            if underlying not in share_ledger:
+                share_ledger[underlying] = self._available_shares(underlying, positions)[0]
+
+            required_shares = int(opp.get('contracts') or 1) * 100
+            if share_ledger[underlying] < required_shares:
+                drop(
+                    item,
+                    DROP_INSUFFICIENT_SHARES,
+                    required_shares=required_shares,
+                    available_shares=share_ledger[underlying],
                 )
                 continue
 
-            if item['collateral'] <= remaining_bp:
-                selected.append(item['opportunity'])
-                selected_underlyings.add(underlying)
-                remaining_bp -= item['collateral']
-                self.logger.info(
-                    "Selected opportunity for batch execution",
-                    event_category="system",
-                    event_type="opportunity_selected_for_execution",
-                    symbol=underlying,
-                    collateral=item['collateral'],
-                    premium=item['premium'],
-                    roi=f"{item['roi']:.4f}",
+            share_ledger[underlying] -= required_shares
+            select(
+                item,
+                underlying,
+                required_shares=required_shares,
+                remaining_shares=share_ledger[underlying],
+                remaining_bp=remaining_bp,
+            )
+
+        # --- Pool 2: cash-secured puts, against buying power ---
+        for item in puts:
+            opp = item['opportunity']
+            underlying = opp.get('symbol')
+
+            if underlying in selected_underlyings:
+                drop(item, DROP_DUPLICATE_UNDERLYING)
+                continue
+
+            collateral = item.get('collateral', 0)
+            if collateral > remaining_bp:
+                drop(
+                    item,
+                    DROP_INSUFFICIENT_BP,
+                    collateral=collateral,
                     remaining_bp=remaining_bp,
                 )
+                continue
+
+            remaining_bp -= collateral
+            select(
+                item,
+                underlying,
+                roi=f"{item.get('roi', 0):.4f}",
+                remaining_bp=remaining_bp,
+            )
 
         self.logger.info(
             "Batch order selection complete",
@@ -245,6 +543,12 @@ class ExecutionEngine:
             event_type="batch_selection_completed",
             total_opportunities=len(ranked_opportunities),
             selected_count=len(selected),
+            calls_selected=selected_counts['call'],
+            puts_selected=selected_counts['put'],
+            dropped_count=sum(drop_counts.values()),
+            dropped_insufficient_available_shares=drop_counts[DROP_INSUFFICIENT_SHARES],
+            dropped_insufficient_buying_power=drop_counts[DROP_INSUFFICIENT_BP],
+            dropped_duplicate_underlying=drop_counts[DROP_DUPLICATE_UNDERLYING],
             initial_bp=available_buying_power,
             bp_to_use=available_buying_power - remaining_bp,
         )
@@ -385,40 +689,13 @@ class ExecutionEngine:
                     contracts = opp.get('contracts', 1)
                     required_shares = contracts * 100
 
-                    try:
-                        positions = self.alpaca_client.get_positions()
-                        stock_pos = next(
-                            (p for p in positions
-                             if p.get('symbol') == underlying
-                             and p.get('asset_class') == 'us_equity'),
-                            None,
-                        )
-                        owned_shares = int(float(stock_pos['qty'])) if stock_pos else 0
-
-                        # Subtract shares already backing existing short calls
-                        committed_shares = 0
-                        for pos in positions:
-                            if (pos.get('asset_class') == 'us_option'
-                                    and float(pos.get('qty', 0)) < 0):  # short option
-                                opt_sym = pos.get('symbol', '')
-                                # FC-052: parse the contract once, strictly.
-                                # This was `'C' in opt_sym` over a hand-rolled
-                                # underlying (chars up to the first digit) --
-                                # the fifth instance of the OCC-substring family
-                                # (FC-041/043/045/048). A short PUT on any
-                                # ticker containing a "C" counted as a committed
-                                # call, over-reporting committed shares and
-                                # silently starving the call side. Latent today
-                                # (no configured symbol contains a C) but it
-                                # fires the moment one is added.
-                                parsed = parse_option_symbol(opt_sym)
-                                if (parsed.get('underlying') == underlying
-                                        and strict_option_type(opt_sym) == 'call'):
-                                    committed_shares += abs(int(float(pos.get('qty', 0)))) * 100
-
-                        available_shares = owned_shares - committed_shares
-                    except Exception:
-                        available_shares = 0
+                    # FC-038: same arithmetic the sizing and selection stages
+                    # use, via one shared helper. Kept here as defence in depth
+                    # — positions can change between selection and execution —
+                    # so a firing is now itself a signal worth its warning log.
+                    available_shares, owned_shares, committed_shares = self._available_shares(
+                        underlying, self._positions_snapshot()
+                    )
 
                     if available_shares < required_shares:
                         self.logger.warning(
