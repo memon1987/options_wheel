@@ -1277,6 +1277,67 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ---
 
+### FC-062: the roller has its own fail-open cost-basis floor and bypasses the execute-time guard
+
+**Status:** Consideration — **must be resolved before any roller revival ships**
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-050 established one shared cost-basis resolver and a fail-closed execute-time guard — but `CallRoller` is a **third** floor implementation that neither uses. `call_roller.py:128-132` derives the floor from raw Alpaca `cost_basis` (not the FC-029 chain) and, when that returns 0, computes `min_strike = max(0, current_strike + 0.01)` — i.e. it **fails open**, replacing a cost-basis floor with "anything above the old strike". Worse, `execute_roll` sells the replacement call by calling `place_option_order` directly, so it **never passes through `execute_call_sale`** and inherits none of FC-050's protection.
+
+**Why it is not urgent today and is urgent soon:** the roller has never executed a roll in production (FC-039 family: quote-key bug, Friday/DTE eligibility gap, state amnesia), so this guard has never been exercised. But the roller revival is queued, and it would ship exactly the dead/absent-guard class that FC-050 exists to eliminate — on the path where a *rolled* call is most likely to be near or below basis, since rolling is triggered by the stock rallying through the strike.
+
+**Fix direction:** route the roller's floor through `CostBasisResolver` (FC-050's shared module) and make the zero case fail closed — refuse the roll rather than substituting a strike-based pseudo-floor; and either route the replacement leg through `execute_call_sale` or apply `opportunity_floor_per_share` at the roller's own order site. Sequence this with, or ahead of, the FC-039 roller work.
+
+**Links:** found in the FC-050 PR #74 two-reviewer pass (reviewer 1, MEDIUM). Related: FC-050 (the shared resolver + execute-time gate), FC-029 (R2 chain), FC-039 (roller repair — this must land with it), `src/strategy/call_roller.py:128-132`, `execute_roll`.
+
+---
+
+### FC-063: type the scan→execute opportunity boundary — three bugs now share this root cause
+
+**Status:** Consideration
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** opportunities cross from producers (`OptionsScanner`, `CallSeller.evaluate_covered_call_opportunity`, `PutSeller`) to consumers (`ExecutionEngine`, `CallSeller.execute_call_sale`) as **untyped dicts with per-producer key vocabularies**, and every consumer hardens against the shapes it happens to know. That has now produced three separate production defects: **FC-045** (`/monitor` misrouting call closes), **FC-048** (execution routing sending calls down the put path), and **FC-050** (the below-basis guard reading `stock_cost_basis`/`shares_covered` while scanner opportunities carry `cost_basis_per_share`/`max_contracts` — a guard that consequently never ran, and by BigQuery evidence let 15 below-basis calls through, 3 of which were called away for −$9,000).
+
+FC-050 added `opportunity_floor_per_share()` — a third place encoding shape knowledge — because hardening the consumer was the right *urgent* move for a money-losing guard. Both FC-050 reviewers independently flagged that the pattern is now the dominant residual risk: "three instances is a pattern, not a coincidence."
+
+**Fix direction:** a typed boundary — dataclass or TypedDict with a normalizing constructor per producer — so a missing or renamed field is a construction-time error rather than a silently-defaulted `0`. Deliberately deferred once already in `docs/plans/fc-048.md` as out-of-scope; this entry exists so the third deferral is a decision rather than an oversight.
+
+**Open questions:**
+- Dataclass with `from_scanner()` / `from_seller()` constructors, or a validating TypedDict at the consumer edge?
+- Migration: strangler (normalize at the two consumer entry points first) or big-bang across producers?
+- Does the GCS opportunity blob become a versioned schema, given `/run` deserializes what `/scan` wrote up to 30 minutes earlier (and across deploys)?
+
+**Links:** FC-045, FC-048, FC-050 (`docs/plans/fc-050.md` Open Question 1; both PR #74 reviewers), `src/data/options_scanner.py`, `src/strategy/execution_engine.py`, `src/strategy/call_seller.py`.
+
+---
+
+### FC-064: cost-basis floor should be `max(BQ assigning strike, broker basis)` for mixed lots
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-050's resolver returns the **first** positive source in FC-029's order (wheel_state → BigQuery last-OPASN put strike → Alpaca `cost_basis`). Because wheel-state persistence has never worked (FC-039), production resolves from **BigQuery** for every held symbol with OPASN history — the raw assigning-put strike. For a clean wheel lot that is conservative (raw strike ≥ premium-adjusted broker basis; verified on all four live positions 2026-07-30, where every floor *rose*: AAPL 303.50→305.00, AMZN 261.20→262.50, GOOGL 368.34→370.00, NVDA 218.43→220.00).
+
+**The unsafe case is a mixed lot.** Assigned 100 shares at $200, later acquire more at a higher price so the *average* basis is $220: BigQuery still resolves $200, so a $205 call passes both the scanner floor and the execute-time guard while being below the account's true basis — a real loss the pre-FC-050 scanner (which used Alpaca's average) would have blocked. Raised by reviewer 2 on PR #74; reviewer 1 independently confirmed it is **unreachable today** (`_has_existing_position` blocks put sales on symbols already held, and account history shows zero manual stock purchases), which is why it was not changed mid-refactor.
+
+**Fix direction:** resolve to `max(bq_strike, alpaca_basis_per_share)` when both are positive — identical to today's behavior for clean wheel lots (basis = strike − premium ≤ strike) and protective only where they diverge. FC-050 shipped the observability prerequisite: `cost_basis_resolved_via_fallback` now carries Alpaca's value and the delta, so the divergence can be measured on real data before the semantics change.
+
+**Open questions:**
+- Does `max()` belong in the resolver (changing FC-029 semantics globally) or only at the scanner's call site?
+- Should a share count that disagrees with the OPASN quantity be its own signal (partial sale, mixed lot) rather than being inferred from a price delta?
+- After FC-039 restores wheel_state, does source 1 make this moot, or does wheel_state carry the same single-assignment assumption?
+
+**Links:** FC-050 Open Question 2 (`docs/plans/fc-050.md`; both PR #74 reviewers), FC-029 (R2 source order), FC-039 (wheel state), `src/strategy/cost_basis.py`.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
