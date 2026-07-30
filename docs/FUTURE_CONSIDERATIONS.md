@@ -824,10 +824,10 @@ never worked); worth a sweep for others.
 
 ### FC-050: production's below-basis protection for covered calls is plausibly nil
 
-**Status:** Consideration — **potential live money bug, verify before acting**
-**Size estimate:** S to fix, but needs live verification first
-**Owner:** unassigned
-**Plan file:** not yet
+**Status:** Plan published — verification done (see the 07-30 note under Half 2); **Half 1 confirmed and is the scope**
+**Size estimate:** M (guaranteed-loss guard on production trading logic → two-reviewer)
+**Owner:** Claude / zeshan
+**Plan file:** `docs/plans/fc-050.md`
 
 **Problem:** the covered-call cost-basis floor — the guard that stops us writing a call below what we paid, i.e. locking in a guaranteed loss — appears to be **non-functional on the path production actually executes**. Two independent halves both fail, and they fail in the same direction.
 
