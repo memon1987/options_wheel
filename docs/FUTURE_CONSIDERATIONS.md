@@ -1060,14 +1060,14 @@ The event was never missing. `market_data.py:148` emits `stock_rejected_filter` 
 
 ### FC-058: Track D blockers — wrong image registry, and the Secret Manager fallback is probably dead
 
-**Status:** Consideration — **blocks Track D (deploying the screen Job)**
+**Status:** Blockers RESOLVED (Track D shipped 2026-07-30); **the code fix remains open**. The deploy was unblocked by reading the live service rather than by changing code: credentials are wired as **`secretKeyRef`** to Secret Manager, so Cloud Run injects the env var directly and the application-level fallback is never exercised. That means the `GOOGLE_CLOUD_PROJECT` / `GCP_PROJECT_ID` vs `GCP_PROJECT` mismatch is **dead code, not a live outage** — but it is still wrong, and the bare `except Exception: pass` around credential resolution still means a silently empty credential. Fix both when convenient.
 **Size estimate:** S once verified; verification needs `gcloud auth`
 **Owner:** unassigned
 **Plan file:** not yet
 
 **Found while attempting Track D.** Two things would each independently break a Cloud Run Job created from the runbook as originally written.
 
-**1. Wrong image registry (my error, now corrected in the runbook).** The handoff doc said `gcr.io/gen-lang-client-0607444019/options-wheel-strategy`. The service is actually built and pushed to **Artifact Registry**: `us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA` (`cloudbuild.yaml:68`). There is also no `:latest` tag published — images are SHA-pinned, so a Job must name a concrete SHA.
+**1. Wrong image registry (my error, now corrected in the runbook).** The handoff doc said `gcr.io/gen-lang-client-0607444019/options-wheel-strategy`. The service is actually built and pushed to **Artifact Registry**: `us-central1-docker.pkg.dev/$PROJECT_ID/options-wheel/options-wheel-strategy:$COMMIT_SHA` (`cloudbuild.yaml:68`). ~~There is also no `:latest` tag published~~ — **CORRECTED 2026-07-30**: a `latest` tag *is* published (verified via `gcloud artifacts docker images list`, which showed `<sha>,latest`). SHA-pinning is still the right choice for a Job — reproducibility, and `latest` moves under you — but the original claim was false.
 
 **2. The Secret Manager fallback almost certainly never resolves.** `src/utils/config.py:33`:
 
