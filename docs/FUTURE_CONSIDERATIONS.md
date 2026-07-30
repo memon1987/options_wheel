@@ -518,6 +518,25 @@ Note this is *not* true of the Stage-2 gap-risk analysis (`_detect_current_gap`,
 
 ---
 
+### FC-038: Covered calls charged phantom cash collateral in execution selection — call starvation
+
+**Status:** Plan published — **execution is the top priority: shares have sat uncovered since 2026-07-15**
+**Size estimate:** M (production trading logic → two-reviewer, high-stakes calibration)
+**Owner:** Claude / zeshan
+**Plan file:** `docs/plans/fc-038.md`
+
+> **Numbering note (2026-07-30):** this entry was filed 2026-07-18 and lost in a three-session index collision; restored here. Some same-day references to "FC-038" in the FC-039 and FC-041 entries refer to a *different* project — the covered-call **extensibility** proposal from a concurrent session — which lost the number and must refile under a fresh one (its two-reviewer pass returned REQUEST_CHANGES and its review doc never landed on `main`).
+
+**Problem / opportunity:** The production `/run` pipeline treats covered calls as if they required full cash collateral, in **two** places: `put_seller._calculate_position_size` (invoked for *all* opportunity types by `ExecutionEngine.rank_opportunities`) silently drops any call whose `strike × 100` exceeds buying power, and `select_batch` charges `strike × 100` phantom collateral against the BP budget for calls that survive. Covered calls need zero cash — the shares are the cover. Verified 2026-07-18 with an exact reproduction of the 07-17 14:15 run (BP $67,142.50; AAPL's top-scored calls dropped for phantom $34k; GOOGL charged $37k it didn't need) and adversarially reviewed; see the investigation doc. Still unfixed as of 2026-07-30: AAPL's 100 shares (basis $303.50, ~$332) have been uncovered for **11 trading days** at ~$75–$190/day of scanned premium foregone. A second wasted-slot bug compounds it: share-committed underlyings win selection, charge phantom BP, then fail `execute_batch`'s available-shares check — every cycle. Selection drops are entirely unlogged.
+
+**Fix (per plan):** two-pool budgeting — calls consume a per-underlying available-shares budget (owned − committed, via the canonical `parse_option_symbol`/`strict_option_type` primitives from FC-048/FC-052), puts consume the cash/BP budget; shares-based call sizing replaces the put-sizing BP gate; every ranking/selection drop logs a reason. Safety pre-check done 2026-07-30: live `cost_basis` verified correct and non-zero on all four held positions, so the scanner's cost-basis floor (the operative below-basis protection, given FC-050 Half 1) is functional — underwater GOOGL/NVDA stay excluded post-fix. FC-050's execute-time-floor fix follows immediately as its own PR.
+
+**Open questions:** see plan file.
+
+**Links:** `docs/plans/fc-038.md`, `docs/investigations/covered-call-starvation-2026-07-18.md` (investigation + adversarial review), FC-050 (execute-time floor — sequenced immediately after), FC-052 (oversell-guard parser this reuses), FC-045 (`/monitor` call-close misroute — adjacent, separate), FC-014 (RiskManager dead code), `src/strategy/execution_engine.py`, `src/strategy/put_seller.py:154`.
+
+---
+
 ### FC-039: Wheel state persistence has never worked in production
 
 **Status:** Consideration
@@ -544,7 +563,7 @@ Same family as FC-035 (`poll_order_statuses` latent `NameError`) and FC-015 (`_e
 - Add `state_storage_bucket` to `Config`, or set `STATE_STORAGE_BUCKET` in `cloudbuild.yaml`? The former is testable; the latter is one line.
 - Should there be a startup assertion that any configured-but-unresolvable persistence target is fatal rather than silently no-op? This bug class keeps recurring.
 
-**Links:** found during the FC-038 two-reviewer plan pass — `docs/investigations/fc-038-plan-review-2026-07-18.md` (BLOCKER B2). Related: FC-029 (R2 cost-basis chain), FC-035, FC-015.
+**Links:** found during the covered-call-**extensibility** two-reviewer plan pass (a concurrent 07-18 project formerly numbered FC-038 — see the FC-038 numbering note; its review doc `fc-038-plan-review-2026-07-18.md` never landed on `main`), BLOCKER B2. Related: FC-029 (R2 cost-basis chain), FC-035, FC-015.
 
 ---
 
@@ -586,7 +605,7 @@ Two defects:
 
 `src/utils/option_symbols.py` already exists and should be used instead; the option type is at a fixed offset in the OCC layout, not a substring.
 
-**Consequence.** Defect (1) is currently latent and costs premium when triggered. Defect (2) is a genuine naked-call path — an uncovered short call has unbounded upside risk. Both become materially more likely under FC-038, which introduces a covered-call account with **no configured symbol universe by design**, where the operator buys arbitrary tickers through the Alpaca UI. FC-038's Phase 2 explicitly relies on this guard as the primitive for committed-share accounting.
+**Consequence.** Defect (1) is currently latent and costs premium when triggered. Defect (2) is a genuine naked-call path — an uncovered short call has unbounded upside risk. Both become materially more likely under the covered-call **extensibility** proposal (a concurrent 07-18 project formerly numbered FC-038; must refile — see the FC-038 numbering note), which introduces a covered-call account with **no configured symbol universe by design**, where the operator buys arbitrary tickers through the Alpaca UI. That proposal's Phase 2 explicitly relies on this guard as the primitive for committed-share accounting. (Today's FC-038 — two-pool selection — also leans on committed-share accounting, but only for the configured universe, and reuses the FC-052-fixed canonical parsers.)
 
 **Open questions:**
 - Replace the parser with `src/utils/option_symbols.py`, or is that module's coverage incomplete for class-share tickers too? Check before assuming.
@@ -594,7 +613,7 @@ Two defects:
 - Are there other places that infer option type or underlying by substring? Sweep for `'C' in` / `'P' in` over option symbols.
 - Regression tests must include a short put on a C-containing ticker and a `BRK.B`-style class-share position.
 
-**Links:** found during the FC-038 two-reviewer plan pass — `docs/investigations/fc-038-plan-review-2026-07-18.md` (HIGH H1); flagged independently by both reviewers. Related: FC-038 (Phase 2 depends on this guard).
+**Links:** found during the covered-call-**extensibility** two-reviewer plan pass (project formerly numbered FC-038; review doc `fc-038-plan-review-2026-07-18.md` never landed on `main`), HIGH H1; flagged independently by both reviewers. Related: the extensibility refile (Phase 2 depends on this guard).
 
 ---
 
@@ -841,6 +860,8 @@ if stock_cost_basis > 0 and strike_price > 0:   # gate self-disables at 0
 Scanner-produced opportunities — the ones production executes — carry **`cost_basis_per_share`**, not `stock_cost_basis` (`src/data/options_scanner.py:~350`). So the key lookup returns the `0` default and **the execute-time floor never runs in production**. Only `call_seller.evaluate_covered_call_opportunity` sets `stock_cost_basis`, and production never calls it (same scanner-vs-wheel_engine path split that caused FC-048).
 
 **Half 2 (rests on FC-029's prior validation; could NOT be re-confirmed today).** The scanner's own floor uses `float(position['cost_basis']) / shares` (`options_scanner.py:128`). FC-029 (2026-05-08) empirically established that **Alpaca returns `cost_basis = 0` for assigned positions** — which is why FC-029 R2 built the `wheel_state → BigQuery → Alpaca` resolution chain. If that still holds, the scanner passes `min_strike_price=0` and applies no floor either. *Not re-verified: the account currently holds zero equity positions, so there was nothing to observe. Confirm against a live assigned position before acting.*
+
+> **Half 2 REFUTED against live data, 2026-07-30 (FC-038 pre-build safety check):** all four currently-held assigned positions return correct non-zero `cost_basis` from the live paper API — AAPL 30350/303.50, AMZN 26120/261.20, GOOGL 36834/368.34, NVDA 21843/218.43 (`cost_basis` ÷ qty = `avg_entry_price` exactly). The 2026-07-17 scan blob independently shows the scanner computing `cost_basis_per_share: 303.5` for AAPL. So the scanner floor IS functional today, and FC-029's "returns 0" observation either predates an Alpaca fix or applied to a different account state. **Half 1 (execute-time floor dead via the `stock_cost_basis` vs `cost_basis_per_share` key mismatch) remains code-confirmed and is the remaining fix** — defense-in-depth is one layer, not zero. Verification item 1 below is done; item 2 (historical below-basis calls) still worth running.
 
 **Consequence if both hold:** covered calls can be written below cost basis in production on exactly the positions the floor exists to protect — assigned shares. That is the guaranteed-loss scenario `docs/CLAUDE.md` calls out as CRITICAL.
 
