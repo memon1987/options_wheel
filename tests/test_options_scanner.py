@@ -325,6 +325,77 @@ class TestOptionsScannerCallScan:
         assert results == []
 
 
+class TestCallScanFailsClosedOnUnresolvedCostBasis:
+    """An unresolved cost basis must emit NO call opportunities (FC-038 review).
+
+    This floor is the operative below-basis protection on the live path:
+    `find_suitable_calls` only warns when `min_strike_price <= 0` and carries
+    on, and the execute-time floor in call_seller is dead (FC-050, the
+    `stock_cost_basis` key mismatch). Alpaca returns `cost_basis` 0 for
+    freshly assigned positions (FC-029), so a basis of 0 must mean "no calls",
+    never "calls at any strike".
+    """
+
+    def setup_method(self):
+        self.mock_alpaca = Mock()
+        self.mock_market_data = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.call_target_dte = 7
+        self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                                      self.mock_config)
+        self.mock_market_data.get_stock_metrics.return_value = {'current_price': 175.0}
+        self.mock_market_data.find_suitable_calls.return_value = [{
+            'symbol': 'AAPL250117C00185000', 'strike_price': 185.0,
+            'expiration_date': '2025-01-17', 'dte': 7, 'delta': 0.15,
+            'mid_price': 1.80, 'bid': 1.75, 'ask': 1.85, 'volume': 2000,
+            'open_interest': 8000, 'implied_volatility': 0.22,
+        }]
+
+    def _position(self, cost_basis):
+        return {'symbol': 'AAPL', 'qty': '100', 'cost_basis': cost_basis,
+                'asset_class': 'us_equity', 'side': 'long'}
+
+    @pytest.mark.parametrize("cost_basis", ['0', '0.0', 0, None, ''])
+    def test_unresolved_cost_basis_emits_nothing(self, cost_basis):
+        self.mock_alpaca.get_positions.return_value = [self._position(cost_basis)]
+
+        with patch('src.data.options_scanner.logger') as mock_logger:
+            results = self.scanner.scan_for_call_opportunities()
+
+        assert results == []
+        self.mock_market_data.find_suitable_calls.assert_not_called(), (
+            "an unprotected chain scan was run with a zero floor")
+        skips = [c.kwargs for c in mock_logger.warning.call_args_list
+                 if c.kwargs.get("event_type") == "call_scan_skipped_cost_basis_unresolved"]
+        assert len(skips) == 1
+        assert skips[0]["event_category"] == "trade"
+        assert skips[0]["symbol"] == "AAPL"
+        assert skips[0]["shares"] == 100
+        assert skips[0]["cost_basis"] == 0.0
+
+    def test_a_valid_cost_basis_still_produces_opportunities(self):
+        """The guard must not cost us the calls we are entitled to sell."""
+        self.mock_alpaca.get_positions.return_value = [self._position('16000.0')]
+
+        results = self.scanner.scan_for_call_opportunities()
+
+        assert len(results) == 1
+        assert results[0]['symbol'] == 'AAPL'
+        self.mock_market_data.find_suitable_calls.assert_called_once_with(
+            'AAPL', min_strike_price=160.0)
+
+    def test_one_bad_position_does_not_suppress_a_good_one(self):
+        self.mock_alpaca.get_positions.return_value = [
+            self._position('0'),
+            {'symbol': 'MSFT', 'qty': '100', 'cost_basis': '38000.0',
+             'asset_class': 'us_equity', 'side': 'long'},
+        ]
+
+        results = self.scanner.scan_for_call_opportunities()
+
+        assert [r['symbol'] for r in results] == ['MSFT']
+
+
 class TestOptionsScannerScanAll:
     """Test OptionsScanner.scan_all_opportunities."""
 
