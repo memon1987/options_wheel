@@ -1129,6 +1129,132 @@ Cloud Run **Services** set `K_SERVICE`. Cloud Run **Jobs** set **`CLOUD_RUN_JOB`
 
 ---
 
+### FC-060: scenario-analysis platform — parameter exploration, an owned option-data history, and persisted scenarios
+
+**Status:** Consideration — **deliberately deferred until the monthly screen is live and verified**
+**Size estimate:** XL (four separable layers; each is L on its own)
+**Owner:** zeshan
+**Plan file:** not yet — needs its own plan, and probably one plan per layer
+
+---
+
+## The vision (owner-stated)
+
+1. **Evaluate how different parameters perform across a selected universe** — either the current live wheel symbols or **new candidate symbols** being considered for inclusion.
+2. **A web UI for ad-hoc exploration** of return curves and scenario analysis.
+3. **Programmatic regression tests** that search optimal permutations of inputs across the symbol universe, so **production parameters are grounded in real data rather than intuition alone**.
+4. **Persist the underlying option data over time** — query once, persist forever — so we accumulate our own history and stop depending on a vendor for data we have already paid to query.
+5. **Persist backtest results** so a past scenario can be revisited rather than recomputed.
+
+Goal 3 is the point of the whole thing. Every threshold in `config/settings.yaml` today was set by judgement, and this session demonstrated repeatedly what that costs: the `$400` price ceiling silently excluded SPY/QQQ/AMD (FC-055), the `$0.50` premium floor made four symbols structurally untradeable (FC-034), and the stage-4 gap threshold of 1.5 turned out to **lose $5,021** when finally measured (FC-036). None of those were wrong on purpose — they were unmeasured.
+
+---
+
+## The architectural insight this should be built around
+
+**Most config parameters do not change the option chains. They only change which contracts get selected from them.**
+
+`simulator.py:313` already builds chains as a discrete phase (`chains = self._build_chains(...)`) before the day loop, and `ChainStore` is already keyed by `(symbol, date, model_fingerprint)`. That splits the parameter space in two:
+
+| class | parameters | invalidates cached chains? |
+|---|---|---|
+| **Selection-only** | `put/call_delta_range`, `min_put/call_premium`, `min/max_stock_price`, `min_avg_volume`, gap thresholds, profit-target DTE bands, `max_position_size`, `max_exposure_per_ticker`, `put/call_target_dte` | **No** |
+| **Chain-invalidating** | risk-free rate, dividend yield, spread-model params | **Yes** — already captured by the model fingerprint |
+
+**Nearly every scenario worth running is selection-only.** So chain building — the expensive, API-throttled, un-parallelisable part — happens **once per (symbol, date)**, and every additional scenario is a replay against data already on disk.
+
+Order-of-magnitude, using this session's measurements: a 50-scenario sweep over 14 symbols is **~70 hours** if each scenario rebuilds chains, versus **minutes** if it replays a warm lake. That ratio is the entire business case.
+
+---
+
+## Proposed architecture — four separable layers
+
+### Layer 1 — the chain lake (goal 4)
+
+GCS-backed, partitioned by symbol/date, keyed by model fingerprint. Immutable by nature: a chain for a settled past session never changes, which is why `ChainStore` correctly has **no TTL**.
+
+**This layer is a data asset, not a cache** — and that reframing matters for priority. Alpaca's option history begins **2024-02-01**. Every month we persist is a month of history that no longer depends on the vendor retaining it, on the subscription tier covering it, or on rate limits at query time. Three years from now this is the difference between a 2-year and a 5-year backtestable window, and **it cannot be retroactively created** — data not captured is gone.
+
+That argues for starting persistence **early and cheaply**, ahead of the rest of the platform. Current local cache: **5,382 files / 137 MB** for ~2 years × 14 symbols → GCS storage cost is roughly **$0.003/month**. The asset is essentially free to accumulate; the cost is only in not starting.
+
+Constraints, measured:
+- **Must stay sequential.** The B2 study measured that Alpaca's trading-API contract-discovery endpoint **throttles independently and does not respond to sharding — 18 parallel processes ran *slower* than 6.** Parallelising this layer makes it worse.
+- **Incremental by construction.** Consecutive monthly windows overlap ~335 of 365 days, so a refresh fetches ~30 new days per symbol, not 365.
+- **New candidate symbols are a cold fetch** (goal 1) — the lake grows along both axes, symbol and date. Onboarding a candidate costs one full backfill, then it is warm forever.
+
+### Layer 2 — the scenario runner (goals 1, 3)
+
+Takes `(window, symbols, config-delta)` and replays against the lake with **zero API calls**. Parallelise **here** — it is pure CPU, so Cloud Run Jobs `--tasks N` or multiprocessing both work and neither hits a rate limit.
+
+The mechanism already exists: the B1, B2 and FC-036 studies all injected config via `config._config["risk"][...]` to run threshold arms. This layer is the productisation of what those one-off harnesses did by hand (`tools/diagnostics/fc002_gap_filter_ab.py`, `fc034_premium_floor_study.py`, `fc036_gap_gate_study.py` are three worked examples of the intended shape).
+
+### Layer 3 — the scenario store (goal 5)
+
+`bq_writer.config_hash()` **already exists** and already hashes `put_delta_range`, `call_delta_range`, `min_put_premium`, `min_call_premium`, `max_position_size`, `max_gap_frequency`, `execution_gap_threshold`, the DTE targets and a `_scoring` block. So:
+
+- Key results on `(config_hash, window, symbol)`
+- **Dedup on re-request** — a scenario already computed returns instantly
+- **Return curves are a `GROUP BY`**, not a new subsystem
+- Revisiting a past scenario (goal 5) is a query, and `config_hash` makes it interpretable — the column exists precisely because *"a verdict is uninterpretable without the thresholds that produced it"*
+
+### Layer 4 — the UI (goal 2)
+
+**Submit-and-poll, never synchronous.** Even warm, a multi-symbol scenario is seconds-to-minutes; the existing `/backtest/screen` endpoint is disabled precisely because no synchronous HTTP request survives a real run. If the requested `config_hash` is already in the store, return immediately — which makes exploring *adjacent* parameters feel instant, and that is most of the perceived quality of such a tool.
+
+---
+
+## The dominant risk: this is a multiple-comparisons machine
+
+**Goal 3 is the most valuable and the most dangerous.** Alpaca's history starts 2024-02 — **one vol regime, predominantly a bull market**. A tool that evaluates dozens of permutations and surfaces the best return curve will reliably find a configuration that looks excellent and is **fitted to that regime**. Deploying it to live trading would then be worse than the intuition it replaced, because it would carry the authority of a number.
+
+Every study this session produced carried a single-regime caveat, and — critically — **each one's honest verdict came from a real-fills layer, not from the engine**. FC-036's engine A/B called threshold 5.0 "free"; the real-fills join proved it was a $1,900 tax that prevented nothing.
+
+So the following are **requirements, not disclaimers**:
+
+- **Out-of-sample by default.** Report fit-window and holdout separately; never a single blended number.
+- **Show the per-symbol distribution, not just the aggregate.** FC-034's entire value was noticing that KMI's flattering +138% annualised came from **one 8-day trade in 273 days**. An aggregate hides that; a distribution cannot.
+- **Keep the real-fills reality check reachable.** For any candidate config, quantify what it would have done to the **330 actual sell-to-open fills** on record — the layer that has survived every engine change this session.
+- **Require a minimum activity threshold** before a config's return is displayed at all. The engine already has an `insufficient` verdict and a `days_in_position_fraction` for exactly this.
+
+### A second, subtler bias that a UI will hide
+
+Reported returns are a **floor**: put leg ~7% low, **call leg ~32% low** (FC-056), spread model 2.46× too wide. Comparing two scenarios is safer than reading absolute levels — **except** when the two differ in call-leg activity, because then the ~32% call understatement **biases the comparison itself**. A configuration that writes more covered calls will look **worse than it is**.
+
+Any scenario-comparison UI must surface call-leg activity alongside return, or it will systematically mislead in a consistent direction. This should be resolved by fixing FC-056 rather than by annotating around it.
+
+---
+
+## Sequencing, and why this is deferred
+
+**Prerequisite: the monthly screen must be live and verified generating real data.** That is the owner's stated gate and it is the right one — a scenario platform built on an engine whose production behaviour is unproven inherits every unknown.
+
+Suggested order once unblocked:
+
+1. **Start persisting the chain lake immediately** (Layer 1, standalone). It is nearly free, and it is the only component whose value is **lost by waiting** — unqueried history cannot be recovered later. This does not require the rest of the platform to exist.
+2. **Split chain-materialisation from replay** behind a clean interface, and prove a warm 10-scenario sweep runs in minutes. **This is the load-bearing bet** — if it does not hold, the rest of the design does not work. It also pays for itself immediately by making FC-055 and FC-002's remaining arm cheap to answer.
+3. **Layer 2 + 3** (runner + store) — the programmatic regression tests (goal 3) become possible here, with the guardrails above.
+4. **Layer 4** (UI) last. It is the most visible and the least load-bearing.
+
+Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter change, for the asymmetric-bias reason above.
+
+---
+
+## Open questions
+
+- **GCS FUSE vs. explicit object access for the lake.** A mount needs no code change, but pays per-object overhead on thousands of ~25 KB files, and **GCS has no atomic rename** — which silently weakens the temp-file-plus-`os.replace` atomicity Track A deliberately added to stop a torn parquet wedging future runs. Measure the FUSE read path before adopting; consider write-once naming so there is nothing to rename.
+- **Where does the search live for goal 3?** Grid, random, or Bayesian over the parameter space — grid explodes combinatorially across ~10 parameters.
+- **How is a candidate symbol admitted?** Goal 1 implies an onboarding path: backfill its chains, screen it, compare against incumbents. Interacts with FC-055/FC-034, since today's filters would reject most candidates before evaluation.
+- **Does the scenario store extend `backtest_runs` or get its own table?** `backtest_runs` is one row per symbol per run and already carries `config_hash` and `run_kind` — extending may be enough.
+
+## Explicitly out of scope
+
+- **Do not build a UI backend that reimplements strategy logic.** The engine's entire value is that it replays the *real* code (the FC-032 premise). A parallel implementation would drift, and an invisible drift is worse than no backtest.
+- **Not programmatic demotion.** Separately deferred by the owner; scenario analysis informs parameters, it does not act.
+
+**Links:** `docs/BACKTEST_ENGINE.md`, `docs/plans/fc-032.md`, `docs/plans/fc-042.md`, FC-034, FC-051, FC-055, FC-056; worked prototypes of Layer 2 in `tools/diagnostics/fc002_gap_filter_ab.py`, `fc034_premium_floor_study.py`, `fc036_gap_gate_study.py`.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
