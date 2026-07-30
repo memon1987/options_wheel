@@ -442,11 +442,25 @@ def trigger_strategy():
                        portfolio_value=account_info.get('portfolio_value'),
                        equity=account_info.get('equity'))
 
-            # Rank opportunities by ROI with position sizing
-            ranked = exec_engine.rank_opportunities(opportunities, put_seller, available_buying_power)
+            # FC-038: ONE positions snapshot for the whole cycle. Sizing and
+            # selection must agree on share availability -- re-fetching between
+            # the two lets a fill land in between and produce a selection the
+            # sizing stage never sanctioned. Fails closed (PositionsUnavailable
+            # is an empty list), so a broker outage sells nothing rather than
+            # something naked.
+            positions_snapshot = exec_engine._positions_snapshot()
 
-            # Select opportunities that fit within buying power
-            selected_opportunities, remaining_bp = exec_engine.select_batch(ranked, available_buying_power)
+            # Rank opportunities: puts sized against buying power, calls
+            # against available shares.
+            ranked = exec_engine.rank_opportunities(
+                opportunities, put_seller, available_buying_power,
+                positions=positions_snapshot
+            )
+
+            # Select from two budgets: shares for calls, buying power for puts
+            selected_opportunities, remaining_bp = exec_engine.select_batch(
+                ranked, available_buying_power, positions=positions_snapshot
+            )
 
             # Execute orders sequentially with real-time buying power validation
             execution_results, trades_executed = exec_engine.execute_batch(

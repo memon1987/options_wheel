@@ -125,7 +125,27 @@ class OptionsScanner:
 
                 # CRITICAL: Calculate cost basis per share for protection
                 # This ensures we never sell calls below cost basis (guaranteed loss)
-                cost_basis_per_share = float(position['cost_basis']) / shares
+                try:
+                    raw_cost_basis = float(position.get('cost_basis') or 0)
+                except (TypeError, ValueError):
+                    raw_cost_basis = 0.0
+                cost_basis_per_share = raw_cost_basis / shares
+
+                # FAIL CLOSED on an unresolved cost basis. This floor is the
+                # operative below-basis protection: find_suitable_calls warns
+                # and continues when min_strike_price <= 0, and the
+                # execute-time floor in call_seller is dead (FC-050). Alpaca
+                # returns cost_basis 0 for freshly assigned positions
+                # (FC-029), so "no basis" must mean "no calls", never "any
+                # strike".
+                if cost_basis_per_share <= 0:
+                    logger.warning("Skipping call scan - cost basis unresolved",
+                                   event_category="trade",
+                                   event_type="call_scan_skipped_cost_basis_unresolved",
+                                   symbol=symbol,
+                                   shares=shares,
+                                   cost_basis=raw_cost_basis)
+                    continue
 
                 # Get call opportunities filtered by cost basis
                 calls = self.market_data.find_suitable_calls(

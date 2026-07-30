@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 from datetime import datetime
 
-from src.strategy.execution_engine import DROP_REASONS, ExecutionEngine
+from src.strategy.execution_engine import (
+    DROP_REASONS, ExecutionEngine, PositionsUnavailable)
 from src.strategy.put_seller import PutSeller
 from src.strategy.call_seller import CallSeller
 from src.utils.config import Config
@@ -1151,3 +1152,179 @@ class TestGoldenReplay20260717:
                      if d["opportunity_type"] == "put"]
         assert len(put_drops) == 6
         assert {d["reason"] for d in put_drops} == {"sizing_failed"}
+
+
+class TestSingleSnapshotPerCycle:
+    """Sizing and selection must reason about the SAME positions (review F2).
+
+    Two fetches means a fill landing between them can produce a selection the
+    sizing stage never sanctioned -- and it doubles the broker calls on the
+    hot path for no benefit.
+    """
+
+    def setup_method(self):
+        self.alpaca = Mock()
+        self.engine = ExecutionEngine(self.alpaca, Mock(spec=Config))
+        self.engine.logger = Mock()
+        self.put_seller = Mock(spec=PutSeller)
+        self.put_seller._calculate_position_size.return_value = {"contracts": 1}
+
+    def test_a_threaded_snapshot_is_never_re_fetched(self):
+        snapshot = [_equity("AAPL", 100)]
+
+        ranked = self.engine.rank_opportunities(
+            [_call("AAPL", 337.5), _put("MSFT", 375.0)], self.put_seller, 67142.50,
+            positions=snapshot)
+        selected, _ = self.engine.select_batch(ranked, 67142.50, positions=snapshot)
+
+        self.alpaca.get_positions.assert_not_called()
+        assert sorted(o["symbol"] for o in selected) == ["AAPL", "MSFT"]
+
+    def test_the_run_endpoint_threads_one_snapshot_into_both_stages(self):
+        """Pin the wiring, not just the capability -- /run is what ships."""
+        source = Path("deploy/cloud_run_server.py").read_text()
+
+        assert "positions_snapshot = exec_engine._positions_snapshot()" in source
+        rank_call = source.split("exec_engine.rank_opportunities(")[1].split(")")[0]
+        select_call = source.split("exec_engine.select_batch(")[1].split(")")[0]
+        assert "positions=positions_snapshot" in rank_call
+        assert "positions=positions_snapshot" in select_call
+
+    def test_an_empty_snapshot_is_honoured_not_treated_as_absent(self):
+        """`[]` means "we looked, you own nothing" -- do not go re-fetch."""
+        self.engine.rank_opportunities(
+            [_call("AAPL", 337.5)], self.put_seller, 0.0, positions=[])
+
+        self.alpaca.get_positions.assert_not_called()
+
+
+class TestPositionsUnavailableIsNotZeroShares:
+    """A failed positions fetch must not read as "the account owns nothing".
+
+    Both are empty, both block the trade -- but one is a normal Tuesday and
+    the other is an outage silently halting every covered call in the fleet.
+    Collapsing them into `insufficient_available_shares` makes the outage
+    unfindable, which is the exact failure mode FC-038 exists to end.
+    """
+
+    def setup_method(self):
+        self.alpaca = Mock()
+        self.alpaca.get_positions.side_effect = RuntimeError("Alpaca 503")
+        self.engine = ExecutionEngine(self.alpaca, Mock(spec=Config))
+        self.engine.logger = Mock()
+        self.put_seller = Mock(spec=PutSeller)
+
+    def test_snapshot_failure_is_its_own_reason_at_ranking(self):
+        ranked = self.engine.rank_opportunities(
+            [_call("AAPL", 337.5)], self.put_seller, 0.0)
+
+        assert ranked == []
+        drops = _drop_events(self.engine.logger)
+        assert [d["reason"] for d in drops] == ["positions_unavailable"]
+
+    def test_snapshot_failure_is_its_own_reason_at_selection(self):
+        item = {"opportunity": _call("AAPL", 337.5, contracts=1), "collateral": 0.0,
+                "premium": 100.0, "roi": 0.0, "type": "call"}
+
+        selected, _ = self.engine.select_batch([item], 0.0)
+
+        assert selected == []
+        drops = _drop_events(self.engine.logger)
+        assert [d["reason"] for d in drops] == ["positions_unavailable"]
+
+    def test_a_genuinely_empty_account_still_says_insufficient_shares(self):
+        """Don't over-correct: a real empty snapshot keeps its own reason."""
+        self.alpaca.get_positions.side_effect = None
+        self.alpaca.get_positions.return_value = []
+
+        self.engine.rank_opportunities([_call("AAPL", 337.5)], self.put_seller, 0.0)
+
+        assert [d["reason"] for d in _drop_events(self.engine.logger)] == [
+            "insufficient_available_shares"]
+
+    def test_the_reason_survives_the_batch_summary(self):
+        item = {"opportunity": _call("AAPL", 337.5, contracts=1), "collateral": 0.0,
+                "premium": 100.0, "roi": 0.0, "type": "call"}
+
+        self.engine.select_batch([item], 0.0)
+
+        summary = next(c.kwargs for c in self.engine.logger.info.call_args_list
+                       if c.kwargs.get("event_type") == "batch_selection_completed")
+        assert summary["dropped_positions_unavailable"] == 1
+        assert summary["dropped_insufficient_available_shares"] == 0
+
+    def test_the_sentinel_still_fails_closed_everywhere(self):
+        """It must behave as an empty list; nothing may be sold on no data."""
+        snapshot = self.engine._positions_snapshot()
+
+        assert isinstance(snapshot, PositionsUnavailable)
+        assert snapshot == [] and not snapshot
+        assert self.engine._available_shares("AAPL", snapshot) == (0, 0, 0)
+
+    def test_the_execution_guard_flags_the_outage_too(self):
+        call_seller = Mock(spec=CallSeller)
+        self.engine.execute_batch(
+            [{"symbol": "AAPL", "option_symbol": CALL_SYM, "strategy": "sell_call",
+              "contracts": 1, "premium": 1.0, "strike_price": 190}],
+            Mock(spec=PutSeller), call_seller=call_seller)
+
+        call_seller.execute_call_sale.assert_not_called()
+        blocked = next(c.kwargs for c in self.engine.logger.warning.call_args_list
+                       if c.kwargs.get("event_type") == "naked_call_blocked")
+        assert blocked["positions_unavailable"] is True
+
+
+class TestEventsCarryUnambiguousPremiumUnits:
+    """`premium` meant per-share on one event and total dollars on the other.
+
+    Any query spanning both silently mixed scales by a factor of 100 x
+    contracts, so both events now name their units.
+    """
+
+    def setup_method(self):
+        self.alpaca = Mock()
+        self.engine = ExecutionEngine(self.alpaca, Mock(spec=Config))
+        self.engine.logger = Mock()
+        self.put_seller = Mock(spec=PutSeller)
+        self.put_seller._calculate_position_size.return_value = {"contracts": 1}
+
+    def test_selection_event_names_both_units(self):
+        self.alpaca.get_positions.return_value = [_equity("AAPL", 200)]
+
+        ranked = self.engine.rank_opportunities(
+            [_call("AAPL", 337.5, premium=0.755)], self.put_seller, 0.0)
+        self.engine.select_batch(ranked, 0.0)
+
+        event = _select_events(self.engine.logger)[0]
+        assert event["contracts"] == 2
+        assert event["premium_per_share"] == pytest.approx(0.755)
+        assert event["total_premium"] == pytest.approx(151.0)   # 0.755 x 100 x 2
+        assert "premium" not in event, "the ambiguous key must be gone"
+
+    def test_drop_event_names_both_units(self):
+        self.alpaca.get_positions.return_value = [_equity("AAPL", 100)]
+
+        ranked = self.engine.rank_opportunities(
+            [_call("AAPL", 337.5, premium=0.755, score=87.2),
+             _call("AAPL", 340.0, premium=1.145, score=87.1)],
+            self.put_seller, 0.0)
+        self.engine.select_batch(ranked, 0.0)
+
+        drop = _drop_events(self.engine.logger)[0]
+        assert drop["reason"] == "duplicate_underlying"
+        assert drop["contracts"] == 1
+        assert drop["premium_per_share"] == pytest.approx(1.145)
+        assert drop["total_premium"] == pytest.approx(114.5)
+        assert "premium" not in drop
+
+    def test_a_drop_before_sizing_reports_no_total(self):
+        """Honest nulls beat a total invented from an assumed contract count."""
+        self.alpaca.get_positions.return_value = []
+
+        self.engine.rank_opportunities(
+            [_call("AAPL", 337.5, premium=0.755)], self.put_seller, 0.0)
+
+        drop = _drop_events(self.engine.logger)[0]
+        assert drop["premium_per_share"] == pytest.approx(0.755)
+        assert drop["total_premium"] is None
+        assert drop["contracts"] is None

@@ -571,8 +571,12 @@ class Simulator:
         available_bp = float(
             account_info.get("options_buying_power") or account_info["buying_power"]
         )
-        ranked = exec_engine.rank_opportunities(opportunities, engine.put_seller, available_bp)
-        selected, _ = exec_engine.select_batch(ranked, available_bp)
+        # One snapshot for the whole cycle, as /run does (FC-038): the two
+        # stages must agree on share availability.
+        ranked = exec_engine.rank_opportunities(
+            opportunities, engine.put_seller, available_bp, positions=positions
+        )
+        selected, _ = exec_engine.select_batch(ranked, available_bp, positions=positions)
         if not selected:
             return
 

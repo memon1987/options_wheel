@@ -24,19 +24,37 @@ from .call_seller import CallSeller
 logger = structlog.get_logger(__name__)
 
 # Machine-queryable drop reasons emitted on the `selection_dropped` event.
-# The four are exhaustive: every opportunity that enters ranking either ends up
-# selected or carries exactly one of these.
+# Exhaustive: every opportunity that enters ranking either ends up selected or
+# carries exactly one of these.
 DROP_INSUFFICIENT_SHARES = "insufficient_available_shares"
 DROP_INSUFFICIENT_BP = "insufficient_buying_power"
 DROP_DUPLICATE_UNDERLYING = "duplicate_underlying"
 DROP_SIZING_FAILED = "sizing_failed"
+# Distinct from insufficient_available_shares on purpose: a failed positions
+# fetch must never masquerade as "the account owns no shares". The two demand
+# opposite responses -- one is a normal, expected outcome, the other is an
+# outage that silently halts every covered call in the fleet.
+DROP_POSITIONS_UNAVAILABLE = "positions_unavailable"
 
 DROP_REASONS = (
     DROP_INSUFFICIENT_SHARES,
     DROP_INSUFFICIENT_BP,
     DROP_DUPLICATE_UNDERLYING,
     DROP_SIZING_FAILED,
+    DROP_POSITIONS_UNAVAILABLE,
 )
+
+
+class PositionsUnavailable(list):
+    """An empty positions snapshot whose emptiness means "we could not look".
+
+    Behaves as ``[]`` everywhere, so every share computation fails closed
+    (nothing available, nothing sold naked). Callers that care about *why* the
+    snapshot is empty test for this type and report
+    ``positions_unavailable`` rather than ``insufficient_available_shares``.
+    """
+
+    __slots__ = ()
 
 # Module-level set tracking option symbols that failed with non-retryable errors today.
 # This prevents the same rejected opportunity from being retried every /run cycle.
@@ -156,7 +174,11 @@ class ExecutionEngine:
         self,
         positions: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        """Return the caller's snapshot, or fetch one. Fails closed on error."""
+        """Return the caller's snapshot, or fetch one.
+
+        Fails closed: a failed fetch yields a :class:`PositionsUnavailable`,
+        which is an empty list *and* carries the reason it is empty.
+        """
         if positions is not None:
             return positions
         try:
@@ -168,7 +190,14 @@ class ExecutionEngine:
                 event_type="positions_snapshot_failed",
                 error=str(e),
             )
-            return []
+            return PositionsUnavailable()
+
+    @staticmethod
+    def _share_drop_reason(positions: List[Dict[str, Any]]) -> str:
+        """Why a call could not be backed: no shares, or no snapshot at all."""
+        return (DROP_POSITIONS_UNAVAILABLE
+                if isinstance(positions, PositionsUnavailable)
+                else DROP_INSUFFICIENT_SHARES)
 
     @classmethod
     def _call_rank_score(cls, item: Dict[str, Any]) -> float:
@@ -205,7 +234,16 @@ class ExecutionEngine:
 
         The 2026-07-18 starvation outage was invisible for four days precisely
         because drops were silent (see docs/investigations/).
+
+        Premium is reported in both units explicitly. A bare ``premium`` field
+        meant per-share here and total-dollars on the selection event, so any
+        query spanning the two silently mixed scales.
         """
+        per_share = opportunity.get('premium')
+        contracts = opportunity.get('contracts')
+        total = (per_share * 100 * contracts
+                 if per_share is not None and contracts else None)
+
         self.logger.info(
             "Opportunity dropped before execution",
             event_category="filtering",
@@ -216,7 +254,9 @@ class ExecutionEngine:
             option_symbol=opportunity.get('option_symbol'),
             opportunity_type=self._opportunity_type(opportunity),
             strike_price=opportunity.get('strike_price'),
-            premium=opportunity.get('premium'),
+            contracts=contracts,
+            premium_per_share=per_share,
+            total_premium=total,
             **fields,
         )
 
@@ -353,7 +393,7 @@ class ExecutionEngine:
                 if contracts <= 0:
                     self._log_drop(
                         opp,
-                        DROP_INSUFFICIENT_SHARES,
+                        self._share_drop_reason(positions),
                         stage="ranking",
                         owned_shares=owned,
                         committed_to_calls=committed,
@@ -467,7 +507,10 @@ class ExecutionEngine:
                 option_symbol=item['opportunity'].get('option_symbol'),
                 opportunity_type=self._item_type(item),
                 collateral=item.get('collateral', 0),
-                premium=item.get('premium'),
+                contracts=item['opportunity'].get('contracts'),
+                # Both units, named. See _log_drop.
+                premium_per_share=item['opportunity'].get('premium'),
+                total_premium=item.get('premium'),
                 **fields,
             )
 
@@ -495,7 +538,7 @@ class ExecutionEngine:
             if share_ledger[underlying] < required_shares:
                 drop(
                     item,
-                    DROP_INSUFFICIENT_SHARES,
+                    self._share_drop_reason(positions),
                     required_shares=required_shares,
                     available_shares=share_ledger[underlying],
                 )
@@ -549,6 +592,7 @@ class ExecutionEngine:
             dropped_insufficient_available_shares=drop_counts[DROP_INSUFFICIENT_SHARES],
             dropped_insufficient_buying_power=drop_counts[DROP_INSUFFICIENT_BP],
             dropped_duplicate_underlying=drop_counts[DROP_DUPLICATE_UNDERLYING],
+            dropped_positions_unavailable=drop_counts[DROP_POSITIONS_UNAVAILABLE],
             initial_bp=available_buying_power,
             bp_to_use=available_buying_power - remaining_bp,
         )
@@ -693,8 +737,9 @@ class ExecutionEngine:
                     # use, via one shared helper. Kept here as defence in depth
                     # — positions can change between selection and execution —
                     # so a firing is now itself a signal worth its warning log.
+                    snapshot = self._positions_snapshot()
                     available_shares, owned_shares, committed_shares = self._available_shares(
-                        underlying, self._positions_snapshot()
+                        underlying, snapshot
                     )
 
                     if available_shares < required_shares:
@@ -708,6 +753,9 @@ class ExecutionEngine:
                             owned_shares=owned_shares,
                             committed_to_calls=committed_shares,
                             available_shares=available_shares,
+                            # "0 owned" reads very differently when it means
+                            # "we could not fetch positions".
+                            positions_unavailable=isinstance(snapshot, PositionsUnavailable),
                         )
                         # Do NOT add to _failed_symbols — share ownership is transient.
                         # The account could acquire shares before the next /run cycle
