@@ -39,6 +39,8 @@ class CallSeller:
         self.market_data = market_data
         self.config = config
         self.wheel_state = wheel_state_manager
+        # Construction-time snapshot, kept for assertions only: the resolver below
+        # took its own copy, so mutating this attribute afterwards changes nothing.
         self.allow_bigquery_cost_basis = allow_bigquery_cost_basis
         self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
         # FC-050: the FC-029 resolution chain now lives in cost_basis.py so the

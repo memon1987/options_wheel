@@ -93,6 +93,29 @@ class TestCostBasisResolverSourceOrder:
             assert resolver.resolve_with_source('AMZN', _position(0.0), 100) == (
                 247.5, SOURCE_BIGQUERY)
 
+    def test_a_bigquery_hit_beats_a_positive_alpaca_basis(self):
+        """FC-029's core semantic: the broker's basis is not trustworthy for an
+        assigned position, so a resolved OPASN strike wins even when Alpaca
+        reports a plausible non-zero number. Without this, a broker basis that
+        is merely *wrong* (rather than 0) would silently become the floor."""
+        resolver = self._resolver()
+
+        with patch.object(resolver, '_lookup_last_opasn_put_strike', return_value=303.50):
+            # Alpaca says $250/share; BQ says the put assigned at $303.50.
+            basis, source = resolver.resolve_with_source('AAPL', _position(25000.0), 100)
+
+        assert (basis, source) == (303.50, SOURCE_BIGQUERY)
+
+    def test_wheel_state_beats_a_positive_alpaca_basis_too(self):
+        wheel_state = Mock()
+        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 303.50}
+        resolver = self._resolver(wheel_state=wheel_state)
+
+        with patch.object(resolver, '_lookup_last_opasn_put_strike', return_value=0.0):
+            basis, source = resolver.resolve_with_source('AAPL', _position(25000.0), 100)
+
+        assert (basis, source) == (303.50, SOURCE_WHEEL_STATE)
+
     def test_alpaca_is_the_last_resort_for_manual_buys(self):
         resolver = self._resolver()
 
@@ -215,8 +238,33 @@ class TestCallSellerDelegationIsBehaviourPreserving:
         with patch.object(seller, '_lookup_last_opasn_put_strike', return_value=247.5):
             assert seller._resolve_cost_basis_floor('AMZN', _position(0.0), 100) == 247.5
 
-    def test_the_wrapper_forwards_the_backtest_bigquery_gate(self):
-        assert self._seller(allow_bigquery=False)._lookup_last_opasn_put_strike('AMZN') == 0.0
+    @pytest.mark.real_bq_lookup
+    def test_the_backtest_gate_stops_the_chain_before_bigquery(self):
+        """A replay must never reach production trade history.
+
+        Marked ``real_bq_lookup`` deliberately: with the suite's blanket stub in
+        place this test would pass whether or not ``__init__`` forwards the
+        gate, because the stub returns 0.0 either way. The assertion that
+        discriminates is that no BigQuery client is ever constructed.
+        """
+        seller = self._seller(allow_bigquery=False)
+
+        with patch('google.cloud.bigquery.Client') as mock_client:
+            basis = seller._resolve_cost_basis_floor('AMZN', _position(0.0), 100)
+
+        mock_client.assert_not_called()
+        assert basis == 0.0
+        assert seller._cost_basis_resolver.allow_bigquery is False
+
+    @pytest.mark.real_bq_lookup
+    def test_the_chain_does_reach_bigquery_when_the_gate_is_open(self):
+        """The negative above is only meaningful if the positive holds."""
+        seller = self._seller(allow_bigquery=True)
+
+        with patch('google.cloud.bigquery.Client') as mock_client:
+            seller._resolve_cost_basis_floor('AMZN', _position(0.0), 100)
+
+        mock_client.assert_called_once()
 
     def test_the_seller_resolves_through_its_wheel_state(self):
         wheel_state = Mock()

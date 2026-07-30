@@ -157,17 +157,23 @@ class OptionsScanner:
                                    cost_basis=raw_cost_basis)
                     continue
 
-                # FC-050: make a non-broker floor visible. A BQ-sourced basis is
-                # correct but has weaker provenance than the broker's own number,
-                # so an investigator should be able to see which one guarded a
-                # given call.
+                # FC-050: make a non-broker floor visible, and comparable. With
+                # wheel-state persistence dead (FC-039) BigQuery is the *primary*
+                # source in production, not an exception — this event fires for
+                # every held symbol on every scan, so what carries the signal is
+                # the broker's number next to it. A BQ/Alpaca divergence means one
+                # of the two is wrong about what these shares cost.
                 if cost_basis_source != SOURCE_ALPACA:
+                    alpaca_basis_per_share = raw_cost_basis / shares if shares > 0 else 0.0
                     logger.info("Cost basis resolved from fallback source",
                                 event_category="risk",
                                 event_type="cost_basis_resolved_via_fallback",
                                 symbol=symbol,
                                 source=cost_basis_source,
-                                resolved_basis=cost_basis_per_share)
+                                resolved_basis=cost_basis_per_share,
+                                alpaca_cost_basis_per_share=alpaca_basis_per_share,
+                                basis_delta=(round(cost_basis_per_share - alpaca_basis_per_share, 4)
+                                             if alpaca_basis_per_share > 0 else None))
 
                 # Get call opportunities filtered by cost basis
                 calls = self.market_data.find_suitable_calls(

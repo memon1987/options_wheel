@@ -456,6 +456,30 @@ class TestCallScanResolvesCostBasisViaTheFC029Chain:
         assert events[0]["symbol"] == "AAPL"
         assert events[0]["source"] == "bigquery"
         assert events[0]["resolved_basis"] == 303.50
+        # Alpaca had nothing to say here, so there is nothing to compare.
+        assert events[0]["alpaca_cost_basis_per_share"] == 0.0
+        assert events[0]["basis_delta"] is None
+
+    def test_a_bigquery_broker_divergence_is_visible_in_the_event(self):
+        """This event fires on every scan while wheel-state persistence is dead
+        (FC-039), so the broker comparison is what makes it signal rather than
+        noise: BQ and Alpaca disagreeing means one of them is wrong."""
+        self.mock_alpaca.get_positions.return_value = [{
+            'symbol': 'AAPL', 'qty': '100', 'cost_basis': '29000.0',   # $290/share
+            'asset_class': 'us_equity', 'side': 'long',
+        }]
+
+        with self._with_opasn_strike(303.50):
+            with patch('src.data.options_scanner.logger') as mock_logger:
+                self.scanner.scan_for_call_opportunities()
+
+        events = [c.kwargs for c in mock_logger.info.call_args_list
+                  if c.kwargs.get("event_type") == "cost_basis_resolved_via_fallback"]
+        assert len(events) == 1
+        assert events[0]["source"] == "bigquery"
+        assert events[0]["resolved_basis"] == 303.50
+        assert events[0]["alpaca_cost_basis_per_share"] == 290.0
+        assert events[0]["basis_delta"] == pytest.approx(13.50)
 
     def test_an_alpaca_sourced_basis_logs_no_fallback_event(self):
         self.mock_alpaca.get_positions.return_value = [{
