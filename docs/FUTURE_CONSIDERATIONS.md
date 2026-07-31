@@ -709,7 +709,9 @@ Cannot read repeated field of type STRING as optional STRING  Field: jsonPayload
 
 The view selects across the `run_googleapis_com_stderr_*` day-sharded log tables and does `TO_JSON_STRING(jsonPayload)`. `jsonPayload.symbols` has been emitted with **three different shapes** over time (FLOAT64, STRING, REPEATED STRING), so the wildcard union cannot resolve a single type. Reproduced live 2026-07-29: `SELECT COUNT(*) FROM options_wheel_logs.trades_executed` errors.
 
-**Why it matters:** this view is treated in plan docs as a live ad-hoc analysis surface (FC-035's behavior contract reasoned carefully about not polluting it). It has in fact been broken — how long is unknown. Any analysis that assumed it works has been silently unavailable, and the schema-collision class is the same one recorded in the 2026-04-07 session memory ("never string-ify arrays").
+**Compounding defect found 2026-07-18 — the sink itself is dead, so fixing the view yields an empty view.** The `options-wheel-logs` export sink stopped writing on **2025-11-22**: the newest day-sharded table is `run_googleapis_com_stderr_20251122` and the partitioned table's `MAX(timestamp)` is null. So there is no log data in BigQuery at all for the last eight months, independent of the schema collision. Any investigation using BigQuery for bot decisions must use `gcloud logging read` instead — which carries only **30-day** retention, meaning FC-038's new `selection_dropped` reasons and FC-050's `cost_basis_resolved_via_fallback` events are queryable for 30 days and then gone. Restoring the sink into the same dataset without addressing the repeated-field collision below will simply re-break it.
+
+**Why it matters:** this view is treated in plan docs as a live ad-hoc analysis surface (FC-035's behavior contract reasoned carefully about not polluting it). It has in fact been broken — since 2025-11-22 for the sink, and unknown-but-longer for the schema collision. Any analysis that assumed it works has been silently unavailable, and the schema-collision class is the same one recorded in the 2026-04-07 session memory ("never string-ify arrays").
 
 **Fix direction:** pin the wildcard union to a consistent projection (extract `symbols` with `JSON_VALUE`/`JSON_QUERY` rather than `TO_JSON_STRING` over the whole payload), or exclude the offending shards. Decide first whether the view is still wanted at all, given the dashboard reads `trades_from_activities`.
 
@@ -1235,6 +1237,55 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 - Should the scanner also consult it and stop emitting call opportunities for fully-held lots?
 
 **Links:** FC-038 (PR #73 review disposition), FC-043 (`get_orders` filter — why order-based guards died), FC-052 (parser primitives the current ledger uses), `src/strategy/execution_engine.py` (`_available_shares`), `src/api/alpaca_client.py:244-259`.
+
+---
+
+### FC-066: the call roller has never executed a roll — quote-key bug, eligibility gap, stateless premium
+
+**Status:** Consideration — **the fatal defect (1) has no other entry; FC-039 covers only cause (3)**
+**Size estimate:** M
+**Owner:** unassigned
+**Plan file:** not yet
+
+> **Filing note (2026-07-31):** this was investigated on 2026-07-18 and its original entry was lost in the three-session index collision (same event that lost FC-038). Refiled here. FC-062 and FC-039 both refer to "the FC-039 family" for the roller — FC-039 is *wheel state persistence*, which is only cause (3) below; causes (1) and (2) had no entry anywhere until now.
+
+**Problem:** `CallRoller` has **never placed a single order** in production. Proven two ways on 2026-07-18: every `roll_cycle_completed` event in log retention (5 Fridays, 6/19 → 7/17) reports `rolls_evaluated=1, rolls_executed=0`, and a scan of the full Alpaca order history (459 orders) finds no option order in any Friday roll window, ever. Four stacked causes:
+
+1. **Quote-key mismatch — fatal and silent.** `call_roller.py:102` reads `quote.get('last_price')/quote.get('ask_price')`, but `AlpacaClient.get_stock_quote` returns keys `bid`/`ask`. Price resolves to 0 and the method returns None **before any gate can log a skip reason** — which is why five Fridays produced zero diagnostic output. (`get_stock_quote` also *raises* on failure rather than returning falsy, so the `if not quote` branch is unreachable as written.)
+2. **Eligibility gap.** Monitor profit-taking churn buys calls back within days and `/run` immediately re-sells a fresh ~7-DTE contract, so the call open on any given Friday is 5–7 DTE — never ≤ `rolling_max_current_dte: 1`. Separately, 52% of call sales expire mid-week, which a Friday-only job can never see. (Note the corrected mechanism: 48% of call expiries *are* Fridays, so a Friday-expiry ITM call at 15:30 would be eligible — churn, not the calendar, is the main idler.)
+3. **Stateless premium needed.** `STATE_STORAGE_BUCKET` is unset, so `original_premium` resolves 0 → `debit_pct_of_premium` 999 → any debit roll rejected; `roll_count` never increments. Setting the bucket is **insufficient**: `/run` builds `CallSeller` with no wheel_state, so `set_active_call_details` never fires regardless. (This cause, and only this one, is FC-039.)
+4. **No observability** on the fatal path.
+
+**Why it matters more now:** covered calls are being written again (FC-038) on a book where positions run underwater, so the assignment-rescue case the roller exists for is live rather than theoretical.
+
+**Fix direction:** fix the quote keys (bid/ask mid); derive `original_premium` **statelessly** from the opening sell's `filled_avg_price` in Alpaca order history rather than depending on state persistence production has never had; move eligibility (DTE ≤ 1 + ITM ratio) into the daily monitor cycle sequenced *before* profit-taking (near-disjoint states: profit-taking fires on OTM winners, rolling on ITM losers), while retaining a ~15:30 ET expiry-day check since the last monitor runs 14:55 ET; log every skip with a reason.
+
+**Must land with FC-062** — the roller's own cost-basis floor fails open and `execute_roll` bypasses FC-050's execute-time guard entirely. Reviving the roller without that fix ships a guaranteed-loss path on the leg most likely to be near basis.
+
+**Links:** FC-062 (roller floor — paired), FC-039 (cause 3 only), FC-011 (item 1 — delivered by the cadence change), FC-033 (escalation interaction), `docs/investigations/covered-call-starvation-2026-07-18.md`, `src/strategy/call_roller.py:102-104,148,487,506-508`, `src/api/alpaca_client.py:317-324`.
+
+---
+
+### FC-067: the trade journal labels every covered call as a put
+
+**Status:** Consideration
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+> **Filing note (2026-07-31):** investigated 2026-07-18, entry lost in the same index collision as FC-038/FC-066. Refiled.
+
+**Problem:** `TradeJournal.record_trade` defaults `option_type` → `'put'` and `strategy` → `'sell_put'` (`src/data/trade_journal.py:148,161`). Scanner-produced call opportunities carry `type: 'call'` but neither of those keys, so the defaults win. Verified by OCC-symbol regex against the labels: **29 rows in `options_wheel.trades` whose symbol is a C-contract are labeled `option_type='put', strategy='sell_put'`**; zero rows are labeled as calls.
+
+**Why it matters beyond tidiness:** this mislabeling actively derailed two investigations. On 2026-07-17 it made a covered-call roll-down chain read as put activity and sent the analysis toward the wrong subsystem entirely; the correction took a second full investigation the next day. Any future analysis that segments by `strategy` or `option_type` on this table silently sees a put-only book.
+
+**Fix direction:** derive `option_type` and `strategy` from the **OCC symbol** inside `record_trade` — the symbol is authoritative and this retro-fixes any future producer that forgets the keys — using the canonical `strict_option_type` / `parse_option_symbol` primitives (FC-048/FC-052 family; six OCC-substring bugs say do not hand-roll this). Backfill the 29 existing rows under the synthetic/corrective-write discipline in `~/CLAUDE.md` (prefix-tagged, audit query, rollback recipe documented in the plan).
+
+**Open questions:**
+- Backfill only `strategy`/`option_type`, or also normalize `expiration`/`dte`, which are null on many rows?
+- Does any dashboard query read these columns today, or is the damage confined to ad-hoc analysis? (`trades_from_activities` is the dashboard's source, so likely the latter — verify before sizing.)
+
+**Links:** `docs/investigations/covered-call-starvation-2026-07-18.md`, FC-048/FC-052 (parser primitives), FC-046 (the other half of this observability gap), `src/data/trade_journal.py:148,161`.
 
 ---
 
