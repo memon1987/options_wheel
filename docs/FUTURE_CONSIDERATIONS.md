@@ -822,45 +822,6 @@ never worked); worth a sweep for others.
 
 ---
 
-### FC-050: production's below-basis protection for covered calls is plausibly nil
-
-**Status:** Plan published — verification done (see the 07-30 note under Half 2); **Half 1 confirmed and is the scope**
-**Size estimate:** M (guaranteed-loss guard on production trading logic → two-reviewer)
-**Owner:** Claude / zeshan
-**Plan file:** `docs/plans/fc-050.md`
-
-**Problem:** the covered-call cost-basis floor — the guard that stops us writing a call below what we paid, i.e. locking in a guaranteed loss — appears to be **non-functional on the path production actually executes**. Two independent halves both fail, and they fail in the same direction.
-
-**Half 1 (confirmed by code inspection).** `execute_call_sale` gates its floor check on `stock_cost_basis` (`src/strategy/call_seller.py:319-325`):
-
-```python
-stock_cost_basis = opportunity.get('stock_cost_basis', 0)
-if stock_cost_basis > 0 and strike_price > 0:   # gate self-disables at 0
-```
-
-Scanner-produced opportunities — the ones production executes — carry **`cost_basis_per_share`**, not `stock_cost_basis` (`src/data/options_scanner.py:~350`). So the key lookup returns the `0` default and **the execute-time floor never runs in production**. Only `call_seller.evaluate_covered_call_opportunity` sets `stock_cost_basis`, and production never calls it (same scanner-vs-wheel_engine path split that caused FC-048).
-
-**Half 2 (rests on FC-029's prior validation; could NOT be re-confirmed today).** The scanner's own floor uses `float(position['cost_basis']) / shares` (`options_scanner.py:128`). FC-029 (2026-05-08) empirically established that **Alpaca returns `cost_basis = 0` for assigned positions** — which is why FC-029 R2 built the `wheel_state → BigQuery → Alpaca` resolution chain. If that still holds, the scanner passes `min_strike_price=0` and applies no floor either. *Not re-verified: the account currently holds zero equity positions, so there was nothing to observe. Confirm against a live assigned position before acting.*
-
-> **Half 2 REFUTED against live data, 2026-07-30 (FC-038 pre-build safety check):** all four currently-held assigned positions return correct non-zero `cost_basis` from the live paper API — AAPL 30350/303.50, AMZN 26120/261.20, GOOGL 36834/368.34, NVDA 21843/218.43 (`cost_basis` ÷ qty = `avg_entry_price` exactly). The 2026-07-17 scan blob independently shows the scanner computing `cost_basis_per_share: 303.5` for AAPL. So the scanner floor IS functional today, and FC-029's "returns 0" observation either predates an Alpaca fix or applied to a different account state. **Half 1 (execute-time floor dead via the `stock_cost_basis` vs `cost_basis_per_share` key mismatch) remains code-confirmed and is the remaining fix** — defense-in-depth is one layer, not zero. Verification item 1 below is done; item 2 (historical below-basis calls) still worth running.
-
-**Consequence if both hold:** covered calls can be written below cost basis in production on exactly the positions the floor exists to protect — assigned shares. That is the guaranteed-loss scenario `docs/CLAUDE.md` calls out as CRITICAL.
-
-**The deeper issue — FC-029 R2 may be dead code in production.** FC-029's headline fix (the cost-basis source-order chain) lives in `evaluate_covered_call_opportunity`. If production only ever runs the scanner path, that fix has never executed in production, for the same structural reason FC-048 existed. **Worth checking whether other FC-029 remediations landed on the unused path too.**
-
-**Verification before any fix:**
-1. Wait for (or create) an assigned equity position; read `cost_basis` and `avg_entry_price` from the live API.
-2. Query `trades_from_activities` for historical covered calls whose strike was below the assigning put's strike — direct evidence of whether this has already cost money.
-3. Confirm which path `/run` executes for calls end to end.
-
-**Fix direction:** make the scanner use the same FC-029 resolution chain, and have `execute_call_sale` read whichever key is actually present (or normalize the opportunity shape — the boundary-dataclass idea rejected as out-of-scope in `docs/plans/fc-048.md` would prevent this whole class).
-
-**Found:** by an FC-048 adversarial reviewer probing whether the newly-live call path could write below basis. In the backtest it cannot (both guards work there); production is the gap.
-
-**Links:** `docs/plans/fc-048.md`, FC-029 (R2 cost-basis chain), FC-038, `docs/CLAUDE.md` (Risk Management Philosophy).
-
----
-
 ### FC-051: the spread model needs per-symbol calibration, not a pooled fit
 
 **Status:** Consideration
@@ -1476,6 +1437,12 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - Notes: Scope was alerting only — the observability half shipped in FC-031. `POST /api/v2/bot-health/pause-alert-check` runs weekdays 17:45 ET and logs a single `DRAWDOWN_PAUSE_ALERT` line when any symbol is paused >= 7 trading days (threshold declared in `cloudbuild.yaml`); a Cloud Monitoring log-based policy emails the operator via the project's **first notification channel**. Built as a strict consumer of FC-031's `get_drawdown_pauses` — one implementation of pause state, not two. Degraded paths are loud: a live-positions outage logs `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED` rather than reporting "nothing paused". **Cloud Build failure alerting shipped on the same channel** and was prioritized ahead of the pause alert — FC-031 had sat undeployed 11 days behind an unnoticed red build; the new alert then caught three real failures the same session. **The mandatory fire drill caught a fatal defect:** the policy's `severity>=WARNING` clause matched zero entries, because Cloud Run only assigns severity to structured JSON logs while Python's `logging.warning()` writes plain text — the alert would have been silent forever, discoverable only as a missing notification. Pure logic lives in `services/pause_alert.py` (the bot CI image has no FastAPI); a module-level `pytest.importorskip` was rejected after verifying it silently skips the pure tests too.
 - Note on duplicate PRs: two parallel sessions independently found and fixed the same severity-filter defect (#41 and #42). The same collision duplicated this file's entire Completed section, repaired in `fix/dedupe-fc-ledger`. No code conflict resulted; the fixes were equivalent.
 - **Operator action outstanding:** confirm the alert email lands (Cloud Monitoring channels may need one-time verification).
+
+### FC-050: the covered-call below-basis floor never ran on the production path
+- Plan: `docs/plans/fc-050.md`
+- PR: https://github.com/memon1987/options_wheel/pull/74 (merged 2026-07-30, `8e05134`; implementation `b4975b2` + review fixes `1485be0`)
+- Date: 2026-07-30 (deployed build `1b6badcb`, revision `00384-yun`; production-verified 2026-07-31)
+- Notes: `execute_call_sale` read `stock_cost_basis`/`shares_covered` while scanner opportunities — the only kind production executes — carry `cost_basis_per_share`/`max_contracts`, so the guaranteed-loss guard **had never run in production**; the scanner's own floor used raw Alpaca `cost_basis` rather than FC-029's chain. Fix: extracted FC-029's resolver into `src/strategy/cost_basis.py` (`CostBasisResolver` + `opportunity_floor_per_share`), wired it into the scanner, and made the execute-time gate real and **fail-closed** on an unresolved floor. Also fixed a `shares_covered` default of 100 that FC-038's multi-contract calls had just made reachable. **Evidence query answered the FC's long-open question: the dead guard already cost money — 15 below-basis calls written, 3 called away for −$9,000** (UNH −1,750 / AMZN −3,500 / AMD −3,750) against $2,585 premium, independently reproduced by a reviewer and matching `strategy-review-2026-05-07.md`'s three-cycle figure; the last below-basis write (NVDA 2026-06-10) was post-FC-029. Two adversarial reviews both REQUEST_CHANGES with no disagreements; **reviewer 2 mutation-proved two new tests pinned nothing** (the backtest BigQuery gate and BQ-over-Alpaca precedence both survived behavior-breaking mutations) — fixed, and the backtest's BQ isolation is now pinned for the first time. Reviewers also caught two errors in the plan itself: a Risks-section mitigation describing a resolution chain that does not exist, and a post-deploy expectation (AAPL 303.50) that would have flagged correct behavior as a bug. Confirmation pass CONFIRMED-CLEAN, re-running both mutations itself. Suite 786. **Production-verified across three scan cycles:** floors resolve from BigQuery — AAPL 305.00, AMZN 262.50, GOOGL 370.00, NVDA 220.00 — every `basis_delta` positive (+1.30 to +1.66, the conservative direction, indicating clean single-assignment lots); zero unresolved-floor blocks; `/scan` 17.1s→25.5s (~2s per held symbol, scales linearly — revisit past ~10 positions). Follow-ups filed: FC-062 (roller fail-open floor + `execute_roll` bypasses this gate), FC-063 (type the opportunity boundary — FC-045/048/050 share this root cause), FC-064 (`max(BQ, broker)` for mixed lots), FC-065 (FC-029's R3 drawdown pause is dead on the same path).
 
 ### FC-038: Covered calls charged phantom cash collateral in execution selection — call starvation
 - Plan: `docs/plans/fc-038.md`
