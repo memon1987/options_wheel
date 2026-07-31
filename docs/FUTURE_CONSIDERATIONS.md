@@ -1277,6 +1277,30 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ---
 
+### FC-065: FC-029's drawdown pause (R3) is also dead on the production path
+
+**Status:** Consideration — **verified dead 2026-07-31**
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-050 restored FC-029's **R2** (cost-basis floor) on the `/scan → /run` path production actually executes. Checking whether FC-029's other remediations landed on the used path — a question FC-050's own entry raised — the answer for **R3 (drawdown pause) is no.** The pause exists solely at `src/strategy/call_seller.py:134` inside `evaluate_covered_call_opportunity`, the `wheel_engine` path production never calls; `src/data/options_scanner.py` contains **zero** drawdown references (`grep -c drawdown` → 0). So `call_drawdown_pause_threshold: 0.05` has never gated a production covered call, and neither has the companion defer-on-bad-quote behavior. Same structural cause as FC-045/FC-048/FC-050: a remediation built on the unused half of a two-path system.
+
+**Live illustration, 2026-07-31:** a GOOGL 8/7 $370 call was written while GOOGL sat at $353.55 — **4.0% below** its $368.34 basis. Not a rule violation (under the 5% threshold, and the strike is at/above the floor, so called-away is still profitable), but it demonstrates the mechanism is absent rather than merely unfired. The same position at 10% underwater would still get a call, because nothing on the scanner path consults the threshold.
+
+**Partially compensated, which is why it went unnoticed:** the cost-basis floor implicitly excludes deeply-underwater symbols — NVDA (9.3% under basis, floor $220) produced no call opportunities the same day. FC-029's R3 rationale explicitly anticipated this ("when shares are deeply underwater every delta-range strike is at-or-below cost basis") and added the pause anyway, so the decision would be **explicit and observable** rather than an emergent side effect. That observability is what is missing.
+
+**Fix direction:** port the pause (and the defer-on-unusable-quote behavior) to the scanner path, reusing FC-050's `CostBasisResolver` for the basis and emitting the existing `covered_call_drawdown_pause` / `covered_call_quote_missing` events so the backtest's rejection taxonomy (`src/backtesting/engine/rejections.py:44`) and any dashboard consumer keep working. Consider whether the pause belongs in the scanner (fewer opportunities emitted) or in selection (opportunity emitted, dropped with a reason) — the latter fits FC-038's drop-reason model.
+
+**Open questions:**
+- Scanner-side skip vs selection-side drop-with-reason?
+- Is 5% still the right threshold now that the floor is the raw assigning strike (FC-050) rather than the premium-adjusted broker basis — the two interact, since the floor rose for every position?
+- Does FC-033 (drawdown-pause escalation) presuppose a pause that has never actually run? Its premise needs re-examination in light of this.
+
+**Links:** FC-029 (R3), FC-050 (restored R2; raised this question), FC-033 (escalation — premise depends on this), FC-030/FC-031 (pause observability + alerting, which consume pause state that production never produces), `src/strategy/call_seller.py:120-143`, `src/data/options_scanner.py`.
+
+---
+
 ### FC-062: the roller has its own fail-open cost-basis floor and bypasses the execute-time guard
 
 **Status:** Consideration — **must be resolved before any roller revival ships**
