@@ -1330,6 +1330,45 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ---
 
+### FC-069: decommission the fictional layer — revive-or-delete every dead control, then rewire what remains for continuity
+
+**Status:** Consideration — **filed 2026-07-31 with a pre-tagged inventory; plan + two-reviewer pass + execution to follow after FC-065/FC-068 land**
+**Size estimate:** L (many S items; the cost is decisions, not code)
+**Owner:** zeshan + Claude
+**Plan file:** not yet
+
+**Problem / opportunity:** the three-agent covered-call investigation (2026-07-31) established that production runs a *stateless* wheel while the codebase maintains a parallel *fictional stateful* one, plus a layer of config knobs and risk controls that read as live but are consumed by nothing on the path that trades. FC-065 and FC-068 remove what sits in their blast radius (the floor chain, the dead engine decision path); everything below survives them. Each item is a **decision, not just a deletion** — several are risk controls the operator may want *revived*: production currently has **no global position cap, no per-ticker exposure cap, and no earnings gate** on the live path. End state: every mechanism in the repo either runs on the path that trades, or does not exist — and the docs describe the system that actually runs.
+
+**Inventory (pre-tagged recommendations — confirm or flip each at plan time):**
+
+| # | Item | Today | Recommendation |
+|---|---|---|---|
+| 1 | `max_total_positions: 10` | Read only by dead `_can_open_new_positions`; **no global cap exists** | **REVIVE** — enforce in `select_batch` |
+| 2 | `max_exposure_per_ticker: 40000` | Dead (only consumer is retired `validate_new_position`) | **DELETE** — structurally implied: one put per underlying × `max_stock_price 400` × 100 = exactly $40k; document the equivalence |
+| 3 | `max_positions_per_stock: 1` | Dead knob; invariant emergent from Stage-6 block + share ledger | **DELETE** knob; document the emergent invariant in `docs/gates.md` (FC-013's artifact) |
+| 4 | Earnings blackout (`earnings.*`, `earnings_avoidance_days`, `EarningsCalendarService`, FINNHUB key) | Never on the live sell path; only consumer is the dead roller | **REVIVE** via FC-013 (its published plan already specifies wiring both sellers) — or delete service+knobs+key; this FC forces the choice |
+| 5 | Gap controls (`execution_gap_threshold: 999` shadow, stage-2 unwired) | Stage-4 wiring dies with FC-068; detector + knobs remain | **DELETE** the shadow knob; resolve stage-2 per FC-049's study (revive only with evidence) |
+| 6 | `min_hold_hours: 4` + `_entry_times` (both sellers) | Dead since inception (per-request instances); DTE bands carry the load (05-12 evidence) | **DELETE** — absorbs FC-015 (if ever wanted, derive from Alpaca `submitted_at`, don't persist) |
+| 7 | `RiskManager.validate_new_position` | Zero call sites; contains the original substring bug | **DELETE** — absorbs FC-014 (keep `validate_roll`, the roller uses it) |
+| 8 | `WheelStateManager` fictional layer (phases, premium accumulators, roll counts, GCS persistence, `can_sell_*`) | Post-FC-068 consumers: reconcile telemetry + dead roller; persistence never worked | **DELETE/SHRINK** to what reconciliation telemetry actually needs — absorbs FC-039 per the coherence principle: derive from durable truth, delete the fiction. Coordinate with FC-066 (roller goes stateless-from-Alpaca anyway) |
+| 9 | `call_drawdown_pause_threshold` knob + its `/config` dashboard exposure | Pause deliberately not built (FC-065 OQ-3); knob now permanently dead | **DELETE** knob + `/config` field |
+| 10 | `wheel_cycles` writer in `reconcile_positions` | Writes duplicate zero-gain rows ~6×/day/assignment (36/31/7 verified); dashboard reads the activities view instead | **STOP writing; drop table** (FC-035 precedent: `order_statuses`) |
+| 11 | Opportunity blob `expires_at` | Written, never read (operative gate is `opportunity_max_age_minutes`) | **DELETE** field |
+| 12 | 7th OCC-substring instance: `_has_existing_position` (`options_scanner.py:575`, put-side, `symbol in position['symbol']`) | Over-blocks (any PFE option blocks F puts) | **REWIRE** to canonical parsers — completes the FC-052 family |
+| 13 | `rolling.*` knobs (11) | Roller structurally dead pending FC-062/FC-066 | **HOLD** — fate decided by FC-066's revival decision, not here |
+| 14 | `docs/CLAUDE.md` Risk Management Philosophy + architecture claims | States call stop-losses protect positions (false since FC-010) and `RiskManager` "validates all positions" (false always) | **REWRITE** to describe the system that runs |
+| 15 | Process-local fragile state (`_closed_today`, `_failed_symbols`, `strategy_status`) | Live but amnesiac across cold starts | **NOTE only** — FC-009 owns `_closed_today`; others documented as accepted |
+
+Explicitly out of scope: call-side limit pricing drift (`mid × 0.95` vs the put side's spread-aware pricing) — a behavior *improvement*, not dead code; deserves its own S-sized FC so its economics get reviewed on their own.
+
+**Sequencing:** after FC-068 (the deletions there determine what is actually left to sweep). Items 1 and 4 are the two genuine policy revivals and should lead the plan discussion.
+
+**Absorbs / supersedes on completion:** FC-014, FC-015, FC-039 (each closes with lineage to this FC's decision on it).
+
+**Links:** `docs/plans/fc-065.md` (three design principles + spin-offs), FC-068, FC-013 (earnings plan, published), FC-049 (gap study), FC-066 (roller), FC-009, the 2026-07-31 mechanism-inventory/coherence investigations recorded via `docs/plans/fc-065.md` Context.
+
+---
+
 ### FC-062: the roller has its own fail-open cost-basis floor and bypasses the execute-time guard
 
 **Status:** Consideration — **must be resolved before any roller revival ships**
