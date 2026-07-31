@@ -353,10 +353,12 @@ This requires a stateful walk over events, which BigQuery can express via `ARRAY
 
 ### FC-033: Drawdown-pause escalation — permit a below-cost-basis call after an extended pause
 
-**Status:** Consideration
+**Status:** **Deferred** (operator decision 2026-07-31 — deliberately *not* Closed, for lineage)
 **Size estimate:** M
-**Owner:** unassigned
+**Owner:** zeshan (revisit is an operator decision only, never automatic)
 **Plan file:** not yet
+
+> **Deferral record (2026-07-31, FC-065 plan review OQ-2):** policy is now **hold uncovered below `avg_entry_price` until recovery — mechanical below-floor call writing is banned permanently** (see `docs/plans/fc-065.md`, "The floor definition, decided"). This FC's escalation idea is *deferred, not rejected*: the trader plan-reviewer argued the supporting evidence for "never, ever" is n=3 in a single V-shaped regime where every name later recovered, hold-until-recovery has no time bound, and a structurally impaired name could freeze $20–40k indefinitely. Reopen trigger: `uncovered_days` data from FC-065 Phase 4's decision record showing a pause long/costly enough that the operator wants to reconsider. Note the current arithmetic favors holding: expected loss per below-floor write ≈ 0.22 × $964 ≈ −$212 vs ~$130/week premium foregone. Also note the *pause mechanism itself* was never built (FC-065 OQ-3: floor-only gating; "paused" exists only as a decision-record label), so any revival here would gate on `uncovered_days`, not on a pause state.
 
 **Problem / opportunity:** Split out of FC-030 (2026-07-18). When a symbol sits paused for a long stretch, the shares are dead capital — AMZN's 62-day pause cost an estimated $1,500–3,000 in foregone premium. One candidate response: after N days paused (14? 21?), allow a single far-OTM call whose strike is *below* the assignment-strike floor, harvesting some premium while accepting a capped share loss if called away.
 
@@ -1291,7 +1293,7 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ### FC-065: FC-029's drawdown pause (R3) is also dead on the production path
 
-**Status:** Plan published — **scope widened 2026-07-31** to the whole covered-call gating layer ("one floor, one path, one decision record"): floor = Alpaca `avg_entry_price` with the resolver chain inverted (operator decision), the pause ported to the live path, and a durable per-symbol decision record. Engine-path deletion + backtest repoint split out as FC-068.
+**Status:** Plan published, two-reviewer plan review passed with amendments, all operator decisions resolved (2026-07-31) — **ready for Phase 1 build.** Scope: floor = Alpaca `avg_entry_price` with the resolver chain inverted, fail-closed everywhere including a divergence cross-check with teeth; roller floor unified; durable per-symbol decision record (subsumes FC-044 Phase 1, repoints the FC-030/031 pause alert to `uncovered_days`). **The drawdown pause is deliberately NOT ported** (OQ-3: floor-only gating; legibility via decision-record labels). Engine-path deletion + backtest repoint split out as FC-068 (now blocked only on Phase 1).
 **Size estimate:** M–L (four phases, one PR each)
 **Owner:** Claude / zeshan
 **Plan file:** `docs/plans/fc-065.md`
@@ -1315,7 +1317,7 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ### FC-068: delete the dead engine call path; repoint the backtest to the real pipeline
 
-**Status:** Consideration — **blocked on FC-065 Phase 3** (porting the drawdown pause; deleting first would remove its only implementation)
+**Status:** Consideration — **blocked on FC-065 Phase 1 only** (the deleted path's floor semantics must be replaced first). *The former Phase-3 blocker dissolved 2026-07-31: the operator decided the drawdown pause is NOT ported (FC-065 OQ-3, floor-only gating), so deletion orphans nothing — the pause tests and the `covered_call_drawdown_pause` taxonomy entry are removed with the path, deliberately.*
 **Size estimate:** M (small code delta, large measurement consequence)
 **Owner:** unassigned
 **Plan file:** not yet (split out of `docs/plans/fc-065.md` Phase 5, 2026-07-31)
