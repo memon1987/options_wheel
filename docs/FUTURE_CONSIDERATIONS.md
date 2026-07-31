@@ -1291,10 +1291,10 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ### FC-065: FC-029's drawdown pause (R3) is also dead on the production path
 
-**Status:** Consideration — **verified dead 2026-07-31**
-**Size estimate:** S
-**Owner:** unassigned
-**Plan file:** not yet
+**Status:** Plan published — **scope widened 2026-07-31** to the whole covered-call gating layer ("one floor, one path, one decision record"): floor = Alpaca `avg_entry_price` with the resolver chain inverted (operator decision), the pause ported to the live path, and a durable per-symbol decision record. Engine-path deletion + backtest repoint split out as FC-068.
+**Size estimate:** M–L (four phases, one PR each)
+**Owner:** Claude / zeshan
+**Plan file:** `docs/plans/fc-065.md`
 
 **Problem:** FC-050 restored FC-029's **R2** (cost-basis floor) on the `/scan → /run` path production actually executes. Checking whether FC-029's other remediations landed on the used path — a question FC-050's own entry raised — the answer for **R3 (drawdown pause) is no.** The pause exists solely at `src/strategy/call_seller.py:134` inside `evaluate_covered_call_opportunity`, the `wheel_engine` path production never calls; `src/data/options_scanner.py` contains **zero** drawdown references (`grep -c drawdown` → 0). So `call_drawdown_pause_threshold: 0.05` has never gated a production covered call, and neither has the companion defer-on-bad-quote behavior. Same structural cause as FC-045/FC-048/FC-050: a remediation built on the unused half of a two-path system.
 
@@ -1310,6 +1310,21 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 - Does FC-033 (drawdown-pause escalation) presuppose a pause that has never actually run? Its premise needs re-examination in light of this.
 
 **Links:** FC-029 (R3), FC-050 (restored R2; raised this question), FC-033 (escalation — premise depends on this), FC-030/FC-031 (pause observability + alerting, which consume pause state that production never produces), `src/strategy/call_seller.py:120-143`, `src/data/options_scanner.py`.
+
+---
+
+### FC-068: delete the dead engine call path; repoint the backtest to the real pipeline
+
+**Status:** Consideration — **blocked on FC-065 Phase 3** (porting the drawdown pause; deleting first would remove its only implementation)
+**Size estimate:** M (small code delta, large measurement consequence)
+**Owner:** unassigned
+**Plan file:** not yet (split out of `docs/plans/fc-065.md` Phase 5, 2026-07-31)
+
+**Problem:** `CallSeller.evaluate_covered_call_opportunity` and its orchestration (`wheel_engine._find_new_opportunities` / `_manage_existing_positions`) have not been called by production since 2025-10-03 (`842dcce`), yet the backtest simulator replays exactly that path — so every backtest measures a strategy with a drawdown pause, phase gating, and single-candidate selection that production does not have, and without the committed-share accounting it does have. Ten months of remediations landed on the unused half (FC-029 R2/R3, FC-048's origin, FC-050's root cause, FC-065's finding).
+
+**Scope:** port-then-delete (sequencing owned by FC-065); repoint `simulator.py` to replay `scan → select → execute`; migrate — not delete — the 27 FC-029 guard tests and the FC-048 golden replay; re-run affected backtest verdicts, since pre/post numbers are non-comparable (FC-048 precedent).
+
+**Links:** `docs/plans/fc-065.md` (§Phase 5 rationale), FC-048, FC-029, `src/backtesting/engine/simulator.py:322-330`, `src/strategy/wheel_engine.py`, commit `842dcce`.
 
 ---
 
