@@ -75,3 +75,4 @@ _List active plans here as they are added._
 - [fc-032.md](fc-032.md) — FC-032: Backtesting engine overhaul (symbol wheel-fitness evaluation), status: draft
 - [fc-038.md](fc-038.md) — FC-038: Two-pool execution selection (covered-call phantom-collateral fix), status: done
 - [fc-050.md](fc-050.md) — FC-050: Restore the covered-call below-basis floor on the production path, status: done
+- [fc-065.md](fc-065.md) — FC-065: One floor, one path, one decision record (covered-call gating layer), status: draft — awaiting review
