@@ -222,7 +222,7 @@ Full table, enum and query cookbook: `docs/operations/DECISION_RECORDS.md`.
 
 ## Test evidence
 
-**Full suite: 989 passing** (baseline on the Phase 2 branch base: 859; **+130**).
+**Full suite: 992 passing** (baseline on the Phase 2 branch base: 859; **+133**).
 `__pycache__` cleared before every run — a stale `.pyc` from a reviewer's
 mutation testing made correct code misbehave once already (FC-032).
 
@@ -233,7 +233,7 @@ New/changed tests:
 
 | File | Adds | Covers |
 |---|---|---|
-| `tests/test_decision_record.py` | 80 | enum closure, dedup + insertId, run_id round trip, both labels, row shape, `/run` stage precedence, flush containment, **run-stage label carriage, the resolver SQL, `run_ts` stability, flush-once** |
+| `tests/test_decision_record.py` | 83 | enum closure, dedup + insertId, run_id round trip, both labels, row shape, `/run` stage precedence, flush containment, **run-stage label carriage, the resolver SQL, `run_ts` stability, flush-once, both `/run` early exits** |
 | `tests/test_options_scanner.py` | +16 | one row per held symbol including the nothing-happened case, `finally`-flush survival, covered→0, underivable→NULL, **label stamping onto the blob, covered-WITH-candidates, build-failure attribution** |
 | `tests/test_dashboard_pause_alert.py` | rewritten, 36 | repointed selection/formatting, read-query dedup + `sold` precedence, `get_uncovered_symbols`, **degraded flag, held-minus-rows, endpoint honouring both** |
 | `tests/test_call_seller.py` | +7 | non-zero economics on a scanner-shaped opportunity |
@@ -321,6 +321,13 @@ And the fixes themselves:
 > pins it: a selected AAPL call drops the AAPL put as `duplicate_underlying`
 > (only one position per underlying across both pools), and that reason must
 > not reach the covered-call channel.
+
+**Round 3 — the confirmation pass's regression. 1 run, 1 caught.**
+
+| # | Mutation | Result |
+|---|---|---|
+| N16 | Re-remove the `selected` / `execution_results` defaults — *the regression, verbatim* | **3 failed** — `test_the_all_non_retryable_exit_writes_its_rows`, `test_the_idempotency_exit_writes_its_rows`, `test_record_run_stage_defaults_the_execution_arguments` |
+
 
 ## Post-merge steps
 
@@ -429,6 +436,19 @@ was praised by both and is unchanged.
 | L6 | LOW | `create_table(exists_ok=True)` never reconciles schema drift | **Accepted, documented** — pre-existing across all four managed tables; noted that it now rides the table the alert reads |
 | L7 | LOW | A local CLI scan with ambient GCP creds writes production rows | **Accepted, documented** — same exposure as every `AnalyticsWriter` caller; rows identifiable by `run_id` mint time; backtest replay already safe (no-op writer) |
 | L8 | LOW | UTC `DATE(transaction_time)` ±1-day boundary | **Accepted, documented** — comment in the SQL builder and a runbook entry |
+| **C1** | **HIGH (confirmation pass)** | **Regression introduced by the flush-in-finally fix (`16afcf5`): `/run`'s two early-exit flushes raised `TypeError` and wrote zero rows, and the once-guard then blocked the `finally` from retrying** | **Fixed** in `e7ddb85` — `selected` / `execution_results` default to `()`; reproduced before and after; 3 pinning tests; mutation N16 |
+
+**The confirmation pass found a regression in the fixes, and it is recorded
+here rather than buried.** All 10 contract items had landed and every number
+reproduced, but `16afcf5`'s flush-in-finally rework swapped a helper that
+defaulted `selected` / `execution_results` for one that forwarded straight
+into a signature requiring them — so `/run`'s two early exits raised
+`TypeError` inside the flusher's `except`, wrote nothing, and left
+`flushed=True` so the `finally` could not recover. Those two exits are exactly
+the "a symbol silently vanished between the stages" cases this phase exists to
+record. Fixed in `e7ddb85` (row C1). My tests missed it because they all
+called `record_run_stage` directly, or passed both kwargs explicitly; three
+tests now exercise `flush()` with only the early-exit kwargs.
 
 **Nothing was dismissed silently, and I did not disagree with any finding.**
 One thing worth flagging to the operator rather than the reviewers: fixing
