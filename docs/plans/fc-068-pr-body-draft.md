@@ -25,14 +25,26 @@ path uniquely guarded. This deletes it and repoints the simulator.
 |---|---|---|
 | **A** | `f6c388e` | the deletion + the repoint (basis still = strike) |
 | **B** | `88c26e5` | broker premium-netting of the assignment basis |
-| **C** | `80fd346` | test-only; closes a gap the mutation record exposed |
+| **C** | `80fd346` | closes a gap the mutation record exposed |
+| — | `4432e03` | bookkeeping: plan Execution section + this draft |
+| — | `7719b27` | **review disposition** (see the section at the end) |
 
 A and B are **deliberately sequenced** (plan §10). One `ENGINE_VERSION` bump covers two
 independent measurement changes, and a flipped verdict alone cannot say which one flipped
 it. The plan rejected a second version tag and an attribution-only runtime flag — a config
 switch whose only purpose is attribution is exactly the dead-knob species this FC family
-deletes — in favour of two commits plus a measured decomposition, below. C changes no
-production behaviour, so it does not disturb that boundary.
+deletes — in favour of two commits plus a measured decomposition, below. C and everything
+after it change no production behaviour, so the A/B boundary is undisturbed and the memo was
+measured against A and B exactly as committed.
+
+> **Labelling correction (deletion reviewer).** Commit C's subject calls it "test-only". It
+> is test-only *in production code*, but it also carried `docs/plans/fc-068.md` — the copy
+> checked out from `main` so the Execution section merges cleanly — because that file was
+> already staged when C was committed. Stated here rather than rewriting published history.
+
+> **Rollback:** a single `git revert` of the **squash** commit. If this is ever merged
+> unsquashed, the reverts must run **C → B → A** in that order: B's tests sit on top of A's
+> broker, and C's tests sit on top of A's day loop.
 
 ---
 
@@ -46,14 +58,14 @@ production behaviour, so it does not disturb that boundary.
 `_get_stock_position_for_symbol`, `_log_daily_stock_snapshots`, plus the `gap_detector` /
 `put_seller` / `call_seller` / `_pending_underlyings` constructor members and their imports.
 **Survives:** `__init__` (slimmed), `reconcile_positions` (`/run` pre-trade housekeeping),
-`run_rolling_cycle` (Friday `/roll`), `_extract_underlying_from_option_symbol`. 1293 → 671
+`run_rolling_cycle` (Friday `/roll`), `_extract_underlying_from_option_symbol`. 1293 → 678
 lines.
 
 **`src/strategy/call_seller.py`** — `evaluate_covered_call_opportunity`,
 `_calculate_call_position`, `_resolve_cost_basis_floor`, the `CostBasisResolver` they shared,
 and the `allow_bigquery_cost_basis` kwarg. `/run` already builds
 `CallSeller(alpaca, market_data, config)` (`cloud_run_server.py:429`), so the signature change
-is call-compatible. 935 → 669 lines.
+is call-compatible. 935 → 668 lines.
 
 **`src/strategy/put_seller.py`** — `find_put_opportunity`. 636 → 548 lines.
 
@@ -349,8 +361,29 @@ requires it to fail.
 | M19b | …after commit C added a test for it | `test_failed_symbols_are_cleared_each_simulated_day` | FAILED as required |
 | M19d | delete the snapshot-restore in the `finally` | `test_the_live_failed_symbol_set_is_restored_after_a_replay` | FAILED as required |
 
-**The two survivors, and what was done about each — reviewers should weigh these, not the
-final all-green count:**
+**Novel mutations from the measurement review** (`7719b27`) — both **survived the full
+988-test suite** as submitted, and both are now killed:
+
+| # | mutation applied | before the fix | test | after the fix |
+|---|---|---|---|---|
+| N1 | delete the `filter_duplicate_opportunities` stage from `Simulator._execute_opportunities` — production runs it on every cycle (`cloud_run_server.py:458`) | **SURVIVED** (988 pass) | `test_the_run_half_invokes_every_production_stage_in_order` | KILLED (1 failed, 989 passed) |
+| N2 | override both day-loop scans with `max_results=50` — `/scan` passes no args (`cloud_run_server.py:193,200`) | **SURVIVED** (988 pass) | `test_the_day_loop_scans_on_production_defaults` | KILLED (1 failed, 989 passed) |
+
+Both were reproduced verbatim at the pre-fix commit before writing the tests, and re-applied
+verbatim after. (N1's *anchor text* had to move by three lines because the fix inserted the
+`get_option_positions` equivalence comment between the two statements; the edit itself —
+delete the stage — is unchanged.)
+
+**Why the 988-test suite could not see them, and what that says about the shape of the
+coverage:** every one of them changes *what is measured* without breaking any *outcome*. The
+ledger still balances, the equity curve is still arithmetic on it, the tally still names a
+binding constraint, the golden replay still completes a wheel. Both fixes are therefore
+**argument-level, not outcome-level**: one asserts the stage sequence and the shared
+positions snapshot on a recording spy, the other asserts both scans are invoked with *no
+arguments at all*, once per simulated day. An outcome assertion could not have caught either.
+
+**The two survivors of the build's own mutation pass, and what was done about each —
+reviewers should weigh these, not the final all-green count:**
 
 - **M15 was an unreachable mutation, not a toothless guard.** The `dip_then_recovering`
   fixture always has a usable quote, so the `call_scan_skipped_quote_unavailable` line the
@@ -374,22 +407,33 @@ covered_call_drawdown_pause|max_stocks_evaluated_per_cycle|max_new_positions_per
   src/ deploy/ main.py tests/ tools/ docs/ | grep -v '^docs/plans/'
 ```
 
-**116 hits, triaged. Zero are live references to deleted code.** `deploy/` is clean — no hit
+**120 hits, triaged. Zero are live references to deleted code.** `deploy/` is clean — no hit
 at all, which is the production-path no-op check in another form.
 
-| where | hits | classification |
-|---|---:|---|
-| `src/**` (7 files) | 13 | **FC-068's own explanatory comments and docstrings**, naming what was deleted and why. `src/strategy/{wheel_engine,call_seller}.py` class docstrings, `src/utils/config.py` (the orphaned-knob note + the two deletion comments), `src/api/market_data.py:410` (repointed comment), `src/backtesting/engine/{simulator,rejections}.py` |
-| `main.py` | 1 | the comment explaining why `--command run` is gone |
-| `tests/**` (6 files) | 16 | **the deletion tests themselves** — `test_the_deleted_path_is_really_gone`'s symbol list, `test_no_dead_path_events_in_replay`'s dead-event set, `RETIRED_EVENTS` in the rejections suite, and the module docstrings recording each disposition |
-| `docs/logging/**` (3 files) | 19 | inside or below the **stale banners this PR added** |
-| `docs/investigations/**` (7 files) | 22 | historical studies, each **annotated by this PR** with a non-comparability header |
-| `docs/releases/**` (4 files) | 7 | release notes — immutable historical record, correct as written |
-| `docs/archive/**` | 1 | archived Oct-2025 test report |
-| `docs/operations/TRADE_EXECUTION_ENABLED.md` | 4 | operator doc — **annotated by this PR**; its advice to set the two deleted knobs is now marked obsolete |
-| `docs/FUTURE_CONSIDERATIONS.md` | 17 | the FC index. Per the no-FC-edits-before-execution rule these are updated at **merge bookkeeping** (see post-merge steps) |
-| `tools/diagnostics/fc002_gap_filter_ab.py` | 6 | **stale-header added by this PR**, which explicitly calls out that its `verify` mode asserts source properties of deleted code and will now fail |
-| `tools/diagnostics/fc034_premium_floor_study.py` | 3 | a **self-contained** local mapping over *historical* Cloud Logging events. Correct for the logs it reads; wrong as a description of a scan today. Noted in the FC-034 investigation's new header rather than edited, because editing it would falsify a historical study |
+> **Corrected after review.** The first version of this table did not survive its own re-run:
+> its rows summed to **109** against 116 hits, `tests/**` was undercounted as 16 hits / 6
+> files, and its "each annotated by this PR" claim for `docs/investigations/**` was **false**
+> for two hit-bearing files. Both are now annotated (see the disposition section), which is
+> why the count moved 116 → 120: the two new investigation headers and the
+> `FILTERING_PIPELINE_MONITORING.md` banner each name deleted symbols. This table is now
+> generated mechanically from the grep output and its buckets are **asserted to sum to the
+> line count** (`120 = 120`).
+
+| where | files | hits | classification |
+|---|---:|---:|---|
+| `docs/investigations/**` | 7 | 26 | historical studies, **all seven hit-bearing files annotated by this PR** with a non-comparability or past-tense header |
+| `tests/**` | 7 | 21 | **the deletion tests themselves** — `test_the_deleted_path_is_really_gone`'s symbol list, `test_no_dead_path_events_in_replay`'s dead-event set, `RETIRED_EVENTS` in the rejections suite, and the module docstrings recording each disposition |
+| `docs/logging/**` | 3 | 21 | inside or below the **stale banners this PR added** to all three runbooks |
+| `docs/FUTURE_CONSIDERATIONS.md` | 1 | 17 | the FC index. Per the no-FC-edits-before-execution rule these are updated at **merge bookkeeping** (see post-merge steps) |
+| `src/**` | 6 | 13 | **FC-068's own explanatory comments and docstrings**, naming what was deleted and why: `src/strategy/{wheel_engine,call_seller}.py` class docstrings, `src/utils/config.py` (orphaned-knob note + the two deletion comments), `src/api/market_data.py:410` (repointed comment), `src/backtesting/engine/{simulator,rejections}.py` |
+| `tools/diagnostics/fc002_gap_filter_ab.py` | 1 | 6 | **stale header added by this PR**, which explicitly calls out that its `verify` mode asserts source properties of deleted code and will now fail |
+| `docs/releases/**` | 3 | 6 | release notes — immutable historical record, correct as written |
+| `docs/operations/TRADE_EXECUTION_ENABLED.md` | 1 | 4 | operator doc — **annotated by this PR**; its advice to set the two deleted knobs is now marked obsolete |
+| `tools/diagnostics/fc034_premium_floor_study.py` | 1 | 3 | a **self-contained** local mapping over *historical* Cloud Logging events. Correct for the logs it reads; wrong as a description of a scan today. Noted in the FC-034 investigation's header rather than edited, because editing it would falsify a historical study |
+| `main.py` | 1 | 1 | the comment explaining why `--command run` is gone |
+| `docs/archive/SYSTEM_TEST_REPORT_OCT3_2025.md` | 1 | 1 | archived Oct-2025 test report |
+| `docs/BACKTEST_ENGINE.md` | 1 | 1 | the rewritten "What it is" section, naming the path that was replaced |
+| **total** | **33** | **120** | |
 
 Two hits worth a reviewer's eye specifically:
 
@@ -400,8 +444,10 @@ Two hits worth a reviewer's eye specifically:
 
 ## Test accounting vs the plan's §9 table
 
-**992 → 988 collected (−4 net; −60 deleted, +56 added/migrated). Full suite green at every
-commit boundary, `__pycache__` cleared before each run.**
+**992 → 990 collected (−2 net; −60 deleted, +58 added/migrated). Full suite green at every
+commit boundary, `__pycache__` cleared before each run.** The table below is the accounting
+at commit C (988); the review disposition (`7719b27`) adds the two stage-parity tests to
+`test_backtest_simulator.py`, taking it to 45 and the suite to 990.
 
 | file | pre | post | Δ | what happened |
 |---|---:|---:|---:|---|
@@ -412,7 +458,7 @@ commit boundary, `__pycache__` cleared before each run.**
 | `test_cost_basis.py` | 64 | 60 | −4 | `TestCallSellerDelegationIsBehaviourPreserving` (4) dies with the object it pinned; the chokepoint census **drops the seller leg and keeps the roller leg**; the mutation-marked BQ-gate contract **transfers** to `test_scanner_cannot_query_bigquery_during_a_replay`, which carries the same mutation obligation (M1) |
 | `test_execution_engine.py` | 87 | 88 | +1 | `TestProducerVocabulary` **restated against the scanner**, not deleted: both emitted-dict tests now drive `_create_{call,put}_opportunity` and assert on the real dicts; the source-literal test repoints to `options_scanner.py` |
 | `test_options_scanner.py` | 57 | 60 | +3 | **§9 mapping-table build steps, both executed:** `'nonsense'` added to `test_unresolved_cost_basis_emits_nothing`'s params (parity with the deleted `[0.0/None/nonsense]`); **+`test_multiple_round_lots_size_to_every_lot`** (the scanner test only ever used one round lot, so a `max_contracts=1` regression would have been invisible); **+`test_a_chain_exception_emits_no_opportunity`** (P4's test pinned only that decision rows survive, not that the scan emits nothing) |
-| `test_backtest_simulator.py` | 38 | 43 | +5 | `TestStage4ExecutionGapGate` (3) deleted — the gate exists nowhere. **+8 new:** the two scanner BQ gates, the simulator-passes-the-gate test, the decision-rows test, the roller tripwire, the dead-vocabulary test, and commit C's two failed-symbol tests. `test_no_call_is_sold_below_cost_basis` re-based onto `detail['basis']`; `test_attribution_conserves_through_a_full_netted_cycle` added |
+| `test_backtest_simulator.py` | 38 | **45** | **+7** | `TestStage4ExecutionGapGate` (3) deleted — the gate exists nowhere. **+10 new:** the two scanner BQ gates, the simulator-passes-the-gate test, the decision-rows test, the roller tripwire, the dead-vocabulary test, commit C's two failed-symbol tests, and the review's two `TestTheReplayRunsTheProductionStages` parity tests. `test_no_call_is_sold_below_cost_basis` re-based onto `detail['basis']`; `test_attribution_conserves_through_a_full_netted_cycle` added |
 | `test_backtest_rejections.py` | 11 | 32 | +21 | rewritten against the live vocabulary: `STAGE_EVENTS` now names each emitter, `RETIRED_EVENTS` asserts the dead entries are gone, plus the `stage_7/8_complete_not_found` and `selection_dropped`-reason classes |
 | `test_backtest_metrics.py` | 42 | 42 | 0 | 3 `TestRejectionTally` tests re-based off gap-filter events (deleted) onto live ones. The `(day, reason)` dedup contract is unchanged; the vehicle changed because **no two live events share a bucket any more** |
 | `test_backtest_engine.py` | 29 | 35 | +6 | `TestAssignmentBasisIsPremiumNetted` (6). `test_put_assigned_buys_shares_at_strike` now asserts cash-at-strike **and** basis-netted |
@@ -493,8 +539,54 @@ migrations old code cannot read (both deleted knobs are absent-tolerant `.get()`
 
 ## Reviewer checklist
 
-- [ ] `deploy/cloud_run_server.py` diff is empty
-- [ ] every deleted symbol's mapping row in §9 is either covered or migrated (three were migrated — see the table)
-- [ ] the ledger contract in commit B is unchanged (`price=strike`, `cash_delta=-strike×shares`) and the three `event.price` readers are unaffected
-- [ ] the decomposition memo's claim that **commit A carries the change** holds against the tables
-- [ ] the two surviving mutations (M15, M19) are dispositioned honestly, not explained away
+- [x] `deploy/cloud_run_server.py` diff is empty — *deletion reviewer verified*
+- [x] every deleted symbol's mapping row in §9 is either covered or migrated (three were migrated — see the table)
+- [x] the ledger contract in commit B is unchanged (`price=strike`, `cash_delta=-strike×shares`) and the three `event.price` readers are unaffected
+- [x] the decomposition memo's claim that **commit A carries the change** holds against the tables — *measurement reviewer reproduced the whole memo independently, to the digit*
+- [x] the surviving mutations are dispositioned honestly, not explained away
+
+---
+
+## Review disposition
+
+**Two adversarial reviews, fresh contexts, distinct personas. Verdicts: REQUEST_CHANGES × 2.
+No BLOCKER, no HIGH, and no disagreement between the two reviewers on any finding** — the
+union of their findings is simply the sum, with no contested item to surface. Every required
+fix was **addressed in code or docs** (option (a)); none was justified-in-writing-only, and
+none was deferred to a follow-up FC.
+
+**Independently verified by the reviewers** (recorded because it is the part of a review that
+is easy to lose):
+
+- The **measurement reviewer reproduced the entire decomposition memo** — both symbols, all
+  three revisions, to the digit. Determinism of the replay across code revisions is therefore
+  confirmed by a second party, not asserted by the author.
+- The **deletion reviewer verified the kill list symbol-exact** against the plan, with an
+  empty `deploy/` diff.
+
+### Required fixes, and what was done
+
+| # | reviewer | finding | disposition |
+|---|---|---|---|
+| 1 | measurement | **Two novel mutations survive the 988-test suite** — deleting the replay's `filter_duplicate_opportunities` stage (N1) and widening both day-loop scans to `max_results=50` (N2). The plan's own words: "Diverging would measure a different strategy." | **Fixed in code.** `TestTheReplayRunsTheProductionStages` adds two argument-level tests (stage sequence + shared positions snapshot; scans invoked with no arguments, once per day). N1/N2 reproduced verbatim before, re-applied verbatim after: both now killed. See the mutation record. |
+| 2 | measurement | The replay passes `client.get_positions()` to the duplicate filter where production passes `get_option_positions()` — equivalent **only** because the filter matches on the OCC `option_symbol` | **Fixed.** Comment at the call site stating the equivalence and its failure mode: if the filter is ever changed to match on the *underlying*, this line silently blocks every covered call in the replay, because the shares are always held when a call is written. |
+| 3 | deletion | `docs/logging/FILTERING_PIPELINE_MONITORING.md` was **half-annotated** — one troubleshooting subsection got a note while the doc still opened "✅ ALL 9 STAGES HAVE COMPREHENSIVE LOGGING" and carried ~25 references to stages 2–6/9, including BigQuery recipes for `stage_4_passed` / `stage_4_blocked` that can never return a row | **Fixed.** Same prominent top banner its two siblings got, naming the six stages that do not exist, the four that do, and the selection/execution events this guide never covered but which are now where trades are decided. The "ALL 9 STAGES" line carries an inline correction. |
+| 4 | deletion | **The grep-triage table did not survive its own re-run** — rows summed to 109 vs 116; `tests/**` was 21 hits / 7 files, not 16 / 6; and "each annotated by this PR" was **false** for two hit-bearing investigation docs | **Fixed, and the two docs annotated rather than reclassified.** `cost-basis-floor-validation-2026-05-08.md` (present-tense claims about a deleted function) and `strategy-review-2026-05-07.md` (recommendation snippets patching it) now carry past-tense headers; all seven hit-bearing investigation docs are covered. The table is rebuilt mechanically from the grep output with its buckets asserted to sum to the line count. |
+| 5 | deletion | **The plan-specified conftest docstring touch-ups were not done** — `tests/conftest.py` still claimed the class patch covers "the one CallSeller owns", and the census test's docstring named the same stale trio | **Fixed.** Both now state the real census — resolver-direct, scanner, roller — with CallSeller's *absence* called out as deliberate, since a stale entry is the same rot in the other direction. |
+| 6 | deletion | Small: orphaned `from typing import Optional` in `src/utils/config.py` (F401 at HEAD, clean at base); two PR-body line-count nits; commit C is not strictly test-only; keep "squash commit" rollback phrasing | **All fixed.** Import dropped. Line counts corrected (`wheel_engine` 1293 → **678**, `call_seller` 935 → **668**). Commit C's labelling correction is stated in the Commits section rather than by rewriting published history. Rollback phrasing kept, with the unsquashed **C → B → A** ordering the reviewer confirmed now written out. |
+
+### Not changed, and why
+
+Nothing was dismissed. Two items were *noted by the reviewers as out of scope* and are carried
+forward rather than fixed here, consistent with the plan's FC-069 boundary:
+
+- `tools/diagnostics/fc002_gap_filter_ab.py`'s `verify` mode will fail — it asserts source
+  properties of deleted code. Its stale header says so explicitly. Fixing or retiring the tool
+  belongs with **FC-069 item 5** (the `GapDetector` disposition).
+- `tools/diagnostics/fc034_premium_floor_study.py` keeps its local mapping of retired event
+  names, because it reads *historical* Cloud Logging rows where those names are correct.
+  Editing it would falsify a completed study.
+
+**Suite after disposition: 988 → 990, green, `__pycache__` cleared.** Since fixes landed in
+code, a **scoped confirmation pass** is the next gate — its contract is the six rows above
+plus a regression check on the work done to satisfy them.
