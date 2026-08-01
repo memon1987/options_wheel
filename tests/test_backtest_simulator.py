@@ -399,13 +399,43 @@ class TestNoProductionSideEffects:
         assert engine.call_seller._cost_basis_resolver._lookup_assignment_basis(
             "XYZ", 100) is None
 
+    def test_call_roller_cannot_query_bigquery_during_a_replay(self):
+        """FC-065 Phase 2: the roller resolves its floor through the same shared
+        resolver now, and ``run_rolling_cycle()`` runs *inside* the replay
+        (Fridays). Without the gate forwarded, a replay's roller would query
+        production trade history against CURRENT_TIMESTAMP() — the identical
+        hazard the seller's gate exists for."""
+        from unittest.mock import Mock, patch
+
+        from src.strategy.wheel_engine import WheelEngine
+        from src.strategy.wheel_state_manager import WheelStateManager
+
+        config = Mock()
+        config.rolling_enabled = True
+        config.earnings_enabled = False
+        alpaca = Mock()
+        alpaca.get_positions.return_value = []
+
+        engine = WheelEngine(config, alpaca_client=alpaca,
+                             wheel_state=WheelStateManager(),
+                             allow_bigquery_cost_basis=False)
+
+        with patch('src.strategy.wheel_engine.CallRoller') as mock_roller:
+            engine.run_rolling_cycle()
+
+        assert mock_roller.call_args.kwargs['allow_bigquery_cost_basis'] is False
+
     def test_bigquery_fallback_stays_enabled_by_default(self):
         from unittest.mock import Mock
 
+        from src.strategy.call_roller import CallRoller
         from src.strategy.call_seller import CallSeller
 
         cs = CallSeller(Mock(), Mock(), Mock())
         assert cs.allow_bigquery_cost_basis is True
+
+        roller = CallRoller(Mock(), Mock(), Mock(), Mock(), Mock())
+        assert roller.cost_basis_resolver.allow_bigquery is True
 
 
 class TestNoOpAnalytics:
