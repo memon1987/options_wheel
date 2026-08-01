@@ -1293,7 +1293,7 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ### FC-065: FC-029's drawdown pause (R3) is also dead on the production path
 
-**Status:** Plan published, two-reviewer plan review passed with amendments, all operator decisions resolved (2026-07-31) — **ready for Phase 1 build.** Scope: floor = Alpaca `avg_entry_price` with the resolver chain inverted, fail-closed everywhere including a divergence cross-check with teeth; roller floor unified; durable per-symbol decision record (subsumes FC-044 Phase 1, repoints the FC-030/031 pause alert to `uncovered_days`). **The drawdown pause is deliberately NOT ported** (OQ-3: floor-only gating; legibility via decision-record labels). Engine-path deletion + backtest repoint split out as FC-068 (now blocked only on Phase 1).
+**Status:** Executing — **Phase 1 (floor inversion) merged + deploy-verified 2026-08-01** (PR #75, squash `630c0bd`; two adversarial reviews + confirmation pass; floors live at avg_entry_price 303.50/261.20/368.34/218.43, cross-check `status=ok` all four lots). Phases 2 and 4 next. Scope: floor = Alpaca `avg_entry_price` with the resolver chain inverted, fail-closed everywhere including a divergence cross-check with teeth; roller floor unified; durable per-symbol decision record (subsumes FC-044 Phase 1, repoints the FC-030/031 pause alert to `uncovered_days`). **The drawdown pause is deliberately NOT ported** (OQ-3: floor-only gating; legibility via decision-record labels). Engine-path deletion + backtest repoint split out as FC-068 (now blocked only on Phase 1).
 **Size estimate:** M–L (four phases, one PR each)
 **Owner:** Claude / zeshan
 **Plan file:** `docs/plans/fc-065.md`
