@@ -444,7 +444,15 @@ class OptionsScanner:
                 'otm_percentage': otm_percentage,
                 'liquidity_score': liquidity_score,
                 'attractiveness_score': attractiveness_score,
-                'assignment_above_cost_basis': strike > cost_basis_per_share,
+                # FC-065 Phase 2: ``>=``, matching the gates. Every floor gate
+                # rejects only ``strike < floor`` (market_data's chain filter,
+                # call_seller's execute-time check, risk_manager.validate_roll),
+                # so an at-floor strike is admitted and sold — GOOGL's 370C was.
+                # With strict ``>`` this flag read False on exactly those
+                # writes: a warning that gated nothing and contradicted the
+                # behaviour. At-floor keeps both premiums and gives up no
+                # capital, which is the decided policy, so the flag says so.
+                'assignment_above_cost_basis': strike >= cost_basis_per_share,
                 'expiration_date': call_option['expiration_date'],
                 'bid': call_option.get('bid', 0),
                 'ask': call_option.get('ask', 0),

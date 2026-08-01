@@ -346,8 +346,13 @@ class TestTheBigQueryChokepoint:
 
     def test_the_hermeticity_guard_covers_every_resolver_instance(self):
         """The autouse conftest fixture patches the class, so a resolver built
-        inside a test — by the scanner, the seller, or directly — cannot
-        reach BigQuery. If this method is ever renamed, this test fails."""
+        inside a test — by the scanner, the seller, the roller, or directly —
+        cannot reach BigQuery. If this method is ever renamed, this test fails.
+
+        Every construction site belongs here. A new one that is not listed is
+        still covered (the patch is on the class), but listing it is what keeps
+        this test an inventory rather than a spot check.
+        """
         assert CostBasisResolver(Mock(), Mock(spec=Config))._lookup_assignment_basis(
             'AAPL', 100) is None
 
@@ -358,6 +363,11 @@ class TestTheBigQueryChokepoint:
         from src.strategy.call_seller import CallSeller
         seller = CallSeller(Mock(), Mock(), Mock(spec=Config))
         assert seller._cost_basis_resolver._lookup_assignment_basis('AAPL', 100) is None
+
+        # FC-065 Phase 2: the roller resolves its strike floor here too.
+        from src.strategy.call_roller import CallRoller
+        roller = CallRoller(Mock(), Mock(), Mock(spec=Config), Mock(), Mock())
+        assert roller.cost_basis_resolver._lookup_assignment_basis('AAPL', 100) is None
 
     @pytest.mark.real_bq_lookup
     def test_allow_bigquery_false_never_builds_a_client(self):

@@ -20,6 +20,7 @@ from ..risk.risk_manager import RiskManager
 from ..utils.config import Config
 from ..utils.option_symbols import parse_option_symbol
 from ..utils.logging_events import log_trade_event, log_error_event, log_position_update
+from .cost_basis import CostBasisResolver
 from .wheel_state_manager import WheelStateManager
 
 logger = structlog.get_logger(__name__)
@@ -36,13 +37,37 @@ class CallRoller:
     def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager,
                  config: Config, wheel_state: WheelStateManager,
                  risk_manager: RiskManager,
-                 earnings_calendar: Optional[EarningsCalendarService] = None):
+                 earnings_calendar: Optional[EarningsCalendarService] = None,
+                 allow_bigquery_cost_basis: bool = True):
+        """Initialize the call roller.
+
+        Args:
+            alpaca_client: Alpaca API client.
+            market_data: Market data manager.
+            config: Configuration instance.
+            wheel_state: State manager for roll counts and active call details.
+            risk_manager: Validates the replacement leg.
+            earnings_calendar: Optional earnings service for the blackout gate.
+            allow_bigquery_cost_basis: whether the cost-basis divergence
+                cross-check may query BigQuery. A backtest passes False: the
+                cross-check would otherwise read *production* trade history —
+                against CURRENT_TIMESTAMP() — mixing real assignments into a
+                simulated run. Mirrors ``CallSeller`` (FC-065).
+        """
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
         self.wheel_state = wheel_state
         self.risk_manager = risk_manager
         self.earnings_calendar = earnings_calendar
+        # FC-065 Phase 2: the roll's strike floor is resolved through the same
+        # shared resolver the scanner and the seller use — one floor
+        # implementation, no fifth copy. The suite's hermeticity guard patches
+        # ``_lookup_assignment_basis`` on the class, so this instance is covered
+        # like the other two.
+        self.cost_basis_resolver = CostBasisResolver(
+            alpaca_client, config, allow_bigquery=allow_bigquery_cost_basis
+        )
 
     def should_roll(self, short_call_position: Dict[str, Any],
                     stock_position: Dict[str, Any],
@@ -123,10 +148,41 @@ class CallRoller:
             )
             return None
 
-        # Get cost basis for strike selection floor
+        # Get cost basis for strike selection floor.
+        # FC-065 Phase 2: resolved through the shared CostBasisResolver rather
+        # than derived here from cost_basis/qty. Rolling is the one path that
+        # places orders without passing execute_call_sale, so this floor is the
+        # only thing between a BTC/STO pair and a strike below what the shares
+        # cost — and the old derivation silently produced 0 whenever Alpaca
+        # reported no cost basis, which left min_strike = current_strike + 0.01,
+        # i.e. no basis protection at all.
         shares = int(float(stock_position.get('qty', 0)))
-        total_cost = float(stock_position.get('cost_basis', 0))
-        cost_basis_per_share = total_cost / shares if shares > 0 else 0
+        resolution = self.cost_basis_resolver.resolve_detailed(
+            underlying, stock_position, shares)
+        cost_basis_per_share = resolution['basis']
+
+        # FAIL CLOSED. resolve_detailed returns a zero basis for both verdicts
+        # that mean "no usable floor" — unresolved (absent/zero avg_entry_price)
+        # and divergent (the broker's number contradicted by assignment
+        # history) — so no roll is evaluated for this position. cost_basis_source
+        # on the event distinguishes the two.
+        if cost_basis_per_share <= 0:
+            cross_check = resolution.get('cross_check') or {}
+            log_trade_event(
+                logger, event_type="call_roll_skipped_cost_basis_unresolved",
+                symbol=option_symbol, underlying=underlying,
+                strategy="roll_call", success=False,
+                skip_reason="cost_basis_unresolved",
+                current_strike=current_strike,
+                stock_price=current_stock_price,
+                shares=shares,
+                cost_basis_source=resolution.get('source'),
+                broker_basis=resolution.get('broker_basis'),
+                cross_check_status=cross_check.get('status'),
+                cross_check_reason=cross_check.get('reason'),
+                **earnings_info,
+            )
+            return None
 
         # Find replacement calls — min strike is max(cost_basis, current_strike + 0.01)
         min_strike = max(cost_basis_per_share, current_strike + 0.01)

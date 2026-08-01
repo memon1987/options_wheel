@@ -42,9 +42,11 @@ class WheelEngine:
             wheel_state: State manager. Defaults to the configured GCS bucket
                 (or in-memory when unset). A backtest injects a bucket-less
                 instance so a replay can never touch production state.
-            allow_bigquery_cost_basis: forwarded to CallSeller. A backtest passes
-                False so the cost-basis floor cannot fall back to querying
-                production trade history mid-replay.
+            allow_bigquery_cost_basis: forwarded to CallSeller and (FC-065
+                Phase 2) to CallRoller, which now resolves its strike floor
+                through the same shared resolver. A backtest passes False so
+                neither can query production trade history mid-replay —
+                run_rolling_cycle() runs inside the replay too.
             earnings_calendar: earnings service used by the rolling cycle.
                 Defaults to constructing the live Finnhub-backed service. A
                 backtest injects a point-in-time calendar, because Finnhub can
@@ -64,6 +66,9 @@ class WheelEngine:
         self.call_seller = CallSeller(self.alpaca, self.market_data, config,
                                       wheel_state_manager=self.wheel_state,
                                       allow_bigquery_cost_basis=allow_bigquery_cost_basis)
+        # Retained for the rolling cycle, which builds its own CallRoller (and
+        # therefore its own CostBasisResolver) per invocation — FC-065 Phase 2.
+        self._allow_bigquery_cost_basis = allow_bigquery_cost_basis
 
         self._injected_earnings_calendar = earnings_calendar
 
@@ -1226,7 +1231,8 @@ class WheelEngine:
 
         roller = CallRoller(
             self.alpaca, self.market_data, self.config,
-            self.wheel_state, risk_manager, earnings_calendar)
+            self.wheel_state, risk_manager, earnings_calendar,
+            allow_bigquery_cost_basis=self._allow_bigquery_cost_basis)
 
         # Get all positions
         positions = self.alpaca.get_positions()

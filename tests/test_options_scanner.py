@@ -550,6 +550,87 @@ class TestCallScanFloorIsTheBrokerBasisCrossCheckedAgainstBigQuery:
         self.mock_market_data.find_suitable_calls.assert_not_called()
 
 
+class TestAtFloorStrikesAreFlaggedTheWayTheGatesTreatThem:
+    """FC-065 Phase 2: ``assignment_above_cost_basis`` is ``strike >= floor``.
+
+    Every floor gate rejects only ``strike < floor`` — ``market_data``'s chain
+    filter, ``call_seller``'s execute-time check
+    (``test_a_strike_exactly_at_basis_is_allowed``), and
+    ``risk_manager.validate_roll``
+    (``test_a_strike_exactly_at_the_floor_is_allowed``). So an at-floor call is
+    admitted and sold, and GOOGL's 370C was. Under strict ``>`` the flag read
+    ``False`` on exactly those writes: a warning that gated nothing and
+    contradicted what the bot had just done.
+
+    At-floor is the decided policy, not an edge case to close — called away at
+    cost keeps both premiums and gives up no capital.
+    """
+
+    def setup_method(self):
+        self.mock_alpaca = Mock()
+        self.mock_market_data = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.call_target_dte = 7
+        self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                                      self.mock_config)
+        self.mock_market_data.get_stock_metrics.return_value = {'current_price': 372.0}
+        # GOOGL's real shape: floor 368.34, and the only candidate is struck
+        # exactly there.
+        self.mock_alpaca.get_positions.return_value = [{
+            'symbol': 'GOOGL', 'qty': '100', 'cost_basis': '36834.0',
+            'avg_entry_price': '368.34', 'asset_class': 'us_equity',
+            'side': 'long',
+        }]
+
+    def _chain(self, strike):
+        self.mock_market_data.find_suitable_calls.return_value = [{
+            'symbol': 'GOOGL260821C%08d' % int(strike * 1000),
+            'strike_price': strike, 'expiration_date': '2026-08-21', 'dte': 7,
+            'delta': 0.20, 'mid_price': 2.10, 'bid': 2.05, 'ask': 2.15,
+            'volume': 1500, 'open_interest': 6000, 'implied_volatility': 0.24,
+        }]
+
+    def test_a_strike_exactly_at_the_floor_is_flagged_above_the_basis(self):
+        """The mutation target. Reverted to strict ``>`` this asserts False on
+        a write the gates admit and the bot executes."""
+        self._chain(368.34)
+
+        results = self.scanner.scan_for_call_opportunities()
+
+        assert len(results) == 1
+        assert results[0]['strike_price'] == 368.34
+        assert results[0]['cost_basis_per_share'] == 368.34
+        assert results[0]['assignment_above_cost_basis'] is True
+
+    def test_the_floor_was_handed_to_the_chain_gate_that_admitted_it(self):
+        """The other half of the reconciliation: the same number that produced
+        the flag is the ``min_strike_price`` the chain scan filtered on, and
+        that filter rejects only ``strike < min_strike_price``."""
+        self._chain(368.34)
+
+        self.scanner.scan_for_call_opportunities()
+
+        self.mock_market_data.find_suitable_calls.assert_called_once_with(
+            'GOOGL', min_strike_price=368.34)
+
+    def test_a_strike_above_the_floor_is_still_flagged_above(self):
+        self._chain(375.00)
+
+        results = self.scanner.scan_for_call_opportunities()
+
+        assert results[0]['assignment_above_cost_basis'] is True
+
+    def test_a_strike_below_the_floor_is_still_flagged_below(self):
+        """``>=`` loosened the boundary by one point, not the predicate. A
+        below-floor strike — which the chain gate would never return, so this
+        pins the flag itself — still reads False."""
+        self._chain(360.00)
+
+        results = self.scanner.scan_for_call_opportunities()
+
+        assert results[0]['assignment_above_cost_basis'] is False
+
+
 class TestCallScanFailsClosedOnAnUnusableQuote:
     """FC-065 (folded in from the removed Phase 3): a failed stock quote used
     to fail OPEN — the opportunity was emitted anyway, with every price-derived
