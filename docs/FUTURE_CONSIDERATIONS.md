@@ -1410,6 +1410,23 @@ Doing (2) without (1) is defensible — it is conservative in the direction that
 
 ---
 
+### FC-074: should an account-level kill switch exist? (decide deliberately — the dead one is being deleted)
+
+**Status:** Consideration — filed 2026-08-01 by operator decision (FC-069 item 7 sub-decision, option 2)
+**Size estimate:** S (the decision); S–M (the build, if REVIVE)
+**Owner:** zeshan + Claude
+**Plan file:** not yet
+
+**Problem:** FC-069's sweep deletes `RiskManager`'s dead sibling methods — the repo's only *account-level* loss-limit concepts: a 10% portfolio-unrealized-loss "reduce positions" trigger, a 15% portfolio-loss emergency stop, a 5% daily-loss threshold, and an 80% margin ceiling. All were dead code (zero call sites since inception; two of the four conditions were declared but never even computed), with hardcoded thresholds nobody chose. The operator chose to delete them **with this FC filed** rather than letting the concept vanish as a rider: FC-065 OQ-3 decided the *per-symbol* pause question; the *account-level* stop was never decided.
+
+**The question:** should any mechanism exist that halts new opens (or flattens risk) when the account as a whole is losing badly — e.g., portfolio drawdown ≥ X%, or daily P&L ≤ −Y%? Post-sweep, the account's protections are position-scoped (sizing, floors, one-per-underlying, BP exhaustion) plus the earnings gate (FC-013 rev 2); nothing reacts to aggregate drawdown. That lean posture is currently *chosen* (control-matrix sign-off, 2026-08-01) — this FC exists so it gets re-examined with real thresholds and real data rather than re-accumulated.
+
+**Inputs when taken up:** FC-031's equity-curve/drawdown data (dashboard KPIs); the FC-065 P4 decision-record history (how often and how deep the book actually draws down); the FC-030 alert channel (a detective-only "account down X% today" alert is the cheapest first step and may be the right *entire* answer — alert-then-human beats an untested automatic halt for a one-operator book).
+
+**Links:** FC-069 item 7 (the deletion + this sub-decision), FC-065 OQ-3 (per-symbol pause — deliberately not this), FC-033 (Deferred — per-symbol escalation, different scope), `docs/plans/fc-069.md` §control matrix, FC-030 (alert channel).
+
+---
+
 ### FC-073: validate the attractiveness score against realized outcomes; tune or simplify
 
 **Status:** Consideration — filed 2026-08-01 at operator request
