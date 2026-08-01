@@ -48,6 +48,15 @@ def uncovered_decisions_sql(dataset: str) -> str:
 
     Kept as a module-level builder rather than an inline f-string so the dedup
     is pinned by a test that does not need BigQuery credentials.
+
+    **Within a dedup key, `sold` wins regardless of write order.** A `/run`
+    retry after a failed `mark_executed` recovers the *same* `run_id` from the
+    blob and re-derives the symbol as `dropped/already_positioned` — the
+    position it finds is the one it just opened. Under a pure
+    `ORDER BY timestamp DESC` that later row would permanently shadow the real
+    `sold` row, in this reader and in every future one (FC-044's grid, the
+    OQ-1 in-gap retro-analysis). A write that reached the broker is the more
+    terminal fact, so it sorts first.
     """
     return f"""
     WITH deduped AS (
@@ -57,7 +66,8 @@ def uncovered_decisions_sql(dataset: str) -> str:
                                        INTERVAL @lookback_days DAY)
         AND symbol IN UNNEST(@symbols)
       QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY dedup_key ORDER BY timestamp DESC) = 1
+        PARTITION BY dedup_key
+        ORDER BY IF(outcome = 'sold', 0, 1), timestamp DESC) = 1
     )
     SELECT symbol, run_id, run_ts, stage, outcome, reason, shares,
            cost_basis_per_share, current_price, underwater_pct, uncovered_days
@@ -1600,6 +1610,12 @@ class BigQueryService:
         result: Dict[str, Any] = {
             "threshold_days": threshold_days,
             "source": "decision_events",
+            # Explicit, and consumed by the alert path. Silence here has three
+            # causes — query failure, a rolled-back bot that stopped writing,
+            # and a table that never got created — and NONE of them mean
+            # "every symbol is covered". The FC-046 sink died silently for
+            # eight months on exactly this shape of assumption.
+            "decision_source_available": True,
             "uncovered": [],
             "unknown_uncovered_days": [],
             "share_count_mismatches": mismatches,
@@ -1618,14 +1634,19 @@ class BigQueryService:
                                          DECISION_LOOKBACK_DAYS),
                 ])
         except Exception:
-            logger.info("decision_events query failed — uncovered card unavailable")
+            logger.warning("decision_events query failed — uncovered state unknown",
+                           exc_info=True)
+            result["decision_source_available"] = False
             return result
 
+        seen = set()
         for row in rows:
             symbol = row.get("symbol")
             if symbol not in held:
                 continue
+            seen.add(symbol)
             days = row.get("uncovered_days")
+            outcome = row.get("outcome") or ""
             entry = {
                 "symbol": symbol,
                 "shares": held[symbol],
@@ -1637,17 +1658,37 @@ class BigQueryService:
                 "underwater_pct": (float(row["underwater_pct"])
                                    if row.get("underwater_pct") is not None else None),
                 "uncovered_days": int(days) if days is not None else None,
-                "outcome": row.get("outcome") or "",
+                "outcome": outcome,
                 "reason": row.get("reason") or "",
                 "run_id": row.get("run_id") or "",
                 "last_decision_at": str(row.get("run_ts") or ""),
             }
+            if outcome == "sold":
+                # A call was written against these shares this cycle. Covered
+                # by definition — never "unknown", whatever the label says.
+                continue
             if days is None:
                 # "We could not tell" is NOT "covered". It gets its own list so
                 # a broken uncovered-days lookup cannot read as an all-clear.
                 result["unknown_uncovered_days"].append(entry)
             elif int(days) > 0:
                 result["uncovered"].append(entry)
+
+        # A held symbol with NO row in the whole lookback window is the
+        # dead-writer case: a rollback to a pre-Phase-4 revision, a failed
+        # table auto-create, a BigQuery outage on the write side. It used to
+        # vanish from both lists and read as covered. It is now explicitly
+        # unknown, which trips CHECK_FAILED within one daily check.
+        for symbol in held_syms:
+            if symbol in seen:
+                continue
+            result["unknown_uncovered_days"].append({
+                "symbol": symbol, "shares": held[symbol],
+                "cost_basis_per_share": None, "last_price": None,
+                "underwater_pct": None, "uncovered_days": None,
+                "outcome": "", "reason": "no_decision_records",
+                "run_id": "", "last_decision_at": "",
+            })
 
         result["uncovered"].sort(key=lambda r: r["uncovered_days"], reverse=True)
         return result

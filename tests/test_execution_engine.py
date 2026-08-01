@@ -1348,7 +1348,7 @@ class TestDropReasonsAreExposedForTheDecisionRecord:
         self.put_seller._calculate_position_size.return_value = {"contracts": 1}
 
     def test_starts_empty(self):
-        assert self.engine.last_drop_reasons == {}
+        assert self.engine.last_call_drop_reasons == {}
 
     def test_a_ranking_drop_is_published(self):
         self.alpaca.get_positions.return_value = []
@@ -1356,7 +1356,7 @@ class TestDropReasonsAreExposedForTheDecisionRecord:
         self.engine.rank_opportunities(
             [_call("AAPL", 337.5)], self.put_seller, 0.0)
 
-        assert self.engine.last_drop_reasons == {
+        assert self.engine.last_call_drop_reasons == {
             "AAPL": "insufficient_available_shares"}
 
     def test_a_selection_drop_is_published(self):
@@ -1367,7 +1367,7 @@ class TestDropReasonsAreExposedForTheDecisionRecord:
             self.put_seller, 0.0)
         self.engine.select_batch(ranked, 0.0)
 
-        assert self.engine.last_drop_reasons == {"AAPL": "duplicate_underlying"}
+        assert self.engine.last_call_drop_reasons == {"AAPL": "duplicate_underlying"}
 
     def test_a_positions_outage_is_not_reported_as_no_shares(self):
         # The two demand opposite responses; the decision record must be able
@@ -1377,7 +1377,7 @@ class TestDropReasonsAreExposedForTheDecisionRecord:
         self.engine.rank_opportunities(
             [_call("AAPL", 337.5)], self.put_seller, 0.0)
 
-        assert self.engine.last_drop_reasons == {"AAPL": "positions_unavailable"}
+        assert self.engine.last_call_drop_reasons == {"AAPL": "positions_unavailable"}
 
     def test_a_selected_symbol_has_no_drop_reason(self):
         self.alpaca.get_positions.return_value = [_equity("AAPL", 100)]
@@ -1387,17 +1387,17 @@ class TestDropReasonsAreExposedForTheDecisionRecord:
         selected, _ = self.engine.select_batch(ranked, 0.0)
 
         assert len(selected) == 1
-        assert self.engine.last_drop_reasons == {}
+        assert self.engine.last_call_drop_reasons == {}
 
     def test_a_new_cycle_does_not_inherit_the_previous_one(self):
         """Last hour's reason reported as this hour's decision is a lie."""
         self.alpaca.get_positions.return_value = []
         self.engine.rank_opportunities(
             [_call("AAPL", 337.5)], self.put_seller, 0.0)
-        assert self.engine.last_drop_reasons
+        assert self.engine.last_call_drop_reasons
 
         self.alpaca.get_positions.return_value = [_equity("MSFT", 100)]
         self.engine.rank_opportunities(
             [_call("MSFT", 400.0)], self.put_seller, 0.0)
 
-        assert "AAPL" not in self.engine.last_drop_reasons
+        assert "AAPL" not in self.engine.last_call_drop_reasons

@@ -343,6 +343,15 @@ async def pause_alert_check() -> Dict[str, Any]:
         return {"status": "degraded", "reason": "live positions unavailable",
                 "threshold_days": threshold_days}
 
+    # The decision table is now the alert's source of truth, so its
+    # unavailability is an unevaluated check — not a quiet all-clear. Reported
+    # with the same marker as a positions outage; both mean "unknown".
+    if not result.get("decision_source_available", True):
+        logger.warning("%s decision records unavailable; uncovered state "
+                       "could not be evaluated", CHECK_FAILED_MARKER)
+        return {"status": "degraded", "reason": "decision records unavailable",
+                "threshold_days": threshold_days}
+
     alertable = select_alertable_uncovered(result.get("uncovered", []),
                                            threshold_days)
     if alertable:

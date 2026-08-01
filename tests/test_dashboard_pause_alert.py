@@ -149,6 +149,18 @@ class TestUncoveredDecisionsQuery:
         assert "@symbols" in sql
         assert "proj.options_wheel.decision_events" in sql
 
+    def test_a_sold_row_outranks_a_later_row_under_the_same_key(self):
+        """A /run retry after a failed mark_executed re-derives the SAME
+        run_id (it comes off the blob) and writes
+        `dropped/already_positioned` at a later timestamp — the position it
+        finds is the one it just opened. Under a pure timestamp ordering that
+        row permanently shadows the real `sold` row, here and in every future
+        reader (FC-044's grid, the OQ-1 in-gap retro-analysis)."""
+        sql = self._sql()
+        assert "IF(outcome = 'sold', 0, 1)" in sql, (
+            "a write that reached the broker is the more terminal fact and "
+            "must win its dedup key regardless of write order")
+
 
 class TestGetUncoveredSymbols:
     """Hermetic: BigQueryService built via __new__ with _run_query stubbed —
@@ -308,3 +320,122 @@ class TestPauseAlertCheckEndpoint:
         out = self._run(v2.pause_alert_check())
         assert out["alerted"] is False
         assert out["unknown_total"] == 1
+
+
+class TestSilenceIsNeverAllClear:
+    """BLOCKER (both reviewers): three separate paths returned `status: ok`
+    while knowing nothing.
+
+    The decision table is now the alert's source of truth, so a table that
+    cannot be read, or that nobody is writing to, must read as UNKNOWN. This
+    is the FC-046 failure shape — that sink died silently for eight months
+    because its silence was indistinguishable from "nothing to report"."""
+
+    @staticmethod
+    def _service(decision_rows=None, raise_on_decisions=False):
+        from services.bigquery import BigQueryService
+
+        svc = BigQueryService.__new__(BigQueryService)
+        svc.dataset = "test.options_wheel"
+
+        def fake_run_query(query, params=None):
+            if "fc018_per_symbol_scorecard" in query:
+                return []
+            if "decision_events" in query:
+                if raise_on_decisions:
+                    raise Exception("BigQuery unavailable")
+                return decision_rows or []
+            raise AssertionError(f"unexpected query: {query[:80]}")
+
+        svc._run_query = fake_run_query
+        return svc
+
+    @staticmethod
+    def _row(symbol, days, outcome="no_candidates", reason="no_qualifying_strikes"):
+        return {
+            "symbol": symbol, "run_id": "20260801T140000Z-abcdef12",
+            "run_ts": "2026-08-01T14:00:00+00:00", "stage": "scan",
+            "outcome": outcome, "reason": reason,
+            "shares": 100, "cost_basis_per_share": 218.43,
+            "current_price": 199.0, "underwater_pct": -0.089,
+            "uncovered_days": days,
+        }
+
+    def test_a_query_failure_is_flagged_not_swallowed(self):
+        svc = self._service(raise_on_decisions=True)
+        out = svc.get_uncovered_symbols(
+            live_positions=[{"symbol": "NVDA", "qty": 100}], threshold_days=7)
+        assert out["decision_source_available"] is False
+
+    def test_a_healthy_read_is_flagged_available(self):
+        svc = self._service([self._row("NVDA", 9)])
+        out = svc.get_uncovered_symbols(
+            live_positions=[{"symbol": "NVDA", "qty": 100}], threshold_days=7)
+        assert out["decision_source_available"] is True
+
+    def test_a_held_symbol_with_no_rows_at_all_is_unknown(self):
+        """The dead-writer case: rollback to a pre-Phase-4 revision, a failed
+        table auto-create, a write-side BigQuery outage. The symbol used to
+        vanish from BOTH lists and read as covered."""
+        svc = self._service([self._row("NVDA", 9)])
+        out = svc.get_uncovered_symbols(
+            live_positions=[{"symbol": "NVDA", "qty": 100},
+                            {"symbol": "AAPL", "qty": 100}], threshold_days=7)
+        assert [r["symbol"] for r in out["unknown_uncovered_days"]] == ["AAPL"]
+        assert out["unknown_uncovered_days"][0]["reason"] == "no_decision_records"
+
+    def test_total_write_silence_makes_every_held_symbol_unknown(self):
+        svc = self._service([])
+        out = svc.get_uncovered_symbols(
+            live_positions=[{"symbol": "NVDA", "qty": 100},
+                            {"symbol": "AAPL", "qty": 100}], threshold_days=7)
+        assert out["uncovered"] == []
+        assert sorted(r["symbol"] for r in out["unknown_uncovered_days"]) == [
+            "AAPL", "NVDA"]
+
+    def test_a_sold_symbol_is_covered_not_unknown(self):
+        # Belt and braces alongside the run-stage's uncovered_days=0: whatever
+        # the label says, a symbol we just wrote a call on is not "unknown".
+        svc = self._service([self._row("NVDA", None, outcome="sold", reason="")])
+        out = svc.get_uncovered_symbols(
+            live_positions=[{"symbol": "NVDA", "qty": 100}], threshold_days=7)
+        assert out["uncovered"] == []
+        assert out["unknown_uncovered_days"] == []
+
+    def test_a_dropped_symbol_with_a_real_count_is_reported(self):
+        svc = self._service([self._row("NVDA", 9, outcome="dropped",
+                                       reason="insufficient_available_shares")])
+        out = svc.get_uncovered_symbols(
+            live_positions=[{"symbol": "NVDA", "qty": 100}], threshold_days=7)
+        assert [r["symbol"] for r in out["uncovered"]] == ["NVDA"]
+
+
+@pytest.mark.skipif(not importlib.util.find_spec("fastapi"),
+                    reason="FastAPI only present in the dashboard image")
+class TestEndpointHonoursTheDegradedFlag:
+    @staticmethod
+    def _run(coro):
+        import asyncio
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    def test_an_unreadable_decision_table_is_degraded_not_ok(self, monkeypatch):
+        import routers.v2 as v2
+
+        async def fake_eval():
+            return {"uncovered": [], "positions_available": True,
+                    "decision_source_available": False}
+
+        monkeypatch.setattr(v2, "_evaluate_uncovered_symbols", fake_eval)
+        out = self._run(v2.pause_alert_check())
+        assert out["status"] == "degraded"
+        assert "decision records" in out["reason"]
+
+    def test_a_missing_flag_defaults_to_available(self, monkeypatch):
+        # Backwards compatibility with any caller/fixture predating the flag.
+        import routers.v2 as v2
+
+        async def fake_eval():
+            return {"uncovered": [], "positions_available": True}
+
+        monkeypatch.setattr(v2, "_evaluate_uncovered_symbols", fake_eval)
+        assert self._run(v2.pause_alert_check())["status"] == "ok"

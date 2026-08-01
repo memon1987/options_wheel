@@ -33,7 +33,7 @@ managed-table set so this cannot happen by accident again.
 |---|---|---|
 | `timestamp` | TIMESTAMP | Write time; the partition field |
 | `run_id` | STRING | Minted once per `/scan`, threaded to `/run` |
-| `run_ts` | TIMESTAMP | Cycle start — stable across both stages |
+| `run_ts` | TIMESTAMP | Cycle start, **derived from `run_id`** — identical in both stages |
 | `stage` | STRING | `scan` \| `run` |
 | `endpoint` | STRING | `/scan` \| `/run` |
 | `symbol` | STRING | Underlying |
@@ -60,7 +60,7 @@ deliberately not adopted.
 | `outcome` | valid `reason` values |
 |---|---|
 | `sold` | *(empty)* |
-| `no_candidates` | `no_qualifying_strikes`, `quote_unavailable` |
+| `no_candidates` | `no_qualifying_strikes`, `quote_unavailable`, `opportunity_build_failed` |
 | `blocked` | `floor_unresolved`, `floor_divergent` |
 | `not_eligible` | `insufficient_shares` |
 | `dropped` | FC-038's selection enum (`insufficient_available_shares`, `insufficient_buying_power`, `duplicate_underlying`, `sizing_failed`, `positions_unavailable`) plus `execution_failed`, `already_positioned`, `previously_failed`, `not_selected` |
@@ -83,13 +83,41 @@ yields exactly one row per held symbol — written by whichever stage decided it
 
 **A held symbol with zero rows for a scan-hour means the cycle did not
 complete for it** — a scheduler miss, a `/scan` crash, or a `/run` that never
-followed a scan that found candidates. That is the condition the fill-rate
-check below exists to surface; silent non-execution is the failure mode that
-hid FC-031 for 11 days and let the roller never fire.
+followed a scan that found candidates. Silent non-execution is the failure
+mode that hid FC-031 for 11 days and let the roller never fire; the controls
+for it are described under *Writer-failure detection* below.
+
+Both stages flush their rows from a `finally`, so a cycle that crashed still
+records what it decided — including, on the `/run` side, orders that had
+already reached the broker before the exception.
 
 ---
 
-## Fill-rate check
+## Writer-failure detection — the automated control
+
+**The daily uncovered check is the control, not the query below.** A
+human-run query is not a control; the FC-046 sink proved that by dying
+silently for eight months while a perfectly good query existed to find it.
+
+`get_uncovered_symbols` computes **held symbols minus symbols with rows** and
+puts the difference into `unknown_uncovered_days`. `pause_alert_check`
+(weekdays 17:45 ET) then logs `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED`, which the
+deployed alert policy turns into an operator email. So:
+
+| Failure | Detected by | Latency |
+|---|---|---|
+| Bot rolled back / stopped writing rows | every held symbol lands in `unknown_uncovered_days` → `_CHECK_FAILED` | ≤ 1 trading day |
+| Table missing / auto-create failed | same | ≤ 1 trading day |
+| Read-side BigQuery failure | `decision_source_available: false` → `_CHECK_FAILED` | ≤ 1 trading day |
+| One symbol silently skipped | that symbol lands in `unknown_uncovered_days` | ≤ 1 trading day |
+| A cycle that ran but produced no row for a symbol with candidates | the fill-rate query below (manual) | on inspection |
+
+**The fill-rate query cannot see total write silence.** Its `cycles` CTE is
+derived from `decision_events` itself, so if nothing is written there are no
+cycles to compare against and it returns zero gaps. It is a *within-cycle*
+diagnostic. Whole-table silence is the daily check's job, per the table above.
+
+## Fill-rate check (manual, within-cycle)
 
 Expected: **one row per held symbol per scan-hour.** Run this to find the gaps.
 
@@ -99,9 +127,11 @@ WITH deduped AS (
   SELECT *
   FROM `options_wheel.decision_events`
   WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 DAY)
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY dedup_key ORDER BY timestamp DESC) = 1
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY dedup_key ORDER BY IF(outcome = 'sold', 0, 1), timestamp DESC) = 1
 ),
 cycles AS (
+  -- run_ts is derived from run_id, so this is one row per cycle.
   SELECT DISTINCT run_id, run_ts FROM deduped
 ),
 symbols AS (
@@ -137,6 +167,14 @@ later inserts a second copy. **Every reading query must therefore dedup on
 unkeyed fire-and-forget writer is what produced 36 duplicate `wheel_cycles`
 rows per assignment.
 
+**Within a dedup key, `sold` wins regardless of write order.** A `/run` retry
+after a failed `mark_executed` recovers the *same* `run_id` off the blob and
+re-derives the symbol as `dropped/already_positioned` — the position it finds
+is the one it just opened. A naive `ORDER BY timestamp DESC` would let that
+later row permanently shadow the real `sold` row, in this reader and in every
+future one. Readers must order by `IF(outcome = 'sold', 0, 1), timestamp DESC`.
+A write that reached the broker is the more terminal fact.
+
 ---
 
 ## Everyday queries
@@ -148,7 +186,8 @@ SELECT run_ts, stage, outcome, reason, cost_basis_per_share, current_price,
        underwater_pct, uncovered_days, reason_counts
 FROM `options_wheel.decision_events`
 WHERE symbol = 'NVDA' AND DATE(run_ts) = CURRENT_DATE()
-QUALIFY ROW_NUMBER() OVER (PARTITION BY dedup_key ORDER BY timestamp DESC) = 1
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY dedup_key ORDER BY IF(outcome = 'sold', 0, 1), timestamp DESC) = 1
 ORDER BY run_ts DESC
 ```
 
@@ -158,7 +197,8 @@ ORDER BY run_ts DESC
 SELECT outcome, reason, COUNT(DISTINCT symbol) AS symbols
 FROM `options_wheel.decision_events`
 WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)
-QUALIFY ROW_NUMBER() OVER (PARTITION BY dedup_key ORDER BY timestamp DESC) = 1
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY dedup_key ORDER BY IF(outcome = 'sold', 0, 1), timestamp DESC) = 1
 GROUP BY outcome, reason ORDER BY symbols DESC
 ```
 
@@ -172,7 +212,8 @@ SELECT symbol, run_ts, strike_price, cost_basis_per_share,
        ROUND(strike_price - cost_basis_per_share, 2) AS above_floor
 FROM `options_wheel.decision_events`
 WHERE outcome = 'sold'
-QUALIFY ROW_NUMBER() OVER (PARTITION BY dedup_key ORDER BY timestamp DESC) = 1
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY dedup_key ORDER BY IF(outcome = 'sold', 0, 1), timestamp DESC) = 1
 ORDER BY above_floor ASC
 ```
 
@@ -197,20 +238,49 @@ call.** Stateless by construction — wheel-state persistence has never worked
    covered *right now* → `0`, with no BigQuery round trip. Classification goes
    through `strict_option_type`, never a substring match (FC-041/043/045/048/052).
 2. **BigQuery `trades_from_activities`** for the rest, batched into **one query
-   per scan** for all held symbols. The anchor is the most recent **call-leg**
-   activity on the underlying — a write, a close, an expiry or an exercise; any
-   of them means the shares were covered that day. A lot that has never had a
-   call written falls back to the **put assignment** that created it, the day
-   the shares became coverable. Trading days are counted against the
-   `stock_history_from_alpaca` benchmark-symbol calendar (FC-031's), not a
-   hand-rolled weekday count — holidays are real and "≥ 7 trading days" is an
-   alert boundary.
+   per scan** for all held symbols (`uncovered_days_sql` in
+   `src/data/decision_record.py`). The anchor is
+   **`GREATEST(last call-leg activity, last put assignment)`** — a call write,
+   close, expiry or exercise means the shares were covered that day; a put
+   assignment means a *new* lot exists and the clock restarts.
+
+   > **`GREATEST`, never `COALESCE`.** A lot called away and later re-assigned
+   > is the wheel's normal cycle, not an edge case. Verified: AMZN was called
+   > away 2026-04-23 and re-assigned 2026-06-06. Under `COALESCE` the call date
+   > wins whenever it exists, so the new lot would report ~30 uncovered days on
+   > its first day and trip the ≥7 alert immediately.
+
+   Trading days are counted against the `stock_history_from_alpaca`
+   benchmark-symbol calendar (FC-031's), not a hand-rolled weekday count —
+   holidays are real and "≥ 7 trading days" is an alert boundary.
+
+**Two known boundary effects, both accepted and bounded:**
+
+- **Calendar staleness is compensated.** Bars ingest at 17:00 ET, so an
+  intraday run sees a calendar ending yesterday — an uncompensated ~1–2 day
+  undercount would have made the *effective* alert threshold ≈9 trading days
+  rather than 7. Days after the calendar's last bar are added back as weekdays.
+  Residual: a market holiday inside that trailing 1–2 day window is counted as
+  a trading day, so the count can read one day high immediately after a
+  holiday.
+- **`DATE(transaction_time)` is UTC** while the calendar holds exchange-local
+  dates, so an activity after 20:00 ET anchors to the next calendar day — a
+  ±1-day effect on a ≥7-day threshold. Noted in the SQL, not corrected.
 
 **NULL is not zero.** No history, BigQuery unreachable, or the lookup gated off
 all yield NULL, meaning "we could not tell". The dashboard puts those symbols
 in a separate `unknown_uncovered_days` list and the daily check logs
 `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED` for them, so an underivable label can never
 read as an all-clear.
+
+**The label is computed once, at scan time, and rides the blob into `/run`**
+(`decision_labels` on each opportunity, stamped exactly as `run_id` is).
+`/run` is a separate stateless request with no positions snapshot and no
+BigQuery lookup of its own; recomputing there would mean a second query per
+cycle, and omitting it made every `/run`-terminated row NULL — which put every
+actively-trading symbol into the unknown bucket and mailed a `_CHECK_FAILED`
+daily. A `sold` row hard-sets `0`: a call was just written against those
+shares, whatever the scan measured fifteen minutes earlier.
 
 ---
 
@@ -219,6 +289,23 @@ read as an all-clear.
 - **Dashboard card** — `GET /api/v2/bot-health/drawdown-pauses` (path kept;
   payload is the uncovered shape). Renders `UncoveredPositionsCard`.
 - **Daily alert** — `POST /api/v2/bot-health/pause-alert-check`, weekdays
-  17:45 ET. Fires on **"symbol uncovered ≥ N trading days"**. Marker strings,
-  policy, channel, scheduler job and threshold env var are all unchanged from
-  FC-030 — see `deploy/monitoring/drawdown_pause_alert.md` §Alert 2.
+  17:45 ET. Fires on **"symbol uncovered ≥ N trading days"**, and logs
+  `_CHECK_FAILED` when the table is unreadable or when any held symbol has no
+  rows at all. Marker strings, policy, channel, scheduler job and threshold env
+  var are all unchanged from FC-030 — see
+  `deploy/monitoring/drawdown_pause_alert.md` §Alert 2.
+
+---
+
+## Known limitations, accepted
+
+- **`create_table(exists_ok=True)` never reconciles schema drift.** Adding a
+  column to `_SCHEMAS` does not alter an existing table; the new field silently
+  fails to land. Pre-existing `AnalyticsWriter` behaviour shared by all four
+  managed tables — but it now rides the table the operator alert depends on, so
+  adding a column here means an explicit `bq update` / `ALTER TABLE` as well.
+- **A local CLI `--command scan` with ambient GCP credentials writes to the
+  production table.** Same exposure as every other `AnalyticsWriter` caller.
+  Such rows are identifiable by their `run_id` mint time if a cleanup is ever
+  needed; a backtest replay is already safe, because it installs a no-op
+  writer for the duration.

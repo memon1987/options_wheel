@@ -95,11 +95,19 @@ $1,500–3,000 in foregone premium and was only found post-hoc.
 > fires when `uncovered_days` could not be derived for a held symbol, because
 > "we could not tell whether a call is written" must not read as all-clear.
 >
-> **New dependency worth knowing at triage time:** the alert reads
-> `decision_events`, which the bot service writes. If the *bot* stops writing
-> (deploy rollback to a pre-Phase-4 revision, BigQuery outage), the card
-> empties and the alert goes quiet. Check the fill-rate query in the decision
-> records runbook before concluding "nothing is uncovered".
+> **New dependency, and the control that watches it.** The alert reads
+> `decision_events`, which the *bot* service writes. If the bot stops writing
+> (rollback to a pre-Phase-4 revision, failed table auto-create, write-side
+> BigQuery outage), the reader would see silence — so silence is explicitly
+> not treated as an all-clear: **every held symbol with no rows in the lookback
+> window is reported as unknown, and unknowns log `_CHECK_FAILED`.** A dead
+> writer therefore emails the operator within one trading day. Same for a
+> read-side failure (`decision_source_available: false`).
+>
+> The fill-rate query in `docs/operations/DECISION_RECORDS.md` is a
+> *within-cycle* diagnostic only — its `cycles` CTE derives from
+> `decision_events` itself, so it structurally cannot see total write silence.
+> Do not treat it as the control; the daily check is the control.
 
 **Threshold:** 7 trading days, declared in `cloudbuild.yaml`'s dashboard
 deploy step.

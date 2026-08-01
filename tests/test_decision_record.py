@@ -33,17 +33,22 @@ from src.data.decision_record import (
     STAGE_RUN,
     STAGE_SCAN,
     DecisionRecorder,
+    RunDecisionFlusher,
     UncoveredDaysResolver,
     UnknownDecisionOutcome,
     build_decision_row,
     covered_underlyings,
+    decision_labels,
     dedup_key,
     is_run_id,
     mint_run_id,
     position_mark_price,
     record_run_stage,
     run_id_from_opportunities,
+    run_ts_from_run_id,
+    stamp_decision_labels,
     stamp_run_id,
+    uncovered_days_sql,
     underwater_pct,
     validate_outcome,
 )
@@ -483,16 +488,31 @@ class TestRecordRunStage:
             already_positioned={"NVDA"}, previously_failed={"NVDA"})
         assert rec.rows[0]["outcome"] == OUTCOME_SOLD
 
-    def test_puts_do_not_produce_covered_call_decision_rows(self):
+    def test_a_put_is_refused_even_if_the_caller_passes_one(self):
+        """Defence in depth, not caller discipline.
+
+        The caller filters by `is_call_opportunity`, but if that filter is
+        ever removed a put reaching here would be recorded as a covered-call
+        verdict for a symbol we may hold no shares in.
+        """
         rec = self._recorder()
         put = {"type": "put", "symbol": "IWM",
                "option_symbol": "IWM260807P00285000", "contracts": 1}
         record_run_stage(rec, call_opportunities=[put], selected=[],
                          execution_results=[])
-        # The caller filters by is_call_opportunity, but the recorder must not
-        # depend on that: a put reaching here would be recorded as a
-        # covered-call verdict for a symbol we hold no shares in.
-        assert [r["symbol"] for r in rec.rows] == ["IWM"]
+        assert rec.rows == []
+
+    def test_a_put_FILL_is_never_recorded_as_a_sold_covered_call(self):
+        # The dangerous half: a fabricated `sold` row that the OQ-1 in-gap
+        # retro-analysis and FC-044's grid would both read as a real call.
+        rec = self._recorder()
+        put = {"type": "put", "symbol": "IWM", "strike_price": 285.0,
+               "option_symbol": "IWM260807P00285000", "contracts": 1}
+        record_run_stage(
+            rec, call_opportunities=[put], selected=[put],
+            execution_results=[{"opportunity": put, "success": True,
+                                "result": {"success": True, "order_id": "p1"}}])
+        assert rec.rows == []
 
     def test_one_row_per_underlying_even_with_three_candidates(self):
         rec = self._recorder()
@@ -519,3 +539,275 @@ class TestFlush:
         rec = DecisionRecorder("R1", STAGE_SCAN, writer=_Boom())
         rec.record("NVDA", OUTCOME_NOT_ELIGIBLE, REASON_INSUFFICIENT_SHARES)
         assert rec.flush() == 1  # must not raise: telemetry cannot fail a cycle
+
+
+# ======================================================================
+# Review round 1 — the two BLOCKERS and the HIGH/MEDIUM findings
+# ======================================================================
+
+
+class TestRunRowsCarryRealUncoveredDays:
+    """BLOCKER (both reviewers): /run rows had a NULL `uncovered_days`.
+
+    Consequences, both demonstrated by the reviewers with probes:
+      * every covered/actively-trading symbol landed in the reader's
+        "could not tell" bucket, so the 17:45 check mailed
+        DRAWDOWN_PAUSE_ALERT_CHECK_FAILED essentially every trading day —
+        alert fatigue kills the one verified notification channel;
+      * a genuinely uncovered symbol whose candidates keep getting dropped at
+        /run could never accumulate a day count, so the ">= 7 trading days"
+        contract was unimplemented for half the outcome enum.
+    """
+
+    def _recorder(self):
+        return DecisionRecorder("R1", STAGE_RUN, writer=_CapturingWriter())
+
+    @staticmethod
+    def _stamped(days, **kw):
+        opp = _call_opp(**kw)
+        stamp_decision_labels(opp, shares=100, current_price=225.0,
+                              underwater=0.030078, uncovered_days=days)
+        return opp
+
+    def test_a_dropped_symbol_carries_the_scan_computed_day_count(self):
+        rec = self._recorder()
+        record_run_stage(rec, call_opportunities=[self._stamped(9)],
+                         selected=[], execution_results=[],
+                         drop_reasons={"NVDA": "insufficient_available_shares"})
+        row = rec.rows[0]
+        assert row["uncovered_days"] == 9
+        assert row["outcome"] == OUTCOME_DROPPED
+
+    def test_a_dropped_symbol_can_cross_the_alert_threshold(self):
+        # The ">= 7" contract must be reachable from the /run half of the enum.
+        rec = self._recorder()
+        record_run_stage(rec, call_opportunities=[self._stamped(7)],
+                         selected=[], execution_results=[])
+        assert rec.rows[0]["uncovered_days"] >= 7
+        assert rec.rows[0]["reason"] == REASON_NOT_SELECTED
+
+    def test_a_sold_symbol_is_zero_by_definition(self):
+        # Whatever the scan measured 15 minutes ago, a call is written now.
+        rec = self._recorder()
+        opp = self._stamped(9)
+        record_run_stage(
+            rec, call_opportunities=[opp], selected=[opp],
+            execution_results=[{"opportunity": opp, "success": True,
+                                "result": {"success": True, "order_id": "x"}}])
+        assert rec.rows[0]["outcome"] == OUTCOME_SOLD
+        assert rec.rows[0]["uncovered_days"] == 0
+
+    def test_a_covered_symbol_with_candidates_reports_zero(self):
+        # The scanner's covered short-circuit stamps 0; the run row must keep
+        # it. Previously only the NO-candidates path was covered by a test,
+        # which is exactly the path a covered symbol does NOT take.
+        rec = self._recorder()
+        record_run_stage(rec, call_opportunities=[self._stamped(0)],
+                         selected=[], execution_results=[])
+        assert rec.rows[0]["uncovered_days"] == 0
+
+    def test_other_labels_ride_along_too(self):
+        rec = self._recorder()
+        record_run_stage(rec, call_opportunities=[self._stamped(9)],
+                         selected=[], execution_results=[])
+        row = rec.rows[0]
+        assert row["shares"] == 100
+        assert row["current_price"] == pytest.approx(225.0)
+        assert row["underwater_pct"] == pytest.approx(0.030078)
+
+    def test_an_unstamped_blob_degrades_honestly(self):
+        # A blob written before this shipped: derivable labels reconstructed,
+        # uncovered_days left NULL rather than invented as 0.
+        rec = self._recorder()
+        record_run_stage(rec, call_opportunities=[_call_opp()],
+                         selected=[], execution_results=[])
+        row = rec.rows[0]
+        assert row["uncovered_days"] is None
+        assert row["current_price"] == pytest.approx(225.0)
+        assert row["underwater_pct"] == pytest.approx(0.030078, abs=1e-6)
+
+    def test_stamping_survives_a_json_round_trip(self):
+        # The labels travel through the GCS blob, which is JSON.
+        import json
+        opp = self._stamped(9)
+        assert decision_labels(json.loads(json.dumps(opp)))["uncovered_days"] == 9
+
+
+class TestRunDecisionFlusher:
+    """MEDIUM: a crash inside execute_batch produced a 500 with ZERO run rows,
+    including for orders that had already reached the broker."""
+
+    def _flusher(self):
+        f = RunDecisionFlusher(writer=_CapturingWriter())
+        f.run_id = "R1"
+        f.opportunities.append(_call_opp())
+        return f
+
+    def test_flushes_once(self):
+        f = self._flusher()
+        assert f.flush(selected=[], execution_results=[]) is True
+        assert f.flush(selected=[], execution_results=[]) is False
+
+    def test_no_run_id_is_a_no_op(self):
+        f = RunDecisionFlusher(writer=_CapturingWriter())
+        assert f.flush() is False
+
+    def test_a_crash_after_a_fill_still_records_the_fill(self):
+        """The endpoint's control flow, in miniature."""
+        f = self._flusher()
+        opp = f.opportunities[0]
+        results = []
+        try:
+            results.append({"opportunity": opp, "success": True,
+                            "result": {"success": True, "order_id": "abc"}})
+            raise RuntimeError("boom inside execute_batch")
+        except RuntimeError:
+            pass
+        finally:
+            f.flush(selected=[opp], execution_results=results)
+        assert f.flushed
+        written = f._writer.batches[0]
+        assert [(r["symbol"], r["outcome"], r["order_id"]) for r in written] == [
+            ("NVDA", OUTCOME_SOLD, "abc")]
+
+    def test_a_broken_recorder_never_propagates_out_of_a_finally(self):
+        class _Boom:
+            def write_decision_events(self, rows):
+                raise RuntimeError("BigQuery down")
+
+        f = RunDecisionFlusher(writer=_Boom())
+        f.run_id = "R1"
+        f.opportunities.append(_call_opp())
+        assert f.flush(selected=[], execution_results=[]) is True  # must not raise
+
+
+class TestRunEndpointFlushesInAFinally:
+    """Source-level, because the alternative is standing up Flask plus GCS.
+
+    The contract is structural: `/run`'s flush must sit in a `finally`, not on
+    the success path. The scanner's equivalent is pinned by 11 behavioural
+    tests; this pins the one line that makes the same guarantee for /run.
+    """
+
+    def test_the_flush_is_inside_a_finally(self):
+        from pathlib import Path
+        import re
+
+        src = Path(__file__).resolve().parents[1] / "deploy" / "cloud_run_server.py"
+        text = src.read_text()
+        body = text[text.index("def trigger_strategy("):text.index("def _is_market_open(")]
+        assert re.search(r"finally:\s*(#[^\n]*\n\s*)*decisions\.flush\(", body), (
+            "/run's decision flush must be in a `finally` — a crash inside "
+            "execute_batch otherwise loses the record of orders that already "
+            "reached the broker")
+
+
+class TestUncoveredDaysSql:
+    """MEDIUM: the SQL was invisible to all 951 tests.
+
+    The hermeticity guard patches `_lookup_uncovered_days` wholesale, so a
+    reviewer's mutation deleting the calendar-symbol join condition — a ~9x
+    day-count inflation in production — survived the entire suite.
+    """
+
+    def _sql(self):
+        return uncovered_days_sql("proj.options_wheel")
+
+    def test_the_calendar_join_is_symbol_scoped(self):
+        # Without this the LEFT JOIN matches every ingested symbol's bar for
+        # each date, multiplying the day count by the ingested-symbol count.
+        assert "b.symbol = @calendar_symbol" in self._sql()
+
+    def test_the_anchor_is_greatest_not_coalesce(self):
+        # Verified against real history: AMZN called away 2026-04-23,
+        # re-assigned 2026-06-06. Under COALESCE the call date wins whenever it
+        # exists, so the NEW lot reports ~30 uncovered days on day one and
+        # trips the ">= 7" alert immediately. This is the wheel's normal cycle.
+        sql = self._sql()
+        assert "GREATEST(" in sql
+        assert "COALESCE(last_call_date, last_assignment_date)" not in sql, (
+            "COALESCE makes a re-assignment after a call-away inherit the old "
+            "lot's clock")
+
+    def test_both_anchor_candidates_are_considered(self):
+        sql = self._sql()
+        assert "last_call_date" in sql and "last_assignment_date" in sql
+
+    def test_the_window_is_bounded_forward(self):
+        assert "b.date > a.anchor_date" in self._sql()
+        assert "b.date <= CURRENT_DATE()" in self._sql()
+
+    def test_calendar_staleness_is_compensated(self):
+        # Bars ingest at 17:00 ET; an intraday run sees a calendar ending
+        # yesterday. Uncompensated, the effective alert threshold drifts to ~9.
+        sql = self._sql()
+        assert "GENERATE_DATE_ARRAY" in sql
+        assert "Saturday" in sql and "Sunday" in sql
+
+    def test_it_is_parameterised_and_scoped_to_the_dataset(self):
+        sql = self._sql()
+        assert "@symbols" in sql and "@calendar_symbol" in sql
+        assert "proj.options_wheel.trades_from_activities" in sql
+        assert "proj.options_wheel.stock_history_from_alpaca" in sql
+
+    @pytest.mark.real_bq_lookup
+    def test_the_resolver_uses_this_builder(self):
+        # A second, inline copy of the SQL would be invisible again. Opts out
+        # of the hermeticity stub (which replaces the very method under test)
+        # via the established marker; the BigQuery client is injected, so
+        # nothing reaches the network.
+        resolver = UncoveredDaysResolver(dataset_id="proj.options_wheel")
+        seen = {}
+
+        class _Job:
+            @staticmethod
+            def result(timeout=None):
+                return []
+
+        class _Client:
+            def query(self, query, job_config=None):
+                seen["query"] = query
+                return _Job()
+
+        resolver._bq_client = _Client()
+        resolver._lookup_uncovered_days(["NVDA"])
+        assert seen["query"] == uncovered_days_sql("proj.options_wheel")
+
+
+class TestRunTsIsStableAcrossStages:
+    """MEDIUM: each stage defaulted run_ts to its own now(), ~15 minutes
+    apart, so the fill-rate query's DISTINCT run_id, run_ts saw two 'cycles'
+    per run — while the schema documented it as the stable cycle start."""
+
+    def test_derived_from_the_run_id(self):
+        run_id = mint_run_id(datetime(2026, 8, 3, 14, 0, 0, tzinfo=timezone.utc))
+        assert run_ts_from_run_id(run_id) == datetime(
+            2026, 8, 3, 14, 0, 0, tzinfo=timezone.utc)
+
+    def test_both_stages_agree(self):
+        run_id = mint_run_id()
+        scan = DecisionRecorder(run_id, STAGE_SCAN, writer=_CapturingWriter())
+        run = DecisionRecorder(run_id, STAGE_RUN, writer=_CapturingWriter())
+        scan.record("NVDA", OUTCOME_NO_CANDIDATES, REASON_NO_QUALIFYING_STRIKES)
+        run.record("AAPL", OUTCOME_SOLD, "")
+        assert scan.rows[0]["run_ts"] == run.rows[0]["run_ts"]
+
+    def test_a_garbage_id_falls_back_rather_than_crashing(self):
+        assert run_ts_from_run_id("not-a-run-id") is None
+        assert DecisionRecorder("legacy", STAGE_RUN,
+                                writer=_CapturingWriter()).run_ts is not None
+
+
+class TestMintRunIdTimezone:
+    """LOW: a naive datetime was stamped under a `Z` suffix — local time
+    labelled UTC. Harmless on Cloud Run (TZ=UTC), wrong everywhere else, and
+    now load-bearing because run_ts is derived back out of the string."""
+
+    def test_a_naive_local_time_is_converted_not_relabelled(self):
+        naive = datetime(2026, 8, 3, 14, 0, 0)
+        expected = naive.astimezone(timezone.utc)
+        assert mint_run_id(naive).startswith(expected.strftime("%Y%m%dT%H%M%S") + "Z-")
+
+    def test_an_aware_time_round_trips(self):
+        aware = datetime(2026, 8, 3, 14, 0, 0, tzinfo=timezone.utc)
+        assert run_ts_from_run_id(mint_run_id(aware)) == aware

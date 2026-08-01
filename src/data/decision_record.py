@@ -98,6 +98,7 @@ REASON_INSUFFICIENT_SHARES = "insufficient_shares"
 # no_candidates{...}
 REASON_NO_QUALIFYING_STRIKES = "no_qualifying_strikes"
 REASON_QUOTE_UNAVAILABLE = "quote_unavailable"
+REASON_OPPORTUNITY_BUILD_FAILED = "opportunity_build_failed"
 # dropped{...} — beyond FC-038's selection enum
 REASON_EXECUTION_FAILED = "execution_failed"
 REASON_ALREADY_POSITIONED = "already_positioned"
@@ -114,7 +115,8 @@ _DROPPED_REASONS = frozenset(DROP_REASONS) | {
 ALLOWED_REASONS: Dict[str, frozenset] = {
     OUTCOME_SOLD: frozenset({""}),
     OUTCOME_NO_CANDIDATES: frozenset(
-        {REASON_NO_QUALIFYING_STRIKES, REASON_QUOTE_UNAVAILABLE}),
+        {REASON_NO_QUALIFYING_STRIKES, REASON_QUOTE_UNAVAILABLE,
+         REASON_OPPORTUNITY_BUILD_FAILED}),
     OUTCOME_DROPPED: _DROPPED_REASONS,
     OUTCOME_BLOCKED: frozenset({REASON_FLOOR_UNRESOLVED, REASON_FLOOR_DIVERGENT}),
     OUTCOME_NOT_ELIGIBLE: frozenset({REASON_INSUFFICIENT_SHARES}),
@@ -161,14 +163,37 @@ def mint_run_id(scan_time: Optional[datetime] = None) -> str:
     two stateless requests (FC-044's survey).
     """
     ts = scan_time or datetime.now(timezone.utc)
-    if ts.tzinfo is not None:
-        ts = ts.astimezone(timezone.utc)
+    # A NAIVE datetime is local time — `/scan` passes `datetime.now()`. Stamping
+    # it under a `Z` suffix would label local time as UTC: harmless on Cloud Run
+    # (TZ=UTC) and wrong everywhere else, including the `run_ts` now derived
+    # back out of this string. `astimezone` on a naive value interprets it as
+    # local, which is exactly right.
+    ts = ts.astimezone(timezone.utc)
     return f"{ts.strftime('%Y%m%dT%H%M%S')}Z-{uuid.uuid4().hex[:8]}"
 
 
 def is_run_id(value: Any) -> bool:
     """True for a string minted by :func:`mint_run_id`."""
     return isinstance(value, str) and bool(_RUN_ID_RE.match(value))
+
+
+def run_ts_from_run_id(run_id: str) -> Optional[datetime]:
+    """The cycle start encoded in a ``run_id``, as an aware UTC datetime.
+
+    ``run_ts`` is documented as "stable across stages", and it was not: each
+    stage defaulted it to its own ``datetime.now()``, so one cycle produced two
+    distinct ``run_ts`` values ~15 minutes apart. Any consumer grouping by
+    ``(run_id, run_ts)`` — including this phase's own fill-rate query — then
+    saw two "cycles" per run. Deriving it from the id makes the claim true by
+    construction, with no extra field to thread through the blob.
+    """
+    if not is_run_id(run_id):
+        return None
+    try:
+        return datetime.strptime(run_id.split("-")[0],
+                                 "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 def stamp_run_id(opportunities: Sequence[Dict[str, Any]], run_id: str) -> int:
@@ -187,6 +212,58 @@ def stamp_run_id(opportunities: Sequence[Dict[str, Any]], run_id: str) -> int:
             opportunity['run_id'] = run_id
             stamped += 1
     return stamped
+
+
+#: Key under which the scan's per-symbol legibility labels ride the blob into
+#: ``/run``. One nested dict rather than four flat keys: it cannot collide with
+#: an opportunity field, and it reads unambiguously as "what the scan computed"
+#: rather than as more opportunity data.
+DECISION_LABELS_KEY = "decision_labels"
+
+_LABEL_FIELDS = ("shares", "current_price", "underwater", "uncovered_days")
+
+
+def stamp_decision_labels(opportunity: Dict[str, Any],
+                          **labels: Any) -> Dict[str, Any]:
+    """Attach the scan's computed labels to an opportunity, like ``run_id``.
+
+    ``uncovered_days`` is the reason this exists. It is derived at scan time
+    from Alpaca positions plus one batched BigQuery query; ``/run`` is a
+    separate stateless request that has neither. Without carrying it, every
+    ``/run``-terminated row (``sold``, ``dropped``) would have a NULL label —
+    which means every actively-trading symbol lands in the reader's
+    "could not tell" bucket and mails the operator a ``CHECK_FAILED`` every
+    trading day, and a symbol whose candidates are dropped every cycle could
+    never accumulate a day count at all. The ">= 7 trading days" contract would
+    have been unimplemented for half the outcome enum.
+    """
+    if isinstance(opportunity, dict):
+        opportunity[DECISION_LABELS_KEY] = {
+            key: labels.get(key) for key in _LABEL_FIELDS
+        }
+    return opportunity
+
+
+def decision_labels(opportunity: Dict[str, Any]) -> Dict[str, Any]:
+    """Read back :func:`stamp_decision_labels`, deriving what is missing.
+
+    A blob written before this shipped, or a wheel-engine opportunity, carries
+    no stamped labels; the derivable ones are reconstructed from the
+    opportunity's own fields and ``uncovered_days`` stays ``None`` — honestly
+    unknown rather than invented.
+    """
+    stamped = opportunity.get(DECISION_LABELS_KEY)
+    if isinstance(stamped, dict):
+        return {key: stamped.get(key) for key in _LABEL_FIELDS}
+
+    price = opportunity.get('current_stock_price')
+    floor = opportunity.get('cost_basis_per_share')
+    return {
+        'shares': _as_int(opportunity.get('shares_owned')),
+        'current_price': _as_float(price),
+        'underwater': underwater_pct(price, floor),
+        'uncovered_days': None,
+    }
 
 
 def run_id_from_opportunities(opportunities: Sequence[Dict[str, Any]]) -> Optional[str]:
@@ -279,6 +356,100 @@ def covered_underlyings(positions: Iterable[Dict[str, Any]]) -> set:
     return covered
 
 
+def uncovered_days_sql(dataset_id: str) -> str:
+    """Trading days since each held symbol was last covered.
+
+    A module-level builder, not an inline f-string, for the same reason
+    ``uncovered_decisions_sql`` is one: the hermeticity guard patches
+    ``_lookup_uncovered_days`` **wholesale**, so this SQL is invisible to every
+    test that goes through the resolver. A reviewer's mutation deleting the
+    ``b.symbol = @calendar_symbol`` join condition — which in production
+    multiplies the day count by the number of ingested symbols (~9x, so a
+    1-day gap alerts as 9) — survived the entire suite. Everything load-bearing
+    in here is now pinned by text and semantics tests.
+
+    **Anchor = ``GREATEST(last_call_date, last_assignment_date)``, not
+    ``COALESCE``.** This is the wheel's normal cycle, not an edge case: a lot is
+    called away, then a new put is assigned weeks later. Verified against real
+    history — AMZN was called away 2026-04-23 and re-assigned 2026-06-06. Under
+    ``COALESCE`` the call date wins whenever it exists, so the *new* lot would
+    have reported ~30 uncovered days on its first day and tripped the ">= 7"
+    alert immediately. ``GREATEST`` takes whichever event is more recent, which
+    is the actual question: when were these shares last either covered or
+    freshly acquired?
+
+    **Calendar staleness is compensated.** ``stock_history_from_alpaca`` is
+    ingested at 17:00 ET, so at the 17:45 ET check today's bar exists but
+    intraday runs see a calendar ending yesterday — a systematic ~1-2 day
+    undercount that would have made the effective alert threshold ~9 trading
+    days rather than 7. Days after the calendar's last bar are added back as
+    weekdays. Residual, accepted and documented: a market holiday inside that
+    trailing window is counted as a trading day.
+
+    Note ``DATE(transaction_time)`` is evaluated in UTC while the calendar is
+    in exchange-local dates, so an activity after 20:00 ET can anchor to the
+    next calendar day — a +-1 day boundary effect on a >= 7 threshold.
+    Accepted; recorded in docs/operations/DECISION_RECORDS.md.
+    """
+    return f"""
+    WITH anchors AS (
+      SELECT
+        underlying,
+        MAX(IF(option_type = 'call', DATE(transaction_time), NULL))
+          AS last_call_date,
+        MAX(IF(activity_type = 'OPASN' AND option_type = 'put',
+               DATE(transaction_time), NULL)) AS last_assignment_date
+      FROM `{dataset_id}.trades_from_activities`
+      WHERE underlying IN UNNEST(@symbols)
+      GROUP BY underlying
+    ),
+    anchored AS (
+      SELECT underlying,
+             -- GREATEST, never COALESCE: a re-assignment AFTER a call-away is
+             -- the normal wheel cycle and resets the clock.
+             GREATEST(COALESCE(last_call_date, DATE '1900-01-01'),
+                      COALESCE(last_assignment_date, DATE '1900-01-01'))
+               AS anchor_date,
+             last_call_date IS NOT NULL
+               AND (last_assignment_date IS NULL
+                    OR last_call_date >= last_assignment_date) AS anchor_is_call
+      FROM anchors
+      WHERE last_call_date IS NOT NULL OR last_assignment_date IS NOT NULL
+    ),
+    calendar_end AS (
+      SELECT MAX(date) AS last_bar
+      FROM `{dataset_id}.stock_history_from_alpaca`
+      WHERE symbol = @calendar_symbol
+    ),
+    counted AS (
+      SELECT a.underlying AS underlying,
+             a.anchor_date AS anchor_date,
+             a.anchor_is_call AS anchor_is_call,
+             COUNT(b.date) AS calendar_days
+      FROM anchored a
+      LEFT JOIN `{dataset_id}.stock_history_from_alpaca` b
+        ON b.symbol = @calendar_symbol
+       AND b.date > a.anchor_date
+       AND b.date <= CURRENT_DATE()
+      GROUP BY a.underlying, a.anchor_date, a.anchor_is_call
+    )
+    SELECT c.underlying AS underlying,
+           c.anchor_date AS anchor_date,
+           c.anchor_is_call AS anchor_is_call,
+           c.calendar_days + (
+             -- Bars not ingested yet: weekdays after the calendar's last bar.
+             SELECT COUNT(*)
+             FROM UNNEST(GENERATE_DATE_ARRAY(
+                    DATE_ADD(e.last_bar, INTERVAL 1 DAY), CURRENT_DATE())) AS d
+             WHERE d > c.anchor_date
+               AND FORMAT_DATE('%A', d) NOT IN ('Saturday', 'Sunday')
+           ) AS trading_days
+    FROM counted c
+    CROSS JOIN calendar_end e
+    WHERE e.last_bar IS NOT NULL
+    """
+
+
 class UncoveredDaysResolver:
     """How many trading days a held symbol has gone without a covered call.
 
@@ -366,36 +537,7 @@ class UncoveredDaysResolver:
                 self._bq_client = (bigquery.Client(project=project_id)
                                    if project_id else bigquery.Client())
 
-            query = f"""
-            WITH anchors AS (
-              SELECT
-                underlying,
-                MAX(IF(option_type = 'call', DATE(transaction_time), NULL))
-                  AS last_call_date,
-                MAX(IF(activity_type = 'OPASN' AND option_type = 'put',
-                       DATE(transaction_time), NULL)) AS last_assignment_date
-              FROM `{self.dataset_id}.trades_from_activities`
-              WHERE underlying IN UNNEST(@symbols)
-              GROUP BY underlying
-            ),
-            anchored AS (
-              SELECT underlying,
-                     COALESCE(last_call_date, last_assignment_date) AS anchor_date,
-                     last_call_date IS NOT NULL AS anchor_is_call
-              FROM anchors
-              WHERE COALESCE(last_call_date, last_assignment_date) IS NOT NULL
-            )
-            SELECT a.underlying AS underlying,
-                   a.anchor_date AS anchor_date,
-                   a.anchor_is_call AS anchor_is_call,
-                   COUNT(b.date) AS trading_days
-            FROM anchored a
-            LEFT JOIN `{self.dataset_id}.stock_history_from_alpaca` b
-              ON b.symbol = @calendar_symbol
-             AND b.date > a.anchor_date
-             AND b.date <= CURRENT_DATE()
-            GROUP BY a.underlying, a.anchor_date, a.anchor_is_call
-            """
+            query = uncovered_days_sql(self.dataset_id)
             job_config = bigquery.QueryJobConfig(query_parameters=[
                 bigquery.ArrayQueryParameter('symbols', 'STRING', list(symbols)),
                 bigquery.ScalarQueryParameter('calendar_symbol', 'STRING',
@@ -536,7 +678,10 @@ class DecisionRecorder:
                 f"unknown decision stage {stage!r}; expected one of {STAGES}")
         self.run_id = run_id
         self.stage = stage
-        self.run_ts = run_ts or datetime.now(timezone.utc)
+        # Derived from the id, so `run_ts` is genuinely identical in both
+        # stages rather than each stage's own `now()` ~15 minutes apart.
+        self.run_ts = (run_ts or run_ts_from_run_id(run_id)
+                       or datetime.now(timezone.utc))
         self._writer = writer
         self._rows: "Dict[str, Dict[str, Any]]" = {}
 
@@ -626,6 +771,50 @@ def is_call_opportunity(opportunity: Dict[str, Any]) -> bool:
     return strict_option_type(opportunity.get('option_symbol') or '') == 'call'
 
 
+class RunDecisionFlusher:
+    """Write ``/run``'s decision rows exactly once, from any exit path.
+
+    ``/run`` has four exits — three early returns, one success — plus an
+    exception path, and telemetry must survive all five. Before this, a crash
+    inside ``execute_batch`` produced a 500 with **zero** run-stage rows,
+    including for orders that had already reached the broker: the cycle you
+    most want a record of was the one guaranteed not to have one.
+
+    Held as an object rather than a closure so the once-semantics are
+    testable without standing up Flask.
+    """
+
+    def __init__(self, writer: Optional[Any] = None):
+        self.run_id: Optional[str] = None
+        self.opportunities: List[Dict[str, Any]] = []
+        self.flushed = False
+        self._writer = writer
+
+    def flush(self, **kwargs: Any) -> bool:
+        """Write once; returns True only for the call that actually wrote."""
+        if self.flushed or not self.run_id:
+            return False
+        self.flushed = True
+        try:
+            recorder = DecisionRecorder(self.run_id, STAGE_RUN,
+                                        writer=self._writer)
+            recorded = record_run_stage(
+                recorder,
+                call_opportunities=[o for o in self.opportunities
+                                    if is_call_opportunity(o)],
+                **kwargs)
+            recorder.flush(expected_symbols=recorded)
+            return True
+        except Exception:
+            # Telemetry must never be able to fail a trading cycle, and this
+            # runs inside a `finally` that may already be unwinding one.
+            logger.warning("Decision-record emission failed for /run",
+                           event_category="data",
+                           event_type="decision_records_run_stage_failed",
+                           run_id=self.run_id, exc_info=True)
+            return False
+
+
 def record_run_stage(
     recorder: DecisionRecorder,
     *,
@@ -654,9 +843,16 @@ def record_run_stage(
     already = set(already_positioned or ())
     failed_before = set(previously_failed or ())
 
+    # Non-calls are refused here, not only by the caller. A put reaching this
+    # function would be recorded as a covered-call verdict for a symbol we may
+    # hold no shares in, and a put FILL would be recorded as `sold` — a
+    # fabricated covered call in the table that the OQ-1 in-gap retro-analysis
+    # and FC-044's grid would both read as real.
     by_symbol: Dict[str, Dict[str, Any]] = {}
     for opp in call_opportunities or []:
-        symbol = opp.get('symbol') if isinstance(opp, dict) else None
+        if not is_call_opportunity(opp):
+            continue
+        symbol = opp.get('symbol')
         if symbol and symbol not in by_symbol:
             by_symbol[symbol] = opp
 
@@ -678,12 +874,17 @@ def record_run_stage(
 
     recorded: List[str] = []
     for symbol, opp in by_symbol.items():
+        # The scan's labels, carried on the blob. `/run` is a separate
+        # stateless request with no positions snapshot and no BigQuery
+        # lookup of its own; recomputing here would mean a second query per
+        # cycle, and omitting them is what made every /run row NULL.
+        stamped = decision_labels(opp)
         labels = {
-            'shares': _as_int(opp.get('shares_owned')),
+            'shares': stamped['shares'],
             'cost_basis_per_share': _as_float(opp.get('cost_basis_per_share')),
-            'current_price': _as_float(opp.get('current_stock_price')),
-            'underwater': underwater_pct(opp.get('current_stock_price'),
-                                         opp.get('cost_basis_per_share')),
+            'current_price': stamped['current_price'],
+            'underwater': stamped['underwater'],
+            'uncovered_days': stamped['uncovered_days'],
             'option_symbol': opp.get('option_symbol') or '',
             'strike_price': _as_float(opp.get('strike_price')),
             'premium': _as_float(opp.get('premium')),
@@ -697,6 +898,10 @@ def record_run_stage(
                 'option_symbol': executed.get('option_symbol') or labels['option_symbol'],
                 'strike_price': _as_float(executed.get('strike_price')),
                 'premium': _as_float(executed.get('premium')),
+                # A call was just written against these shares. Zero by
+                # definition, whatever the scan measured 15 minutes ago —
+                # and never NULL, which the reader would read as "unknown".
+                'uncovered_days': 0,
             })
             recorder.record(symbol, OUTCOME_SOLD, "",
                             contracts=_as_int(result.get('contracts')

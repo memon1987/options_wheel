@@ -287,6 +287,10 @@ export interface UncoveredRow {
 export interface UncoveredSymbols {
   threshold_days: number;
   source: string;
+  // False when the decision table could not be read. NEVER render an
+  // all-clear on this: silence has three causes and none of them is
+  // "everything is covered".
+  decision_source_available?: boolean;
   uncovered: UncoveredRow[];
   unknown_uncovered_days: UncoveredRow[];
   share_count_mismatches: ShareCountMismatch[];

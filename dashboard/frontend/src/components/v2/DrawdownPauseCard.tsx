@@ -23,6 +23,24 @@ export default function UncoveredPositionsCard({ data }: Props) {
 
   const unknown = data.unknown_uncovered_days ?? [];
 
+  // The decision table could not be read. Rendering the empty-state copy here
+  // would assert "every held symbol has a call written against it" on the
+  // strength of a failed query — the precise failure this card exists to end.
+  if (data.decision_source_available === false) {
+    return (
+      <div className="rounded-lg border border-yellow-700/60 bg-gray-800 p-5">
+        <h3 className="text-base font-semibold text-white">Uncovered Positions</h3>
+        <p className="text-sm text-yellow-400 mt-2">
+          ⚠ Decision records unavailable — coverage state is <strong>unknown</strong>, not clear.
+        </p>
+        <p className="text-xs text-gray-500 mt-2">
+          The bot may have stopped writing decision records (rolled-back revision, BigQuery
+          outage). See docs/operations/DECISION_RECORDS.md.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="rounded-lg border border-gray-700 bg-gray-800 p-5">
       <div className="flex items-baseline justify-between flex-wrap gap-2">
@@ -32,7 +50,12 @@ export default function UncoveredPositionsCard({ data }: Props) {
         </span>
       </div>
       {data.uncovered.length === 0 ? (
-        <p className="text-sm text-gray-400 mt-2">Every held symbol has a call written against it.</p>
+        <p className="text-sm text-gray-400 mt-2">
+          {unknown.length > 0
+            // Not an all-clear: at least one held symbol's coverage is unknown.
+            ? 'No symbol is confirmed uncovered — but see the unknowns below.'
+            : 'Every held symbol has a call written against it.'}
+        </p>
       ) : (
         <table className="w-full mt-3 text-sm">
           <thead className="text-xs uppercase tracking-wide text-gray-400">

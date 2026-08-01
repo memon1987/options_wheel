@@ -823,19 +823,80 @@ class TestScanStageDecisionRecords:
         assert [(r['outcome'], r['reason']) for r in rows] == [
             ('blocked', 'floor_divergent')]
 
-    def test_a_symbol_with_candidates_is_deferred_to_the_run_stage(self):
-        """Its terminal verdict is `sold`/`dropped`, which only /run knows."""
-        self.mock_alpaca.get_positions.return_value = [self._nvda()]
-        self.mock_market_data.find_suitable_calls.return_value = [{
+    @staticmethod
+    def _chain():
+        return [{
             'symbol': 'NVDA260807C00230000', 'strike_price': 230.0,
             'expiration_date': '2026-08-07', 'dte': 7, 'delta': 0.18,
             'mid_price': 1.20, 'bid': 1.15, 'ask': 1.25,
             'volume': 900, 'open_interest': 3000, 'implied_volatility': 0.4,
         }]
 
+    def test_a_symbol_with_candidates_is_deferred_to_the_run_stage(self):
+        """Its terminal verdict is `sold`/`dropped`, which only /run knows."""
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.mock_market_data.find_suitable_calls.return_value = self._chain()
+
         rows = self._rows()
 
         assert rows == []
+
+    def test_candidates_carry_the_scan_labels_into_the_run_stage(self):
+        """BLOCKER: without this every /run row had a NULL uncovered_days.
+
+        /run is a separate stateless request with no positions snapshot and no
+        BigQuery lookup, so the labels have to ride the blob exactly as
+        `run_id` does.
+        """
+        from src.data.decision_record import decision_labels
+
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.mock_market_data.find_suitable_calls.return_value = self._chain()
+
+        opportunities = self.scanner.scan_for_call_opportunities(run_id="R1")
+
+        assert len(opportunities) == 1
+        labels = decision_labels(opportunities[0])
+        assert labels['uncovered_days'] == 9
+        assert labels['shares'] == 100
+        assert labels['current_price'] == pytest.approx(199.0)
+        assert labels['underwater'] == pytest.approx(-0.088953, abs=1e-6)
+
+    def test_a_covered_symbol_with_candidates_stamps_zero_days(self):
+        """The path the old covered-symbol test did NOT exercise.
+
+        A covered symbol has candidates far more often than not, so it is
+        terminated by /run — and a NULL there is what mailed the operator a
+        CHECK_FAILED every trading day.
+        """
+        from src.data.decision_record import decision_labels
+
+        self.mock_alpaca.get_positions.return_value = [
+            self._nvda(),
+            {'symbol': 'NVDA260807C00230000', 'qty': '-1',
+             'asset_class': 'us_option', 'side': 'short', 'market_value': '-120.0'},
+        ]
+        self.mock_market_data.find_suitable_calls.return_value = self._chain()
+        self.scanner.uncovered_days_resolver._lookup_uncovered_days = (
+            lambda symbols: (_ for _ in ()).throw(
+                AssertionError("must not query for a covered symbol")))
+
+        opportunities = self.scanner.scan_for_call_opportunities(run_id="R1")
+
+        assert decision_labels(opportunities[0])['uncovered_days'] == 0
+
+    def test_a_builder_failure_is_not_filed_as_a_bad_quote(self):
+        """A closed vocabulary that misfiles is worse than one more value."""
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.mock_market_data.find_suitable_calls.return_value = self._chain()
+        # Quote is fine; the builder swallowed its own exception and returned
+        # None, which is exactly what its `except` clause does in production.
+        self.scanner._create_call_opportunity = lambda *a, **k: None
+
+        rows = self._rows()
+
+        assert [(r['outcome'], r['reason']) for r in rows] == [
+            ('no_candidates', 'opportunity_build_failed')]
 
     def test_a_dead_quote_records_no_candidates_rather_than_vanishing(self):
         # The chain HAD qualifying strikes; opportunity construction failed

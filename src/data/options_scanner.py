@@ -20,6 +20,7 @@ from .decision_record import (
     REASON_FLOOR_UNRESOLVED,
     REASON_INSUFFICIENT_SHARES,
     REASON_NO_QUALIFYING_STRIKES,
+    REASON_OPPORTUNITY_BUILD_FAILED,
     REASON_QUOTE_UNAVAILABLE,
     STAGE_SCAN,
     DecisionRecorder,
@@ -27,6 +28,7 @@ from .decision_record import (
     covered_underlyings,
     mint_run_id,
     position_mark_price,
+    stamp_decision_labels,
     underwater_pct,
 )
 
@@ -291,15 +293,24 @@ class OptionsScanner:
                         call, position, cost_basis_per_share
                     )
                     if opportunity:
+                        # Carry the scan's labels into /run on the blob, the
+                        # same way run_id rides. /run has no positions
+                        # snapshot and no BigQuery lookup of its own, so
+                        # without this every /run-terminated row would carry
+                        # a NULL uncovered_days.
+                        stamp_decision_labels(opportunity, **floor_labels)
                         opportunities.append(opportunity)
                         created += 1
 
                 if created == 0:
                     # The chain had qualifying strikes but none survived
-                    # opportunity construction — today that means the stock
-                    # quote was unusable (fail-closed, FC-065 Phase 1).
+                    # opportunity construction. Attribute honestly rather than
+                    # filing everything under a bad quote: the quote is the
+                    # expected cause (fail-closed, FC-065 Phase 1) but an
+                    # exception inside the builder lands here too, and a closed
+                    # vocabulary that misfiles is worse than one more value.
                     recorder.record(symbol, OUTCOME_NO_CANDIDATES,
-                                    REASON_QUOTE_UNAVAILABLE,
+                                    self._construction_failure_reason(symbol),
                                     candidates=0,
                                     reason_counts=self._symbol_rejection_counts(symbol),
                                     **floor_labels)
@@ -380,6 +391,22 @@ class OptionsScanner:
             if count > 0:
                 out[str(key)] = count
         return out
+
+    def _construction_failure_reason(self, symbol: str) -> str:
+        """Why every candidate failed to become an opportunity.
+
+        ``_create_call_opportunity`` returns ``None`` for an unusable stock
+        quote (the expected cause) *or* on an exception. Re-reading the
+        already-cached metrics distinguishes the two for a few microseconds,
+        instead of filing a builder crash as a quote problem forever.
+        """
+        try:
+            metrics = self.market_data.get_stock_metrics(symbol) or {}
+            price = float(metrics.get('current_price', 0) or 0)
+        except (TypeError, ValueError, AttributeError):
+            return REASON_QUOTE_UNAVAILABLE
+        return (REASON_QUOTE_UNAVAILABLE if price <= 0
+                else REASON_OPPORTUNITY_BUILD_FAILED)
 
     def _symbol_rejection_counts(self, symbol: str) -> Dict[str, int]:
         """Look up ``symbol``'s last chain-rejection breakdown from market data."""

@@ -25,49 +25,13 @@ from src.utils.config import Config
 from src.utils.logging_events import log_system_event, log_performance_metric, log_error_event, log_trade_event
 from src.utils.option_symbols import strict_option_type
 from src.data.decision_record import (
-    STAGE_RUN,
-    DecisionRecorder,
+    RunDecisionFlusher,
     is_call_opportunity,
     mint_run_id,
-    record_run_stage,
     run_id_from_opportunities,
 )
 
 logger = structlog.get_logger(__name__)
-
-
-def _flush_run_decisions(run_id, blob_opportunities, selected=(),
-                         execution_results=(), drop_reasons=None,
-                         already_positioned=(), previously_failed=()):
-    """Write the ``/run`` half of FC-065 Phase 4's decision record.
-
-    Called from every exit of ``/run`` that got as far as reading the blob,
-    including the three early returns — a symbol filtered out by the
-    idempotency or non-retryable guard is one of the ways a symbol silently
-    disappears between the stages, so those returns are exactly the ones that
-    need a row.
-
-    Contained: telemetry must never be able to fail a trading cycle, and the
-    failure is logged rather than swallowed.
-    """
-    try:
-        recorder = DecisionRecorder(run_id, STAGE_RUN)
-        recorded = record_run_stage(
-            recorder,
-            call_opportunities=[o for o in blob_opportunities
-                                if is_call_opportunity(o)],
-            selected=selected,
-            execution_results=execution_results,
-            drop_reasons=drop_reasons,
-            already_positioned=already_positioned,
-            previously_failed=previously_failed,
-        )
-        recorder.flush(expected_symbols=recorded)
-    except Exception:
-        logger.warning("Decision-record emission failed for /run",
-                       event_category="data",
-                       event_type="decision_records_run_stage_failed",
-                       run_id=run_id, exc_info=True)
 
 
 def _underlyings_removed(before, after):
@@ -348,6 +312,18 @@ def trigger_strategy():
     """Trigger strategy execution."""
     with strategy_lock:
         start_time = datetime.now()
+        # FC-065 Phase 4 decision-record state, initialised BEFORE the try so
+        # the `finally` below can always read it. A crash inside execute_batch
+        # used to 500 with zero run-stage rows — including for orders that had
+        # already reached the broker, which is the cycle you most want a
+        # record of. Mirrors the scanner's flush-in-finally.
+        decisions = RunDecisionFlusher()
+        blob_opportunities = decisions.opportunities
+        selected_opportunities = []
+        execution_results = []
+        already_positioned_symbols = set()
+        previously_failed_symbols = set()
+
         try:
             # Removed duplicate - already logged below with log_system_event()
 
@@ -427,7 +403,7 @@ def trigger_strategy():
             # FC-065 Phase 4: the scan's run_id rides in on the opportunities.
             # A blob written before this shipped carries none — mint an orphan
             # id and say so, rather than dropping the cycle's telemetry.
-            blob_opportunities = list(opportunities)
+            blob_opportunities[:] = list(opportunities)
             run_id = run_id_from_opportunities(blob_opportunities)
             if not run_id:
                 run_id = mint_run_id(start_time)
@@ -435,6 +411,7 @@ def trigger_strategy():
                                event_category="system",
                                event_type="run_id_missing_on_blob",
                                run_id=run_id)
+            decisions.run_id = run_id
             structlog.contextvars.bind_contextvars(run_id=run_id)
 
             logger.info("Retrieved opportunities for execution",
@@ -457,13 +434,12 @@ def trigger_strategy():
                 opportunities
             )
             previously_failed_symbols = _underlyings_removed(
-                blob_opportunities, opportunities)
+                blob_opportunities, opportunities)  # noqa: F841 - read in finally
             if non_retryable_filtered > 0 and not opportunities:
                 logger.info("All opportunities previously failed with non-retryable errors",
                            event_category="system",
                            event_type="all_opportunities_non_retryable")
-                _flush_run_decisions(
-                    run_id, blob_opportunities,
+                decisions.flush(
                     previously_failed=previously_failed_symbols)
                 return jsonify({
                     'message': 'All opportunities previously failed (non-retryable)',
@@ -492,8 +468,7 @@ def trigger_strategy():
                     logger.info("All opportunities already have positions - likely duplicate execution",
                                event_category="system",
                                event_type="duplicate_execution_prevented")
-                    _flush_run_decisions(
-                        run_id, blob_opportunities,
+                    decisions.flush(
                         already_positioned=already_positioned_symbols,
                         previously_failed=previously_failed_symbols)
                     return jsonify({
@@ -560,11 +535,10 @@ def trigger_strategy():
             # FC-065 Phase 4: the terminal per-symbol decision for every
             # covered-call candidate this cycle carried. Emitted before the
             # mark-executed step, which has its own 500 exit.
-            _flush_run_decisions(
-                run_id, blob_opportunities,
+            decisions.flush(
                 selected=selected_opportunities,
                 execution_results=execution_results,
-                drop_reasons=exec_engine.last_drop_reasons,
+                drop_reasons=exec_engine.last_call_drop_reasons,
                 already_positioned=already_positioned_symbols,
                 previously_failed=previously_failed_symbols,
             )
@@ -716,6 +690,18 @@ def trigger_strategy():
                 'error': f"Strategy execution failed: {str(e)}"
             })
             return jsonify({'error': f"Strategy execution failed: {str(e)}"}), 500
+
+        finally:
+            # A cycle that crashed is the cycle most worth a record — not
+            # least because orders may already have reached the broker before
+            # the exception. Whatever partial state exists is written; the
+            # once-guard makes the normal paths' explicit flush win.
+            decisions.flush(
+                selected=selected_opportunities,
+                execution_results=execution_results,
+                already_positioned=already_positioned_symbols,
+                previously_failed=previously_failed_symbols,
+            )
 
 def _is_market_open() -> bool:
     """Check if the US stock market is currently open.
