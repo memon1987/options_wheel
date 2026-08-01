@@ -673,6 +673,14 @@ class Simulator:
             return
 
         positions = client.get_positions()
+        # Production passes `get_option_POSITIONS()` here (cloud_run_server.py:458);
+        # the replay passes the full position list. Equivalent ONLY because
+        # `filter_duplicate_opportunities` matches on the OCC `option_symbol`,
+        # which no equity symbol can collide with — so the extra stock rows are
+        # inert. That equivalence is load-bearing: if the filter is ever changed
+        # to match on the UNDERLYING, this line silently starts blocking every
+        # covered call in the replay (the shares are always held when a call is
+        # written). Narrow it to option positions at the same time.
         opportunities, _ = exec_engine.filter_duplicate_opportunities(opportunities, positions)
         if not opportunities:
             return

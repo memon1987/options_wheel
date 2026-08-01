@@ -346,12 +346,15 @@ class TestTheBigQueryChokepoint:
 
     def test_the_hermeticity_guard_covers_every_resolver_instance(self):
         """The autouse conftest fixture patches the class, so a resolver built
-        inside a test — by the scanner, the seller, the roller, or directly —
-        cannot reach BigQuery. If this method is ever renamed, this test fails.
+        inside a test — by the scanner, the roller, or directly — cannot reach
+        BigQuery. If this method is ever renamed, this test fails.
 
         Every construction site belongs here. A new one that is not listed is
         still covered (the patch is on the class), but listing it is what keeps
-        this test an inventory rather than a spot check.
+        this test an inventory rather than a spot check — and an entry left
+        here after its site is deleted is the same rot in the other direction,
+        which is why CallSeller's *absence* is asserted below rather than just
+        dropped (FC-068).
         """
         assert CostBasisResolver(Mock(), Mock(spec=Config))._lookup_assignment_basis(
             'AAPL', 100) is None

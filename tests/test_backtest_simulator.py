@@ -603,6 +603,149 @@ class TestNoProductionSideEffects:
         assert roller.cost_basis_resolver.allow_bigquery is True
 
 
+class TestTheReplayRunsTheProductionStages:
+    """FC-068's whole premise is that the replay runs the *live* pipeline, and
+    nothing was pinning that it runs ALL of it, in order, on production's
+    arguments.
+
+    Two adversarial-review mutations survived the 988-test suite:
+      * deleting the ``filter_duplicate_opportunities`` stage from
+        ``_execute_opportunities`` — production runs it on every cycle
+        (``cloud_run_server.py:458``), and the replay would silently stop;
+      * overriding both day-loop scans with ``max_results=50`` — ``/scan``
+        passes no args (``cloud_run_server.py:193,200``), so a replay with a
+        wider cap measures a different strategy. The plan's own words:
+        "Diverging would measure a different strategy."
+
+    Neither is caught by outcome assertions: both change WHAT is measured
+    without breaking the ledger, the equity curve or the tally, which is
+    exactly the class of silent drift this FC exists to end.
+    """
+
+    class _StageSpy:
+        """A recording stand-in for ExecutionEngine.
+
+        Deliberately a spy rather than a ``wraps=`` mock on the real class: the
+        contract being pinned is *which stages the replay invokes and in what
+        order*, and a pass-through would let a dropped stage still produce a
+        plausible run.
+        """
+
+        def __init__(self):
+            self.calls = []
+            self.positions_seen = []
+
+        def filter_failed_opportunities(self, opportunities):
+            self.calls.append("filter_failed_opportunities")
+            return opportunities, 0
+
+        def filter_duplicate_opportunities(self, opportunities, positions):
+            self.calls.append("filter_duplicate_opportunities")
+            self.positions_seen.append(id(positions))
+            return opportunities, 0
+
+        def rank_opportunities(self, opportunities, put_seller,
+                               available_bp, positions=None):
+            self.calls.append("rank_opportunities")
+            self.positions_seen.append(id(positions))
+            self.available_bp = available_bp
+            return list(opportunities)
+
+        def select_batch(self, ranked, available_bp, positions=None):
+            self.calls.append("select_batch")
+            self.positions_seen.append(id(positions))
+            return list(ranked), available_bp
+
+        def execute_batch(self, selected, put_seller, call_seller=None):
+            self.calls.append("execute_batch")
+            self.selected = list(selected)
+            self.put_seller = put_seller
+            self.call_seller = call_seller
+            return [], 0
+
+    class _Client:
+        def __init__(self):
+            self._positions = [{"symbol": "XYZ", "qty": 100.0,
+                                "asset_class": "us_equity"}]
+
+        def get_positions(self):
+            return self._positions
+
+        def get_account(self):
+            return {"buying_power": 50_000.0, "options_buying_power": 40_000.0}
+
+    def test_the_run_half_invokes_every_production_stage_in_order(self):
+        """Kills N1. The order is ``/run``'s, stage for stage."""
+        spy = self._StageSpy()
+        client = self._Client()
+        put_seller, call_seller = object(), object()
+        opportunities = [{"type": "put", "symbol": "XYZ",
+                          "option_symbol": "XYZ240607P00090000",
+                          "strike_price": 90.0, "premium": 1.0}]
+
+        Simulator._execute_opportunities(
+            spy, put_seller, call_seller, opportunities, client)
+
+        assert spy.calls == [
+            "filter_failed_opportunities",
+            "filter_duplicate_opportunities",
+            "rank_opportunities",
+            "select_batch",
+            "execute_batch",
+        ], f"replay stage sequence diverged from /run: {spy.calls}"
+        # FC-038: ONE positions snapshot for the whole cycle. Re-fetching
+        # between sizing and selection lets a fill land in between and produce
+        # a selection the sizing stage never sanctioned.
+        assert len(set(spy.positions_seen)) == 1, (
+            "the duplicate filter, ranking and selection did not share one "
+            "positions snapshot"
+        )
+        # options_buying_power wins over buying_power, as /run does.
+        assert spy.available_bp == 40_000.0
+        # Both sellers reach execution, or the call leg silently dies again
+        # (FC-048).
+        assert spy.put_seller is put_seller and spy.call_seller is call_seller
+
+    def test_the_day_loop_scans_on_production_defaults(self, falling_then_flat):
+        """Kills N2. ``/scan`` passes no ``max_results``; neither may the replay.
+
+        Asserted on the call arguments rather than on any outcome, because a
+        wider cap does not break a run — it quietly widens the candidate pool
+        every simulated day, which is a different strategy measured under the
+        same name.
+        """
+        from unittest.mock import patch
+
+        import src.backtesting.engine.simulator as simulator_module
+
+        days, closes, exps = falling_then_flat
+        put_calls, call_calls = [], []
+        real_cls = simulator_module.OptionsScanner
+
+        class RecordingScanner(real_cls):
+            def scan_for_put_opportunities(self, *args, **kwargs):
+                put_calls.append((args, kwargs))
+                return super().scan_for_put_opportunities(*args, **kwargs)
+
+            def scan_for_call_opportunities(self, *args, **kwargs):
+                call_calls.append((args, kwargs))
+                return super().scan_for_call_opportunities(*args, **kwargs)
+
+        with patch.object(simulator_module, "OptionsScanner", RecordingScanner):
+            result = _simulator("XYZ", closes, exps, days).run()
+
+        assert len(put_calls) == len(result.daily) > 0, "the put scan did not run daily"
+        assert len(call_calls) == len(result.daily), "the call scan did not run daily"
+        assert all(a == () and k == {} for a, k in put_calls), (
+            f"put scan was called with an override: "
+            f"{[c for c in put_calls if c != ((), {})][:3]}"
+        )
+        assert all(a == () and k == {} for a, k in call_calls), (
+            f"call scan was called with an override: "
+            f"{[c for c in call_calls if c != ((), {})][:3]}"
+        )
+
+
 class TestNoOpAnalytics:
     def test_records_calls_and_returns_none(self):
         w = NoOpAnalyticsWriter()

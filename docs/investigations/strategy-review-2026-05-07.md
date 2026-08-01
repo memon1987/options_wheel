@@ -1,4 +1,14 @@
 # Wheel Strategy Review — Senior Trader's Recommendations
+
+> **⚠️ Code references are past tense as of FC-068 (2026-08-01).** The recommendation
+> snippets below patch `call_seller.evaluate_covered_call_opportunity`, which this
+> project has **deleted** — it sat on the engine orchestration path production
+> abandoned on 2025-10-03, which is itself why several recommendations here were
+> implemented onto code that never ran (FC-029 R3's drawdown pause, most directly:
+> shipped, never executed in production, and deleted by FC-068 per FC-065 OQ-3 rather
+> than ported). The *analysis* — the −$9k share-loss cycles, the call-delta finding
+> that became FC-029 R1 — stands. The code locations do not.
+
 **Author:** Claude (analyst persona)
 **Date:** 2026-05-07
 **Scope:** Full strategy parameter audit + actionable recommendations

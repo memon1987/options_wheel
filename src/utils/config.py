@@ -4,7 +4,7 @@ import os
 import yaml
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 import structlog
 
 logger = structlog.get_logger(__name__)

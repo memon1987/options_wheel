@@ -1,5 +1,17 @@
 # Cost-Basis Floor Validation — 2026-05-08
 
+> **⚠️ Code references are past tense as of FC-068 (2026-08-01).** Every claim below
+> about `call_seller.evaluate_covered_call_opportunity` — that it is "the only
+> opportunity-builder that reads `stock_position['cost_basis']`", that AMZN cycle 1's
+> calls went through it, that the failure could be reproduced by tracing through it —
+> describes a function this project has **deleted**. The *finding* stands and was acted
+> on: FC-029 R2, then FC-050, then FC-065 Phase 1, which made the floor Alpaca's
+> `avg_entry_price` and moved it onto the live `/scan` path. The floor now lives in
+> `options_scanner.scan_for_call_opportunities` (scan-time) and
+> `call_seller.execute_call_sale` (execute-time, FC-050). Read this as the record of a
+> 2026-05 investigation, not as a map of current code.
+
+
 **Triggered by:** User question — "before we execute Phase 1 changes I want to validate the findings on cost basis floor. Confirm this is actually the case. We should be getting cost basis based on assignment price (static floor) vs the dynamic floor the analysis suggested."
 
 **Finding:** **The original strategy review's "dynamic erosion" hypothesis was wrong. The truth is more severe: the cost-basis floor is non-functional — Alpaca's `cost_basis` field returns 0 for stock positions acquired via option assignment, and both safety checks in the call-selling path are gated on `> 0`, so a 0 value trivially bypasses them.**
