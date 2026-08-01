@@ -786,7 +786,19 @@ class TestTheCallLegActuallyRuns:
         assert kinds.index("sell_call_open") > kinds.index("put_assignment")
 
     def test_no_call_is_sold_below_cost_basis(self, dip_then_recovering):
-        """Enabling the call leg must not enable selling below basis."""
+        """Enabling the call leg must not enable selling below basis.
+
+        Re-based by FC-068 from ``event.price`` (the strike, and the *cash*
+        number) onto ``detail['basis']`` (the premium-netted lot basis, and the
+        number the floor actually gates on). The two are deliberately different
+        now: netting the premium into ``event.price`` would double-count it in
+        every assigned cycle, so both ride the event explicitly.
+
+        Note this is the *weaker* of the two assertions after netting — the
+        netted basis is lower, so a strike passing here would also have passed
+        the old strike-based test. That is correct: the point is to assert the
+        floor production enforces, not a stricter one the backtest invented.
+        """
         days, closes, exps = dip_then_recovering
         result = _simulator("XYZ", closes, exps, days).run()
 
@@ -794,12 +806,44 @@ class TestTheCallLegActuallyRuns:
         calls = [e for e in result.broker.ledger if e.kind == "sell_call_open"]
         if not (assigns and calls):
             pytest.skip("covered by test_a_covered_call_is_sold_after_assignment")
-        basis = assigns[0].price
+        basis = assigns[0].detail["basis"]
+        assert basis < assigns[0].price, (
+            "basis is not premium-netted — FC-068's broker change is missing"
+        )
         for c in calls:
             strike = float(c.symbol[-8:]) / 1000.0
             assert strike >= basis, (
                 f"covered call struck at {strike} below cost basis {basis}"
             )
+
+    def test_attribution_conserves_through_a_full_netted_cycle(self, dip_then_recovering):
+        """The double-count guard for FC-068's premium netting.
+
+        `option_pnl` counts the put premium at `sell_to_open`; `stock_pnl` is
+        booked against the cycle's cost basis, which `metrics/cycles.py`
+        derives from `event.price`. If the netting had been pushed into
+        `event.price` or `cash_delta` instead of the lot basis, the premium
+        would be counted twice — once as option P&L, again through a lowered
+        stock basis — and the attribution would stop reconciling to the equity
+        change. That is exactly what this asserts.
+        """
+        days, closes, exps = dip_then_recovering
+        result = _simulator("XYZ", closes, exps, days).run()
+
+        cycles = build_cycles(result.broker.ledger)
+        assert any(c.called_away for c in cycles), (
+            "no completed wheel — the double-count would not be reachable"
+        )
+        report = compute_fitness(
+            "XYZ", result.daily, cycles, result.starting_cash,
+            benchmark_prices={d: closes[d] for d in days},
+            data_quality={"decision_days": len(result.daily)},
+        )
+        assert report.reconciliation_gap == pytest.approx(0.0, abs=0.01), (
+            f"attribution does not reconcile to the equity change "
+            f"(gap={report.reconciliation_gap}) — a premium double-count looks "
+            f"exactly like this"
+        )
 
     def test_no_opportunity_dies_at_the_router(self, dip_then_recovering):
         """Guards a half-fix: calls found but still rejected at execution."""

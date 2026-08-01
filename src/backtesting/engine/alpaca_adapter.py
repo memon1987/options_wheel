@@ -180,11 +180,11 @@ class BacktestAlpacaClient:
                     "market_value": market_value,
                     "cost_basis": basis * shares,
                     # FC-065: the covered-call floor reads this field, so the
-                    # simulated broker has to emit it too. Interim semantics,
-                    # accepted in writing in the plan: the backtest broker sets
-                    # assignment basis = strike (broker.py:_assign_put), NOT
-                    # premium-netted, so the simulated floor sits one put
-                    # premium above production's until FC-068 closes the gap.
+                    # simulated broker has to emit it too. FC-068 closed the
+                    # interim gap: `_assign_put` now books the lot at
+                    # `strike − put premium`, matching Alpaca's own
+                    # `avg_entry_price` semantics, so the simulated floor is
+                    # the production floor rather than one premium above it.
                     "avg_entry_price": basis,
                     "unrealized_pl": market_value - basis * shares,
                     "asset_class": "us_equity",

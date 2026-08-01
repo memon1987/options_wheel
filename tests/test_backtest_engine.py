@@ -7,7 +7,7 @@ removed in Phase 0. This is the rebuilt kernel's suite.)
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
 import pytest
 
@@ -86,9 +86,11 @@ class TestPutLifecycle:
         b.settle_expirations(EXP, {"XYZ": 85.0})  # below strike -> assigned
         assert not b.options
         assert b.shares("XYZ") == 100
-        assert b.average_cost_basis("XYZ") == pytest.approx(90.0)
-        assert b.cash == pytest.approx(cash_after_open - 9000.0)  # bought 100 @ 90
+        # CASH moves at the strike: 100 shares × $90.
+        assert b.cash == pytest.approx(cash_after_open - 9000.0)
         assert b.reserved_collateral == 0.0
+        # BASIS is premium-netted (FC-068) — see the class below.
+        assert b.average_cost_basis("XYZ") == pytest.approx(89.0)
 
     def test_itm_threshold_penny(self):
         # Exactly 1 cent ITM -> assigned; 0.9 cent ITM -> worthless.
@@ -101,6 +103,99 @@ class TestPutLifecycle:
         b2.sell_put_to_open("A", "A", 90.0, EXP, 1, 1.0, 0.9, D0)
         b2.settle_expirations(EXP, {"A": 89.991})  # 0.009 ITM -> not assigned
         assert b2.shares("A") == 0
+
+
+class TestAssignmentBasisIsPremiumNetted:
+    """FC-068 §7 — the backtest floor was one put premium above production's.
+
+    Production's covered-call floor is Alpaca's ``avg_entry_price``, which for
+    an assigned lot is ``strike − the assigning put's premium`` (verified to
+    the penny on all four live lots, FC-065 Phase 1). The broker booked the lot
+    at the bare strike, and the adapter derives ``avg_entry_price`` from lot
+    basis — so every replay gated covered calls one premium too high. On IWM's
+    $1 strike grid that is a full rung, and IWM is in the six-symbol effective
+    universe.
+
+    Every test in this class FAILS against the pre-FC-068 broker.
+    """
+
+    def test_assignment_basis_is_premium_netted(self):
+        b = _broker(100_000.0, fill_haircut=0.0)
+        b.sell_put_to_open("XYZ_P90", "XYZ", 90.0, EXP, 1, mark=1.50, bid=1.40, opened=D0)
+        b.settle_expirations(EXP, {"XYZ": 85.0})
+
+        assert b.average_cost_basis("XYZ") == pytest.approx(88.50)   # 90 − 1.50
+
+    def test_the_adapter_reports_the_netted_basis_as_avg_entry_price(self):
+        """The floor reads `avg_entry_price` off the adapter, not the broker,
+        so netting the lot without the adapter surfacing it changes nothing."""
+        from src.backtesting.engine.alpaca_adapter import BacktestAlpacaClient
+
+        b = _broker(100_000.0, fill_haircut=0.0)
+        b.sell_put_to_open("XYZ_P90", "XYZ", 90.0, EXP, 1, mark=1.50, bid=1.40, opened=D0)
+        b.settle_expirations(EXP, {"XYZ": 85.0})
+
+        client = BacktestAlpacaClient(b, chains={}, stock_bars={})
+        with time_seam.frozen(datetime.combine(EXP, time(16, 0))):
+            equity = [p for p in client.get_positions()
+                      if p["asset_class"] == "us_equity"]
+        assert len(equity) == 1
+        assert float(equity[0]["avg_entry_price"]) == pytest.approx(88.50)
+
+    def test_the_haircut_premium_is_what_nets(self):
+        """The netting uses the fill this engine actually modelled, not the
+        mid — consistent with the cash the ledger credited at open."""
+        b = _broker(100_000.0, fill_haircut=1.0)     # fill at the bid
+        fill = b.sell_put_to_open("XYZ_P90", "XYZ", 90.0, EXP, 1,
+                                  mark=1.50, bid=1.00, opened=D0)
+        assert fill == pytest.approx(1.00)
+        b.settle_expirations(EXP, {"XYZ": 85.0})
+
+        assert b.average_cost_basis("XYZ") == pytest.approx(89.00)
+
+    def test_multi_lot_weighting_is_the_brokers_weighted_average(self):
+        """Alpaca averages across lots; so must this. Two assignments at
+        different strikes and different premiums."""
+        b = _broker(100_000.0, fill_haircut=0.0)
+        b.sell_put_to_open("A_P90", "A", 90.0, EXP, 1, mark=1.00, bid=0.9, opened=D0)
+        b.settle_expirations(EXP, {"A": 85.0})
+        exp2 = EXP + timedelta(days=7)
+        b.sell_put_to_open("A_P80", "A", 80.0, exp2, 2, mark=2.00, bid=1.9, opened=D0)
+        b.settle_expirations(exp2, {"A": 70.0})
+
+        assert b.shares("A") == 300
+        # (100 × 89.00 + 200 × 78.00) / 300
+        assert b.average_cost_basis("A") == pytest.approx((89.0 + 2 * 78.0) / 3)
+
+    def test_the_cash_ledger_still_moves_at_the_strike(self):
+        """The ledger event is the load-bearing half of the split contract:
+        `metrics/cycles.py`, `metrics/fitness.py` and `reporting/report.py` all
+        derive the cycle's cost basis from `event.price`, while `option_pnl`
+        separately counts the put premium. Netting the premium into `price` or
+        `cash_delta` double-counts it in every assigned cycle."""
+        b = _broker(100_000.0, fill_haircut=0.0)
+        b.sell_put_to_open("XYZ_P90", "XYZ", 90.0, EXP, 1, mark=1.50, bid=1.40, opened=D0)
+        cash_after_open = b.cash
+        b.settle_expirations(EXP, {"XYZ": 85.0})
+
+        event = [e for e in b.ledger if e.kind == "put_assignment"][0]
+        assert event.price == pytest.approx(90.0)
+        assert event.cash_delta == pytest.approx(-9000.0)
+        assert b.cash == pytest.approx(cash_after_open - 9000.0)
+        # Both numbers are on the event, explicitly, so a reader never has to
+        # guess which one it is holding.
+        assert event.detail["strike"] == pytest.approx(90.0)
+        assert event.detail["basis"] == pytest.approx(88.50)
+
+    def test_a_premium_at_or_above_the_strike_falls_back_to_the_strike(self):
+        """Not a real fill, but a zero or negative basis would silently DISABLE
+        the covered-call floor: `find_suitable_calls` warns and carries on when
+        `min_strike_price <= 0`. Fail toward protection."""
+        b = _broker(100_000.0, fill_haircut=0.0)
+        b.sell_put_to_open("XYZ_P5", "XYZ", 5.0, EXP, 1, mark=5.0, bid=5.0, opened=D0)
+        b.settle_expirations(EXP, {"XYZ": 1.0})
+
+        assert b.average_cost_basis("XYZ") == pytest.approx(5.0)
 
 
 # --------------------------------------------------------------------------- #
