@@ -535,6 +535,54 @@ class TestNoProductionSideEffects:
                 'XYZ', 100) is None
         mock_client.assert_not_called()
 
+    def test_the_live_failed_symbol_set_is_restored_after_a_replay(self, falling_then_flat):
+        """`/backtest/screen` lives on the LIVE trading server (disabled by
+        default, opt-in via ENABLE_SCREEN_ENDPOINT). ExecutionEngine's
+        `_failed_symbols` is a module global, so an in-server replay clearing it
+        would wipe the non-retryable set `/run` depends on — and it also leaked
+        across the 14 sequential per-symbol runs of a screen.
+
+        The set is also NOT the replay's to inherit: a live non-retryable symbol
+        must not suppress a simulated one."""
+        from src.strategy.execution_engine import (
+            clear_failed_symbols, get_failed_symbols)
+
+        days, closes, exps = falling_then_flat
+        clear_failed_symbols()
+        get_failed_symbols().add("LIVE_SENTINEL_240607P00090000")
+        try:
+            _simulator("XYZ", closes, exps, days).run()
+            assert "LIVE_SENTINEL_240607P00090000" in get_failed_symbols(), (
+                "the replay wiped the live non-retryable set"
+            )
+        finally:
+            clear_failed_symbols()
+
+    def test_failed_symbols_are_cleared_each_simulated_day(self, falling_then_flat):
+        """Production's `_failed_symbols` clears roughly daily (Cloud Run cold
+        start). Clearing once per RUN instead would let a day-1 non-retryable
+        failure suppress a symbol for a months-long window — a divergence from
+        production, not fidelity to it."""
+        from unittest.mock import patch
+
+        import src.backtesting.engine.simulator as simulator_module
+
+        days, closes, exps = falling_then_flat
+        clears = []
+        real = simulator_module.clear_failed_symbols
+
+        def counting():
+            clears.append(1)
+            return real()
+
+        with patch.object(simulator_module, "clear_failed_symbols", counting):
+            result = _simulator("XYZ", closes, exps, days).run()
+
+        assert len(clears) == len(result.daily), (
+            f"expected one clear per simulated day ({len(result.daily)}), "
+            f"got {len(clears)} — a once-per-run clear is not production's cadence"
+        )
+
     def test_scanner_bigquery_stays_enabled_by_default(self):
         """The gate must not leak into production. ``/scan`` constructs
         ``OptionsScanner(alpaca_client, market_data, config)`` with no keyword,
