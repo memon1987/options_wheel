@@ -12,6 +12,23 @@ from ..utils.config import Config
 from ..utils.logging_events import log_performance_metric, log_error_event
 from ..utils.positions import get_stock_positions
 from ..strategy.cost_basis import CostBasisResolver, SOURCE_DIVERGENT
+from .decision_record import (
+    OUTCOME_BLOCKED,
+    OUTCOME_NOT_ELIGIBLE,
+    OUTCOME_NO_CANDIDATES,
+    REASON_FLOOR_DIVERGENT,
+    REASON_FLOOR_UNRESOLVED,
+    REASON_INSUFFICIENT_SHARES,
+    REASON_NO_QUALIFYING_STRIKES,
+    REASON_QUOTE_UNAVAILABLE,
+    STAGE_SCAN,
+    DecisionRecorder,
+    UncoveredDaysResolver,
+    covered_underlyings,
+    mint_run_id,
+    position_mark_price,
+    underwater_pct,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -36,6 +53,10 @@ class OptionsScanner:
         self.cost_basis_resolver = CostBasisResolver(
             alpaca_client, config, allow_bigquery=True
         )
+        # FC-065 Phase 4: the `uncovered_days` label. One batched BigQuery
+        # query per scan for every held symbol, behind its own patchable
+        # chokepoint (see tests/conftest.py).
+        self.uncovered_days_resolver = UncoveredDaysResolver()
 
     def scan_for_put_opportunities(self, max_results: int = 10) -> List[Dict[str, Any]]:
         """Scan for cash-secured put opportunities across all configured stocks.
@@ -104,30 +125,59 @@ class OptionsScanner:
             )
             return []
     
-    def scan_for_call_opportunities(self, max_results: int = 10) -> List[Dict[str, Any]]:
+    def scan_for_call_opportunities(self, max_results: int = 10,
+                                    run_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Scan for covered call opportunities on assigned stock positions.
-        
+
         Args:
             max_results: Maximum number of opportunities to return
-            
+            run_id: FC-065 Phase 4 — the identifier joining this scan to the
+                ``/run`` that executes from its blob. ``/scan`` mints it and
+                passes it here; a caller that omits it (the CLI ``--command
+                scan``) gets a self-contained one so its decisions are still
+                recorded, they just have no execution stage to join to.
+
         Returns:
             List of call opportunities sorted by attractiveness
         """
+        recorder: Optional[DecisionRecorder] = None
+        recorded_symbols: List[str] = []
         try:
             logger.info("Scanning for covered call opportunities")
-            
+
             opportunities = []
-            
+
             # Get current stock positions
             positions = self.alpaca.get_positions()
             stock_positions = get_stock_positions(positions)
-            
+
+            # FC-065 Phase 4: one decision record per held symbol per cycle.
+            # The scan stage writes the row for every symbol IT terminates
+            # (not eligible / blocked / no candidates); symbols that produced
+            # candidates are terminated by /run instead, so a held symbol with
+            # no row at all for a scan-hour means the cycle did not complete —
+            # which is the point of the fill-rate check.
+            recorder = DecisionRecorder(run_id or mint_run_id(), STAGE_SCAN)
+            held_symbols = [p['symbol'] for p in stock_positions]
+            uncovered_days = self.uncovered_days_resolver.resolve(
+                held_symbols, covered_underlyings(positions)
+            )
+
             for position in stock_positions:
                 symbol = position['symbol']
                 shares = int(float(position['qty']))
+                mark_price = position_mark_price(position)
+                labels = {
+                    'shares': shares,
+                    'current_price': mark_price,
+                    'uncovered_days': uncovered_days.get(symbol),
+                }
 
                 # Only consider positions with at least 100 shares
                 if shares < 100:
+                    recorder.record(symbol, OUTCOME_NOT_ELIGIBLE,
+                                    REASON_INSUFFICIENT_SHARES, **labels)
+                    recorded_symbols.append(symbol)
                     continue
 
                 # CRITICAL: Resolve cost basis per share for protection.
@@ -161,6 +211,12 @@ class OptionsScanner:
                                    tolerance=cross_check.get('tolerance'),
                                    reconstructed_shares=cross_check.get('reconstructed_shares'),
                                    reason=cross_check.get('reason'))
+                    recorder.record(symbol, OUTCOME_BLOCKED, REASON_FLOOR_DIVERGENT,
+                                    cost_basis_per_share=resolution.get('broker_basis'),
+                                    underwater=underwater_pct(
+                                        mark_price, resolution.get('broker_basis')),
+                                    **labels)
+                    recorded_symbols.append(symbol)
                     continue
 
                 # FAIL CLOSED on an unresolved cost basis. This floor is the
@@ -176,6 +232,10 @@ class OptionsScanner:
                                    shares=shares,
                                    cost_basis=raw_cost_basis,
                                    avg_entry_price=resolution.get('broker_basis'))
+                    recorder.record(symbol, OUTCOME_BLOCKED, REASON_FLOOR_UNRESOLVED,
+                                    cost_basis_per_share=cost_basis_per_share,
+                                    **labels)
+                    recorded_symbols.append(symbol)
                     continue
 
                 # FC-065: the cross-check's verdict is logged on every scan of
@@ -205,14 +265,59 @@ class OptionsScanner:
                             symbol=symbol,
                             cost_basis_per_share=cost_basis_per_share,
                             calls_found=len(calls))
-                
+
+                floor_labels = dict(labels)
+                floor_labels['cost_basis_per_share'] = cost_basis_per_share
+                floor_labels['underwater'] = underwater_pct(
+                    mark_price, cost_basis_per_share)
+
+                if not calls:
+                    # THE "nothing happened" CASE. Before this record, an
+                    # underwater symbol simply produced no output anywhere —
+                    # NVDA has ended every scan since 07-30 at
+                    # `stage_8_complete_not_found` and nothing downstream said
+                    # so. It is now a labelled row.
+                    recorder.record(symbol, OUTCOME_NO_CANDIDATES,
+                                    REASON_NO_QUALIFYING_STRIKES,
+                                    candidates=0,
+                                    reason_counts=self._symbol_rejection_counts(symbol),
+                                    **floor_labels)
+                    recorded_symbols.append(symbol)
+                    continue
+
+                created = 0
                 for call in calls[:3]:  # Top 3 calls per position
                     opportunity = self._create_call_opportunity(
                         call, position, cost_basis_per_share
                     )
                     if opportunity:
                         opportunities.append(opportunity)
-            
+                        created += 1
+
+                if created == 0:
+                    # The chain had qualifying strikes but none survived
+                    # opportunity construction — today that means the stock
+                    # quote was unusable (fail-closed, FC-065 Phase 1).
+                    recorder.record(symbol, OUTCOME_NO_CANDIDATES,
+                                    REASON_QUOTE_UNAVAILABLE,
+                                    candidates=0,
+                                    reason_counts=self._symbol_rejection_counts(symbol),
+                                    **floor_labels)
+                    recorded_symbols.append(symbol)
+                    continue
+
+                # Terminated by /run, not here. Logged so the hand-off is
+                # visible even when /run never happens.
+                logger.info("Decision deferred to execution stage",
+                            event_category="system",
+                            event_type="decision_record_deferred",
+                            run_id=recorder.run_id,
+                            symbol=symbol,
+                            candidates=created,
+                            uncovered_days=labels['uncovered_days'],
+                            underwater_pct=floor_labels['underwater'])
+
+
             # Sort by overall attractiveness score
             opportunities.sort(key=lambda x: x.get('attractiveness_score', 0), reverse=True)
 
@@ -247,7 +352,41 @@ class OptionsScanner:
                 scan_type="call"
             )
             return []
-    
+        finally:
+            # Flush in `finally`, not on the happy path: a scan that dies
+            # halfway still knows what it decided about the symbols it got
+            # to, and losing that is losing exactly the cycles worth
+            # investigating.
+            if recorder is not None:
+                recorder.flush(expected_symbols=recorded_symbols)
+
+    @staticmethod
+    def _call_rejection_counts(stats: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+        """Non-zero chain-rejection counts from a stats dict, or ``{}``.
+
+        Defensive about the shape because ``market_data`` is a ``MagicMock``
+        in much of the suite, where attribute access returns another mock
+        rather than raising.
+        """
+        counts = stats if isinstance(stats, dict) else {}
+        out: Dict[str, int] = {}
+        for key, value in counts.items():
+            if key == 'total_rejected':
+                continue
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                out[str(key)] = count
+        return out
+
+    def _symbol_rejection_counts(self, symbol: str) -> Dict[str, int]:
+        """Look up ``symbol``'s last chain-rejection breakdown from market data."""
+        published = getattr(self.market_data, 'last_call_rejection_stats', None)
+        stats = published.get(symbol) if isinstance(published, dict) else None
+        return self._call_rejection_counts(stats)
+
     def scan_all_opportunities(self) -> Dict[str, List[Dict[str, Any]]]:
         """Scan for both put and call opportunities.
         

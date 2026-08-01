@@ -1328,3 +1328,76 @@ class TestEventsCarryUnambiguousPremiumUnits:
         assert drop["premium_per_share"] == pytest.approx(0.755)
         assert drop["total_premium"] is None
         assert drop["contracts"] is None
+
+
+class TestDropReasonsAreExposedForTheDecisionRecord:
+    """FC-065 Phase 4: `/run` needs to say WHY a symbol was not traded.
+
+    The reasons already existed on the `selection_dropped` log event, which
+    lives only in Cloud Logging's 30-day window (the BigQuery sink died —
+    FC-046). They are now also published on the engine so the durable
+    decision record can carry them, from the single `_log_drop` chokepoint
+    that both ranking and selection already share.
+    """
+
+    def setup_method(self):
+        self.alpaca = Mock()
+        self.engine = ExecutionEngine(self.alpaca, Mock(spec=Config))
+        self.engine.logger = Mock()
+        self.put_seller = Mock(spec=PutSeller)
+        self.put_seller._calculate_position_size.return_value = {"contracts": 1}
+
+    def test_starts_empty(self):
+        assert self.engine.last_drop_reasons == {}
+
+    def test_a_ranking_drop_is_published(self):
+        self.alpaca.get_positions.return_value = []
+
+        self.engine.rank_opportunities(
+            [_call("AAPL", 337.5)], self.put_seller, 0.0)
+
+        assert self.engine.last_drop_reasons == {
+            "AAPL": "insufficient_available_shares"}
+
+    def test_a_selection_drop_is_published(self):
+        self.alpaca.get_positions.return_value = [_equity("AAPL", 200)]
+
+        ranked = self.engine.rank_opportunities(
+            [_call("AAPL", 337.5, score=87.2), _call("AAPL", 340.0, score=87.1)],
+            self.put_seller, 0.0)
+        self.engine.select_batch(ranked, 0.0)
+
+        assert self.engine.last_drop_reasons == {"AAPL": "duplicate_underlying"}
+
+    def test_a_positions_outage_is_not_reported_as_no_shares(self):
+        # The two demand opposite responses; the decision record must be able
+        # to tell them apart just as the log event can.
+        self.alpaca.get_positions.side_effect = Exception("broker down")
+
+        self.engine.rank_opportunities(
+            [_call("AAPL", 337.5)], self.put_seller, 0.0)
+
+        assert self.engine.last_drop_reasons == {"AAPL": "positions_unavailable"}
+
+    def test_a_selected_symbol_has_no_drop_reason(self):
+        self.alpaca.get_positions.return_value = [_equity("AAPL", 100)]
+
+        ranked = self.engine.rank_opportunities(
+            [_call("AAPL", 337.5)], self.put_seller, 0.0)
+        selected, _ = self.engine.select_batch(ranked, 0.0)
+
+        assert len(selected) == 1
+        assert self.engine.last_drop_reasons == {}
+
+    def test_a_new_cycle_does_not_inherit_the_previous_one(self):
+        """Last hour's reason reported as this hour's decision is a lie."""
+        self.alpaca.get_positions.return_value = []
+        self.engine.rank_opportunities(
+            [_call("AAPL", 337.5)], self.put_seller, 0.0)
+        assert self.engine.last_drop_reasons
+
+        self.alpaca.get_positions.return_value = [_equity("MSFT", 100)]
+        self.engine.rank_opportunities(
+            [_call("MSFT", 400.0)], self.put_seller, 0.0)
+
+        assert "AAPL" not in self.engine.last_drop_reasons

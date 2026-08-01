@@ -30,7 +30,10 @@ def test_managed_table_set_is_explicit():
         assert _SCHEMAS == {}
         return
 
-    assert set(_SCHEMAS) == {"errors", "executions", "wheel_cycles"}, (
+    # `decision_events` added deliberately by FC-065 Phase 4. Auto-creation on
+    # the next cold start IS the bootstrap — no manual `bq mk` step.
+    assert set(_SCHEMAS) == {"errors", "executions", "wheel_cycles",
+                             "decision_events"}, (
         f"managed analytics tables changed: {sorted(_SCHEMAS)}. Each key here is "
         "auto-created in BigQuery on service start — update this test "
         "deliberately if that is intended."

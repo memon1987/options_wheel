@@ -719,3 +719,219 @@ class TestOptionsScannerScanAll:
         # so scan_all should still succeed
         assert 'puts' in result
         assert result['puts'] == []
+
+
+class TestScanStageDecisionRecords:
+    """FC-065 Phase 4: every held symbol gets a decision, every cycle.
+
+    Before this, an underwater symbol produced *silence* — NVDA has ended
+    every scan since 2026-07-30 at `stage_8_complete_not_found` with nothing
+    downstream saying so. The acceptance test for this phase is that the
+    silence becomes a labelled row.
+    """
+
+    def setup_method(self):
+        self.mock_alpaca = Mock()
+        self.mock_market_data = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.call_target_dte = 7
+
+        self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                                      self.mock_config)
+        # Deterministic label: the hermeticity fixture already forces the
+        # BigQuery chokepoint to "no comparison"; tests that care inject one.
+        self.scanner.uncovered_days_resolver._lookup_uncovered_days = (
+            lambda symbols: {s: 9 for s in symbols})
+        self.mock_market_data.last_call_rejection_stats = {}
+        self.mock_market_data.get_stock_metrics.return_value = {'current_price': 199.0}
+
+    # -- helpers ---------------------------------------------------- #
+
+    @staticmethod
+    def _nvda(qty=100, avg_entry_price='218.43', market_value='19900.0'):
+        return {
+            'symbol': 'NVDA', 'qty': str(qty), 'cost_basis': '21843.0',
+            'avg_entry_price': avg_entry_price, 'market_value': market_value,
+            'asset_class': 'us_equity', 'side': 'long',
+        }
+
+    def _rows(self, run_id="20260803T140000Z-abcdef12", **kw):
+        captured = []
+        with patch('src.data.decision_record.DecisionRecorder.flush',
+                   autospec=True,
+                   side_effect=lambda self, **_: captured.extend(self.rows)):
+            self.scanner.scan_for_call_opportunities(run_id=run_id, **kw)
+        return captured
+
+    # -- the acceptance test ---------------------------------------- #
+
+    def test_the_nothing_happened_case_produces_a_labelled_row(self):
+        """NVDA's silent exclusion becomes a row — the phase's acceptance test."""
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.mock_market_data.find_suitable_calls.return_value = []
+        self.mock_market_data.last_call_rejection_stats = {
+            'NVDA': {'below_cost_basis': 41, 'delta_out_of_range': 0,
+                     'premium_too_low': 2, 'total_rejected': 43},
+        }
+
+        rows = self._rows()
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['symbol'] == 'NVDA'
+        assert row['outcome'] == 'no_candidates'
+        assert row['reason'] == 'no_qualifying_strikes'
+        assert row['candidates'] == 0
+        assert row['cost_basis_per_share'] == 218.43
+        # Both legibility labels present and meaningful.
+        assert row['underwater_pct'] == pytest.approx(-0.088953, abs=1e-6)
+        assert row['uncovered_days'] == 9
+        # The chain breakdown rides along as a REPEATED record, and the
+        # meaningless roll-up is not one of its entries.
+        assert row['reason_counts'] == [
+            {'reason': 'below_cost_basis', 'count': 41},
+            {'reason': 'premium_too_low', 'count': 2},
+        ]
+
+    def test_under_100_shares_is_recorded_not_just_skipped(self):
+        self.mock_alpaca.get_positions.return_value = [
+            self._nvda(qty=50, market_value='9950.0')]
+
+        rows = self._rows()
+
+        assert [(r['outcome'], r['reason']) for r in rows] == [
+            ('not_eligible', 'insufficient_shares')]
+        assert rows[0]['shares'] == 50
+
+    def test_an_unresolved_floor_is_recorded_as_blocked(self):
+        self.mock_alpaca.get_positions.return_value = [
+            self._nvda(avg_entry_price='0')]
+
+        rows = self._rows()
+
+        assert [(r['outcome'], r['reason']) for r in rows] == [
+            ('blocked', 'floor_unresolved')]
+
+    def test_a_divergent_cross_check_is_recorded_as_blocked(self):
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.scanner.cost_basis_resolver._lookup_assignment_basis = (
+            lambda symbol, shares_held: {
+                'expected_basis_per_share': 300.0, 'reconstructed_shares': 100})
+
+        rows = self._rows()
+
+        assert [(r['outcome'], r['reason']) for r in rows] == [
+            ('blocked', 'floor_divergent')]
+
+    def test_a_symbol_with_candidates_is_deferred_to_the_run_stage(self):
+        """Its terminal verdict is `sold`/`dropped`, which only /run knows."""
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.mock_market_data.find_suitable_calls.return_value = [{
+            'symbol': 'NVDA260807C00230000', 'strike_price': 230.0,
+            'expiration_date': '2026-08-07', 'dte': 7, 'delta': 0.18,
+            'mid_price': 1.20, 'bid': 1.15, 'ask': 1.25,
+            'volume': 900, 'open_interest': 3000, 'implied_volatility': 0.4,
+        }]
+
+        rows = self._rows()
+
+        assert rows == []
+
+    def test_a_dead_quote_records_no_candidates_rather_than_vanishing(self):
+        # The chain HAD qualifying strikes; opportunity construction failed
+        # closed on an unusable quote (Phase 1). That must not be silence.
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.mock_market_data.find_suitable_calls.return_value = [{
+            'symbol': 'NVDA260807C00230000', 'strike_price': 230.0,
+            'expiration_date': '2026-08-07', 'dte': 7, 'delta': 0.18,
+            'mid_price': 1.20, 'bid': 1.15, 'ask': 1.25,
+            'volume': 900, 'open_interest': 3000, 'implied_volatility': 0.4,
+        }]
+        self.mock_market_data.get_stock_metrics.return_value = {'current_price': 0}
+
+        rows = self._rows()
+
+        assert [(r['outcome'], r['reason']) for r in rows] == [
+            ('no_candidates', 'quote_unavailable')]
+
+    def test_every_held_symbol_gets_exactly_one_row(self):
+        self.mock_alpaca.get_positions.return_value = [
+            self._nvda(),
+            {'symbol': 'AAPL', 'qty': '100', 'cost_basis': '30350.0',
+             'avg_entry_price': '303.50', 'market_value': '31000.0',
+             'asset_class': 'us_equity', 'side': 'long'},
+            {'symbol': 'F', 'qty': '40', 'cost_basis': '400.0',
+             'avg_entry_price': '10.0', 'market_value': '440.0',
+             'asset_class': 'us_equity', 'side': 'long'},
+        ]
+        self.mock_market_data.find_suitable_calls.return_value = []
+
+        rows = self._rows()
+
+        assert sorted(r['symbol'] for r in rows) == ['AAPL', 'F', 'NVDA']
+        assert len({r['dedup_key'] for r in rows}) == 3
+
+    def test_all_rows_carry_the_run_id_they_were_given(self):
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.mock_market_data.find_suitable_calls.return_value = []
+
+        rows = self._rows(run_id="20260803T150000Z-99887766")
+
+        assert rows[0]['run_id'] == "20260803T150000Z-99887766"
+        assert rows[0]['dedup_key'] == "20260803T150000Z-99887766|NVDA|scan"
+        assert rows[0]['stage'] == 'scan'
+        assert rows[0]['endpoint'] == '/scan'
+
+    def test_a_covered_symbol_reports_zero_uncovered_days(self):
+        # An open short call on the underlying means covered TODAY, answered
+        # from the positions snapshot without a BigQuery round trip.
+        self.mock_alpaca.get_positions.return_value = [
+            self._nvda(),
+            {'symbol': 'NVDA260807C00230000', 'qty': '-1',
+             'asset_class': 'us_option', 'side': 'short', 'market_value': '-120.0'},
+        ]
+        self.mock_market_data.find_suitable_calls.return_value = []
+        self.scanner.uncovered_days_resolver._lookup_uncovered_days = (
+            lambda symbols: (_ for _ in ()).throw(
+                AssertionError("must not query for a covered symbol")))
+
+        rows = self._rows()
+
+        assert rows[0]['uncovered_days'] == 0
+
+    def test_an_underivable_uncovered_days_is_null_not_zero(self):
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.mock_market_data.find_suitable_calls.return_value = []
+        self.scanner.uncovered_days_resolver._lookup_uncovered_days = (
+            lambda symbols: None)
+
+        rows = self._rows()
+
+        assert rows[0]['uncovered_days'] is None
+
+    def test_records_survive_a_scan_that_dies_partway(self):
+        # A cycle that crashed is exactly the cycle worth investigating; the
+        # rows it did produce must not die with it.
+        self.mock_alpaca.get_positions.return_value = [
+            self._nvda(qty=50, market_value='9950.0'), self._nvda()]
+        self.mock_market_data.find_suitable_calls.side_effect = Exception("chain down")
+
+        rows = self._rows()
+
+        assert [r['symbol'] for r in rows] == ['NVDA']
+        assert rows[0]['outcome'] == 'not_eligible'
+
+    def test_a_scan_without_a_run_id_still_records_under_a_minted_one(self):
+        from src.data.decision_record import is_run_id
+
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.mock_market_data.find_suitable_calls.return_value = []
+
+        captured = []
+        with patch('src.data.decision_record.DecisionRecorder.flush',
+                   autospec=True,
+                   side_effect=lambda self, **_: captured.extend(self.rows)):
+            self.scanner.scan_for_call_opportunities()
+
+        assert len(captured) == 1
+        assert is_run_id(captured[0]['run_id'])
