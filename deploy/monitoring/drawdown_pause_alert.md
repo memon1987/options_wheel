@@ -238,19 +238,87 @@ gcloud logging read \
   --limit=5 --freshness=2d --format="value(timestamp,jsonPayload.event_type,jsonPayload.symbol)"
 
 # 2. Confirm the healthy-path counterpart IS present, which proves the scan is
-#    reaching the cross-check on every held symbol every scan.
+#    reaching the cross-check. Every held symbol with >=100 shares that was
+#    NOT skipped emits one of these per scan.
 gcloud logging read \
   'resource.labels.service_name="options-wheel-strategy" AND jsonPayload.event_type="cost_basis_cross_check"' \
-  --limit=10 --freshness=1d --format="value(timestamp,jsonPayload.symbol,jsonPayload.status)"
+  --limit=10 --freshness=1d \
+  --format="value(timestamp,jsonPayload.symbol,jsonPayload.status,jsonPayload.basis_delta)"
 ```
 
 If step 2 returns nothing, the alert is watching a path that never runs —
 treat that as a broken alert, not a quiet book (the FC-006 failure mode).
 
+**Read the `status`, not just the presence of the row.** Every held symbol
+should show `status=ok` with a non-null `basis_delta`. A row saying
+`status=unavailable` means the cross-check did not actually compare anything —
+see "Blind spot" below. A book of `unavailable` rows looks identical to a
+healthy book if you only check that the event exists.
+
 **Triage when it fires:** compare the logged `broker_basis` / `expected_basis`
 against the Alpaca UI position and the symbol's OPASN rows in
 `options_wheel.trades_from_activities`. Do **not** lower the floor to unblock
 writing — the floor blocking a write is the control working.
+
+### Divergence triage: "the broker is right, the history is wrong"
+
+A divergence does **not** imply the broker's number is wrong. Three benign
+causes are known, and all three present as a standing divergence on one symbol:
+
+- **(a) Multi-lot partial call-away — the most likely one.** Alpaca's
+  `avg_entry_price` is an *entry* average and is **not recomputed when shares
+  are partially disposed of**, while the cross-check's reconstruction prices
+  the newest remaining lots (FIFO-shaped). After a partial call-away out of a
+  multi-lot position the two therefore measure different things, and the gap is
+  roughly the **spread between the lot bases** — persisting until the position
+  fully cycles out. Expected, safe in direction (the broker's average is the
+  looser number; blocking is conservative), and a false alarm. Pinning the
+  exact semantics is **FC-070**.
+- **(b) A stock split Alpaca adjusted correctly** while the OPASN strikes in
+  `trades_from_activities` remain unadjusted. The reconstruction is then
+  pre-split and the broker post-split, so the ratio between `broker_basis` and
+  `expected_basis` is the split ratio — a clean tell.
+- **(c) Multi-fill sell-to-open.** The derivation uses the **last** fill's
+  price as the put premium (plan-specified); a lot opened across fills at
+  materially different prices can exceed tolerance. Zero instances in the 640
+  historical fills at the time of writing, so treat this as the last hypothesis,
+  not the first.
+
+**If the broker is confirmed right** (verified against the position in the
+Alpaca UI), the sanctioned unblock is to fix the *history*, never the floor:
+
+1. Write synthetic corrective rows into `trades_from_activities` under the
+   repo's prefix-tagging discipline — a stable `synthetic-fc-NNN-` identifier,
+   an audit query, and a rollback recipe, all documented in a plan file (see
+   `~/CLAUDE.md` §"Synthetic / corrective data writes", and FC-021 / FC-025 for
+   precedents); **or**
+2. Accept the divergence in writing as an FC entry, if the correction is not
+   worth making.
+
+**Never** lower the tolerance, bypass the cross-check, or hand-edit the floor in
+code to clear a divergence. That converts a working control into a silent one,
+which is the failure mode this whole layer exists to end.
+
+**If ALL held symbols diverge at once**, do not triage four symbols
+individually — suspect a **systemic netting-semantics change**: a broker-side
+change to how `avg_entry_price` is reported, or a live-account cutover with a
+different convention. One cause, one fix; per-symbol data corruption does not
+arrive simultaneously across the book.
+
+### Blind spot: a broken cross-check is silent
+
+A cross-check that cannot run — BigQuery schema drift, revoked permissions, a
+SQL error, an outage — degrades **every** scan to `status=unavailable`, which
+keeps the broker's floor and lets trading continue. That is deliberate
+(availability of the check must not gate the book), but it means the *control*
+can be dead while the *alert* stays quiet: the failure is logged as
+`cost_basis_cross_check_unavailable` / `cost_basis_cross_check_lookup_failed`
+and **is not alerted on**.
+
+Until an alert on *persistent* `unavailable` exists (a follow-up, deliberately
+not in FC-065 Phase 1), check it by hand periodically — the fire-drill query in
+step 2 above is the check: every held symbol should show `status=ok`, not
+`unavailable`.
 
 ---
 
