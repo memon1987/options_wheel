@@ -28,12 +28,12 @@ class CallSeller:
             market_data: Market data manager
             config: Configuration instance
             wheel_state_manager: Optional WheelStateManager for tracking active call details
-            allow_bigquery_cost_basis: whether the cost-basis floor may fall back
-                to a BigQuery OPASN lookup. A backtest passes False: the
-                wheel-state path (first in the resolution chain) always holds the
-                simulated assignment strike, and this fallback would otherwise
-                query *production* trade history — against CURRENT_TIMESTAMP() —
-                mixing real assignments into a simulated run.
+            allow_bigquery_cost_basis: whether the cost-basis divergence
+                cross-check may query BigQuery. A backtest passes False: the
+                cross-check would otherwise read *production* trade history —
+                against CURRENT_TIMESTAMP() — mixing real assignments into a
+                simulated run. With it off the cross-check is "unavailable",
+                which keeps the simulated broker's floor (FC-065).
         """
         self.alpaca = alpaca_client
         self.market_data = market_data
@@ -43,17 +43,16 @@ class CallSeller:
         # took its own copy, so mutating this attribute afterwards changes nothing.
         self.allow_bigquery_cost_basis = allow_bigquery_cost_basis
         self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
-        # FC-050: the FC-029 resolution chain now lives in cost_basis.py so the
-        # scanner shares it. The lookup is injected as a late-bound call through
-        # this instance's wrapper (rather than the resolver's own method) so
-        # patching CallSeller._lookup_last_opasn_put_strike still intercepts the
-        # chain — the test suite's hermeticity guard depends on that.
+        # FC-050: the floor resolution lives in cost_basis.py so the scanner
+        # shares it. FC-065: it resolves from Alpaca's avg_entry_price and
+        # cross-checks against BigQuery, so there is no wheel_state source and
+        # no injected lookup any more — the resolver's own
+        # ``_lookup_assignment_basis`` is the single BigQuery chokepoint, and
+        # the test suite's hermeticity guard patches it on the class.
         self._cost_basis_resolver = CostBasisResolver(
             alpaca_client,
             config,
-            wheel_state=wheel_state_manager,
             allow_bigquery=allow_bigquery_cost_basis,
-            opasn_lookup=lambda symbol: self._lookup_last_opasn_put_strike(symbol),
         )
         
     def evaluate_covered_call_opportunity(self, stock_position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -84,10 +83,10 @@ class CallSeller:
                        symbol=symbol,
                        shares=shares_owned)
 
-            # FC-029 (R2): cost basis = strike of the assigning put. Resolved
-            # via wheel_state (canonical) → BQ lookup of last OPASN → Alpaca
-            # fallback. Alpaca's `cost_basis` returns 0 for assigned positions
-            # in paper trading, so the historical direct read was a no-op.
+            # FC-065: cost basis = Alpaca's avg_entry_price for the equity
+            # position, vetoed by the BigQuery divergence cross-check. Zero
+            # means the broker field was missing/zero or the cross-check
+            # disagreed — both are "no floor", both block the write below.
             stock_cost_basis = self._resolve_cost_basis_floor(
                 symbol, stock_position, shares_owned
             )
@@ -101,8 +100,9 @@ class CallSeller:
                     logger,
                     error_type="cost_basis_floor_unresolved",
                     error_message=(
-                        f"No cost-basis floor resolved from any source for {symbol} "
-                        f"(wheel_state, BQ, Alpaca all returned 0). Holding "
+                        f"No cost-basis floor resolved for {symbol} (Alpaca "
+                        f"avg_entry_price missing/zero, or the BigQuery "
+                        f"cross-check found it divergent). Holding "
                         f"{shares_owned} shares with no protection. Blocking call write."
                     ),
                     component="call_seller",
@@ -513,27 +513,23 @@ class CallSeller:
 
         FC-050: delegates to the shared :class:`CostBasisResolver`, which the
         scanner uses too. Kept as a method so callers and tests that patch this
-        entry point keep working; the FC-029 source order, the wheel_state
-        back-fill and the BigQuery gating are unchanged.
+        entry point keep working.
+
+        FC-065: the resolved value is Alpaca's ``avg_entry_price`` for the
+        equity position, and it is 0 whenever the broker field is missing or
+        the BigQuery divergence cross-check vetoed it. Both cases mean "no
+        floor", and the caller must fail closed.
 
         Args:
             symbol: Underlying ticker (e.g. ``"AMD"``).
-            stock_position: Alpaca position dict (provides the Alpaca fallback).
-            shares_owned: Current share count for fallback per-share division.
+            stock_position: Alpaca position dict (carries ``avg_entry_price``).
+            shares_owned: Current share count, used to bound the cross-check's
+                lot reconstruction.
 
         Returns:
-            Per-share cost basis, or 0 if no source resolves one.
+            Per-share cost basis, or 0 if there is no usable floor.
         """
         return self._cost_basis_resolver.resolve(symbol, stock_position, shares_owned)
-
-    def _lookup_last_opasn_put_strike(self, symbol: str, lookback_days: int = 90) -> float:
-        """Return strike of the most recent OPASN-put for ``symbol``.
-
-        FC-050: delegates to the shared :class:`CostBasisResolver`. This wrapper
-        is also the single interception point for the resolution chain used by
-        this seller (see ``opasn_lookup`` in ``__init__``).
-        """
-        return self._cost_basis_resolver._lookup_last_opasn_put_strike(symbol, lookback_days)
 
     def _parse_dte_from_option_symbol(self, option_symbol: str) -> int:
         """

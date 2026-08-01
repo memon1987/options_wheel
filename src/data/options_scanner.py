@@ -11,7 +11,7 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_performance_metric, log_error_event
 from ..utils.positions import get_stock_positions
-from ..strategy.cost_basis import CostBasisResolver, SOURCE_ALPACA
+from ..strategy.cost_basis import CostBasisResolver, SOURCE_DIVERGENT
 
 logger = structlog.get_logger(__name__)
 
@@ -30,12 +30,11 @@ class OptionsScanner:
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
-        # FC-050: the covered-call floor comes from the FC-029 resolution chain,
-        # not from Alpaca's cost_basis alone (which reports 0 for freshly
-        # assigned positions). wheel_state is None here — the scanner has no
-        # state manager, so the chain starts at the BigQuery OPASN lookup.
+        # FC-065: the covered-call floor is Alpaca's avg_entry_price for the
+        # equity position, with BigQuery running inline as a divergence
+        # cross-check that can veto the broker's number but never supply one.
         self.cost_basis_resolver = CostBasisResolver(
-            alpaca_client, config, wheel_state=None, allow_bigquery=True
+            alpaca_client, config, allow_bigquery=True
         )
 
     def scan_for_put_opportunities(self, max_results: int = 10) -> List[Dict[str, Any]]:
@@ -133,15 +132,36 @@ class OptionsScanner:
 
                 # CRITICAL: Resolve cost basis per share for protection.
                 # This ensures we never sell calls below cost basis (guaranteed loss).
-                # FC-050: resolved through the FC-029 chain (wheel_state → BQ
-                # OPASN strike → Alpaca) rather than reading Alpaca directly.
+                # FC-065: the floor is Alpaca's avg_entry_price, verified inline
+                # against reconstructed assignment history (BigQuery). Both
+                # failure modes below skip the symbol for this scan.
                 try:
                     raw_cost_basis = float(position.get('cost_basis') or 0)
                 except (TypeError, ValueError):
                     raw_cost_basis = 0.0
-                cost_basis_per_share, cost_basis_source = (
-                    self.cost_basis_resolver.resolve_with_source(symbol, position, shares)
+                resolution = self.cost_basis_resolver.resolve_detailed(
+                    symbol, position, shares
                 )
+                cost_basis_per_share = resolution['basis']
+                cost_basis_source = resolution['source']
+                cross_check = resolution.get('cross_check') or {}
+
+                # FAIL CLOSED on a divergent cross-check. The broker reported a
+                # number and the assignment history says it is wrong — presence
+                # with a wrong value, which the zero check below cannot catch.
+                if cost_basis_source == SOURCE_DIVERGENT:
+                    logger.warning("Skipping call scan - cost basis divergent",
+                                   event_category="trade",
+                                   event_type="call_scan_skipped_cost_basis_divergent",
+                                   symbol=symbol,
+                                   shares=shares,
+                                   broker_basis=resolution.get('broker_basis'),
+                                   expected_basis=cross_check.get('expected_basis'),
+                                   basis_delta=cross_check.get('basis_delta'),
+                                   tolerance=cross_check.get('tolerance'),
+                                   reconstructed_shares=cross_check.get('reconstructed_shares'),
+                                   reason=cross_check.get('reason'))
+                    continue
 
                 # FAIL CLOSED on an unresolved cost basis. This floor is the
                 # first of the two below-basis protections: find_suitable_calls
@@ -154,26 +174,26 @@ class OptionsScanner:
                                    event_type="call_scan_skipped_cost_basis_unresolved",
                                    symbol=symbol,
                                    shares=shares,
-                                   cost_basis=raw_cost_basis)
+                                   cost_basis=raw_cost_basis,
+                                   avg_entry_price=resolution.get('broker_basis'))
                     continue
 
-                # FC-050: make a non-broker floor visible, and comparable. With
-                # wheel-state persistence dead (FC-039) BigQuery is the *primary*
-                # source in production, not an exception — this event fires for
-                # every held symbol on every scan, so what carries the signal is
-                # the broker's number next to it. A BQ/Alpaca divergence means one
-                # of the two is wrong about what these shares cost.
-                if cost_basis_source != SOURCE_ALPACA:
-                    alpaca_basis_per_share = raw_cost_basis / shares if shares > 0 else 0.0
-                    logger.info("Cost basis resolved from fallback source",
-                                event_category="risk",
-                                event_type="cost_basis_resolved_via_fallback",
-                                symbol=symbol,
-                                source=cost_basis_source,
-                                resolved_basis=cost_basis_per_share,
-                                alpaca_cost_basis_per_share=alpaca_basis_per_share,
-                                basis_delta=(round(cost_basis_per_share - alpaca_basis_per_share, 4)
-                                             if alpaca_basis_per_share > 0 else None))
+                # FC-065: the cross-check's verdict is logged on every scan of
+                # every held symbol, including when it could not run. An
+                # "unavailable" run is not an "all clear" — it is the state in
+                # which the floor rests on a single broker field with nothing
+                # watching it, which is precisely what needs to be visible.
+                logger.info("Cost basis cross-check completed",
+                            event_category="risk",
+                            event_type="cost_basis_cross_check",
+                            symbol=symbol,
+                            source=cost_basis_source,
+                            resolved_basis=cost_basis_per_share,
+                            status=cross_check.get('status'),
+                            expected_basis=cross_check.get('expected_basis'),
+                            basis_delta=cross_check.get('basis_delta'),
+                            tolerance=cross_check.get('tolerance'),
+                            reason=cross_check.get('reason'))
 
                 # Get call opportunities filtered by cost basis
                 calls = self.market_data.find_suitable_calls(
@@ -344,10 +364,26 @@ class OptionsScanner:
             symbol = stock_position['symbol']
             shares_owned = int(float(stock_position['qty']))
 
-            # Get current stock price
-            stock_metrics = self.market_data.get_stock_metrics(symbol)
-            current_price = stock_metrics.get('current_price', 0)
-            
+            # Get current stock price. FC-065 (folded in from the removed
+            # Phase 3): a failed quote used to fail OPEN here — the opportunity
+            # was still emitted, with every price-relative metric (annualized
+            # return, OTM distance, attractiveness score) computed against a
+            # current price of 0. Fail closed for this symbol instead;
+            # the next cycle re-evaluates in minutes.
+            stock_metrics = self.market_data.get_stock_metrics(symbol) or {}
+            try:
+                current_price = float(stock_metrics.get('current_price', 0) or 0)
+            except (TypeError, ValueError):
+                current_price = 0.0
+
+            if current_price <= 0:
+                logger.warning("Skipping call opportunity - stock quote unavailable",
+                               event_category="trade",
+                               event_type="call_scan_skipped_quote_unavailable",
+                               symbol=symbol,
+                               option_symbol=call_option.get('symbol'))
+                return None
+
             # Calculate key metrics
             premium = call_option['mid_price']
             strike = call_option['strike_price']

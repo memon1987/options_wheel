@@ -1328,6 +1328,8 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 **Links:** `docs/plans/fc-065.md` (§Phase 5 rationale), FC-048, FC-029, `src/backtesting/engine/simulator.py:322-330`, `src/strategy/wheel_engine.py`, commit `842dcce`.
 
+**Carried in from the FC-065 Phase 1 review (PR #75, reviewer 2, LOW-4) — do not lose this on repoint:** `OptionsScanner` hardcodes `allow_bigquery=True` when it builds its `CostBasisResolver` (`src/data/options_scanner.py:37`). Today that is correct, because only production runs the scanner. The moment FC-068 repoints the simulator to replay `scan → select → execute`, the flag must be **threaded through to the scanner** — otherwise every backtest replay issues the divergence cross-check against *production* trade history (`options_wheel.trades_from_activities`, against `CURRENT_TIMESTAMP()`), which is exactly the leak `allow_bigquery=False` exists to prevent on the seller path.
+
 ---
 
 ### FC-069: decommission the fictional layer — revive-or-delete every dead control, then rewire what remains for continuity
@@ -1366,6 +1368,30 @@ Explicitly out of scope: call-side limit pricing drift (`mid × 0.95` vs the put
 **Absorbs / supersedes on completion:** FC-014, FC-015, FC-039 (each closes with lineage to this FC's decision on it).
 
 **Links:** `docs/plans/fc-065.md` (three design principles + spin-offs), FC-068, FC-013 (earnings plan, published), FC-049 (gap study), FC-066 (roller), FC-009, the 2026-07-31 mechanism-inventory/coherence investigations recorded via `docs/plans/fc-065.md` Context.
+
+---
+
+### FC-070: pin Alpaca's partial-disposal `avg_entry_price` semantics; consider asymmetric divergence tolerance
+
+**Status:** Consideration — filed 2026-08-01 from the FC-065 Phase 1 review (PR #75, reviewer 2, HIGH-1)
+**Size estimate:** S (the empirical pin is one observation; the tolerance change is a small, reviewable diff)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-065 Phase 1's divergence cross-check reconstructs the expected basis by consuming OPASN lots **newest-first** — FIFO-shaped, on the assumption that a partial disposal removes the oldest shares. Alpaca's `avg_entry_price`, however, is an **entry average that is not recomputed when shares are partially sold**. The two therefore measure different quantities the moment a multi-lot position is partially called away: the broker keeps the blended entry average across *all* lots ever acquired, while the reconstruction prices only the newest remaining ones.
+
+**Consequence, and why it is not urgent:** the first multi-lot partial call-away will produce a **false divergence** roughly equal to the spread between the lot bases, and the symbol will fail closed — writing no calls — until the position fully cycles out. The direction is safe (fail-closed, no unprotected write, no money at risk) and the runbook now documents it as benign cause (a) with a sanctioned remediation path, but it is a real false-positive that stops premium collection on a live symbol.
+
+**Why it was not pinned in Phase 1:** confirming the semantics empirically requires either a **deliberate partial sell** — an operator action, since this pipeline never places orders — or waiting for a natural occurrence. Neither is available to a hermetic build. All four live lots are single-lot today, so the case has not yet arisen. Reviewer 2 sanctioned deferring it explicitly, conditional on the runbook note landing with Phase 1 (it did).
+
+**Fix directions, in order of cost:**
+
+1. **Pin the semantics.** Observe one partial disposal — natural, or an operator-initiated partial sell on a paper lot — and record what Alpaca reports for `avg_entry_price` before and after. That single observation decides whether the reconstruction should be FIFO, entry-average, or something else.
+2. **Asymmetric / two-tier tolerance (reviewer 2's design alternative).** The two directions are not symmetric in risk: when the **broker's basis sits above** the reconstruction, the floor is *stricter* than the history implies — the conservative direction, which cannot cause an unprotected write. That direction could be tolerated far more loosely at **zero risk cost**, while the dangerous direction (broker below reconstruction — the split/corruption case the check exists for) keeps today's tight bound. This roughly halves the false-positive surface and specifically absorbs the partial-disposal case, since a blended entry average across lots sits above a newest-lots reconstruction whenever the newer lots are cheaper.
+
+Doing (2) without (1) is defensible — it is conservative in the direction that matters — but (1) is what turns the tolerance choice from a guess into a measurement.
+
+**Links:** PR #75 (FC-065 Phase 1 review, reviewer 2 HIGH-1), `docs/plans/fc-065.md` §Phase 1, `src/strategy/cost_basis.py` (`reconstruct_expected_basis`, `_cross_check`), `deploy/monitoring/drawdown_pause_alert.md` §"Divergence triage" cause (a).
 
 ---
 

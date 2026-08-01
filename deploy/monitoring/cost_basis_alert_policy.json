@@ -1,0 +1,24 @@
+{
+  "displayName": "Cost-basis floor blocked a covered call — options-wheel",
+  "documentation": {
+    "content": "The covered-call scan skipped a held symbol because it had no usable cost-basis floor (FC-065 Phase 1).\n\nTwo events match:\n- call_scan_skipped_cost_basis_unresolved: Alpaca reported no usable avg_entry_price for the equity position. Since FC-065 that ONE field is the whole floor, and every wheel position is an assigned position, so a recurrence of FC-029's zero-basis behaviour would starve the entire book. Nothing else alerts on it.\n- call_scan_skipped_cost_basis_divergent: the broker's avg_entry_price disagreed with the basis reconstructed from BigQuery assignment history by more than max($0.10, 0.1%). The dangerous case is presence with a WRONG value (mis-adjusted split, partial disposal, corporate action), which fail-closed-on-zero cannot catch.\n\nEither way the bot is holding shares and writing no calls on them — idle capital, silently, until this is looked at.\n\nTriage:\n1. gcloud logging read 'jsonPayload.event_type=\"call_scan_skipped_cost_basis_divergent\" OR jsonPayload.event_type=\"call_scan_skipped_cost_basis_unresolved\"' --limit=20 --freshness=1d\n2. Compare the logged broker_basis / expected_basis against the Alpaca UI position and against options_wheel.trades_from_activities OPASN rows for the symbol.\n3. Fail-closed is correct behaviour, not a bug to work around: do NOT lower the floor to unblock writing.\n\nNOTE: the filter deliberately does NOT constrain severity. Cloud Run captures the app's stderr as plain text with EMPTY severity, so a severity>=WARNING clause matches nothing (verified by the FC-030 fire drill 2026-07-18). Payload shape is matched both ways.\n\nPlan: docs/plans/fc-065.md. Runbook: deploy/monitoring/drawdown_pause_alert.md",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "Covered call blocked by the cost-basis floor",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"options-wheel-strategy\" AND (jsonPayload.event_type=\"call_scan_skipped_cost_basis_unresolved\" OR jsonPayload.event_type=\"call_scan_skipped_cost_basis_divergent\" OR textPayload:\"call_scan_skipped_cost_basis_unresolved\" OR textPayload:\"call_scan_skipped_cost_basis_divergent\")"
+      }
+    }
+  ],
+  "alertStrategy": {
+    "notificationRateLimit": {"period": "86400s"},
+    "autoClose": "172800s"
+  },
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ]
+}

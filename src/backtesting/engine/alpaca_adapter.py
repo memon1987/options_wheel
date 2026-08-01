@@ -179,6 +179,13 @@ class BacktestAlpacaClient:
                     "side": "long",
                     "market_value": market_value,
                     "cost_basis": basis * shares,
+                    # FC-065: the covered-call floor reads this field, so the
+                    # simulated broker has to emit it too. Interim semantics,
+                    # accepted in writing in the plan: the backtest broker sets
+                    # assignment basis = strike (broker.py:_assign_put), NOT
+                    # premium-netted, so the simulated floor sits one put
+                    # premium above production's until FC-068 closes the gap.
+                    "avg_entry_price": basis,
                     "unrealized_pl": market_value - basis * shares,
                     "asset_class": "us_equity",
                 }
@@ -198,6 +205,9 @@ class BacktestAlpacaClient:
                     "side": "short",
                     "market_value": market_value,
                     "cost_basis": cost_basis,
+                    # Per-contract-share premium received, as Alpaca reports it
+                    # for a short option (positive, unlike cost_basis).
+                    "avg_entry_price": pos.entry_price,
                     # Short premium: profit as the option decays toward zero.
                     "unrealized_pl": (pos.entry_price - mark) * 100 * pos.contracts,
                     "asset_class": "us_option",

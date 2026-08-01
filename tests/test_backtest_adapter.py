@@ -249,6 +249,52 @@ class TestPositionsAndAccount:
         assert len(stock) == 1
         assert stock[0]["symbol"] == "XYZ" and stock[0]["qty"] == 100.0
 
+    def test_assigned_shares_carry_avg_entry_price(self, setup):
+        """FC-065 contract test: the simulated broker must emit the field the
+        covered-call floor reads, or a replay fails closed on every symbol
+        while production does not.
+
+        Interim semantics, accepted in writing in the plan: the backtest broker
+        sets assignment basis = strike (``broker._assign_put``), NOT
+        premium-netted, so the simulated floor sits one put premium above
+        production's until FC-068 repoints the simulator.
+        """
+        broker, client = setup
+        with _at(D1):
+            client.place_option_order(PUT, 1, "sell", limit_price=1.0)
+        broker.settle_expirations(EXP, {"XYZ": 85.0})
+        with _at(EXP):
+            stock = [p for p in client.get_positions()
+                     if p["asset_class"] == "us_equity"][0]
+
+        assert "avg_entry_price" in stock, (
+            "the covered-call floor field is missing from the simulated broker")
+        assert stock["avg_entry_price"] == pytest.approx(90.0)      # the strike
+        assert stock["avg_entry_price"] == pytest.approx(
+            stock["cost_basis"] / stock["qty"])
+
+    def test_a_multi_lot_stock_position_reports_the_weighted_average(self, setup):
+        """Alpaca's own semantic — and what FC-064's mixed-lot case needed."""
+        broker, client = setup
+        broker._add_stock("XYZ", 100, 90.0, D1)
+        broker._add_stock("XYZ", 100, 110.0, D2)
+        with _at(D2):
+            stock = [p for p in client.get_positions()
+                     if p["asset_class"] == "us_equity"][0]
+
+        assert stock["qty"] == 200.0
+        assert stock["avg_entry_price"] == pytest.approx(100.0)
+
+    def test_a_short_option_carries_its_entry_premium(self, setup):
+        _, client = setup
+        with _at(D1):
+            client.place_option_order(PUT, 1, "sell", limit_price=1.0)
+            opt = [p for p in client.get_positions()
+                   if p["asset_class"] == "us_option"][0]
+
+        # Positive, as Alpaca reports it for a short — unlike cost_basis.
+        assert opt["avg_entry_price"] == pytest.approx(0.975)
+
 
 class TestActivities:
     def test_assignment_surfaces_as_an_opasn_activity(self, setup):

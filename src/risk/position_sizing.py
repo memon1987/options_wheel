@@ -142,9 +142,10 @@ class PositionSizer:
         from Alpaca's API, which is known-broken for assigned positions in paper
         trading (returns 0). It is currently UNUSED in production (no callers
         outside tests). If you revive this code path, you MUST route the cost-
-        basis read through ``CallSeller._resolve_cost_basis_floor`` (or a
-        shared utility derived from it) so the wheel_state-canonical source
-        is consulted before falling back to Alpaca. See
+        basis read through ``CostBasisResolver`` (FC-065:
+        ``src/strategy/cost_basis.py``) so the floor is the broker's
+        ``avg_entry_price`` and passes the BigQuery divergence cross-check
+        rather than trusting a raw total. See
         ``docs/investigations/cost-basis-floor-validation-2026-05-08.md``
         for the failure mode.
 

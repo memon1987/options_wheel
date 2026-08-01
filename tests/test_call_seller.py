@@ -23,16 +23,14 @@ class TestCallSellerEvaluateOpportunity:
         self.mock_config.call_drawdown_pause_threshold = 0.05
 
         self.call_seller = CallSeller(self.mock_alpaca, self.mock_market_data, self.mock_config)
-        # Unit isolation: stub the FC-029 BQ cost-basis fallback to "not
-        # found" so it falls through to the mocked Alpaca value. With ambient
-        # GCP credentials (Cloud Build, dev machines with ADC) the real
-        # fallback reaches LIVE production BigQuery and the resolved floor
-        # drifts with the prod 90-day assignment window — AAPL's real $305
-        # assignment (2026-06-13) made the mocked $160 price read as a
-        # drawdown pause and broke these tests in CI. The BQ branch itself
-        # is covered by TestCallSellerCostBasisFloorFC029 with a patched
-        # client.
-        self.call_seller._lookup_last_opasn_put_strike = Mock(return_value=0.0)
+        # Unit isolation: the suite's autouse hermeticity fixture stubs the
+        # resolver's single BigQuery chokepoint
+        # (`CostBasisResolver._lookup_assignment_basis`) to "no comparison
+        # available", so these tests resolve against the position's own
+        # `avg_entry_price` and never reach live production history. With
+        # ambient GCP credentials (Cloud Build, dev machines with ADC) an
+        # unstubbed lookup would read real AAPL assignments and the
+        # cross-check would fail these fixtures closed as divergent (FC-065).
 
         # Default stock metrics
         self.mock_market_data.get_stock_metrics.return_value = {
@@ -50,6 +48,7 @@ class TestCallSellerEvaluateOpportunity:
             'symbol': 'AAPL',
             'qty': 100,
             'cost_basis': 16000.0,  # $160/share
+            'avg_entry_price': 160.0,
             'market_value': 17500.0,
         }
 
@@ -83,6 +82,7 @@ class TestCallSellerEvaluateOpportunity:
             'symbol': 'MSFT',
             'qty': 200,
             'cost_basis': 60000.0,  # $300/share
+            'avg_entry_price': 300.0,
             'market_value': 62000.0,
         }
 
@@ -106,6 +106,7 @@ class TestCallSellerEvaluateOpportunity:
             'symbol': 'AAPL',
             'qty': 50,
             'cost_basis': 8000.0,
+            'avg_entry_price': 160.0,
             'market_value': 8750.0,
         }
 
@@ -120,6 +121,7 @@ class TestCallSellerEvaluateOpportunity:
             'symbol': 'AAPL',
             'qty': 100,
             'cost_basis': 16000.0,
+            'avg_entry_price': 160.0,
             'market_value': 17500.0,
         }
 
@@ -134,6 +136,7 @@ class TestCallSellerEvaluateOpportunity:
             'symbol': 'AAPL',
             'qty': 300,
             'cost_basis': 48000.0,  # $160/share
+            'avg_entry_price': 160.0,
             'market_value': 52500.0,
         }
 
@@ -160,6 +163,7 @@ class TestCallSellerEvaluateOpportunity:
             'symbol': 'AAPL',
             'qty': 100,
             'cost_basis': 16000.0,
+            'avg_entry_price': 160.0,
             'market_value': 17500.0,
         }
 
@@ -179,16 +183,14 @@ class TestCallSellerExecuteSale:
         self.mock_config = Mock(spec=Config)
 
         self.call_seller = CallSeller(self.mock_alpaca, self.mock_market_data, self.mock_config)
-        # Unit isolation: stub the FC-029 BQ cost-basis fallback to "not
-        # found" so it falls through to the mocked Alpaca value. With ambient
-        # GCP credentials (Cloud Build, dev machines with ADC) the real
-        # fallback reaches LIVE production BigQuery and the resolved floor
-        # drifts with the prod 90-day assignment window — AAPL's real $305
-        # assignment (2026-06-13) made the mocked $160 price read as a
-        # drawdown pause and broke these tests in CI. The BQ branch itself
-        # is covered by TestCallSellerCostBasisFloorFC029 with a patched
-        # client.
-        self.call_seller._lookup_last_opasn_put_strike = Mock(return_value=0.0)
+        # Unit isolation: the suite's autouse hermeticity fixture stubs the
+        # resolver's single BigQuery chokepoint
+        # (`CostBasisResolver._lookup_assignment_basis`) to "no comparison
+        # available", so these tests resolve against the position's own
+        # `avg_entry_price` and never reach live production history. With
+        # ambient GCP credentials (Cloud Build, dev machines with ADC) an
+        # unstubbed lookup would read real AAPL assignments and the
+        # cross-check would fail these fixtures closed as divergent (FC-065).
 
     def test_execute_call_sale_success(self):
         """Test successful call sale execution."""
@@ -313,16 +315,14 @@ class TestCallSellerEarlyClose:
         self.mock_config.profit_taking_static_target = 0.50
 
         self.call_seller = CallSeller(self.mock_alpaca, self.mock_market_data, self.mock_config)
-        # Unit isolation: stub the FC-029 BQ cost-basis fallback to "not
-        # found" so it falls through to the mocked Alpaca value. With ambient
-        # GCP credentials (Cloud Build, dev machines with ADC) the real
-        # fallback reaches LIVE production BigQuery and the resolved floor
-        # drifts with the prod 90-day assignment window — AAPL's real $305
-        # assignment (2026-06-13) made the mocked $160 price read as a
-        # drawdown pause and broke these tests in CI. The BQ branch itself
-        # is covered by TestCallSellerCostBasisFloorFC029 with a patched
-        # client.
-        self.call_seller._lookup_last_opasn_put_strike = Mock(return_value=0.0)
+        # Unit isolation: the suite's autouse hermeticity fixture stubs the
+        # resolver's single BigQuery chokepoint
+        # (`CostBasisResolver._lookup_assignment_basis`) to "no comparison
+        # available", so these tests resolve against the position's own
+        # `avg_entry_price` and never reach live production history. With
+        # ambient GCP credentials (Cloud Build, dev machines with ADC) an
+        # unstubbed lookup would read real AAPL assignments and the
+        # cross-check would fail these fixtures closed as divergent (FC-065).
 
     def test_should_close_at_profit_target(self):
         """Test closing when profit target is reached."""
@@ -381,18 +381,15 @@ class TestCallSellerEarlyClose:
         assert result is False
 
 
-class TestCallSellerCostBasisFloorFC029:
-    """FC-029 (R2 + R3): cost-basis floor source order + drawdown pause.
+class TestCallSellerCostBasisFloorFC065:
+    """FC-065 (floor) + FC-029 R3 (drawdown pause, engine path only).
 
-    The bot must source the per-share cost basis from (in order):
-      1. wheel_state.symbol_states[symbol]['stock_cost_basis']
-         — populated at OPASN time from the put strike
-      2. BQ lookup of the most recent OPASN-put strike for the symbol
-         — handles silent assignments and cold starts
-      3. Alpaca's reported cost_basis — last-resort fallback
+    The per-share floor is Alpaca's ``avg_entry_price`` for the equity
+    position, vetoed by the BigQuery divergence cross-check. There is no
+    wheel_state source and no BigQuery floor source any more — the inversion
+    these tests were rewritten for.
 
-    See docs/plans/fc-029.md and
-    docs/investigations/cost-basis-floor-validation-2026-05-08.md.
+    See docs/plans/fc-065.md §Phase 1.
     """
 
     def setup_method(self):
@@ -403,20 +400,23 @@ class TestCallSellerCostBasisFloorFC029:
         self.mock_config.min_call_premium = 0.30
         self.mock_config.call_drawdown_pause_threshold = 0.05
 
-        # Patch BQ at the import site so no real network call is attempted.
-        # Each test re-patches with the specific behavior it needs.
+        # The suite's autouse fixture stubs the resolver's BigQuery chokepoint,
+        # so no real network call is attempted. Tests that want a cross-check
+        # answer inject one explicitly.
         self.mock_market_data.get_stock_metrics.return_value = {'current_price': 230.0}
 
-    def _make_seller(self, wheel_state=None):
+    def _make_seller(self):
         # Stock quote returns near-cost (no drawdown) by default.
         self.mock_alpaca.get_stock_quote.return_value = {'bid': 247.0, 'ask': 248.0}
-        return CallSeller(self.mock_alpaca, self.mock_market_data, self.mock_config,
-                          wheel_state_manager=wheel_state)
+        return CallSeller(self.mock_alpaca, self.mock_market_data, self.mock_config)
 
-    def _amzn_position(self):
-        # Alpaca returns cost_basis=0 for assigned positions in paper trading
-        # — this is the bug FC-029 R2 works around.
-        return {'symbol': 'AMZN', 'qty': 100, 'cost_basis': 0.0, 'market_value': 24700.0}
+    def _amzn_position(self, avg_entry_price=247.5):
+        # An assigned lot: the broker reports the premium-netted entry price,
+        # and cost_basis agrees with it (qty * avg_entry_price).
+        return {'symbol': 'AMZN', 'qty': 100,
+                'cost_basis': avg_entry_price * 100,
+                'avg_entry_price': avg_entry_price,
+                'market_value': 24700.0}
 
     def _candidate_call(self, strike: float, delta: float = 0.20):
         return {
@@ -429,15 +429,9 @@ class TestCallSellerCostBasisFloorFC029:
             'annual_return': 0.30,
         }
 
-    def test_cost_basis_floor_uses_wheel_state(self):
-        """FC-029 R2 source 1: wheel_state's stock_cost_basis is the floor.
-
-        Even when Alpaca returns cost_basis=0 (paper-engine quirk), the floor
-        must be the OPASN-put strike from wheel_state.
-        """
-        wheel_state = Mock()
-        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 247.5}
-        seller = self._make_seller(wheel_state=wheel_state)
+    def test_cost_basis_floor_is_the_brokers_avg_entry_price(self):
+        """FC-065: one field, broker-authoritative, no chain to walk."""
+        seller = self._make_seller()
 
         # Call with strike >= cost basis is offered; floor passed correctly.
         self.mock_market_data.find_suitable_calls.return_value = [self._candidate_call(250.0)]
@@ -445,57 +439,53 @@ class TestCallSellerCostBasisFloorFC029:
         result = seller.evaluate_covered_call_opportunity(self._amzn_position())
 
         assert result is not None
-        # Critical: find_suitable_calls received the wheel_state floor (247.5),
-        # NOT the Alpaca cost_basis/100 = 0.
         self.mock_market_data.find_suitable_calls.assert_called_once_with(
             'AMZN', min_strike_price=247.5
         )
 
-    def test_cost_basis_floor_falls_back_to_bq_when_state_empty(self):
-        """FC-029 R2 source 2: BQ lookup recovers OPASN-put strike, then backfills wheel_state.
-
-        Uses a stateful mock so the backfill via ``set_stock_cost_basis`` is
-        actually observed by the second ``get_position_summary`` call inside
-        ``_calculate_call_position`` (which means the BQ lookup runs once, not
-        twice — proving the backfill optimization works).
-        """
-        # Stateful wheel_state mock: get_position_summary reflects the latest
-        # value written by set_stock_cost_basis.
-        wheel_state = Mock()
-        cb_state = {'stock_cost_basis': 0.0}
-        wheel_state.get_position_summary.side_effect = lambda _s: dict(cb_state)
-        wheel_state.set_stock_cost_basis.side_effect = lambda _s, cb: cb_state.update(stock_cost_basis=cb)
-
-        seller = self._make_seller(wheel_state=wheel_state)
+    def test_a_divergent_cross_check_blocks_the_call_write(self):
+        """The execute path fails closed on divergence too — one floor, one
+        implementation, no path that fails open. Fails if the cross-check is
+        reverted to warn-only."""
+        seller = self._make_seller()
         self.mock_market_data.find_suitable_calls.return_value = [self._candidate_call(250.0)]
 
-        with patch.object(seller, '_lookup_last_opasn_put_strike', return_value=247.5) as mock_bq:
+        with patch.object(seller._cost_basis_resolver, '_lookup_assignment_basis',
+                          return_value={'expected_basis_per_share': 210.0,
+                                        'reconstructed_shares': 100, 'lots': []}):
+            result = seller.evaluate_covered_call_opportunity(self._amzn_position())
+
+        assert result is None
+        self.mock_market_data.find_suitable_calls.assert_not_called()
+
+    def test_an_agreeing_cross_check_leaves_the_floor_alone(self):
+        """The veto must not cost us the calls we are entitled to sell."""
+        seller = self._make_seller()
+        self.mock_market_data.find_suitable_calls.return_value = [self._candidate_call(250.0)]
+
+        with patch.object(seller._cost_basis_resolver, '_lookup_assignment_basis',
+                          return_value={'expected_basis_per_share': 247.45,
+                                        'reconstructed_shares': 100, 'lots': []}):
             result = seller.evaluate_covered_call_opportunity(self._amzn_position())
 
         assert result is not None
-        # BQ lookup ran exactly once (second resolve hits the wheel_state cache).
-        mock_bq.assert_called_once_with('AMZN')
-        # Floor was 247.5 from BQ.
         self.mock_market_data.find_suitable_calls.assert_called_once_with(
             'AMZN', min_strike_price=247.5
         )
-        # Backfilled wheel_state for fast-path on subsequent calls.
-        wheel_state.set_stock_cost_basis.assert_called_once_with('AMZN', 247.5)
 
-    def test_cost_basis_floor_falls_back_to_alpaca_for_manual_buys(self):
-        """FC-029 R2 source 3: Alpaca's value is correct for non-wheel positions."""
-        wheel_state = Mock()
-        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 0}
-        seller = self._make_seller(wheel_state=wheel_state)
+    def test_the_floor_works_for_a_manually_bought_position(self):
+        """A non-wheel position has no assignment history, so the cross-check
+        reports 'no comparison' and the broker's entry price stands."""
+        seller = self._make_seller()
         self.mock_market_data.find_suitable_calls.return_value = [self._candidate_call(255.0)]
 
-        # Alpaca returns a real cost basis (manual buy at $250/share).
-        manual_buy_position = {'symbol': 'AMZN', 'qty': 100, 'cost_basis': 25000.0, 'market_value': 25500.0}
+        # Manual buy at $250/share.
+        manual_buy_position = {'symbol': 'AMZN', 'qty': 100, 'cost_basis': 25000.0,
+                               'avg_entry_price': 250.0, 'market_value': 25500.0}
         # No fresh near-cost quote: drawdown check uses 250 cb, mock current 248 → 0.8% drawdown < 5% → skip pause.
         self.mock_alpaca.get_stock_quote.return_value = {'bid': 247.0, 'ask': 249.0}
 
-        with patch.object(seller, '_lookup_last_opasn_put_strike', return_value=0.0):
-            result = seller.evaluate_covered_call_opportunity(manual_buy_position)
+        result = seller.evaluate_covered_call_opportunity(manual_buy_position)
 
         assert result is not None
         # 25000 / 100 = 250.0 from Alpaca fallback.
@@ -505,9 +495,7 @@ class TestCallSellerCostBasisFloorFC029:
 
     def test_drawdown_pause_skips_when_underwater(self):
         """FC-029 R3: drawdown pause when shares > 5% below cost basis."""
-        wheel_state = Mock()
-        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 247.5}
-        seller = self._make_seller(wheel_state=wheel_state)
+        seller = self._make_seller()
 
         # AMZN at $230 vs cost $247.5 → 7.07% drawdown > 5% threshold → skip.
         self.mock_alpaca.get_stock_quote.return_value = {'bid': 229.5, 'ask': 230.5}
@@ -520,9 +508,7 @@ class TestCallSellerCostBasisFloorFC029:
 
     def test_drawdown_pause_does_not_skip_when_at_cost(self):
         """Drawdown pause should NOT fire when stock is within threshold of cost."""
-        wheel_state = Mock()
-        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 247.5}
-        seller = self._make_seller(wheel_state=wheel_state)
+        seller = self._make_seller()
 
         # AMZN at $245 vs cost $247.5 → 1% drawdown < 5% threshold → don't skip.
         self.mock_alpaca.get_stock_quote.return_value = {'bid': 244.5, 'ask': 245.5}
@@ -540,13 +526,12 @@ class TestCallSellerCostBasisFloorFC029:
 
         Concern from peer review (concern #1) — get the boundary nailed.
         """
-        wheel_state = Mock()
-        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 100.0}
-        seller = self._make_seller(wheel_state=wheel_state)
+        seller = self._make_seller()
 
         # 5.00% exact: cost $100, current $95 → drawdown_pct = 0.05 ≥ 0.05 → pause.
         self.mock_alpaca.get_stock_quote.return_value = {'bid': 94.5, 'ask': 95.5}
-        position = {'symbol': 'AMZN', 'qty': 100, 'cost_basis': 0.0, 'market_value': 9500.0}
+        position = {'symbol': 'AMZN', 'qty': 100, 'cost_basis': 10000.0,
+                    'avg_entry_price': 100.0, 'market_value': 9500.0}
 
         result = seller.evaluate_covered_call_opportunity(position)
 
@@ -559,9 +544,7 @@ class TestCallSellerCostBasisFloorFC029:
         When the quote fetch raises, we must NOT proceed without the drawdown
         protection. Defer to the next monitor cycle (re-evaluates in ~5 min).
         """
-        wheel_state = Mock()
-        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 247.5}
-        seller = self._make_seller(wheel_state=wheel_state)
+        seller = self._make_seller()
 
         self.mock_alpaca.get_stock_quote.side_effect = Exception("network blip")
 
@@ -579,9 +562,7 @@ class TestCallSellerCostBasisFloorFC029:
         protection precisely on noisy quotes (premarket, illiquid intraday,
         halts) — exactly the regimes the pause exists for. Now defers.
         """
-        wheel_state = Mock()
-        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 247.5}
-        seller = self._make_seller(wheel_state=wheel_state)
+        seller = self._make_seller()
 
         # Malformed quote (one side zero). Pre-FC-029-review proceeded; now defers.
         self.mock_alpaca.get_stock_quote.return_value = {'bid': 230.0, 'ask': 0}
@@ -591,41 +572,39 @@ class TestCallSellerCostBasisFloorFC029:
         assert result is None
         self.mock_market_data.find_suitable_calls.assert_not_called()
 
-    def test_no_cost_basis_floor_resolved_blocks_call_write(self):
-        """FC-029 review MEDIUM 6: when shares are held but no source resolved
-        a cost basis (wheel_state, BQ, AND Alpaca all return 0), block the
-        call write entirely. Prior behavior returned 0 ('no floor'); the new
-        behavior is structured-error-block.
+    @pytest.mark.parametrize("avg_entry_price", [0.0, None, 'nonsense'])
+    def test_no_cost_basis_floor_resolved_blocks_call_write(self, avg_entry_price):
+        """FC-029 review MEDIUM 6, carried forward to FC-065's single source:
+        shares held but the broker reports no usable ``avg_entry_price`` means
+        no floor, and no floor means no call — a structured-error block, not a
+        write at any strike.
 
-        This catches the failure mode: position acquired via a path the bot
-        doesn't know about + Alpaca lost the cost basis (or paper-engine
-        quirk) + no recent OPASN history. Operator intervention required.
+        FC-029 (2026-05-08) observed exactly this on assigned paper positions
+        (``cost_basis = 0``). It was not reproducible in July 2026, but the
+        whole floor now rests on one field of that payload, so a regression to
+        zero must halt writing rather than write unprotected.
         """
-        # Empty wheel_state, no BQ history, Alpaca returns 0.
-        wheel_state = Mock()
-        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 0}
-        seller = self._make_seller(wheel_state=wheel_state)
-        ghost_position = {'symbol': 'AMZN', 'qty': 100, 'cost_basis': 0.0, 'market_value': 24700.0}
+        seller = self._make_seller()
+        ghost_position = {'symbol': 'AMZN', 'qty': 100, 'cost_basis': 0.0,
+                          'avg_entry_price': avg_entry_price,
+                          'market_value': 24700.0}
 
-        with patch.object(seller, '_lookup_last_opasn_put_strike', return_value=0.0):
-            result = seller.evaluate_covered_call_opportunity(ghost_position)
+        result = seller.evaluate_covered_call_opportunity(ghost_position)
 
         assert result is None
         self.mock_market_data.find_suitable_calls.assert_not_called()
 
-    @pytest.mark.real_bq_lookup
-    def test_lookup_last_opasn_put_strike_handles_bq_failure(self):
-        """``_lookup_last_opasn_put_strike`` must return 0 on any BQ exception.
-
-        Concern from peer review (concern #3): the try/except is the only thing
-        keeping the bot alive when BQ is unavailable. Pin it.
-        """
+    def test_a_position_without_the_broker_field_at_all_blocks_the_write(self):
+        """The plumbing failure the plan review caught: a caller handing the
+        seller a position dict that never carried ``avg_entry_price``."""
         seller = self._make_seller()
-        with patch('google.cloud.bigquery.Client',
-                   side_effect=Exception("no creds in test env")):
-            result = seller._lookup_last_opasn_put_strike('AMZN')
 
-        assert result == 0.0
+        result = seller.evaluate_covered_call_opportunity(
+            {'symbol': 'AMZN', 'qty': 100, 'cost_basis': 24750.0,
+             'market_value': 24700.0})
+
+        assert result is None
+        self.mock_market_data.find_suitable_calls.assert_not_called()
 
     def test_amzn_cycle_1_failure_mode_now_blocked(self):
         """End-to-end regression: AMZN cycle 1 (Nov 2025) loss scenario.
@@ -641,9 +620,7 @@ class TestCallSellerCostBasisFloorFC029:
         for either a price recovery or for cycle to roll without share-side
         loss.
         """
-        wheel_state = Mock()
-        wheel_state.get_position_summary.return_value = {'stock_cost_basis': 247.5}
-        seller = self._make_seller(wheel_state=wheel_state)
+        seller = self._make_seller()
 
         # AMZN at $230 = 7.07% below cost basis $247.5.
         self.mock_alpaca.get_stock_quote.return_value = {'bid': 229.5, 'ask': 230.5}
@@ -711,9 +688,7 @@ class TestExecuteTimeCostBasisFloorFC050:
 
     def _seller(self):
         self.mock_alpaca = Mock()
-        seller = CallSeller(self.mock_alpaca, Mock(), Mock(spec=Config))
-        seller._lookup_last_opasn_put_strike = Mock(return_value=0.0)
-        return seller
+        return CallSeller(self.mock_alpaca, Mock(), Mock(spec=Config))
 
     def _scanner_opportunity(self, strike, cost_basis_per_share=303.50):
         """The shape OptionsScanner._create_call_opportunity emits."""

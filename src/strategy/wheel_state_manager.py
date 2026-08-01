@@ -303,10 +303,16 @@ class WheelStateManager:
     def set_stock_cost_basis(self, symbol: str, cost_basis: float) -> None:
         """Backfill ``stock_cost_basis`` for a symbol's state entry.
 
-        FC-029 (R2): used by ``CallSeller._resolve_cost_basis_floor`` after
-        a BQ lookup recovers the assigning OPASN-put strike (e.g. on cold
-        start with empty GCS state, or for silent-assignment positions
-        that bypassed the activities-API path).
+        FC-029 (R2): was the back-fill target when a BQ lookup recovered the
+        assigning OPASN-put strike.
+
+        **FC-065: no longer read by the cost-basis floor.** ``wheel_state`` was
+        removed from the resolution chain entirely — it has never been
+        populated in production (``STATE_STORAGE_BUCKET`` unset since
+        inception) and its apparent liveness misled three separate
+        investigations. The floor is Alpaca's ``avg_entry_price``
+        (``src/strategy/cost_basis.py``). This setter survives only for the
+        engine path's own bookkeeping, which FC-068 deletes.
 
         Idempotent. Persists immediately via ``_save_state``.
         """
