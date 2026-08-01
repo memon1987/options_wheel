@@ -1410,6 +1410,32 @@ Doing (2) without (1) is defensible — it is conservative in the direction that
 
 ---
 
+### FC-073: validate the attractiveness score against realized outcomes; tune or simplify
+
+**Status:** Consideration — filed 2026-08-01 at operator request
+**Size estimate:** M (the cost is analysis, not code; any weight change is then S)
+**Owner:** zeshan + Claude
+**Plan file:** not yet
+
+**Problem:** the scanner's attractiveness scores (`_calculate_call_attractiveness_score` / `_calculate_put_attractiveness_score`, `src/data/options_scanner.py:472-591`) decide which strike wins per symbol and — on the call side — which symbols win at selection (`ExecutionEngine._call_rank_score`), yet **the weights are inherited, not chosen, and have never been validated against realized outcomes.** Known structural issues, all verified 2026-08-01:
+
+- **The return component saturates and stops discriminating.** Calls: `min(35, annual_return × 3)` caps at ~11.7% annualized — nearly every 7-DTE candidate clearing the $0.50 premium floor maxes it, so delta-proximity-to-0.20 and the OTM band do almost all the intra-symbol ranking work. Puts: same shape (`min(40, annual_return × 2)`).
+- **The delta component peaks mid-band** (exactly 0.20; the configured band edges 0.15/0.25 score 15/20) — an implicit preference inside the band that nobody decided.
+- **The put score is computed but unused at selection** (puts are re-ranked by ROI per FC-038) — it only orders the blob; either give it a job or document that it's cosmetic.
+- **The at-floor bonus asymmetry is FC-071** (strict `>` into the 15-vs-5 bonus) — that small decision stays its own FC; this FC is the holistic review that would also catch the next such drift.
+- Liquidity (10 pts, saturates at ~1,000 blended contracts) and DTE (5 pts) are near-tiebreaks; whether that's right is undecided.
+
+**Evaluation approach (the data now exists or is landing):**
+1. **Historical join:** score-at-scan (opportunity blobs in `gs://options-wheel-opportunities`, ~1,300 objects) × realized outcomes (`trades_from_activities` / `trades_with_outcomes`) — did higher-scored candidates deliver better premium-per-day, fewer called-away-at-loss events, better fill rates? FC-065 P4's `decision_events` (run_id-joined) makes this query clean going forward.
+2. **Counterfactual replay:** the post-FC-068 backtest replays the literal production pipeline including this score — re-run the effective universe under alternative weightings (e.g., de-saturated return component, flat-in-band delta) and compare cycle outcomes. Non-comparability discipline per FC-048/FC-068 applies.
+3. **Decision:** tune weights, simplify (a score most of whose components don't discriminate may reduce to delta+OTM), or keep-and-document — each with the evidence attached. Any behavior change ships under its own plan + two-reviewer gate (money-path ranking).
+
+**Sequencing:** after FC-065 P4 and FC-068 land (both are the measurement instruments); independent of FC-069.
+
+**Links:** FC-071 (at-floor bonus — subset decision), FC-038 (call-rank-by-score / put-rank-by-ROI asymmetry), FC-044 (grid UI reading `decision_events`), FC-048/FC-068 (replay comparability precedent), `docs/BACKTEST_ENGINE.md`, `src/data/options_scanner.py:472-591`, `src/strategy/execution_engine.py:203-215`.
+
+---
+
 ### FC-062: the roller has its own fail-open cost-basis floor and bypasses the execute-time guard
 
 **Status:** Consideration — **must be resolved before any roller revival ships**
