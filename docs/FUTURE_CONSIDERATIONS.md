@@ -1334,7 +1334,7 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ### FC-069: decommission the fictional layer — revive-or-delete every dead control, then rewire what remains for continuity
 
-**Status:** Consideration — **filed 2026-07-31 with a pre-tagged inventory; plan + two-reviewer pass + execution to follow after FC-065/FC-068 land**
+**Status:** **Plan SIGNED OFF by operator 2026-08-01** (docs/plans/fc-069.md §Operator sign-off record — all 17 cards decided: item 1 flipped to DELETE, item 4 revived via FC-013 rev 2.1, item 7 sub-decision spawned FC-074, card 16 SYNC, item 5 module deleted with SHA pointer, rest confirmed). Execution queued after FC-068 lands; S1–S6 partition as amended (S4 dropped).
 **Size estimate:** L (many S items; the cost is decisions, not code)
 **Owner:** zeshan + Claude
 **Plan file:** not yet
