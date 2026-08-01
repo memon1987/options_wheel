@@ -819,8 +819,16 @@ def record_run_stage(
     recorder: DecisionRecorder,
     *,
     call_opportunities: Sequence[Dict[str, Any]],
-    selected: Sequence[Dict[str, Any]],
-    execution_results: Sequence[Dict[str, Any]],
+    # Defaulted, and they must stay defaulted. `/run` has two early exits that
+    # happen BEFORE selection or execution exist — the all-non-retryable exit
+    # and the idempotency exit — and both call through
+    # `RunDecisionFlusher.flush(**kwargs)` with only the filter kwargs. When
+    # these were required, both raised TypeError inside the flusher's except,
+    # writing zero rows; and because the once-guard had already set
+    # `flushed=True`, the `finally` could not retry. Caught by the
+    # confirmation pass after the flush-in-finally fix introduced it.
+    selected: Sequence[Dict[str, Any]] = (),
+    execution_results: Sequence[Dict[str, Any]] = (),
     drop_reasons: Optional[Dict[str, str]] = None,
     already_positioned: Optional[Iterable[str]] = None,
     previously_failed: Optional[Iterable[str]] = None,

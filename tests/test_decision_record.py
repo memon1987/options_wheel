@@ -652,6 +652,39 @@ class TestRunDecisionFlusher:
         f = RunDecisionFlusher(writer=_CapturingWriter())
         assert f.flush() is False
 
+    # -- the two /run early exits -------------------------------------- #
+    #
+    # REGRESSION (confirmation pass, after the flush-in-finally fix): both
+    # exits happen BEFORE selection or execution exist, so they call
+    # `flush()` with only their filter kwarg. `record_run_stage` required
+    # `selected` and `execution_results`, so both raised TypeError inside the
+    # flusher's except — zero rows written — and the once-guard had already
+    # set `flushed=True`, so the `finally` could not retry. The two exits are
+    # exactly the "a symbol silently vanished between the stages" cases this
+    # phase exists to record, so they failed where it mattered most.
+
+    def test_the_all_non_retryable_exit_writes_its_rows(self):
+        f = self._flusher()
+        assert f.flush(previously_failed={"NVDA"}) is True
+        rows = f._writer.batches[0]
+        assert [(r["symbol"], r["outcome"], r["reason"]) for r in rows] == [
+            ("NVDA", OUTCOME_DROPPED, REASON_PREVIOUSLY_FAILED)]
+
+    def test_the_idempotency_exit_writes_its_rows(self):
+        f = self._flusher()
+        assert f.flush(already_positioned={"NVDA"},
+                       previously_failed=set()) is True
+        rows = f._writer.batches[0]
+        assert [(r["symbol"], r["outcome"], r["reason"]) for r in rows] == [
+            ("NVDA", OUTCOME_DROPPED, REASON_ALREADY_POSITIONED)]
+
+    def test_record_run_stage_defaults_the_execution_arguments(self):
+        # The signature itself is the contract the two exits rely on.
+        rec = DecisionRecorder("R1", STAGE_RUN, writer=_CapturingWriter())
+        record_run_stage(rec, call_opportunities=[_call_opp()],
+                         previously_failed={"NVDA"})
+        assert rec.rows[0]["reason"] == REASON_PREVIOUSLY_FAILED
+
     def test_a_crash_after_a_fill_still_records_the_fill(self):
         """The endpoint's control flow, in miniature."""
         f = self._flusher()
