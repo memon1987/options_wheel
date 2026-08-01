@@ -24,6 +24,13 @@ from ...utils import clock
 
 # Live event_type -> the human-facing reason a day produced no trade. Ordered
 # roughly by how early the stage sits in the pipeline.
+#
+# FC-068 rewrote this table. The replay used to drive WheelEngine's dead
+# orchestration path, which emitted a gap/wheel-state/per-cycle-cap vocabulary
+# production has not spoken since 2025-10-03. Those entries are gone with their
+# emitters; what is here is what OptionsScanner -> ExecutionEngine actually
+# emits. An entry with no live emitter is worse than no entry: it reads as
+# coverage while counting nothing.
 _REASONS = {
     # FC-057: stage 1 was invisible. A symbol blocked on the price band or
     # volume floor produced NO tally entry at all, so a screen reported it as
@@ -32,23 +39,50 @@ _REASONS = {
     # QQQ and AMD for months while their verdicts were read as strategy
     # results. The event was always emitted with full detail; nothing counted it.
     "stock_rejected_filter": "price/volume band (stage 1)",
-    "stock_filtered_by_gap_risk": "gap-risk filter (stage 2)",
-    "rejected_high_gap_frequency": "gap-risk filter (stage 2)",
-    "stage_4_blocked": "execution gap check (stage 4)",
-    "stage_5_blocked": "wheel state (stage 5)",
-    "stage_6_blocked": "already holding a position or order (stage 6)",
-    "no_suitable_puts": "no put cleared delta/DTE/premium (stage 7)",
+    # The two chain-empty events, both from market_data, both on the path the
+    # scanner drives. `stage_7_complete_not_found` is the PUT leg's binding
+    # constraint -- the one that makes F/PFE/KMI/VZ untradeable at the $0.50
+    # premium floor -- and it was never mapped: pre-FC-068 the tally counted
+    # `no_suitable_puts`, whose only emitter lived inside the deleted
+    # `put_seller.find_put_opportunity`. Leaving it unmapped would have
+    # produced zero tally entries for the single most common no-trade outcome,
+    # which is the exact FC-057 failure mode this module exists to end.
+    "stage_7_complete_not_found": "no put cleared delta/DTE/premium (stage 7)",
+    # And the CALL leg's, mapped for the same reason: it is the dominant
+    # call-side no-trade in production today (every NVDA scan since 07-30 ends
+    # here). Fixing one leg's blindness and not the other is the same defect
+    # twice.
+    "stage_8_complete_not_found": "no call cleared floor/delta/DTE/premium (stage 8, scan)",
     "stage_8_blocked": "position sizing (stage 8)",
-    "position_size_validation_failed": "position sizing (stage 8)",
-    "put_blocked_by_wheel_state": "wheel state (stage 5)",
-    "covered_call_drawdown_pause": "drawdown pause (cost-basis floor)",
+    # Scan-stage skips (FC-065). A held symbol whose floor will not resolve, or
+    # whose cross-check disagrees with the broker, writes no calls at all --
+    # a decision, not an absence.
+    "call_scan_skipped_cost_basis_unresolved": "cost-basis floor unresolved (scan)",
+    "call_scan_skipped_cost_basis_divergent": "cost-basis floor divergent (scan)",
+    "call_scan_skipped_quote_unavailable": "stock quote unusable (scan)",
     # Execution-stage failures (FC-048). Without these the tally cannot see an
     # opportunity that was found and ranked but died at the router or in the
     # wrong seller -- which is exactly how the covered-call misroute stayed
     # invisible: every call was rejected here and nothing counted it.
+    "naked_call_blocked": "insufficient available shares (execution)",
     "unroutable_opportunity": "unroutable opportunity (execution)",
     "call_rejected_by_put_seller": "wrong_seller: call sent to put_seller (execution)",
     "put_rejected_by_call_seller": "wrong_seller: put sent to call_seller (execution)",
+}
+
+# `selection_dropped` is ONE event_type carrying a `reason` field (the closed
+# DROP_REASONS enum), so it cannot be a flat _REASONS row -- every drop would
+# collapse into one bucket. FC-068 made batch selection the stage that decides
+# what trades, so a tally blind to *why* selection dropped something is blind to
+# the deciding stage. Bucketed per reason instead.
+SELECTION_DROPPED_EVENT = "selection_dropped"
+
+_SELECTION_DROP_REASONS = {
+    "insufficient_available_shares": "selection: insufficient available shares",
+    "insufficient_buying_power": "selection: insufficient buying power",
+    "duplicate_underlying": "selection: duplicate underlying",
+    "sizing_failed": "selection: sizing failed",
+    "positions_unavailable": "selection: positions snapshot unavailable",
 }
 
 
@@ -91,7 +125,10 @@ class RejectionTally:
             # Synthetic cycles must be distinguishable from live ones in Cloud
             # Logging. Promised by the plan (§5).
             event_dict.setdefault("backtest", True)
-            reason = _REASONS.get(event_type)
+            if event_type == SELECTION_DROPPED_EVENT:
+                reason = _SELECTION_DROP_REASONS.get(event_dict.get("reason"))
+            else:
+                reason = _REASONS.get(event_type)
             if reason and day is not None:
                 self._seen.add((day, reason))
             # Days on which the chain *was examined* and offered a qualifying

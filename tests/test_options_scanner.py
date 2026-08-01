@@ -301,10 +301,55 @@ class TestOptionsScannerCallScan:
         assert len(results) == 1
         assert results[0]['type'] == 'call'
         assert results[0]['symbol'] == 'AAPL'
+        assert results[0]['max_contracts'] == 1
         # Should filter by cost basis
         self.mock_market_data.find_suitable_calls.assert_called_once_with(
             'AAPL', min_strike_price=160.0
         )
+
+    def test_multiple_round_lots_size_to_every_lot(self):
+        """FC-068 migration of the engine path's `test_multiple_round_lots`.
+
+        A 300-share position must offer 3 contracts, not 1. The deleted
+        `_calculate_call_position` pinned this; nothing on the scanner path
+        did — `test_scan_call_opportunities_with_stock_positions` only ever
+        used 100 shares, so a `max_contracts = 1` regression would have been
+        invisible after the deletion.
+        """
+        self.mock_alpaca.get_positions.return_value = [
+            {
+                'symbol': 'AAPL',
+                'qty': '300',
+                'cost_basis': '48000.0',
+                'avg_entry_price': '160.0',
+                'asset_class': 'us_equity',
+                'side': 'long',
+            }
+        ]
+        self.mock_market_data.get_stock_metrics.return_value = {'current_price': 175.0}
+        self.mock_market_data.find_suitable_calls.return_value = [
+            {
+                'symbol': 'AAPL250117C00185000',
+                'strike_price': 185.0,
+                'expiration_date': '2025-01-17',
+                'dte': 7,
+                'delta': 0.15,
+                'mid_price': 1.80,
+                'bid': 1.75,
+                'ask': 1.85,
+                'volume': 2000,
+                'open_interest': 8000,
+                'implied_volatility': 0.22,
+            }
+        ]
+
+        results = self.scanner.scan_for_call_opportunities()
+
+        assert len(results) == 1
+        assert results[0]['shares_owned'] == 300
+        assert results[0]['max_contracts'] == 3
+        # Premium income must scale with the lots, not with a bare 100.
+        assert results[0]['premium_income'] == pytest.approx(1.80 * 100 * 3)
 
     def test_scan_call_skips_insufficient_shares(self):
         """Test that positions with < 100 shares are skipped."""
@@ -363,7 +408,13 @@ class TestCallScanFailsClosedOnUnresolvedCostBasis:
             position['avg_entry_price'] = avg_entry_price
         return position
 
-    @pytest.mark.parametrize("avg_entry_price", ['0', '0.0', 0, None, '', _ABSENT])
+    # 'nonsense' added by FC-068: it is the third parametrization of the
+    # engine-path test this one replaces
+    # (`test_no_cost_basis_floor_resolved_blocks_call_write[0.0/None/nonsense]`),
+    # and an unparseable string is a distinct failure from a zero or an absent
+    # field — it reaches float() rather than the falsy checks.
+    @pytest.mark.parametrize("avg_entry_price",
+                             ['0', '0.0', 0, None, '', 'nonsense', _ABSENT])
     def test_unresolved_cost_basis_emits_nothing(self, avg_entry_price):
         self.mock_alpaca.get_positions.return_value = [
             self._position(avg_entry_price)]
@@ -981,6 +1032,19 @@ class TestScanStageDecisionRecords:
 
         assert [r['symbol'] for r in rows] == ['NVDA']
         assert rows[0]['outcome'] == 'not_eligible'
+
+    def test_a_chain_exception_emits_no_opportunity(self):
+        """FC-068 migration of `test_api_error_returns_none`.
+
+        The test above pins that the *records* survive a mid-scan exception.
+        The deleted engine-path test pinned the other half — that the scan
+        emits nothing rather than a half-built opportunity — and nothing on
+        the scanner path asserted it.
+        """
+        self.mock_alpaca.get_positions.return_value = [self._nvda()]
+        self.mock_market_data.find_suitable_calls.side_effect = Exception("chain down")
+
+        assert self.scanner.scan_for_call_opportunities() == []
 
     def test_a_scan_without_a_run_id_still_records_under_a_minted_one(self):
         from src.data.decision_record import is_run_id

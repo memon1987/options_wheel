@@ -205,9 +205,14 @@ ORDER BY stage_number
 **Expected**: If no opportunities found in Stage 7, won't see Stages 8-9.
 
 ### "No Stage 2 or 3 events"
-**Reason**:
-- Stage 2 logs once per scan (summary)
-- Stage 3 only logs if `max_stocks_evaluated_per_cycle` is configured (currently `null`)
+**Reason (superseded — FC-068, 2026-08-01)**: stages 2 and 3 **do not exist**. They ran
+only inside `WheelEngine._find_new_opportunities`, which production stopped calling on
+2025-10-03 and FC-068 deleted; `max_stocks_evaluated_per_cycle` was deleted with it.
+Absence of these events is correct and permanent. See the banner on
+`docs/logging/FILTERING_STAGES_LOGGING.md` for the stages that do exist.
+
+~~- Stage 2 logs once per scan (summary)~~
+~~- Stage 3 only logs if `max_stocks_evaluated_per_cycle` is configured (currently `null`)~~
 
 ---
 

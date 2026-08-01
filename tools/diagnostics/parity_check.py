@@ -9,9 +9,16 @@ exactly that, one real decision at a time:
      `options_wheel.trades_from_activities` is derived from).
   2. For each (date, underlying) the bot actually traded, rebuild that day's
      chain from historical data, wrap it in BacktestAlpacaClient, and run the
-     *live* selection path — MarketDataManager.find_suitable_puts()[0], which is
-     precisely what PutSeller.find_put_opportunity() picks.
+     *live* selection path — MarketDataManager.find_suitable_{puts,calls}()
+     narrowed to the scanner's top 3, then ranked the way ExecutionEngine ranks
+     (see `_mirror_selection`).
   3. Compare the selected contract against the one that really filled.
+
+⚠️ **The 81% / 55.2% / 0.676 figures in docs/BACKTEST_ENGINE.md and
+docs/investigations/fc-032-*.md predate FC-068** and were produced by the old
+mirror (`suitable[0]`, matching the since-deleted sellers). They are marked
+stale there pending a re-run of this tool on both legs. Do not quote them as
+current.
 
 Why per-decision rather than a full replay: a full-window replay makes its own
 sequence of decisions, so assignment timing diverges from live within days and
@@ -225,9 +232,19 @@ def main() -> int:
                   f"{d['premium']:>8.2f}{'—':>8}{'—':>8}  no_candidate")
             continue
 
-        # Exactly what the seller takes: find_put_opportunity /
-        # evaluate_covered_call_opportunity both use suitable[0].
-        best = suitable[0]
+        # FC-068: the two legs select DIFFERENTLY, and mirroring both with
+        # `suitable[0]` (what the deleted sellers did) would mis-measure the
+        # tool whose whole purpose is fidelity. Production is:
+        #   scanner emits top-3 per symbol by chain order  ->  ExecutionEngine
+        #   ranks and select_batch picks one per underlying.
+        # Call pool ranks by `attractiveness_score` (`_call_rank_score`); put
+        # pool ranks by ROI = premium_collected / collateral. Contracts cancel
+        # out of the put ROI (premium*100*n / strike*100*n), so with one
+        # underlying per decision the winner is max(premium/strike) — which is
+        # also why sizing, which this tool has no account to model, cannot
+        # change the *order*. It can only drop a candidate entirely
+        # (`sizing_failed`); that residual is reported below, not hidden.
+        best = _mirror_selection(suitable, args.side, symbol, market_data, config)
         sim_strike = float(best["strike_price"])
         sim_prem = float(best.get("mid_price") or 0.0)
         sim_delta = abs(float(best.get("delta") or 0.0))
@@ -253,6 +270,65 @@ def main() -> int:
             json.dump(results, fh, indent=2, default=str)
         print(f"\nWrote {len(results)} decisions to {args.out}")
     return 0
+
+
+SCANNER_TOP_N = 3   # options_scanner: `for put in puts[:3]` / `for call in calls[:3]`
+
+
+def _mirror_selection(suitable, side, symbol, market_data, config):
+    """The contract production's batch selection would pick, for one symbol.
+
+    Mirrors `OptionsScanner` (top-3 by chain order) into
+    `ExecutionEngine._sort_pools` (calls by `attractiveness_score`, puts by
+    ROI). Pre-FC-068 this was `suitable[0]` for both legs, mirroring the
+    sellers that FC-068 deleted.
+
+    Falls back to `suitable[0]` only if the scoring cannot be computed at all,
+    and says so rather than silently changing the question.
+    """
+    pool = suitable[:SCANNER_TOP_N]
+    if len(pool) == 1:
+        return pool[0]
+
+    if side == "put":
+        # ROI = premium_collected / collateral; contracts cancel.
+        def score(c):
+            strike = float(c.get("strike_price") or 0)
+            premium = float(c.get("mid_price") or 0)
+            return premium / strike if strike > 0 else 0.0
+        return max(pool, key=score)
+
+    # Call leg: the scanner's own attractiveness score, computed by the
+    # scanner's own method so this mirror cannot drift from it.
+    from src.data.options_scanner import OptionsScanner  # noqa: E402
+
+    scanner = OptionsScanner(None, market_data, config, allow_bigquery=False)
+    try:
+        current_price = float(
+            (market_data.get_stock_metrics(symbol) or {}).get("current_price") or 0
+        )
+    except Exception:  # noqa: BLE001 - diagnostic tool
+        current_price = 0.0
+    if current_price <= 0:
+        return pool[0]
+
+    def call_score(c):
+        strike = float(c.get("strike_price") or 0)
+        premium = float(c.get("mid_price") or 0)
+        dte = int(c.get("dte") or 0)
+        annual = ((premium / current_price) * (365 / dte) * 100) if dte > 0 else 0
+        otm = (strike - current_price) / current_price * 100
+        volume = c.get("volume", 0) or 0
+        open_interest = c.get("open_interest", 0) or 0
+        liquidity = min(100, (volume * 0.3 + open_interest * 0.7) / 10)
+        # `find_suitable_calls` already applied the floor, so every survivor is
+        # at or above it — the `above_cost_basis` bonus is constant across the
+        # pool and cannot reorder it.
+        return scanner._calculate_call_attractiveness_score(
+            annual, abs(float(c.get("delta") or 0)), otm, liquidity, dte, True
+        )
+
+    return max(pool, key=call_score)
 
 
 def _key(d):

@@ -406,8 +406,9 @@ class MarketDataManager:
 
         # Warn if cost basis protection is not being used. Pre-FC-029 this
         # warning fired for legitimate put-only scans too (no shares held);
-        # post-FC-029 callers (`call_seller.evaluate_covered_call_opportunity`)
-        # always pass a non-zero floor when shares are held, so this warning
+        # the sole remaining caller (`OptionsScanner.scan_for_call_opportunities`
+        # — FC-068 deleted `call_seller.evaluate_covered_call_opportunity`)
+        # always passes a non-zero floor when shares are held, so this warning
         # now only fires when the floor genuinely failed to resolve from any
         # source — a real risk signal worth investigating.
         if min_strike_price <= 0.0:

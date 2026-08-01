@@ -1,5 +1,14 @@
 # Call-side parity: the first measurement of the engine's other half
 
+> **⚠️ Method predates FC-068 (2026-08-01); 55.2% / 0.676 are STALE.** This measured
+> `find_suitable_calls(...)[0]`, mirroring the since-deleted
+> `CallSeller.evaluate_covered_call_opportunity`. Production ranks the scanner's top 3
+> by `attractiveness_score` and lets the best available-shares candidate win.
+> `parity_check.py` now mirrors that per leg, but **has not been re-run**. The strike
+> figure is the one at risk; the premium ratio depends on the chain model, not the
+> selection rule.
+
+
 **Date:** 2026-07-29
 **Tool:** `python tools/diagnostics/parity_check.py --side call` (re-runnable)
 **Companion:** `docs/investigations/fc-032-parity-check.md` (the put side)

@@ -1,5 +1,14 @@
 # FC-048 re-validation: what changed when the backtest stopped running half a wheel
 
+> **⚠️ Predates FC-068 (2026-08-01).** These numbers came from the engine-path replay.
+> FC-068 repointed the simulator onto the production scan → select → execute pipeline
+> and premium-netted the assignment basis, so **every figure here is non-comparable
+> with post-FC-068 runs**. The finding it established — that every backtest before
+> FC-048 ran a put-only wheel — stands; the magnitudes do not. Also of note: FC-048
+> never bumped `ENGINE_VERSION`, so its boundary is timestamp-only (2026-07-29);
+> FC-068's is queryable (`engine_version = 'fc-068-prod-pipeline'`).
+
+
 **Date:** 2026-07-29
 **Trigger:** FC-048 (PR #57, `ea5cfa5`) — covered calls were misrouted to `put_seller`
 and rejected, so every backtest this project had ever run modelled a **put-only**

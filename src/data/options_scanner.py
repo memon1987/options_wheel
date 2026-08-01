@@ -1,7 +1,6 @@
 """Options scanning utilities for wheel strategy opportunity identification."""
 
 from typing import Dict, List, Any, Optional, Tuple
-from datetime import datetime, timedelta
 import pandas as pd
 import structlog
 import numpy as np
@@ -9,6 +8,7 @@ import numpy as np
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
+from ..utils import clock
 from ..utils.logging_events import log_performance_metric, log_error_event
 from ..utils.positions import get_stock_positions
 from ..strategy.cost_basis import CostBasisResolver, SOURCE_DIVERGENT
@@ -38,27 +38,48 @@ logger = structlog.get_logger(__name__)
 class OptionsScanner:
     """Scanner for identifying options wheel trading opportunities."""
     
-    def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager, config: Config):
+    def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager,
+                 config: Config, allow_bigquery: bool = True):
         """Initialize options scanner.
-        
+
         Args:
             alpaca_client: Alpaca API client
             market_data: Market data manager
             config: Configuration instance
+            allow_bigquery: whether this scanner's BigQuery readers may run.
+                Production ``/scan`` passes nothing and gets ``True``. FC-068
+                repointed the backtest onto this scanner, and both readers
+                below query production data against ``CURRENT_TIMESTAMP()`` —
+                the cost-basis divergence cross-check would mix real
+                assignments into a replay, and the ``uncovered_days`` lookup
+                would issue one query per simulated day. A replay passes
+                ``False``: the cross-check reports "unavailable" (the
+                simulated broker's floor stands) and ``uncovered_days``
+                answers ``None`` ("could not tell"), which are the honest
+                labels rather than fabricated ones.
+
+                Deliberately an explicit constructor parameter rather than a
+                ``clock.is_frozen()`` check inside the chokepoints: a
+                clock-keyed data-access policy is action at a distance,
+                ``is_frozen`` is thread-local, and explicit injection is the
+                seam every other replay gate here uses (FC-065 P1/P2).
         """
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
+        self.allow_bigquery = allow_bigquery
         # FC-065: the covered-call floor is Alpaca's avg_entry_price for the
         # equity position, with BigQuery running inline as a divergence
         # cross-check that can veto the broker's number but never supply one.
         self.cost_basis_resolver = CostBasisResolver(
-            alpaca_client, config, allow_bigquery=True
+            alpaca_client, config, allow_bigquery=allow_bigquery
         )
         # FC-065 Phase 4: the `uncovered_days` label. One batched BigQuery
         # query per scan for every held symbol, behind its own patchable
         # chokepoint (see tests/conftest.py).
-        self.uncovered_days_resolver = UncoveredDaysResolver()
+        self.uncovered_days_resolver = UncoveredDaysResolver(
+            allow_bigquery=allow_bigquery
+        )
 
     def scan_for_put_opportunities(self, max_results: int = 10) -> List[Dict[str, Any]]:
         """Scan for cash-secured put opportunities across all configured stocks.
@@ -427,7 +448,7 @@ class OptionsScanner:
             return {
                 'puts': put_opportunities,
                 'calls': call_opportunities,
-                'scan_timestamp': datetime.now().isoformat(),
+                'scan_timestamp': clock.now().isoformat(),
                 'total_opportunities': len(put_opportunities) + len(call_opportunities)
             }
             
@@ -493,7 +514,7 @@ class OptionsScanner:
                 'volume': volume,
                 'open_interest': open_interest,
                 'implied_volatility': put_option.get('implied_volatility', 0),
-                'scan_timestamp': datetime.now().isoformat()
+                'scan_timestamp': clock.now().isoformat()
             }
             
             return opportunity
@@ -625,7 +646,7 @@ class OptionsScanner:
                 'volume': volume,
                 'open_interest': open_interest,
                 'implied_volatility': call_option.get('implied_volatility', 0),
-                'scan_timestamp': datetime.now().isoformat()
+                'scan_timestamp': clock.now().isoformat()
             }
             
             return opportunity
@@ -799,7 +820,7 @@ class OptionsScanner:
         """
         try:
             overview = {
-                'scan_timestamp': datetime.now().isoformat(),
+                'scan_timestamp': clock.now().isoformat(),
                 'configured_stocks': len(self.config.stock_symbols),
                 'suitable_stocks': 0,
                 'average_iv_rank': 0,

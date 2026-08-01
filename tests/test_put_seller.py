@@ -1,4 +1,14 @@
-"""Tests for put selling module."""
+"""Tests for put selling module.
+
+FC-068 deleted ``find_put_opportunity`` — the dead engine path's put producer,
+whose only caller was ``WheelEngine._find_new_opportunities``. The 5
+``test_find_put_opportunity_*`` tests went with it. The selection behaviour they
+pinned (delta / DTE / premium filtering) lives in
+``market_data.find_suitable_puts``, which the scanner calls and which keeps its
+own tests in ``tests/test_market_data.py``; the wheel-state gating half was
+fictional (``STATE_STORAGE_BUCKET`` has never been set) and is deleted, not
+migrated.
+"""
 
 import pytest
 from unittest.mock import Mock, MagicMock, patch
@@ -6,97 +16,6 @@ from datetime import datetime
 
 from src.strategy.put_seller import PutSeller
 from src.utils.config import Config
-
-
-class TestPutSellerFindOpportunity:
-    """Test PutSeller.find_put_opportunity."""
-
-    def setup_method(self):
-        """Set up test fixtures."""
-        self.mock_alpaca = Mock()
-        self.mock_market_data = Mock()
-        self.mock_config = Mock(spec=Config)
-        self.mock_config.max_position_size = 0.10
-        self.mock_config.min_put_premium = 0.50
-        self.mock_config.put_target_dte = 7
-
-        self.put_seller = PutSeller(self.mock_alpaca, self.mock_market_data, self.mock_config)
-
-        # Standard account info for position sizing
-        self.mock_alpaca.get_account.return_value = {
-            'portfolio_value': 100000.0,
-            'buying_power': 50000.0,
-            'options_buying_power': 50000.0,
-        }
-
-    def test_find_put_opportunity_success(self):
-        """Test finding a suitable put opportunity."""
-        self.mock_market_data.find_suitable_puts.return_value = [
-            {
-                'symbol': 'AAPL250117P00080000',
-                'strike_price': 80.0,
-                'expiration_date': '2025-01-17',
-                'dte': 7,
-                'delta': -0.15,
-                'mid_price': 2.50,
-                'annual_return': 0.24,
-            }
-        ]
-
-        result = self.put_seller.find_put_opportunity('AAPL')
-
-        assert result is not None
-        assert result['strategy'] == 'sell_put'
-        assert result['symbol'] == 'AAPL'
-        assert result['strike_price'] == 80.0
-        assert result['premium'] == 2.50
-        assert result['contracts'] == 1
-        self.mock_market_data.find_suitable_puts.assert_called_once_with('AAPL')
-
-    def test_find_put_opportunity_no_suitable_puts(self):
-        """Test returns None when no suitable puts exist."""
-        self.mock_market_data.find_suitable_puts.return_value = []
-
-        result = self.put_seller.find_put_opportunity('AAPL')
-        assert result is None
-
-    def test_find_put_opportunity_api_error(self):
-        """Test returns None on API error."""
-        self.mock_market_data.find_suitable_puts.side_effect = Exception("API Error")
-
-        result = self.put_seller.find_put_opportunity('AAPL')
-        assert result is None
-
-    def test_find_put_opportunity_blocked_by_wheel_state(self):
-        """Test returns None when wheel state blocks put selling."""
-        mock_wheel_state = Mock()
-        mock_wheel_state.can_sell_puts.return_value = False
-        mock_wheel_state.get_wheel_phase.return_value = Mock(value='holding_stock')
-
-        result = self.put_seller.find_put_opportunity('AAPL', wheel_state_manager=mock_wheel_state)
-        assert result is None
-        self.mock_market_data.find_suitable_puts.assert_not_called()
-
-    def test_find_put_opportunity_wheel_state_allows(self):
-        """Test proceeds when wheel state allows put selling."""
-        mock_wheel_state = Mock()
-        mock_wheel_state.can_sell_puts.return_value = True
-
-        self.mock_market_data.find_suitable_puts.return_value = [
-            {
-                'symbol': 'AAPL250117P00080000',
-                'strike_price': 80.0,
-                'expiration_date': '2025-01-17',
-                'dte': 7,
-                'delta': -0.15,
-                'mid_price': 2.50,
-                'annual_return': 0.24,
-            }
-        ]
-
-        result = self.put_seller.find_put_opportunity('AAPL', wheel_state_manager=mock_wheel_state)
-        assert result is not None
-        assert result['strategy'] == 'sell_put'
 
 
 class TestPutSellerPositionSizing:

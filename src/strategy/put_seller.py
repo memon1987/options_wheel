@@ -1,6 +1,6 @@
 """Put selling module for options wheel strategy."""
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
 from datetime import datetime
 import structlog
 
@@ -8,7 +8,7 @@ from ..utils import clock
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
-from ..utils.logging_events import log_trade_event, log_error_event, log_risk_event
+from ..utils.logging_events import log_trade_event, log_error_event
 from ..utils.option_symbols import parse_option_symbol
 
 logger = structlog.get_logger(__name__)
@@ -30,94 +30,6 @@ class PutSeller:
         self.config = config
         self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
         
-    def find_put_opportunity(self, symbol: str, wheel_state_manager=None) -> Optional[Dict[str, Any]]:
-        """Find the best put selling opportunity for a stock.
-
-        Args:
-            symbol: Stock symbol
-            wheel_state_manager: Optional wheel state manager for validation
-
-        Returns:
-            Put opportunity details or None
-        """
-        try:
-            logger.info("Evaluating put opportunity",
-                       event_category="trade",
-                       event_type="put_opportunity_evaluation",
-                       symbol=symbol)
-
-            # Check wheel state if manager provided
-            if wheel_state_manager and not wheel_state_manager.can_sell_puts(symbol):
-                logger.info("Put selling blocked by wheel state",
-                           event_category="trade",
-                           event_type="put_blocked_by_wheel_state",
-                           symbol=symbol,
-                           wheel_phase=wheel_state_manager.get_wheel_phase(symbol).value)
-                return None
-
-            # Get suitable puts for this stock
-            suitable_puts = self.market_data.find_suitable_puts(symbol)
-
-            if not suitable_puts:
-                logger.info("No suitable puts found",
-                           event_category="trade",
-                           event_type="no_suitable_puts",
-                           symbol=symbol)
-                return None
-
-            # Select the best put (first in sorted list)
-            best_put = suitable_puts[0]
-
-            # Calculate position size and validate
-            position_details = self._calculate_position_size(best_put)
-
-            if not position_details:
-                logger.info("Position size validation failed",
-                           event_category="trade",
-                           event_type="position_size_validation_failed",
-                           symbol=symbol)
-                return None
-            
-            # Create opportunity
-            opportunity = {
-                'action_type': 'new_position',
-                'strategy': 'sell_put',
-                # FC-048: see call_seller -- both producers now set both keys.
-                'type': 'put',
-                'symbol': symbol,
-                'option_symbol': best_put['symbol'],
-                'strike_price': best_put['strike_price'],
-                'expiration_date': best_put['expiration_date'],
-                'dte': best_put['dte'],
-                'delta': best_put.get('delta', 0),
-                'premium': best_put['mid_price'],
-                'annual_return': best_put.get('annual_return', 0),
-                'contracts': position_details['contracts'],
-                'capital_required': position_details['capital_required'],
-                'max_profit': position_details['max_profit'],
-                'breakeven': position_details['breakeven'],
-                'timestamp': clock.now().isoformat()
-            }
-            
-            logger.info("Put opportunity identified",
-                       event_category="trade",
-                       event_type="put_opportunity_found",
-                       symbol=symbol,
-                       strike=best_put['strike_price'],
-                       premium=best_put['mid_price'],
-                       dte=best_put['dte'],
-                       contracts=position_details['contracts'])
-            
-            return opportunity
-            
-        except Exception as e:
-            logger.error("Failed to find put opportunity",
-                        event_category="error",
-                        event_type="put_opportunity_error",
-                        symbol=symbol,
-                        error=str(e))
-            return None
-    
     def _calculate_position_size(self, put_option: Dict[str, Any], override_buying_power: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Calculate appropriate position size for put selling.
 

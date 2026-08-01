@@ -1,6 +1,6 @@
 """Call selling module for options wheel strategy."""
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
 from datetime import datetime
 import structlog
 
@@ -11,7 +11,6 @@ from ..utils.config import Config
 from ..utils.logging_events import log_trade_event, log_error_event, log_position_update
 from ..utils.option_symbols import parse_option_symbol
 from .cost_basis import (
-    CostBasisResolver,
     opportunity_floor_per_share,
     opportunity_shares_covered,
     opportunity_total_return_if_called,
@@ -21,285 +20,44 @@ logger = structlog.get_logger(__name__)
 
 
 class CallSeller:
-    """Handles covered call selling for the wheel strategy."""
-    
+    """Executes covered call trades and manages open call positions.
+
+    FC-068 deleted this class's opportunity-*generation* half
+    (``evaluate_covered_call_opportunity``, ``_calculate_call_position``,
+    ``_resolve_cost_basis_floor`` and the ``CostBasisResolver`` they shared).
+    Covered-call candidates come from
+    :class:`~src.data.options_scanner.OptionsScanner` on the ``/scan`` path;
+    what remains here is the ``/run`` execute leg (with the FC-050 execute-time
+    floor read off the opportunity) and the monitor-cycle close checks.
+    """
+
     def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager,
-                 config: Config, wheel_state_manager=None,
-                 allow_bigquery_cost_basis: bool = True):
+                 config: Config, wheel_state_manager=None):
         """Initialize call seller.
+
+        FC-068 removed the ``allow_bigquery_cost_basis`` keyword with the
+        resolver it gated: ``execute_call_sale`` reads its floor from the
+        opportunity via ``opportunity_floor_per_share`` and touches no
+        resolver, so there is no BigQuery reader left on this class. The
+        replay gate now lives on ``OptionsScanner``, the sole remaining
+        producer.
 
         Args:
             alpaca_client: Alpaca API client
             market_data: Market data manager
             config: Configuration instance
-            wheel_state_manager: Optional WheelStateManager for tracking active call details
-            allow_bigquery_cost_basis: whether the cost-basis divergence
-                cross-check may query BigQuery. A backtest passes False: the
-                cross-check would otherwise read *production* trade history —
-                against CURRENT_TIMESTAMP() — mixing real assignments into a
-                simulated run. With it off the cross-check is "unavailable",
-                which keeps the simulated broker's floor (FC-065).
+            wheel_state_manager: Optional WheelStateManager for tracking active
+                call details. Orphaned in practice as of FC-068 — ``/run``
+                constructs this class without it and the repointed replay
+                mirrors that, so ``set_active_call_details`` fires nowhere.
+                FC-069 item 8 owns the WheelStateManager shrink.
         """
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
         self.wheel_state = wheel_state_manager
-        # Construction-time snapshot, kept for assertions only: the resolver below
-        # took its own copy, so mutating this attribute afterwards changes nothing.
-        self.allow_bigquery_cost_basis = allow_bigquery_cost_basis
         self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
-        # FC-050: the floor resolution lives in cost_basis.py so the scanner
-        # shares it. FC-065: it resolves from Alpaca's avg_entry_price and
-        # cross-checks against BigQuery, so there is no wheel_state source and
-        # no injected lookup any more — the resolver's own
-        # ``_lookup_assignment_basis`` is the single BigQuery chokepoint, and
-        # the test suite's hermeticity guard patches it on the class.
-        self._cost_basis_resolver = CostBasisResolver(
-            alpaca_client,
-            config,
-            allow_bigquery=allow_bigquery_cost_basis,
-        )
-        
-    def evaluate_covered_call_opportunity(self, stock_position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Evaluate covered call opportunity for an assigned stock position.
-        
-        Args:
-            stock_position: Stock position from assignment
-            
-        Returns:
-            Call opportunity details or None
-        """
-        try:
-            symbol = stock_position['symbol']
-            shares_owned = int(float(stock_position['qty']))
-            
-            # Only sell calls if we own shares in round lots (100 shares per contract)
-            if shares_owned < 100:
-                logger.info("Insufficient shares for covered calls",
-                           event_category="trade",
-                           event_type="insufficient_shares_for_calls",
-                           symbol=symbol,
-                           shares=shares_owned)
-                return None
 
-            logger.info("Evaluating covered call opportunity",
-                       event_category="trade",
-                       event_type="call_opportunity_evaluation",
-                       symbol=symbol,
-                       shares=shares_owned)
-
-            # FC-065: cost basis = Alpaca's avg_entry_price for the equity
-            # position, vetoed by the BigQuery divergence cross-check. Zero
-            # means the broker field was missing/zero or the cross-check
-            # disagreed — both are "no floor", both block the write below.
-            stock_cost_basis = self._resolve_cost_basis_floor(
-                symbol, stock_position, shares_owned
-            )
-
-            # FC-029 review fix (MEDIUM 6): when shares are held but no source
-            # resolved a cost basis, we have no floor — this is unsafe. Block
-            # the call write entirely with a structured error rather than
-            # writing at any strike. Operator intervention required.
-            if stock_cost_basis <= 0:
-                log_error_event(
-                    logger,
-                    error_type="cost_basis_floor_unresolved",
-                    error_message=(
-                        f"No cost-basis floor resolved for {symbol} (Alpaca "
-                        f"avg_entry_price missing/zero, or the BigQuery "
-                        f"cross-check found it divergent). Holding "
-                        f"{shares_owned} shares with no protection. Blocking call write."
-                    ),
-                    component="call_seller",
-                    recoverable=True,
-                    symbol=symbol,
-                    shares=shares_owned,
-                )
-                return None
-
-            # FC-029 (R3): drawdown pause — when shares are deeply underwater
-            # every delta-range strike is at-or-below cost basis. Make this an
-            # explicit, observable decision instead of relying on the (now
-            # working) cost-basis filter to silently return no candidates.
-            try:
-                quote = self.alpaca.get_stock_quote(symbol) or {}
-                bid = float(quote.get('bid', 0) or 0)
-                ask = float(quote.get('ask', 0) or 0)
-                # Defensive: a malformed quote with one side zero would yield
-                # a wildly-wrong mid (e.g. bid=$10, ask=$0 → mid=$5).
-                current_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0
-            except Exception:
-                current_price = 0
-
-            # FC-029 review fix (HIGH 2): no usable quote → defer to next cycle
-            # rather than writing without drawdown protection. The pause IS the
-            # protection; failing open means LESS protection precisely when
-            # quotes are noisy (premarket, illiquid intraday, halts) — exactly
-            # the regimes the pause exists for. Monitor cycle re-evaluates in
-            # ~5 min; cost of deferring is negligible.
-            if current_price <= 0:
-                logger.info("Covered call deferred: quote unavailable",
-                           event_category="trade",
-                           event_type="covered_call_quote_missing",
-                           symbol=symbol,
-                           cost_basis=stock_cost_basis)
-                return None
-
-            drawdown_pct = (stock_cost_basis - current_price) / stock_cost_basis
-            threshold = self.config.call_drawdown_pause_threshold
-            if drawdown_pct >= threshold:
-                logger.info("Covered call skipped: drawdown pause",
-                           event_category="trade",
-                           event_type="covered_call_drawdown_pause",
-                           symbol=symbol,
-                           cost_basis=stock_cost_basis,
-                           current_price=current_price,
-                           drawdown_pct=round(drawdown_pct, 4),
-                           threshold_pct=threshold)
-                return None
-
-            # Get suitable calls for this stock (with cost basis protection)
-            suitable_calls = self.market_data.find_suitable_calls(symbol, min_strike_price=stock_cost_basis)
-            
-            if not suitable_calls:
-                logger.info("No suitable calls found",
-                           event_category="trade",
-                           event_type="no_suitable_calls",
-                           symbol=symbol)
-                return None
-            
-            # Select the best call (first in sorted list)
-            best_call = suitable_calls[0]
-            
-            # Calculate position details
-            position_details = self._calculate_call_position(best_call, shares_owned, stock_position)
-            
-            if not position_details:
-                logger.info("Call position validation failed",
-                           event_category="trade",
-                           event_type="call_position_validation_failed",
-                           symbol=symbol)
-                return None
-            
-            # Create opportunity
-            opportunity = {
-                'action_type': 'new_position',
-                'strategy': 'sell_call',
-                # FC-048: the router keys off the OCC symbol, so this is
-                # documentation/telemetry rather than load-bearing -- but the
-                # sellers previously set only 'strategy' while the scanner set
-                # only 'type', and that vocabulary split is what caused the
-                # covered-call misroute. Both producers now speak both.
-                'type': 'call',
-                'symbol': symbol,
-                'option_symbol': best_call['symbol'],
-                'strike_price': best_call['strike_price'],
-                'expiration_date': best_call['expiration_date'],
-                'dte': best_call['dte'],
-                'delta': best_call.get('delta', 0),
-                'premium': best_call['mid_price'],
-                'annual_return': best_call.get('annual_return', 0),
-                'contracts': position_details['contracts'],
-                'shares_covered': position_details['shares_covered'],
-                'max_profit': position_details['max_profit'],
-                # FC-029 (R2): canonical floor (per-share × shares_covered).
-                # Used by the defensive check in execute_call_sale.
-                'stock_cost_basis': stock_cost_basis * position_details['shares_covered'],
-                'current_stock_price': position_details['current_stock_price'],
-                'total_return_if_called': position_details['total_return_if_called'],
-                'timestamp': clock.now().isoformat()
-            }
-            
-            logger.info("Covered call opportunity identified",
-                       event_category="trade",
-                       event_type="call_opportunity_found",
-                       symbol=symbol,
-                       strike=best_call['strike_price'],
-                       premium=best_call['mid_price'],
-                       dte=best_call['dte'],
-                       contracts=position_details['contracts'])
-            
-            return opportunity
-            
-        except Exception as e:
-            logger.error("Failed to evaluate covered call opportunity",
-                        event_category="error",
-                        event_type="call_opportunity_error",
-                        symbol=stock_position.get('symbol', 'unknown'),
-                        error=str(e))
-            return None
-    
-    def _calculate_call_position(self, call_option: Dict[str, Any], shares_owned: int, 
-                                stock_position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Calculate covered call position details.
-        
-        Args:
-            call_option: Call option details
-            shares_owned: Number of shares owned
-            stock_position: Stock position details
-            
-        Returns:
-            Position details or None if invalid
-        """
-        try:
-            # Calculate number of contracts we can sell (1 contract = 100 shares)
-            max_contracts = shares_owned // 100
-            
-            # Conservative approach - sell calls on all round lots
-            contracts = max_contracts
-            
-            if contracts <= 0:
-                return None
-            
-            shares_covered = contracts * 100
-            strike_price = call_option['strike_price']
-            premium_per_contract = call_option['mid_price']
-            
-            # Get current stock price
-            symbol = stock_position['symbol']
-            stock_metrics = self.market_data.get_stock_metrics(symbol)
-            current_price = stock_metrics.get('current_price', 0)
-            
-            # Calculate returns
-            premium_income = contracts * premium_per_contract * 100
-            # FC-029 (R2): same canonical-source resolution as the entry path.
-            stock_cost_basis = self._resolve_cost_basis_floor(
-                symbol, stock_position, shares_owned
-            )
-            
-            # If called away, calculate total return
-            if current_price > 0:
-                capital_gain_per_share = strike_price - stock_cost_basis
-                total_capital_gain = capital_gain_per_share * shares_covered
-                total_return_if_called = premium_income + total_capital_gain
-                
-                # Return as percentage
-                total_cost_basis = stock_cost_basis * shares_covered
-                if total_cost_basis > 0:
-                    return_percentage = (total_return_if_called / total_cost_basis) * 100
-                else:
-                    return_percentage = 0
-            else:
-                total_return_if_called = premium_income
-                return_percentage = 0
-            
-            return {
-                'contracts': contracts,
-                'shares_covered': shares_covered,
-                'max_profit': premium_income,
-                'current_stock_price': current_price,
-                'total_return_if_called': total_return_if_called,
-                'return_percentage': return_percentage,
-                'premium_per_contract': premium_per_contract
-            }
-            
-        except Exception as e:
-            logger.error("Failed to calculate call position",
-                        event_category="error",
-                        event_type="call_position_calculation_error",
-                        error=str(e))
-            return None
-    
     def execute_call_sale(self, opportunity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Execute a covered call trade.
 
@@ -527,31 +285,6 @@ class CallSeller:
                 'timestamp': clock.now().isoformat()
             }
     
-    def _resolve_cost_basis_floor(
-        self, symbol: str, stock_position: Dict[str, Any], shares_owned: int
-    ) -> float:
-        """Resolve the per-share cost basis for covered-call strike floor.
-
-        FC-050: delegates to the shared :class:`CostBasisResolver`, which the
-        scanner uses too. Kept as a method so callers and tests that patch this
-        entry point keep working.
-
-        FC-065: the resolved value is Alpaca's ``avg_entry_price`` for the
-        equity position, and it is 0 whenever the broker field is missing or
-        the BigQuery divergence cross-check vetoed it. Both cases mean "no
-        floor", and the caller must fail closed.
-
-        Args:
-            symbol: Underlying ticker (e.g. ``"AMD"``).
-            stock_position: Alpaca position dict (carries ``avg_entry_price``).
-            shares_owned: Current share count, used to bound the cross-check's
-                lot reconstruction.
-
-        Returns:
-            Per-share cost basis, or 0 if there is no usable floor.
-        """
-        return self._cost_basis_resolver.resolve(symbol, stock_position, shares_owned)
-
     def _parse_dte_from_option_symbol(self, option_symbol: str) -> int:
         """
         Extract DTE (Days to Expiration) from option symbol.

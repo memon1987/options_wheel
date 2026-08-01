@@ -1,5 +1,14 @@
 # FC-032 Phase 3 — Replay-vs-reality parity check
 
+> **⚠️ Method predates FC-068 (2026-08-01); the 81% headline is STALE.** This measured
+> the selection made by `MarketDataManager.find_suitable_puts()[0]` — "precisely what
+> `PutSeller.find_put_opportunity()` picks". FC-068 **deleted**
+> `find_put_opportunity`; production selects the scanner's top 3 and then takes the
+> highest-ROI candidate per underlying in `ExecutionEngine.select_batch`.
+> `parity_check.py` has been rewritten to mirror that, but **has not been re-run**.
+> Presented as re-runnable — re-run it before quoting the number.
+
+
 **Date:** 2026-07-17
 **Plan:** [docs/plans/fc-032.md](../plans/fc-032.md)
 **Tool:** [`tools/diagnostics/parity_check.py`](../../tools/diagnostics/parity_check.py)

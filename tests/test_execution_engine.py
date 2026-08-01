@@ -531,62 +531,75 @@ class TestExecuteBatchRouting:
 
 
 class TestProducerVocabulary:
-    """Both producers must set both keys (FC-048 D2).
+    """The producer must declare its own type (FC-048 D2).
 
-    Not load-bearing after the router change, but the sellers setting only
-    'strategy' while the scanner set only 'type' is the asymmetry that caused
-    the misroute. Asserted against the real emitted dicts, not the source text.
+    The sellers setting only 'strategy' while the scanner set only 'type' is
+    the vocabulary asymmetry that caused the covered-call misroute. FC-068
+    deleted the seller-side producers (``evaluate_covered_call_opportunity``,
+    ``find_put_opportunity``), so ``OptionsScanner`` is the sole remaining one
+    — and the contract is *restated against it*, not dropped: an opportunity
+    with no declared type is exactly what the misroute was made of.
+
+    Stated for the record: the scanner sets ``type`` and no ``strategy`` key.
+    ``ExecutionEngine._declared_type`` still understands both vocabularies and
+    is untouched — the OCC symbol remains the router; ``type`` is the
+    telemetry/mismatch-warning input.
     """
 
-    def test_call_seller_opportunity_declares_its_type(self):
-        """Assert the REAL emitted dict, not the source text.
+    def _scanner(self):
+        from src.data.options_scanner import OptionsScanner
 
-        The first version of this test stubbed the seller so loosely that
-        _resolve_cost_basis_floor found nothing, evaluate_covered_call_opportunity
-        returned None, and the test skipped on every run — coverage that never
-        executed. Patch the floor so the builder actually reaches its return.
-        """
-        from src.strategy.call_seller import CallSeller as CS
+        config = Mock(spec=Config)
+        config.put_target_dte = 7
+        config.call_target_dte = 7
+        market_data = Mock()
+        market_data.get_stock_metrics.return_value = {"current_price": 160.05}
+        return OptionsScanner(Mock(), market_data, config)
 
-        seller = CS.__new__(CS)          # builder-only; no __init__ wiring
-        seller.config = Mock(spec=Config)
-        seller.config.call_drawdown_pause_threshold = 0.05
-        seller.market_data = Mock()
-        seller.alpaca = Mock()
-        # Spot above the 150 basis so the FC-029 drawdown pause does not fire.
-        seller.alpaca.get_stock_quote.return_value = {"bid": 160.0, "ask": 160.10}
-        seller.wheel_state = None
-        seller.market_data.find_suitable_calls.return_value = [{
-            "symbol": "AAPL250117C00190000", "strike_price": 190.0,
-            "expiration_date": "2025-01-17", "dte": 7, "delta": 0.20,
-            "mid_price": 1.10, "annual_return": 0.3,
-        }]
+    def test_scanner_call_opportunity_declares_its_type(self):
+        """Assert the REAL emitted dict, not the source text."""
+        scanner = self._scanner()
 
-        with patch.object(CS, "_resolve_cost_basis_floor", return_value=150.0), \
-             patch.object(CS, "_calculate_call_position",
-                          return_value={"contracts": 1, "shares_covered": 100,
-                                        "max_profit": 110.0,
-                                        "current_stock_price": 160.05,
-                                        "total_return_if_called": 0.07}):
-            opp = seller.evaluate_covered_call_opportunity(
-                {"symbol": "AAPL", "qty": "100", "avg_entry_price": "150.0"})
+        opp = scanner._create_call_opportunity(
+            {"symbol": "AAPL250117C00190000", "strike_price": 190.0,
+             "expiration_date": "2025-01-17", "dte": 7, "delta": 0.20,
+             "mid_price": 1.10},
+            {"symbol": "AAPL", "qty": "100"},
+            150.0,
+        )
 
         assert opp is not None, (
-            "builder returned None — the stub is too loose again; this test "
-            "must ASSERT, never skip"
+            "builder returned None — the stub is too loose; this test must "
+            "ASSERT, never skip"
         )
         assert opp["type"] == "call"
-        assert opp["strategy"] == "sell_call"
+        assert ExecutionEngine._declared_type(opp) == "call"
 
-    def test_both_sellers_declare_type_in_their_opportunity_shape(self):
-        """Belt-and-braces contract check that survives a constant refactor."""
-        import re as _re
+    def test_scanner_put_opportunity_declares_its_type(self):
+        scanner = self._scanner()
+
+        opp = scanner._create_put_opportunity(
+            {"symbol": "AAPL250117P00150000", "strike_price": 150.0,
+             "expiration_date": "2025-01-17", "dte": 7, "delta": -0.20,
+             "mid_price": 1.10},
+            {"symbol": "AAPL", "current_price": 160.05},
+        )
+
+        assert opp is not None
+        assert opp["type"] == "put"
+        assert ExecutionEngine._declared_type(opp) == "put"
+
+    def test_the_producer_declares_type_in_its_opportunity_shape(self):
+        """Belt-and-braces contract check that survives a constant refactor.
+
+        Repointed by FC-068 from the two seller modules — whose only ``'type'``
+        literals lived inside the deleted producers — to the sole survivor.
+        """
         from pathlib import Path as _P
 
-        for f, want in (("src/strategy/call_seller.py", "'type': 'call'"),
-                        ("src/strategy/put_seller.py", "'type': 'put'")):
-            body = _P(f).read_text()
-            assert want in body, f"{f} no longer declares {want}"
+        body = _P("src/data/options_scanner.py").read_text()
+        for want in ("'type': 'put'", "'type': 'call'"):
+            assert want in body, f"options_scanner.py no longer declares {want}"
 
 
 class TestCommittedSharesCheck:

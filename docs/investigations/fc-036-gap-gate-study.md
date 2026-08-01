@@ -1,5 +1,13 @@
 # FC-036 Half 1 — what a *working* stage-4 gap gate would have done
 
+> **⚠️ Engine layers predate FC-068 (2026-08-01).** Every layer measured here was
+> produced by the *engine-path* replay (`WheelEngine.run_strategy_cycle`,
+> single-candidate selection, pre-batch-selection) and is **non-comparable with
+> post-FC-068 runs**. Not re-run, and deliberately so: the headline conclusion rests
+> on the real-fills layer, which FC-068 does not touch. The stage-4 gate this studies
+> now runs nowhere at all — FC-068 deleted its only caller.
+
+
 **Date:** 2026-07-29
 **Plan:** [docs/plans/fc-036.md](../plans/fc-036.md) — "Half 1 — Study design"
 **Branch:** `fc-036-gap-gate` (Phase A merged: gate math fixed, threshold 999, disarmed)

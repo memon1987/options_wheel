@@ -1,5 +1,40 @@
 # Risk Filtering Steps During Market Scan
 
+> # ⚠️ STALE — DESCRIBES A PIPELINE THAT NO LONGER RUNS
+>
+> Generated 2025-10-03. That is the same day `842dcce` removed
+> `WheelEngine.run_strategy_cycle()` from `/run` — so this document was describing a dead
+> path from the day it was written, three days before the live account's first fill.
+> **FC-068 (2026-08-01) deleted that path.**
+>
+> **Gone, with the code that emitted them:**
+> - **Stage 2** — gap-risk analysis (`GapDetector.filter_stocks_by_gap_risk`). The
+>   detector class survives but is now consumed by *nothing*, in production or in
+>   backtests (FC-049, FC-069 item 5).
+> - **Stage 3** — `max_stocks_evaluated_per_cycle`. **Knob deleted** by FC-068 (it was
+>   `null`, so it never limited anything).
+> - **Stage 4** — execution gap check (`GapDetector.can_execute_trade`).
+> - **Stage 5** — wheel-state phase gating. The state layer it read has never been
+>   populated (`STATE_STORAGE_BUCKET` unset since inception).
+> - **Stage 6** — the engine's own duplicate/open-order guard. Live duplicate protection
+>   is `options_scanner._has_existing_position` +
+>   `execution_engine.filter_duplicate_opportunities` + the opportunity store's
+>   idempotency machinery. The *open-order* window stage 6 uniquely covered is covered by
+>   nothing on the live path, before or after — that is FC-009's standing territory.
+> - **Stage 9** — `max_new_positions_per_cycle`. **Knob deleted** by FC-068 (also `null`).
+> - The **covered-call drawdown pause** (`covered_call_drawdown_pause`), deleted per
+>   FC-065 OQ-3. `call_drawdown_pause_threshold` survives as an orphaned knob until
+>   FC-069 item 9 removes it and its `/config` field.
+>
+> **What actually gates a trade today:** stage 1 (price/volume band) → the options-chain
+> filters (`find_suitable_puts` / `find_suitable_calls`, including the cost-basis floor on
+> calls) → put position sizing → `ExecutionEngine`'s two-pool **batch selection**
+> (`selection_dropped`, with a machine-readable `reason`) → the execute-time guards
+> (`naked_call_blocked`, the FC-050 cost-basis floor, the wrong-seller guards). See
+> `docs/logging/FILTERING_STAGES_LOGGING.md`'s banner for the event names to search on.
+>
+> Full rewrite is **FC-069 item 14**.
+
 **Complete flow diagram of all risk filters applied during each hourly market scan**
 
 Generated: October 3, 2025

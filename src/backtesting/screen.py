@@ -32,7 +32,14 @@ from .reporting.bq_writer import BacktestRunWriter, build_row, config_hash
 
 logger = structlog.get_logger(__name__)
 
-ENGINE_VERSION = "fc-032-phase-5"
+# Stamped on every `backtest_runs` row so a verdict can be traced to the engine
+# that produced it. FC-068 repointed the replay from WheelEngine's dead
+# orchestration path onto the production scan -> select -> execute pipeline and
+# premium-netted the assignment basis: rows either side of this string are NOT
+# comparable. (FC-048 changed the measurement just as much — every backtest
+# before it ran a put-only wheel — and did NOT bump this, so its boundary is
+# timestamp-only, 2026-07-29.)
+ENGINE_VERSION = "fc-068-prod-pipeline"
 
 # Default lookback for a screening run. Long enough for a meaningful number of
 # cycles, short enough that a symbol's *recent* behavior dominates — a demotion

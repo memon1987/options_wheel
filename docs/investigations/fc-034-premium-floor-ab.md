@@ -1,5 +1,13 @@
 # FC-034 — Premium-floor A/B: demote the low-price cohort, or re-shape the threshold?
 
+> **⚠️ Engine layers predate FC-068 (2026-08-01).** The engine-replay layers were
+> produced by `WheelEngine.run_strategy_cycle` with single-candidate selection and are
+> **non-comparable with post-FC-068 runs**. Not re-run: the verdict rests on the
+> real-fills layer. (`tools/diagnostics/fc034_premium_floor_study.py` maps some
+> event types FC-068 retired — correct for the historical logs it reads, wrong as a
+> description of what a scan emits today.)
+
+
 **Study:** Track B2 of `docs/plans/fc-042.md` · **FC entry:** FC-034
 **Harness:** `tools/diagnostics/fc034_premium_floor_study.py` — the pre-registered decision rules were committed in `fc926e8` **before any result was collected**.
 **Date:** 2026-07-29

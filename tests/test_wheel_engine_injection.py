@@ -1,10 +1,15 @@
 """WheelEngine dependency-injection seam (FC-032 Phase 3).
 
-The backtest replays the *actual* staged pipeline in WheelEngine rather than a
-reimplementation of it. That only works if injecting one client redirects every
-component the engine builds — market data, gap detector, put seller, call seller.
-If any of them quietly keeps a real AlpacaClient, a replay would fire live API
-calls mid-simulation.
+The backtest replays the *actual* live code rather than a reimplementation of
+it. That only works if injecting one client redirects every component the
+engine builds. If any of them quietly keeps a real AlpacaClient, a replay would
+fire live API calls mid-simulation.
+
+FC-068 shrank what the engine builds: the put seller, call seller and gap
+detector existed only to feed the deleted orchestration path, and the simulator
+now constructs its own scanner and sellers on the same injected client (see
+``tests/test_backtest_simulator.py``). What the engine still hangs off the
+client is its market-data manager and, per roll cycle, the CallRoller.
 
 Production behavior is unchanged: omit the argument and the real client is built.
 """
@@ -23,11 +28,26 @@ class TestAlpacaClientInjection:
         engine = WheelEngine(Mock(), alpaca_client=sentinel, wheel_state=WheelStateManager())
 
         assert engine.alpaca is sentinel
-        # The whole graph must hang off the injected client.
+        # The whole surviving graph must hang off the injected client.
         assert engine.market_data.alpaca is sentinel
-        assert engine.put_seller.alpaca is sentinel
-        assert engine.call_seller.alpaca is sentinel
-        assert engine.gap_detector.alpaca is sentinel
+
+    def test_the_injected_client_reaches_the_roller_too(self):
+        """The roll cycle builds its CallRoller per invocation, so the seam has
+        to hold at call time rather than construction time — and it runs inside
+        the replay (Fridays)."""
+        sentinel = Mock(name="BacktestAlpacaClient")
+        sentinel.get_positions.return_value = []
+        config = Mock()
+        config.rolling_enabled = True
+        config.earnings_enabled = False
+        engine = WheelEngine(config, alpaca_client=sentinel,
+                             wheel_state=WheelStateManager())
+
+        with patch("src.strategy.wheel_engine.CallRoller") as roller:
+            engine.run_rolling_cycle()
+
+        assert roller.call_args.args[0] is sentinel
+        assert roller.call_args.args[1] is engine.market_data
 
     def test_injection_constructs_no_real_client(self):
         """A replay must not build an AlpacaClient at all — it would read creds."""
@@ -46,11 +66,23 @@ class TestAlpacaClientInjection:
 
 
 class TestWheelStateInjection:
-    def test_injected_state_is_used_and_shared_with_call_seller(self):
+    def test_injected_state_is_used_and_shared_with_the_roller(self):
+        """Pre-FC-068 the shared consumer asserted here was the engine's
+        CallSeller. That seller is deleted; the roller is now the component the
+        state must reach, and it is the one that runs inside a replay."""
         state = WheelStateManager()
-        engine = WheelEngine(Mock(), alpaca_client=Mock(), wheel_state=state)
+        alpaca = Mock()
+        alpaca.get_positions.return_value = []
+        config = Mock()
+        config.rolling_enabled = True
+        config.earnings_enabled = False
+        engine = WheelEngine(config, alpaca_client=alpaca, wheel_state=state)
         assert engine.wheel_state is state
-        assert engine.call_seller.wheel_state is state
+
+        with patch("src.strategy.wheel_engine.CallRoller") as roller:
+            engine.run_rolling_cycle()
+
+        assert roller.call_args.args[3] is state
 
     def test_injected_state_never_touches_cloud_storage(self):
         """A bucket-less manager must not construct a GCS client."""
