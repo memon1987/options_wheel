@@ -267,21 +267,28 @@ export interface BotAnomaly {
   evidence: unknown;
 }
 
-export interface DrawdownPauseRow {
+// FC-065 Phase 4: sourced from the bot's own decision records, not from an
+// OPASN-strike price inference. There is no drawdown pause any more (OQ-3) —
+// the reported state is "held with no covered call written", which is the
+// thing that actually costs money.
+export interface UncoveredRow {
   symbol: string;
   shares: number;
-  assignment_strike: number;
-  pause_floor: number;
-  last_close: number;
-  last_close_date: string;
-  trading_days_paused: number;
-  pct_below_strike: number;
+  cost_basis_per_share: number | null;   // the floor the bot enforced
+  last_price: number | null;
+  underwater_pct: number | null;         // signed; NEGATIVE is below the floor
+  uncovered_days: number | null;         // null = could not be derived
+  outcome: string;                       // closed enum, see decision_record.py
+  reason: string;
+  run_id: string;
+  last_decision_at: string;
 }
 
-export interface DrawdownPauses {
-  threshold: number;
-  threshold_source: string;
-  paused: DrawdownPauseRow[];
+export interface UncoveredSymbols {
+  threshold_days: number;
+  source: string;
+  uncovered: UncoveredRow[];
+  unknown_uncovered_days: UncoveredRow[];
   share_count_mismatches: ShareCountMismatch[];
 }
 

@@ -6,13 +6,13 @@ import type {
   ErrorEvent,
   DailySummary,
   BotAnomaly,
-  DrawdownPauses,
+  UncoveredSymbols,
 } from '../../types/v2';
 import IngestHealthCard from '../../components/v2/IngestHealthCard';
 import GateHitsHeatmap from '../../components/v2/GateHitsHeatmap';
 import DecisionFunnel from '../../components/v2/DecisionFunnel';
 import AnomalyFlags from '../../components/v2/AnomalyFlags';
-import DrawdownPauseCard from '../../components/v2/DrawdownPauseCard';
+import UncoveredPositionsCard from '../../components/v2/DrawdownPauseCard';
 import { fmtDateTime, fmtNumber, fmtPercent, cls } from '../../utils/format';
 
 export default function BotHealth() {
@@ -33,7 +33,7 @@ export default function BotHealth() {
   const { data: errors } = useApi<ErrorEvent[]>('/api/history/errors?days=7');
   const { data: daily } = useApi<DailySummary[]>('/api/history/daily-summary?days=30');
   const { data: anomalies } = useApi<BotAnomaly[]>('/api/v2/bot-health/anomalies', { refreshInterval: 300_000 });
-  const { data: pauses } = useApi<DrawdownPauses>('/api/v2/bot-health/drawdown-pauses', { refreshInterval: 300_000 });
+  const { data: uncovered } = useApi<UncoveredSymbols>('/api/v2/bot-health/drawdown-pauses', { refreshInterval: 300_000 });
 
   // Explicit client-side ordering — never assume API order (FC-031).
   const dailySorted = [...(daily ?? [])].sort((a, b) => (b.date_et ?? '').localeCompare(a.date_et ?? ''));
@@ -66,7 +66,7 @@ export default function BotHealth() {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <AnomalyFlags data={anomalies ?? null} />
-        <DrawdownPauseCard data={pauses ?? null} />
+        <UncoveredPositionsCard data={uncovered ?? null} />
       </div>
 
       <div className="flex items-center justify-between flex-wrap gap-2">

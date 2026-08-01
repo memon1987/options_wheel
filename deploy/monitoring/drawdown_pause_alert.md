@@ -64,12 +64,42 @@ gcloud run revisions list --service=options-wheel-strategy  --region=us-central1
 
 ---
 
-## Alert 2 — Extended drawdown pause (FC-030)
+## Alert 2 — Symbol uncovered too long (FC-030, repointed by FC-065 Phase 4)
 
-**Why it exists:** FC-029 R3 stops covered-call writes when shares sit >5%
-below their assignment strike. Correct short-term, expensive if it persists
-silently — AMZN's 62-day implicit pause (Feb 6 → Apr 10, 2026) cost an
-estimated $1,500–3,000 in foregone premium and was only found post-hoc.
+**Why it exists:** shares held with no call written against them are idle
+capital. AMZN's 62-day gap (Feb 6 → Apr 10, 2026) cost an estimated
+$1,500–3,000 in foregone premium and was only found post-hoc.
+
+> ### Repointed 2026-08-01 (FC-065 Phase 4) — read this before triaging
+>
+> **Nothing about this alert's deployment surface changed.** Same marker
+> strings, same policy, same notification channel, same scheduler job, same
+> `PAUSE_ALERT_THRESHOLD_DAYS` env var, same endpoint path. **No `gcloud`
+> action is required for the repoint.**
+>
+> **What changed is the question and its data source.** It used to fire on
+> "symbol paused ≥ N trading days", *inferred* from price versus the latest
+> OPASN put strike. Two things broke that:
+>
+> * **There is no pause.** FC-065 OQ-3 removed the drawdown gate entirely —
+>   the cost-basis floor is the only gate — so the alert described a state the
+>   bot does not have.
+> * **The reference price was wrong.** Since FC-065 Phase 1 the bot's floor is
+>   Alpaca's `avg_entry_price`, one put premium *below* the assignment strike
+>   this alert compared against. Near the threshold the alert and the bot
+>   would have disagreed about the same position.
+>
+> It now fires on **"symbol uncovered ≥ N trading days"**, read from the bot's
+> own `options_wheel.decision_events` records — see
+> `docs/operations/DECISION_RECORDS.md`. The `CHECK_FAILED` marker now also
+> fires when `uncovered_days` could not be derived for a held symbol, because
+> "we could not tell whether a call is written" must not read as all-clear.
+>
+> **New dependency worth knowing at triage time:** the alert reads
+> `decision_events`, which the bot service writes. If the *bot* stops writing
+> (deploy rollback to a pre-Phase-4 revision, BigQuery outage), the card
+> empties and the alert goes quiet. Check the fill-rate query in the decision
+> records runbook before concluding "nothing is uncovered".
 
 **Threshold:** 7 trading days, declared in `cloudbuild.yaml`'s dashboard
 deploy step.
@@ -92,6 +122,10 @@ gcloud run services update options-wheel-dashboard --region=us-central1 \
 `dashboard/backend/services/pause_alert.py`. **Renaming it breaks the alert**;
 a unit test pins the literal
 (`tests/test_dashboard_pause_alert.py::test_carries_marker_and_is_single_line`).
+FC-065 Phase 4 kept the literal `DRAWDOWN_PAUSE_ALERT` deliberately, even
+though the alert no longer describes a pause: renaming it would have silently
+disarmed the operator's only escalation control for idle capital — the FC-030
+fire-drill failure in a different costume.
 
 > Selection/formatting live in `services/pause_alert.py`, not the router, so
 > they are testable in the **bot CI image**, which does not install FastAPI —
