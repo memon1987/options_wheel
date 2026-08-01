@@ -1395,6 +1395,21 @@ Doing (2) without (1) is defensible — it is conservative in the direction that
 
 ---
 
+### FC-072: call-side limit pricing never received the put side's spread-aware improvement
+
+**Status:** Consideration — filed 2026-08-01 (spin-off from `docs/plans/fc-065.md` §Spin-offs, deliberately excluded from FC-069 so its economics get reviewed on their own)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** the put side prices sell-to-open limits spread-aware — `mid + 10% of spread`, biased toward the ask for premium collection (`put_seller.py:318-327`, falling back to `mid × 0.95` only when bid/ask are unusable). The call side never got that improvement: every covered-call open is priced at a blunt `mid × 0.95` (`call_seller.py:393`) — roughly 5% of mid donated per open, plus half the spread. A Symmetry Principle violation with a direct, recurring premium cost across every call write (~88 historical writes and counting).
+
+**Fix direction:** port the put side's spread-aware formula to `execute_call_sale`'s limit calculation, with the same unusable-quote fallback. Behavior change on a money path → plan file + two-reviewer gate per ~/CLAUDE.md; the economics (expected $/write recovered, fill-rate risk of pricing closer to the ask) should be estimated from fill history before shipping.
+
+**Links:** `docs/plans/fc-065.md` §Context item 4 + §Spin-offs, `src/strategy/call_seller.py:393`, `src/strategy/put_seller.py:318-327`, FC-069 (explicitly out of its scope), Symmetry Principle (`docs/CLAUDE.md`).
+
+---
+
 ### FC-062: the roller has its own fail-open cost-basis floor and bypasses the execute-time guard
 
 **Status:** Consideration — **must be resolved before any roller revival ships**
@@ -1436,7 +1451,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-064: cost-basis floor should be `max(BQ assigning strike, broker basis)` for mixed lots
 
-**Status:** Consideration
+**Status:** Closed — resolved by FC-065 Phase 1 (2026-08-01, PR #75). The floor is now Alpaca `avg_entry_price` — already the broker's weighted average across lots, which is exactly the semantic the mixed-lot case needed — and BigQuery no longer competes to set the floor (it is a divergence cross-check that fail-closes, with share-count mismatch as its own signal, answering this FC's second open question). The `max()` proposal was a workaround for two sources measuring different quantities; the source unification dissolves it. Lineage: `docs/plans/fc-065.md` §"The floor definition, decided" + §Spin-offs.
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
