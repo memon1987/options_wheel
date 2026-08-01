@@ -320,8 +320,14 @@ class TestTheRollFloorComesFromTheSharedResolver:
     def test_a_divergent_cross_check_blocks_the_roll(self, roller, mock_alpaca,
                                                      mock_market_data):
         """The broker gave a number and the assignment history contradicts it.
+
         ``resolve_detailed`` returns a zero basis for that verdict too, so the
-        same fail-closed branch catches it — with the source recorded."""
+        same fail-closed branch catches it — but under its **own** event name.
+        "Resolved and vetoed" is not "unresolved": labelling it so is wrong on
+        its face and hides the symbol from every ``*_divergent`` taxonomy, which
+        is the one that means "the broker's number may be wrong" rather than
+        "the broker said nothing". Mirrors the scanner's two-event split.
+        """
         self._arm(mock_alpaca, mock_market_data, candidate_strike=115.0)
 
         with patch.object(roller.cost_basis_resolver, '_lookup_assignment_basis',
@@ -337,10 +343,60 @@ class TestTheRollFloorComesFromTheSharedResolver:
 
         skips = [c.kwargs for c in mock_logger.info.call_args_list
                  if c.kwargs.get('event_type')
-                 == 'call_roll_skipped_cost_basis_unresolved']
+                 == 'call_roll_skipped_cost_basis_divergent']
         assert len(skips) == 1
+        assert skips[0]['skip_reason'] == 'cost_basis_divergent'
         assert skips[0]['cost_basis_source'] == 'divergent'
         assert skips[0]['broker_basis'] == 110.00
+        assert skips[0]['expected_basis'] == 90.00
+        assert skips[0]['basis_delta'] == pytest.approx(20.00)
+        assert skips[0]['cross_check_reason'] == 'basis_mismatch'
+
+        # ...and it does NOT also fire the unresolved event. The two are
+        # distinct failures and a divergence must not be double-counted as one.
+        assert not [c.kwargs for c in mock_logger.info.call_args_list
+                    if c.kwargs.get('event_type')
+                    == 'call_roll_skipped_cost_basis_unresolved']
+
+    def test_an_unresolved_basis_is_not_labelled_divergent(self, roller,
+                                                           mock_alpaca,
+                                                           mock_market_data):
+        """The other side of the split: nothing to floor against is not a
+        contradicted floor. Swapping the two labels fails here and in the
+        divergent test above."""
+        self._arm(mock_alpaca, mock_market_data, candidate_strike=105.0)
+
+        with patch('src.strategy.call_roller.logger') as mock_logger:
+            result = roller.evaluate_roll_opportunity(
+                self._call_position(), self._stock_position(avg_entry_price='0'))
+
+        assert result is None
+        events = [c.kwargs.get('event_type') for c in mock_logger.info.call_args_list]
+        assert 'call_roll_skipped_cost_basis_unresolved' in events
+        assert 'call_roll_skipped_cost_basis_divergent' not in events
+
+    def test_the_fallback_re_floor_still_honours_the_basis(self, roller,
+                                                          mock_alpaca,
+                                                          mock_market_data):
+        """FC-065 Phase 2 (review, R1 LOW): ``_attempt_stc`` re-derives the floor
+        when both direct STO attempts fail, and that is the **second** live
+        application of the basis floor on the roll path — untested until now.
+
+        Basis $110.00 against a $100 old strike, so the basis term is the one
+        that must win the ``max()``. Dropping it floors the fallback search at
+        $100.01 and lets the retry sell strikes below what the shares cost —
+        precisely the hole the evaluation-time floor was fixed to close.
+        """
+        opportunity = {'cost_basis_per_share': 110.00, 'old_strike': 100.0}
+        # Both direct attempts fail, so the fallback re-floor runs. A rejected
+        # order returns immediately — no polling, no sleep.
+        mock_alpaca.place_option_order.return_value = {'success': False}
+        mock_market_data.find_suitable_calls.return_value = []
+
+        roller._attempt_stc('AMD260424C00105000', 'AMD', 1, 1.40, opportunity, {})
+
+        mock_market_data.find_suitable_calls.assert_called_once_with(
+            'AMD', min_strike_price=110.00)
 
     def test_the_resolved_basis_is_the_strike_floor(self, roller, mock_alpaca,
                                                     mock_market_data):

@@ -425,6 +425,29 @@ class TestNoProductionSideEffects:
 
         assert mock_roller.call_args.kwargs['allow_bigquery_cost_basis'] is False
 
+    @pytest.mark.real_bq_lookup
+    def test_the_rollers_replay_gate_reaches_its_own_resolver(self):
+        """The test above pins the *engine* handing the flag to ``CallRoller``.
+        This pins ``CallRoller`` handing it to the resolver — the other half of
+        the same link, and the half that was untested: hardcoding
+        ``allow_bigquery=True`` inside ``CallRoller.__init__`` (ignoring the
+        parameter entirely) passed the whole suite while a replay would read
+        production trade history. Seller-style: no BigQuery client is built at
+        all. (``real_bq_lookup`` opts out of the conftest stub so the real
+        method runs and the gate is what stops it.)"""
+        from unittest.mock import Mock, patch
+
+        from src.strategy.call_roller import CallRoller
+
+        roller = CallRoller(Mock(), Mock(), Mock(), Mock(), Mock(),
+                            allow_bigquery_cost_basis=False)
+
+        assert roller.cost_basis_resolver.allow_bigquery is False
+        with patch('google.cloud.bigquery.Client') as mock_client:
+            assert roller.cost_basis_resolver._lookup_assignment_basis(
+                'XYZ', 100) is None
+        mock_client.assert_not_called()
+
     def test_bigquery_fallback_stays_enabled_by_default(self):
         from unittest.mock import Mock
 

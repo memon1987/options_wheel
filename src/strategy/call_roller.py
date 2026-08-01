@@ -20,7 +20,7 @@ from ..risk.risk_manager import RiskManager
 from ..utils.config import Config
 from ..utils.option_symbols import parse_option_symbol
 from ..utils.logging_events import log_trade_event, log_error_event, log_position_update
-from .cost_basis import CostBasisResolver
+from .cost_basis import CostBasisResolver, SOURCE_DIVERGENT
 from .wheel_state_manager import WheelStateManager
 
 logger = structlog.get_logger(__name__)
@@ -162,22 +162,33 @@ class CallRoller:
         cost_basis_per_share = resolution['basis']
 
         # FAIL CLOSED. resolve_detailed returns a zero basis for both verdicts
-        # that mean "no usable floor" — unresolved (absent/zero avg_entry_price)
-        # and divergent (the broker's number contradicted by assignment
-        # history) — so no roll is evaluated for this position. cost_basis_source
-        # on the event distinguishes the two.
+        # that mean "no usable floor", and they are split into two events
+        # mirroring the scanner's pair, because they are different failures:
+        #   - unresolved: absent/zero avg_entry_price, nothing to floor against.
+        #   - divergent:  the broker gave a number and the assignment history
+        #     contradicts it — resolved and *vetoed*. Labelling that
+        #     "unresolved" is actively wrong, and it hides the symbol from any
+        #     *_divergent taxonomy, which is the one that means "the broker's
+        #     number may be wrong" rather than "the broker said nothing".
         if cost_basis_per_share <= 0:
             cross_check = resolution.get('cross_check') or {}
+            divergent = resolution.get('source') == SOURCE_DIVERGENT
             log_trade_event(
-                logger, event_type="call_roll_skipped_cost_basis_unresolved",
+                logger,
+                event_type=("call_roll_skipped_cost_basis_divergent" if divergent
+                            else "call_roll_skipped_cost_basis_unresolved"),
                 symbol=option_symbol, underlying=underlying,
                 strategy="roll_call", success=False,
-                skip_reason="cost_basis_unresolved",
+                skip_reason=("cost_basis_divergent" if divergent
+                             else "cost_basis_unresolved"),
                 current_strike=current_strike,
                 stock_price=current_stock_price,
                 shares=shares,
                 cost_basis_source=resolution.get('source'),
                 broker_basis=resolution.get('broker_basis'),
+                expected_basis=cross_check.get('expected_basis'),
+                basis_delta=cross_check.get('basis_delta'),
+                tolerance=cross_check.get('tolerance'),
                 cross_check_status=cross_check.get('status'),
                 cross_check_reason=cross_check.get('reason'),
                 **earnings_info,
