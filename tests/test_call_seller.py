@@ -823,3 +823,118 @@ class TestExecuteTimeCostBasisFloorFC050:
         assert result['error_type'] == 'wrong_seller'
         assert result['non_retryable'] is True
         self.mock_alpaca.place_option_order.assert_not_called()
+
+
+class TestCallSaleExecutedTelemetryFC065P4:
+    """FC-065 Phase 4: `call_sale_executed` must carry real economics.
+
+    The event read ``shares_covered`` / ``stock_cost_basis`` /
+    ``total_return_if_called`` straight off the opportunity. Those are
+    wheel-engine-only keys and production runs the *scanner* path, so every
+    live covered-call fill logged **0 / 0 / 0** — the fourth instance of the
+    untyped-shape root cause (FC-050 fixed the floor's copy of it) and the
+    reason FC-029's production-validation item could not be satisfied.
+
+    These tests fail against pre-Phase-4 code: the assertions are on the very
+    fields that were zero.
+    """
+
+    def _seller(self, order_id='order-123'):
+        self.mock_alpaca = Mock()
+        self.mock_alpaca.place_option_order.return_value = {
+            'success': True, 'order_id': order_id, 'status': 'new',
+        }
+        return CallSeller(self.mock_alpaca, Mock(), Mock(spec=Config))
+
+    @staticmethod
+    def _scanner_opportunity(**kw):
+        """The shape OptionsScanner._create_call_opportunity emits.
+
+        AAPL at the live post-Phase-1 floor (303.50 = Alpaca avg_entry_price).
+        """
+        opp = {
+            'type': 'call',
+            'symbol': 'AAPL',
+            'option_symbol': 'AAPL260821C00310000',
+            'strike_price': 310.0,
+            'premium': 1.80,
+            'dte': 7,
+            'shares_owned': 100,
+            'max_contracts': 1,
+            'contracts': 1,
+            'cost_basis_per_share': 303.50,
+        }
+        opp.update(kw)
+        return opp
+
+    def _execute_and_capture(self, opportunity, seller=None):
+        seller = seller or self._seller()
+        events = []
+        with patch('src.strategy.call_seller.log_trade_event',
+                   side_effect=lambda logger, **kw: events.append(kw)):
+            result = seller.execute_call_sale(opportunity)
+        assert result['success'] is True
+        executed = [e for e in events if e.get('event_type') == 'call_sale_executed']
+        assert len(executed) == 1
+        return executed[0]
+
+    def test_shares_covered_is_not_zero_on_a_scanner_opportunity(self):
+        event = self._execute_and_capture(self._scanner_opportunity())
+        assert event['shares_covered'] == 100, (
+            "pre-Phase-4 this read the wheel-engine-only `shares_covered` key "
+            "and logged 0 on every production fill")
+
+    def test_cost_basis_is_not_zero_on_a_scanner_opportunity(self):
+        event = self._execute_and_capture(self._scanner_opportunity())
+        assert event['stock_cost_basis'] == 30350.0    # 303.50 x 100 shares
+        assert event['cost_basis_per_share'] == 303.50
+
+    def test_total_return_if_called_is_not_zero_on_a_scanner_opportunity(self):
+        event = self._execute_and_capture(self._scanner_opportunity())
+        # premium 1.80 x 100 + (310.00 - 303.50) x 100 = 180 + 650
+        assert event['total_return_if_called'] == pytest.approx(830.0)
+
+    def test_multi_contract_scales_by_contracts_not_by_a_bare_100(self):
+        event = self._execute_and_capture(
+            self._scanner_opportunity(contracts=3, shares_owned=300,
+                                      max_contracts=3))
+        assert event['shares_covered'] == 300
+        assert event['stock_cost_basis'] == 91050.0
+        assert event['total_return_if_called'] == pytest.approx(2490.0)
+
+    def test_a_partially_sized_write_reports_what_it_actually_sold(self):
+        # 300 shares owned, only 1 contract selected. The scanner's own
+        # `total_return_if_assigned` is max_contracts-scaled and would
+        # overstate this by 3x, which is why the value is derived instead.
+        event = self._execute_and_capture(
+            self._scanner_opportunity(contracts=1, shares_owned=300,
+                                      max_contracts=3,
+                                      total_return_if_assigned=2490.0))
+        assert event['shares_covered'] == 100
+        assert event['total_return_if_called'] == pytest.approx(830.0)
+
+    def test_the_wheel_engine_shape_still_works(self):
+        # Symmetry: fixing the scanner shape must not break the other producer.
+        event = self._execute_and_capture({
+            'option_symbol': 'AAPL250117C00185000',
+            'symbol': 'AAPL',
+            'contracts': 1,
+            'premium': 1.80,
+            'strike_price': 185.0,
+            'stock_cost_basis': 16000.0,
+            'shares_covered': 100,
+            'dte': 7,
+        })
+        assert event['shares_covered'] == 100
+        assert event['stock_cost_basis'] == 16000.0
+        assert event['total_return_if_called'] == pytest.approx(2680.0)
+
+    def test_an_at_floor_write_reports_premium_only(self):
+        # GOOGL's 370C case: at-floor is allowed and gives up no capital.
+        event = self._execute_and_capture(
+            self._scanner_opportunity(symbol='GOOGL',
+                                      option_symbol='GOOGL260821C00370000',
+                                      strike_price=368.34,
+                                      cost_basis_per_share=368.34,
+                                      premium=2.50))
+        assert event['total_return_if_called'] == pytest.approx(250.0)
