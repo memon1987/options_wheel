@@ -1389,6 +1389,29 @@ class TestDropReasonsAreExposedForTheDecisionRecord:
         assert len(selected) == 1
         assert self.engine.last_call_drop_reasons == {}
 
+    def test_a_dropped_put_never_becomes_a_calls_drop_reason(self):
+        """Only one position per underlying is allowed across BOTH pools.
+
+        So a selected AAPL call drops the AAPL put as `duplicate_underlying`.
+        A symbol-keyed map holding both would hand the covered-call decision
+        record the PUT's reason for a symbol whose call was never dropped at
+        all — a wrong answer in the table the operator alert reads.
+        """
+        self.alpaca.get_positions.return_value = [_equity("AAPL", 100)]
+
+        ranked = self.engine.rank_opportunities(
+            [_call("AAPL", 337.5, score=90.0), _put("AAPL", 300.0)],
+            self.put_seller, 1_000_000.0)
+        selected, _ = self.engine.select_batch(ranked, 1_000_000.0)
+
+        # The call was selected; the put was dropped as a duplicate.
+        assert [o["option_symbol"] for o in selected] == ["AAPL260724C00337500"]
+        dropped = _drop_events(self.engine.logger)
+        assert [d["reason"] for d in dropped] == ["duplicate_underlying"]
+        assert dropped[0]["opportunity_type"] == "put"
+        # ...and none of that reached the covered-call channel.
+        assert self.engine.last_call_drop_reasons == {}
+
     def test_a_new_cycle_does_not_inherit_the_previous_one(self):
         """Last hour's reason reported as this hour's decision is a lie."""
         self.alpaca.get_positions.return_value = []
