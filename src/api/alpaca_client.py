@@ -240,23 +240,54 @@ class AlpacaClient:
                         error=str(e))
             raise
     
+    @staticmethod
+    def _avg_entry_price(position: Any, qty: float, cost_basis: float) -> float:
+        """Per-share entry price for a position, with a derived fallback.
+
+        FC-065: this field is the covered-call cost-basis floor, so it has to
+        survive an SDK that omits it. For a long position it equals
+        ``cost_basis / qty`` — verified against all four live lots — so that is
+        the fallback. Shorts are left at 0 rather than derived: their
+        ``cost_basis`` is negative and nothing reads a floor off them.
+        """
+        raw = getattr(position, 'avg_entry_price', None)
+        try:
+            value = float(raw) if raw is not None else 0.0
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+        if qty > 0 and cost_basis > 0:
+            return cost_basis / qty
+        return 0.0
+
     @api_retry
     def get_positions(self) -> List[Dict[str, Any]]:
-        """Get all current positions."""
+        """Get all current positions.
+
+        FC-065 (plan-review BLOCKER): ``avg_entry_price`` is emitted here. It
+        is the sole cost-basis floor source for covered calls, and this wrapper
+        used to strip it — so the floor resolver would have failed closed
+        fleet-wide while unit tests passed against a fixture that happened to
+        carry the field.
+        """
         try:
             positions = self.trading_client.get_all_positions()
-            return [
-                {
+            result: List[Dict[str, Any]] = []
+            for pos in positions:
+                qty = float(pos.qty)
+                cost_basis = float(pos.cost_basis)
+                result.append({
                     'symbol': pos.symbol,
-                    'qty': float(pos.qty),
+                    'qty': qty,
                     'side': pos.side,
                     'market_value': float(pos.market_value),
-                    'cost_basis': float(pos.cost_basis),
+                    'cost_basis': cost_basis,
+                    'avg_entry_price': self._avg_entry_price(pos, qty, cost_basis),
                     'unrealized_pl': float(pos.unrealized_pl),
                     'asset_class': pos.asset_class
-                }
-                for pos in positions
-            ]
+                })
+            return result
         except Exception as e:
             logger.error("Failed to get positions",
                         event_category="error",

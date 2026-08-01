@@ -353,6 +353,127 @@ class TestAlpacaClientPositions:
         assert "250117P" in option_positions[0]['symbol']
 
 
+class _SdkPosition:
+    """A position as the Alpaca SDK returns it: plain attributes, string
+    numerics, and only the fields the SDK actually sets.
+
+    Deliberately NOT a ``MagicMock``: a mock answers every attribute, so it
+    cannot show whether the wrapper reads a field the SDK omits — which is the
+    exact failure mode this contract test exists to catch.
+    """
+
+    def __init__(self, **fields):
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+
+class TestGetPositionsOutputContract:
+    """FC-065 (plan-review BLOCKER): ``get_positions()`` must emit
+    ``avg_entry_price``.
+
+    The covered-call floor is that one field. The wrapper used to strip it, so
+    a resolver reading it would have failed closed fleet-wide while unit tests
+    passed against ``tests/conftest.py``'s position fixture, which happens to
+    carry it. These tests therefore exercise the REAL wrapper with only the
+    SDK boundary (``trading_client.get_all_positions``) mocked, and they fail
+    against the pre-FC-065 implementation.
+    """
+
+    @patch('src.api.alpaca_client.OptionHistoricalDataClient')
+    @patch('src.api.alpaca_client.StockHistoricalDataClient')
+    @patch('src.api.alpaca_client.TradingClient')
+    def _positions(self, mock_config, sdk_positions, mock_trading_client,
+                   mock_stock_client, mock_option_client):
+        """Run the real wrapper with only the SDK boundary mocked.
+
+        (``mock.patch`` appends its mocks after the caller's arguments, hence
+        the parameter order.)
+        """
+        mock_trading_client.return_value.get_all_positions.return_value = sdk_positions
+        return AlpacaClient(mock_config).get_positions()
+
+    def test_a_long_equity_position_carries_avg_entry_price(self, mock_config):
+        """The four live wheel lots are shaped exactly like this."""
+        positions = self._positions(mock_config, [_SdkPosition(
+            symbol="AAPL", qty="100", side="long", market_value="31000.00",
+            cost_basis="30350.00", avg_entry_price="303.50",
+            unrealized_pl="650.00", asset_class="us_equity",
+        )])
+
+        assert len(positions) == 1
+        assert 'avg_entry_price' in positions[0], (
+            "the covered-call floor field was stripped by the wrapper")
+        assert positions[0]['avg_entry_price'] == 303.50
+        assert isinstance(positions[0]['avg_entry_price'], float)
+
+    def test_a_short_option_position_carries_avg_entry_price(self, mock_config):
+        positions = self._positions(mock_config, [_SdkPosition(
+            symbol="AAPL260821C00320000", qty="-1", side="short",
+            market_value="-150.00", cost_basis="-200.00",
+            avg_entry_price="2.00", unrealized_pl="50.00",
+            asset_class="us_option",
+        )])
+
+        assert positions[0]['avg_entry_price'] == 2.00
+
+    def test_a_missing_sdk_field_is_derived_for_a_long_position(self, mock_config):
+        """Plan: for long positions ``avg_entry_price == cost_basis / qty`` —
+        verified on all four live lots — so that is the fallback if the SDK
+        ever stops sending the field."""
+        positions = self._positions(mock_config, [_SdkPosition(
+            symbol="AAPL", qty="100", side="long", market_value="31000.00",
+            cost_basis="30350.00", unrealized_pl="650.00",
+            asset_class="us_equity",
+        )])
+
+        assert positions[0]['avg_entry_price'] == 303.50
+
+    @pytest.mark.parametrize("raw", [None, "", "not-a-number"])
+    def test_an_unusable_sdk_value_falls_back_to_the_derivation(self, raw, mock_config):
+        positions = self._positions(mock_config, [_SdkPosition(
+            symbol="AAPL", qty="100", side="long", market_value="31000.00",
+            cost_basis="30350.00", avg_entry_price=raw,
+            unrealized_pl="650.00", asset_class="us_equity",
+        )])
+
+        assert positions[0]['avg_entry_price'] == 303.50
+
+    def test_an_underivable_value_is_zero_so_the_floor_fails_closed(self, mock_config):
+        """A zero here is what makes the resolver skip the symbol. It must be
+        0, never a guess: FC-029 saw Alpaca report ``cost_basis = 0`` on
+        assigned positions, and a guessed floor is worse than no floor."""
+        positions = self._positions(mock_config, [_SdkPosition(
+            symbol="AAPL", qty="100", side="long", market_value="31000.00",
+            cost_basis="0", unrealized_pl="0", asset_class="us_equity",
+        )])
+
+        assert positions[0]['avg_entry_price'] == 0.0
+
+    def test_a_short_position_is_not_derived_from_its_negative_cost_basis(self, mock_config):
+        positions = self._positions(mock_config, [_SdkPosition(
+            symbol="AAPL260821C00320000", qty="-1", side="short",
+            market_value="-150.00", cost_basis="-200.00",
+            unrealized_pl="50.00", asset_class="us_option",
+        )])
+
+        assert positions[0]['avg_entry_price'] == 0.0
+
+    def test_the_rest_of_the_shape_is_unchanged(self, mock_config):
+        """Every consumer of this dict keeps working."""
+        positions = self._positions(mock_config, [_SdkPosition(
+            symbol="AAPL", qty="100", side="long", market_value="31000.00",
+            cost_basis="30350.00", avg_entry_price="303.50",
+            unrealized_pl="650.00", asset_class="us_equity",
+        )])
+
+        assert positions[0] == {
+            'symbol': "AAPL", 'qty': 100.0, 'side': "long",
+            'market_value': 31000.0, 'cost_basis': 30350.0,
+            'avg_entry_price': 303.50, 'unrealized_pl': 650.0,
+            'asset_class': "us_equity",
+        }
+
+
 class TestAlpacaClientMarketData:
     """Test AlpacaClient market data methods."""
 

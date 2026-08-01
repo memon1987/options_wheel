@@ -392,7 +392,12 @@ class TestNoProductionSideEffects:
                              wheel_state=WheelStateManager(),
                              allow_bigquery_cost_basis=False)
         assert engine.call_seller.allow_bigquery_cost_basis is False
-        assert engine.call_seller._lookup_last_opasn_put_strike("XYZ") == 0.0
+        # FC-065: the gate now stops the divergence cross-check, which is the
+        # only BigQuery reader left on this path. "None" is "no comparison
+        # available" — it leaves the simulated broker's floor untouched.
+        assert engine.call_seller._cost_basis_resolver.allow_bigquery is False
+        assert engine.call_seller._cost_basis_resolver._lookup_assignment_basis(
+            "XYZ", 100) is None
 
     def test_bigquery_fallback_stays_enabled_by_default(self):
         from unittest.mock import Mock

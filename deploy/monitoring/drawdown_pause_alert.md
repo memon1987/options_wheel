@@ -186,12 +186,81 @@ Google Cloud Monitoring (including spam) and click through. Re-run the drill.
 
 ---
 
+## Alert 3 — Cost-basis floor blocked a covered call (FC-065)
+
+**Why it exists:** since FC-065 Phase 1 the covered-call floor is a *single*
+broker field — Alpaca's `avg_entry_price` for the equity position. Two events
+mean the bot is holding shares and deliberately writing no calls on them:
+
+| Event | Meaning |
+|---|---|
+| `call_scan_skipped_cost_basis_unresolved` | no usable `avg_entry_price`. Every wheel position is an assigned position, so a recurrence of FC-029's reported `cost_basis = 0` would starve the whole book |
+| `call_scan_skipped_cost_basis_divergent` | the broker's number disagrees with the basis reconstructed from BigQuery assignment history by more than `max($0.10, 0.1%)` — presence with a *wrong* value, which fail-closed-on-zero cannot catch |
+
+Fail-closed is the correct behaviour in both cases. The alert exists because
+the *consequence* — idle capital, indefinitely, with no other signal — is
+exactly the FC-030 failure mode.
+
+**Policy:** `deploy/monitoring/cost_basis_alert_policy.json`, created the same
+way as Alert 2 (Monitoring REST API, `gcloud alpha` is not installed):
+
+```bash
+TOKEN=$(gcloud auth print-access-token)
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d @deploy/monitoring/cost_basis_alert_policy.json \
+  "https://monitoring.googleapis.com/v3/projects/gen-lang-client-0607444019/alertPolicies"
+```
+
+**Match filter** — note this one targets the **bot** service, not the
+dashboard, and matches on `jsonPayload.event_type` because the bot renders
+structlog as JSON to stderr (`src/utils/logger.py`), which Cloud Run parses
+into `jsonPayload`. `textPayload` is matched too, for the same
+future-proofing reason as Alert 2. **No `severity>=` clause** — see Alert 2.
+
+```
+resource.type="cloud_run_revision"
+AND resource.labels.service_name="options-wheel-strategy"
+AND (jsonPayload.event_type="call_scan_skipped_cost_basis_unresolved"
+  OR jsonPayload.event_type="call_scan_skipped_cost_basis_divergent"
+  OR textPayload:"call_scan_skipped_cost_basis_unresolved"
+  OR textPayload:"call_scan_skipped_cost_basis_divergent")
+```
+
+**Fire drill** (do it on day one — untested alerting is worse than none). The
+guard fires naturally only on a real defect, so provoke it from the logs side
+and confirm the policy matches:
+
+```bash
+# 1. Confirm the events are being emitted at all (they should be absent in
+#    a healthy book — absence here is the expected steady state).
+gcloud logging read \
+  'resource.labels.service_name="options-wheel-strategy" AND jsonPayload.event_type:"call_scan_skipped_cost_basis"' \
+  --limit=5 --freshness=2d --format="value(timestamp,jsonPayload.event_type,jsonPayload.symbol)"
+
+# 2. Confirm the healthy-path counterpart IS present, which proves the scan is
+#    reaching the cross-check on every held symbol every scan.
+gcloud logging read \
+  'resource.labels.service_name="options-wheel-strategy" AND jsonPayload.event_type="cost_basis_cross_check"' \
+  --limit=10 --freshness=1d --format="value(timestamp,jsonPayload.symbol,jsonPayload.status)"
+```
+
+If step 2 returns nothing, the alert is watching a path that never runs —
+treat that as a broken alert, not a quiet book (the FC-006 failure mode).
+
+**Triage when it fires:** compare the logged `broker_basis` / `expected_basis`
+against the Alpaca UI position and the symbol's OPASN rows in
+`options_wheel.trades_from_activities`. Do **not** lower the floor to unblock
+writing — the floor blocking a write is the control working.
+
+---
+
 ## Alert inventory
 
 | Alert | Signal | Threshold | Rate limit |
 |---|---|---|---|
 | Cloud Build failure | `resource.type="build" AND severity>=ERROR` | any failure | 5 min |
 | Extended drawdown pause | `DRAWDOWN_PAUSE_ALERT` in dashboard logs | ≥7 trading days | 24 h |
+| Cost-basis floor blocked a call | `call_scan_skipped_cost_basis_{unresolved,divergent}` in bot logs | any occurrence | 24 h |
 
 Candidates to add on this channel (each a small follow-up): reconciliation
 banner `warn`, `critical`-severity bot-health anomalies, ingest staleness.
