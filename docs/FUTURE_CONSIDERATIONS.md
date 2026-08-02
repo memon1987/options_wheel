@@ -1439,7 +1439,7 @@ Doing (2) without (1) is defensible — it is conservative in the direction that
 - **The return component saturates and stops discriminating.** Calls: `min(35, annual_return × 3)` caps at ~11.7% annualized — nearly every 7-DTE candidate clearing the $0.50 premium floor maxes it, so delta-proximity-to-0.20 and the OTM band do almost all the intra-symbol ranking work. Puts: same shape (`min(40, annual_return × 2)`).
 - **The delta component peaks mid-band** (exactly 0.20; the configured band edges 0.15/0.25 score 15/20) — an implicit preference inside the band that nobody decided.
 - **The put score is computed but unused at selection** (puts are re-ranked by ROI per FC-038) — it only orders the blob; either give it a job or document that it's cosmetic.
-- **The at-floor bonus asymmetry is FC-071** (strict `>` into the 15-vs-5 bonus) — that small decision stays its own FC; this FC is the holistic review that would also catch the next such drift.
+- **The at-floor bonus asymmetry is FC-071** (strict `>` into the 15-vs-5 bonus) — resolved 2026-08-02 (aligned to `>=`, dual-APPROVE, queued behind the Monday train). **Consequence for this FC (FC-071 trader review):** post-alignment the basis component carries *zero ranking information in production* — every scored candidate is ≥ floor by construction, so all real candidates collect the same +15 and the `False → +5` arm is dead outside unit tests. Correct end state (safety is the gates' job), but this review should weigh whether a constant 15-point offset earns its slot in the 0–100 budget or should be folded out.
 - Liquidity (10 pts, saturates at ~1,000 blended contracts) and DTE (5 pts) are near-tiebreaks; whether that's right is undecided.
 
 **Evaluation approach (the data now exists or is landing):**
