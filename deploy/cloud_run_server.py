@@ -170,6 +170,18 @@ def _account_interlock_ok(config):
             recoverable=True,  # not cached; retried next request
         )
         return False
+    # A missing account number means we did NOT obtain a genuine result (e.g. an
+    # Alpaca SDK shape change) — treat it as a check failure, not a mismatch, so
+    # it does not latch a permanent "mismatch" halt on a transient/shape problem.
+    if actual is None:
+        log_error_event(
+            logger,
+            error_type="account_interlock_check_failed",
+            error_message="get_account() returned no account_number",
+            component="cloud_run_server",
+            recoverable=True,  # not cached; retried next request
+        )
+        return False
     expected = config.expected_account_number
     verdict = (actual == expected)
     _INTERLOCK_VERDICT = verdict
@@ -206,6 +218,19 @@ def require_account_match(f):
     return wrapper
 
 
+def interlock_status():
+    """Report the cached interlock verdict WITHOUT triggering a network check.
+
+    'unchecked' — no trading endpoint has run the check yet (or only transient
+    check-failures, which do not latch); 'ok' — account matched; 'mismatch' — a
+    genuine account mismatch is latched and trading is disabled. Safe to call
+    from health endpoints (no Alpaca call).
+    """
+    if _INTERLOCK_VERDICT is None:
+        return "unchecked"
+    return "ok" if _INTERLOCK_VERDICT else "mismatch"
+
+
 def reset_strategy_state():
     """Reset process-scoped caches. For tests only."""
     global _CONFIG_CACHE, _INTERLOCK_VERDICT
@@ -215,10 +240,16 @@ def reset_strategy_state():
 
 @app.route('/')
 def health_check():
-    """Health check endpoint for Cloud Run."""
+    """Health check endpoint for Cloud Run (liveness).
+
+    Always returns 200 so a latched account-interlock mismatch does not cause
+    Cloud Run to loop-restart the instance; the interlock state is surfaced as a
+    field for visibility. Detailed status/alerting lives on /health.
+    """
     return jsonify({
         'status': 'healthy',
         'service': 'options-wheel-strategy',
+        'account_interlock': interlock_status(),
         'timestamp': datetime.now().isoformat()
     })
 
@@ -1370,6 +1401,7 @@ def backtest_screen():
 
 @app.route('/ingest-activities', methods=['POST'])
 @require_api_key
+@require_account_match
 def ingest_activities():
     """Pull Alpaca account activities and append to BigQuery (FC-012 §2.1).
 
@@ -1427,6 +1459,7 @@ def ingest_activities():
 
 @app.route('/ingest-portfolio-history', methods=['POST'])
 @require_api_key
+@require_account_match
 def ingest_portfolio_history():
     """Pull Alpaca portfolio/history and append finalized days to BigQuery (FC-012 §2.5).
 
@@ -1477,6 +1510,7 @@ def ingest_portfolio_history():
 
 @app.route('/ingest-stock-history', methods=['POST'])
 @require_api_key
+@require_account_match
 def ingest_stock_history():
     """Pull daily Alpaca stock bars for the traded universe and append to BQ (FC-018 PR B).
 
@@ -1557,6 +1591,14 @@ def detailed_health():
         health_data['status'] = 'unhealthy'
     else:
         health_data['checks']['environment'] = 'ok'
+
+    # Account-number interlock (FC-075 Seam 2). A latched mismatch means trading
+    # is disabled (all trading endpoints 503) — surface it here so it is not a
+    # silent red state. 'unchecked' is not unhealthy (no trading call yet).
+    interlock = interlock_status()
+    health_data['checks']['account_interlock'] = interlock
+    if interlock == 'mismatch':
+        health_data['status'] = 'unhealthy'
 
     return jsonify(health_data)
 

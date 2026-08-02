@@ -116,9 +116,19 @@ class Config:
         """Validate configuration values for correctness and safety."""
         errors = []
 
-        # strategy_id selects which validation profile applies. Absent means the
-        # legacy wheel profile, so an unmodified settings.yaml stays valid.
-        strategy_id = self._config.get('strategy_id', 'wheel')
+        # strategy_id is REQUIRED, not defaulted. Defaulting to 'wheel' was a
+        # fail-open isolation hole: a covered-call config that omitted the key
+        # would validate as wheel, pass the account interlock (its own account
+        # matches), fall back to the wheel's opportunity bucket, and place wheel
+        # orders in the covered-call account. Every config must declare identity.
+        if 'strategy_id' not in self._config:
+            raise ValueError(
+                "strategy_id is required (top-level key; "
+                f"one of {list(self._KNOWN_STRATEGY_IDS)}). It selects the "
+                "validation profile and the isolation boundary; it must never "
+                "be inferred."
+            )
+        strategy_id = self._config['strategy_id']
         if strategy_id not in self._KNOWN_STRATEGY_IDS:
             raise ValueError(
                 f"Unknown strategy_id '{strategy_id}' "
@@ -147,6 +157,22 @@ class Config:
                 "alpaca.expected_account_number is required (pins the service to "
                 "a specific brokerage account; see the account-number interlock)"
             )
+
+        # Isolation resources must be declared explicitly for any non-wheel
+        # profile — never allowed to fall back to the wheel's bucket/dataset,
+        # which would silently co-mingle a second strategy's data with the
+        # wheel's. The wheel keeps its historical defaults.
+        if strategy_id != 'wheel':
+            if not self._config.get('gcs', {}).get('opportunity_bucket'):
+                errors.append(
+                    f"gcs.opportunity_bucket is required for strategy_id="
+                    f"'{strategy_id}' (must not default to the wheel's bucket)"
+                )
+            if not self._config.get('bigquery', {}).get('dataset'):
+                errors.append(
+                    f"bigquery.dataset is required for strategy_id='{strategy_id}' "
+                    f"(must not default to the wheel's dataset)"
+                )
 
         # Alpaca validation
         alpaca = self._config.get('alpaca', {})
@@ -317,6 +343,11 @@ class Config:
 
         Defaults to ``options_wheel`` so the wheel's writers are unchanged when
         the key is absent.
+
+        NOTE: as of FC-075 Phase 1 this property is NOT yet consumed — Seam 4
+        (threading the dataset through the five BQ writers + a strategy_id
+        column) is deferred to Phase 3 because it needs an ALTER on the live
+        wheel tables. The property exists so Phase 3 has the config surface ready.
         """
         return self._config.get("bigquery", {}).get("dataset", "options_wheel")
 

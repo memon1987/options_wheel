@@ -86,10 +86,36 @@ class TestConfigProfiles:
             "monitoring": {"check_interval_minutes": 15},
         }
 
-    def test_absent_strategy_id_defaults_to_wheel(self, tmp_path):
+    def test_absent_strategy_id_rejected(self, tmp_path):
+        # strategy_id is the isolation boundary; it must never be inferred.
         data = self._valid_wheel()
         del data["strategy_id"]
-        assert Config(self._write(tmp_path, data)).strategy_id == "wheel"
+        with pytest.raises(ValueError, match="strategy_id is required"):
+            Config(self._write(tmp_path, data))
+
+    def test_non_wheel_must_set_bucket_and_dataset_explicitly(self, tmp_path):
+        # A non-wheel profile that omits its own bucket/dataset must NOT silently
+        # fall back to the wheel's resources — the core isolation hole.
+        base = {
+            "strategy_id": "covered_call",
+            "alpaca": {"paper_trading": True, "api_key_id": "k", "secret_key": "s",
+                       "expected_account_number": "PA_CC"},
+            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25],
+                         "max_positions_per_stock": 1, "max_total_positions": 20,
+                         "max_exposure_per_ticker": 200000},
+            "risk": {"max_portfolio_allocation": 0.8, "max_position_size": 0.35,
+                     "min_cash_reserve": 0.2},
+            "monitoring": {"check_interval_minutes": 15},
+        }
+        with pytest.raises(ValueError, match="opportunity_bucket is required"):
+            Config(self._write(tmp_path, base))
+        # Adding only the bucket still fails on the dataset.
+        base["gcs"] = {"opportunity_bucket": "cc-bucket"}
+        with pytest.raises(ValueError, match="bigquery.dataset is required"):
+            Config(self._write(tmp_path, base))
+        # With both, it validates.
+        base["bigquery"] = {"dataset": "covered_call"}
+        assert Config(self._write(tmp_path, base)).strategy_id == "covered_call"
 
     def test_unknown_strategy_id_rejected(self, tmp_path):
         data = self._valid_wheel()
@@ -120,6 +146,8 @@ class TestConfigProfiles:
                          "max_exposure_per_ticker": 200000},
             "risk": {"max_portfolio_allocation": 0.8, "max_position_size": 0.35,
                      "min_cash_reserve": 0.2},
+            "gcs": {"opportunity_bucket": "cc-bucket"},
+            "bigquery": {"dataset": "covered_call"},
             "monitoring": {"check_interval_minutes": 15},
         }
         c = Config(self._write(tmp_path, data))
@@ -256,6 +284,20 @@ class TestOpportunityStoreIsolation:
         assert ok is False
         assert wheel_blob.uploaded is None  # never mutated
 
+    def test_mark_executed_search_path_skips_other_strategys_blob(self):
+        # No explicit scan_blob_path → the search branch must also filter by
+        # strategy_id and refuse to mark a wheel blob for a covered_call service.
+        wheel_blob = _FakeBlob(
+            "opportunities/2026-08-02/14-00.json",
+            {"strategy_id": "wheel", "scan_time": "2026-08-02T14:00:00",
+             "status": "pending", "opportunities": []},
+            datetime(2026, 8, 2, 14, 0),
+        )
+        store, _ = _store("covered_call", blobs=[wheel_blob])
+        ok = store.mark_executed(datetime(2026, 8, 2, 14, 5), 1, [{"r": 1}])
+        assert ok is False
+        assert wheel_blob.uploaded is None
+
 
 # --------------------------------------------------------------------------- #
 # Seam 2 — config accessor + account interlock
@@ -305,6 +347,7 @@ class TestAccountInterlock:
 
     def test_mismatched_account_returns_503_on_scan(self, server, monkeypatch):
         monkeypatch.delenv("STRATEGY_CONFIG", raising=False)
+        monkeypatch.delenv("STRATEGY_API_KEY", raising=False)  # else 401 masks 503
         server.reset_strategy_state()
         alpaca = _mock_alpaca("WRONG_ACCOUNT")
         with patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca):
@@ -312,14 +355,31 @@ class TestAccountInterlock:
         assert resp.status_code == 503
         assert b"account_interlock_mismatch" in resp.data
 
-    def test_mismatch_blocks_run_and_monitor_and_roll(self, server, monkeypatch):
+    def test_mismatch_blocks_all_write_endpoints(self, server, monkeypatch):
         monkeypatch.delenv("STRATEGY_CONFIG", raising=False)
+        monkeypatch.delenv("STRATEGY_API_KEY", raising=False)
         alpaca = _mock_alpaca("WRONG_ACCOUNT")
-        for endpoint in ("/run", "/monitor", "/roll"):
+        # Trading endpoints AND the ingest endpoints (which write canonical BQ).
+        for endpoint in ("/run", "/monitor", "/roll", "/ingest-activities",
+                         "/ingest-portfolio-history", "/ingest-stock-history"):
             server.reset_strategy_state()
             with patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca):
                 resp = server.app.test_client().post(endpoint)
             assert resp.status_code == 503, f"{endpoint} should be blocked"
+
+    def test_none_account_number_does_not_latch(self, server, monkeypatch):
+        # An SDK shape change (no account_number) is a check FAILURE, not a
+        # mismatch — it must not latch a permanent halt.
+        monkeypatch.delenv("STRATEGY_CONFIG", raising=False)
+        server.reset_strategy_state()
+        shapeless = Mock()
+        shapeless.get_account.return_value = {}  # no account_number
+        with patch("src.api.alpaca_client.AlpacaClient", return_value=shapeless):
+            assert server._account_interlock_ok(server.strategy_config()) is False
+            assert server.interlock_status() == "unchecked"  # not latched
+        good = _mock_alpaca("PA3D36DVXSZ2")
+        with patch("src.api.alpaca_client.AlpacaClient", return_value=good):
+            assert server._account_interlock_ok(server.strategy_config()) is True
 
     def test_mismatch_verdict_latches(self, server, monkeypatch):
         monkeypatch.delenv("STRATEGY_CONFIG", raising=False)
@@ -342,3 +402,37 @@ class TestAccountInterlock:
         good = _mock_alpaca("PA3D36DVXSZ2")
         with patch("src.api.alpaca_client.AlpacaClient", return_value=good):
             assert server._account_interlock_ok(server.strategy_config()) is True
+
+
+class TestHealthReportsInterlock:
+    def test_detailed_health_flips_unhealthy_on_mismatch(self, server, monkeypatch):
+        monkeypatch.delenv("STRATEGY_CONFIG", raising=False)
+        monkeypatch.delenv("STRATEGY_API_KEY", raising=False)
+        server.reset_strategy_state()
+        alpaca = _mock_alpaca("WRONG_ACCOUNT")
+        client = server.app.test_client()
+        with patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca):
+            client.post("/scan")  # trip the interlock → latched mismatch
+            health = client.get("/health").get_json()
+        assert health["checks"]["account_interlock"] == "mismatch"
+        assert health["status"] == "unhealthy"
+
+    def test_root_reports_interlock_but_stays_200(self, server, monkeypatch):
+        # Root is the Cloud Run liveness probe: must stay 200 even on mismatch,
+        # or a latched mismatch would loop-restart the instance.
+        monkeypatch.delenv("STRATEGY_CONFIG", raising=False)
+        monkeypatch.delenv("STRATEGY_API_KEY", raising=False)
+        server.reset_strategy_state()
+        alpaca = _mock_alpaca("WRONG_ACCOUNT")
+        client = server.app.test_client()
+        with patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca):
+            client.post("/scan")
+            resp = client.get("/")
+        assert resp.status_code == 200
+        assert resp.get_json()["account_interlock"] == "mismatch"
+
+    def test_health_unchecked_before_any_trading_call(self, server, monkeypatch):
+        monkeypatch.delenv("STRATEGY_CONFIG", raising=False)
+        server.reset_strategy_state()
+        health = server.app.test_client().get("/health").get_json()
+        assert health["checks"]["account_interlock"] == "unchecked"

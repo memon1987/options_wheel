@@ -26,8 +26,13 @@ alpaca:
 gcs:
   opportunity_bucket: "covered-call-opportunities"
 
-# Analytics dataset, strategy-scoped (Seam 4). Provisioned + IAM-granted in
-# Phase 3 (the runtime SA cannot create datasets).
+# Analytics dataset, strategy-scoped (Seam 4).
+# NOT YET WIRED: Seam 4 (threading this dataset through the five BQ writers +
+# adding a strategy_id column) is deferred to Phase 3. Until it lands, the
+# writers still target "options_wheel", so THIS SERVICE MUST NOT RUN ingest or
+# analytics-writing jobs before Phase 3 — it would write covered-call rows into
+# the wheel's dataset. Dataset provisioned + IAM-granted in Phase 3 (the runtime
+# SA cannot create datasets).
 bigquery:
   dataset: "covered_call"
 
@@ -74,6 +79,22 @@ risk:
   # equity. Consumed in Phase 2.
   sizing_basis: equity
   max_long_market_value_pct_of_equity: 1.0
+  # Shared-machinery keys the reused call/monitor path hard-indexes today
+  # (Config.use_call_stop_loss / use_put_stop_loss / stop_loss_multiplier and
+  # the profit_taking accessors). Present so the reused code does not KeyError
+  # when the Phase 2 engine drives it. The Phase 2 design pass tunes these for
+  # the covered-call target; values here mirror the wheel's call side as a
+  # starting point. Stop-losses off (FC-010 disabled call stop-losses).
+  use_put_stop_loss: false
+  use_call_stop_loss: false
+  stop_loss_multiplier: 1.5
+  profit_taking:
+    use_dynamic_profit_target: true
+    static_profit_target: 0.50
+    min_profit_target: 0.30
+    max_profit_target: 0.80
+    default_long_dte_target: 0.50
+    dte_bands: []
 
 monitoring:
   check_interval_minutes: 15

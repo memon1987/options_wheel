@@ -15,6 +15,7 @@ class TestConfig:
     def setup_method(self):
         """Set up test fixtures."""
         self.test_config_data = {
+            'strategy_id': 'wheel',  # FC-075: required top-level key
             'alpaca': {
                 'paper_trading': True,
                 'api_key_id': '${TEST_API_KEY}',

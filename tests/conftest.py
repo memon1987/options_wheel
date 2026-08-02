@@ -117,6 +117,7 @@ def _deterministic_alpaca_credentials(monkeypatch):
 def test_config_data() -> Dict[str, Any]:
     """Return a complete, valid test configuration dictionary."""
     return {
+        'strategy_id': 'wheel',  # FC-075: required top-level key
         'alpaca': {
             'paper_trading': True,
             'api_key_id': 'test_api_key',
