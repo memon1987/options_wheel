@@ -207,13 +207,20 @@ def require_account_match(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         if not _account_interlock_ok(strategy_config()):
-            return jsonify({
-                'status': 'error',
-                'error': 'account_interlock_mismatch',
-                'message': ("Service credentials do not match the expected brokerage "
-                            "account; trading is disabled. See account_interlock_mismatch "
-                            "log event."),
-            }), 503
+            # Distinguish a latched account mismatch from a transient
+            # check-failure (Alpaca unreachable / no account_number) so the HTTP
+            # body matches the log events and /health, not just alerting.
+            if interlock_status() == 'mismatch':
+                error = 'account_interlock_mismatch'
+                message = ("Service credentials do not match the expected brokerage "
+                           "account; trading is disabled (latched). See "
+                           "account_interlock_mismatch log event.")
+            else:
+                error = 'account_interlock_unverified'
+                message = ("Could not verify the brokerage account this request; "
+                           "trading refused until a check succeeds. See "
+                           "account_interlock_check_failed log event.")
+            return jsonify({'status': 'error', 'error': error, 'message': message}), 503
         return f(*args, **kwargs)
     return wrapper
 

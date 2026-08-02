@@ -367,6 +367,19 @@ class TestAccountInterlock:
                 resp = server.app.test_client().post(endpoint)
             assert resp.status_code == 503, f"{endpoint} should be blocked"
 
+    def test_check_failure_503_body_says_unverified_not_mismatch(self, server, monkeypatch):
+        # A transient check-failure must not read as a real mismatch in the body.
+        monkeypatch.delenv("STRATEGY_CONFIG", raising=False)
+        monkeypatch.delenv("STRATEGY_API_KEY", raising=False)
+        server.reset_strategy_state()
+        boom = Mock()
+        boom.get_account.side_effect = RuntimeError("alpaca down")
+        with patch("src.api.alpaca_client.AlpacaClient", return_value=boom):
+            resp = server.app.test_client().post("/scan")
+        assert resp.status_code == 503
+        assert b"account_interlock_unverified" in resp.data
+        assert b"account_interlock_mismatch" not in resp.data
+
     def test_none_account_number_does_not_latch(self, server, monkeypatch):
         # An SDK shape change (no account_number) is a check FAILURE, not a
         # mismatch — it must not latch a permanent halt.
