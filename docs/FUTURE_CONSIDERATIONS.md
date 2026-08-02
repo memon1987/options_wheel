@@ -1512,6 +1512,21 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 **Links:** FC-050 Open Question 2 (`docs/plans/fc-050.md`; both PR #74 reviewers), FC-029 (R2 source order), FC-039 (wheel state), `src/strategy/cost_basis.py`.
 
+### FC-075: Standalone covered-call strategy — separate account, shared machinery
+
+**Status:** Plan published
+**Size estimate:** L
+**Owner:** zeshan
+**Plan file:** `docs/plans/fc-075.md`
+
+**Problem / opportunity:** Owner wants covered calls written in a **separate Alpaca account** (paper `PA37XLNWDLB3`, provisioned 2026-07-18) isolated from the wheel, by **reusing mechanical components** (FC-038 two-pool share ledger, FC-050/FC-065 cost-basis floor, OCC utils) rather than duplicating the engine, with **its own tunable parameters** (`config/covered_call.yaml`) and **separate backtests**. Architecture settled by two adversarial reviews: separate account per strategy (no tagging — the wheel's `reconcile_positions` adopts any untracked position), one repo/one image/N config-selected Cloud Run services. Plan ships Phase 1 (isolation seams: strategy-keyed opportunity store, `STRATEGY_CONFIG` accessor + account-number interlock, profile-aware config, BQ dataset threading) now; Phases 2/4 (engine + backtest) are design-gated on FC-068 + FC-069 landing. Supersedes the abandoned plan formerly renumbered FC-032→037→038 (collided with merged two-pool FC-038).
+
+**Open questions:**
+- Post-FC-068/069: reuse `OptionsScanner.scan_for_call_opportunities` with a holdings-derived list, or a thinner holdings-first scanner? (blocking, decided in the Phase 2 design pass)
+- Initial tunables for `covered_call.yaml` (delta band, DTE, min premium, validator thresholds) — operator to set before first sale (non-blocking)
+
+**Links:** `docs/plans/fc-075.md`; gates: FC-068, FC-069; prerequisites/risks: FC-067 (journal put-labeling), FC-061 (ledger vs open orders), FC-056 (backtest call pricing 0.676×), FC-062/FC-066 (roller excluded from scope).
+
 ---
 
 ## Completed
