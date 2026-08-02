@@ -18,7 +18,8 @@ class TestConfig:
             'alpaca': {
                 'paper_trading': True,
                 'api_key_id': '${TEST_API_KEY}',
-                'secret_key': '${TEST_SECRET_KEY}'
+                'secret_key': '${TEST_SECRET_KEY}',
+                'expected_account_number': 'PA_TEST_ACCT'  # FC-075 Seam 2 interlock
             },
             'strategy': {
                 'put_target_dte': 7,

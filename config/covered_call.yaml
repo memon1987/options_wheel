@@ -1,0 +1,84 @@
+# Covered-Call Strategy Configuration (FC-075)
+#
+# A standalone covered-call strategy that runs in its OWN Alpaca account,
+# isolated from the wheel. Selected by a Cloud Run service via
+# STRATEGY_CONFIG=config/covered_call.yaml.
+#
+# Scope note: FC-075 Phase 1 only wires ISOLATION (this file must load, validate,
+# and supply strategy_id / expected_account_number / opportunity_bucket /
+# dataset). The strategy: and universe: tunables below are consumed by the
+# Phase 2 covered-call engine, which is gated on FC-068 + FC-069 and will be
+# re-derived by a design pass. Values here are sensible starting defaults,
+# operator-tunable (see the plan's OQ-2) — NOT final.
+
+strategy_id: covered_call
+
+alpaca:
+  paper_trading: true
+  api_key_id: "${ALPACA_API_KEY}"
+  secret_key: "${ALPACA_SECRET_KEY}"
+  # Account-number interlock (Seam 2): the covered-call paper account. The
+  # service refuses to trade if the live account number does not match.
+  expected_account_number: "PA37XLNWDLB3"
+
+# GCS opportunity handoff, strategy-scoped so this service and the wheel cannot
+# read each other's scan output (Seam 1). Bucket is provisioned in Phase 3.
+gcs:
+  opportunity_bucket: "covered-call-opportunities"
+
+# Analytics dataset, strategy-scoped (Seam 4). Provisioned + IAM-granted in
+# Phase 3 (the runtime SA cannot create datasets).
+bigquery:
+  dataset: "covered_call"
+
+# Covered-call trading parameters — this strategy's OWN tunables, distinct from
+# the wheel's (requirement #3). No put phase.
+strategy:
+  # Days to expiration for the calls written against held shares.
+  call_target_dte: 7
+  # Delta band for call selection. Own band; starts at the wheel's tightened
+  # value and is tuned independently once there's covered-call backtest data.
+  call_delta_range: [0.15, 0.25]
+  # Minimum acceptable call premium (per share).
+  min_call_premium: 0.30
+  # Strike-floor policy. Only 'avg_entry_price' is supported today (hard floor:
+  # never write a strike below the shares' average entry price). The key is
+  # explicit so the mode is auditable, not to invite alternatives. Reuses the
+  # shared CostBasisResolver (FC-050). Consumed in Phase 2.
+  floor_mode: avg_entry_price
+  # Position limits.
+  max_positions_per_stock: 1
+  max_total_positions: 20
+  max_exposure_per_ticker: 200000  # larger book than the wheel; $200k/ticker cap
+
+# Holdings-derived universe (requirement: no configured stock list). The engine
+# writes calls against whatever equity it finds in the account. These controls
+# only EXCLUDE or VALIDATE — they never select. Consumed in Phase 2.
+universe:
+  # Symbols the bot must never write calls against (operator opt-out). Empty by
+  # default: the operator invariant is "this account holds nothing you are
+  # unwilling to have called away."
+  excluded_symbols: []
+  # Inventory validator thresholds (Phase 2): a holding failing these is skipped
+  # + logged, never traded.
+  min_open_interest: 500
+  max_spread_pct: 0.10          # reject chains wider than 10% bid/ask
+  earnings_exclusion_days: 5    # no new calls within N days of earnings
+
+risk:
+  max_portfolio_allocation: 0.80
+  max_position_size: 0.35
+  min_cash_reserve: 0.20
+  # 4x-margin discipline (Phase 0 found this account is 4x vs the wheel's 2x):
+  # size against equity, never buying_power, and alert if long exposure exceeds
+  # equity. Consumed in Phase 2.
+  sizing_basis: equity
+  max_long_market_value_pct_of_equity: 1.0
+
+monitoring:
+  check_interval_minutes: 15
+  assignment_alert: true
+  profit_target_alert: true
+  loss_threshold_alert: true
+  enable_cloud_logging: true
+  max_execution_time_minutes: 5

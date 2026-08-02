@@ -15,21 +15,57 @@ logger = structlog.get_logger(__name__)
 class OpportunityStore:
     """Manages storage and retrieval of trading opportunities between scan and execution."""
 
-    def __init__(self, config: Config, bucket_name: str = "options-wheel-opportunities"):
+    def __init__(self, config: Config, bucket_name: Optional[str] = None):
         """Initialize opportunity store.
 
         Args:
             config: Configuration instance
-            bucket_name: GCS bucket name for storing opportunities
+            bucket_name: GCS bucket name for storing opportunities. When omitted,
+                resolved from ``config.opportunity_bucket`` (FC-075 Seam 1) so two
+                services built from the same image use strategy-scoped buckets and
+                cannot read each other's scan output. Explicit values are honored
+                for tests.
         """
         self.config = config
-        self.bucket_name = bucket_name
+        self.strategy_id = config.strategy_id
+        self.bucket_name = bucket_name if bucket_name is not None else config.opportunity_bucket
         self.storage_client = storage.Client()
 
         # Ensure bucket exists
         self._ensure_bucket_exists()
 
-        logger.info("OpportunityStore initialized", event_category="system", event_type="opportunity_store_initialized", bucket=bucket_name)
+        logger.info("OpportunityStore initialized", event_category="system", event_type="opportunity_store_initialized", bucket=self.bucket_name, strategy_id=self.strategy_id)
+
+    def _blob_belongs_to_strategy(self, data: Dict[str, Any], blob_name: str) -> bool:
+        """Fail-closed strategy check on an opportunity blob (Seam 1 defense-in-depth).
+
+        Bucket-per-strategy is the primary isolation boundary; this is a second,
+        independent control so that a mis-configured bucket becomes a loud no-op
+        (a logged skip) rather than an order placed in the wrong brokerage
+        account. Both controls must fail for a cross-strategy order to occur.
+
+        A blob written before this field existed carries no ``strategy_id``;
+        absent is treated as ``wheel`` for one deploy cycle (blobs are same-day
+        ephemeral), after which every blob written by this build carries the
+        field.
+        """
+        blob_strategy = data.get('strategy_id', 'wheel')
+        if blob_strategy != self.strategy_id:
+            log_error_event(
+                logger,
+                error_type="opportunity_strategy_mismatch",
+                error_message=(
+                    f"Opportunity blob strategy_id={blob_strategy!r} does not match "
+                    f"service strategy_id={self.strategy_id!r}; refusing to consume it"
+                ),
+                component="opportunity_store",
+                recoverable=True,
+                blob_path=blob_name,
+                blob_strategy_id=blob_strategy,
+                service_strategy_id=self.strategy_id,
+            )
+            return False
+        return True
 
     def _ensure_bucket_exists(self):
         """Create bucket if it doesn't exist."""
@@ -60,8 +96,10 @@ class OpportunityStore:
             # Create storage object with timestamp-based path
             blob_path = self._get_blob_path(scan_time)
 
-            # Add metadata
+            # Add metadata. strategy_id (FC-075 Seam 1) tags the blob so the
+            # consuming service can refuse blobs written by another strategy.
             storage_data = {
+                'strategy_id': self.strategy_id,
                 'scan_time': scan_time.isoformat(),
                 'expires_at': (scan_time + timedelta(minutes=20)).isoformat(),
                 'opportunity_count': len(opportunities),
@@ -145,6 +183,10 @@ class OpportunityStore:
                     # Download and parse
                     content = blob.download_as_string()
                     data = json.loads(content)
+
+                    # Fail closed if this blob belongs to another strategy.
+                    if not self._blob_belongs_to_strategy(data, blob.name):
+                        continue
 
                     # Parse scan time
                     scan_time = datetime.fromisoformat(data['scan_time'].replace('Z', '+00:00'))
@@ -244,6 +286,11 @@ class OpportunityStore:
                     try:
                         content = blob.download_as_string()
                         data = json.loads(content)
+
+                        # Fail closed on cross-strategy blobs (Seam 1).
+                        if not self._blob_belongs_to_strategy(data, blob.name):
+                            continue
+
                         scan_time = datetime.fromisoformat(data['scan_time'].replace('Z', '+00:00'))
                         age = execution_time - scan_time
 
@@ -272,6 +319,12 @@ class OpportunityStore:
             # Update status
             content = blob.download_as_string()
             data = json.loads(content)
+
+            # Fail closed: never mark another strategy's blob (Seam 1). This can
+            # only happen if a caller passed an explicit scan_blob_path from the
+            # wrong strategy; the search path above already filters.
+            if not self._blob_belongs_to_strategy(data, scan_blob_path):
+                return False
 
             data['status'] = 'executed'
             data['executed_at'] = execution_time.isoformat()

@@ -107,12 +107,30 @@ class Config:
 
         self._config = substitute_recursive(self._config)
 
+    # Strategy profiles this codebase knows how to run. Each Cloud Run service
+    # selects one via the top-level ``strategy_id`` key (see STRATEGY_CONFIG in
+    # deploy/cloud_run_server.py). ``wheel`` is the historical default.
+    _KNOWN_STRATEGY_IDS = ("wheel", "covered_call")
+
     def _validate_config(self):
         """Validate configuration values for correctness and safety."""
         errors = []
 
-        # Required sections
-        required_sections = ['alpaca', 'strategy', 'risk', 'stocks', 'monitoring']
+        # strategy_id selects which validation profile applies. Absent means the
+        # legacy wheel profile, so an unmodified settings.yaml stays valid.
+        strategy_id = self._config.get('strategy_id', 'wheel')
+        if strategy_id not in self._KNOWN_STRATEGY_IDS:
+            raise ValueError(
+                f"Unknown strategy_id '{strategy_id}' "
+                f"(expected one of {list(self._KNOWN_STRATEGY_IDS)})"
+            )
+
+        # Required sections. ``stocks`` is a configured trading universe, which
+        # only the wheel has — the covered-call universe is derived from account
+        # holdings, so that profile has no ``stocks`` section.
+        required_sections = ['alpaca', 'strategy', 'risk', 'monitoring']
+        if strategy_id == 'wheel':
+            required_sections.append('stocks')
         for section in required_sections:
             if section not in self._config:
                 errors.append(f"Missing required section: '{section}'")
@@ -120,6 +138,15 @@ class Config:
         if errors:
             # Can't proceed with validation if sections missing
             raise ValueError(f"Configuration validation failed:\n" + "\n".join(errors))
+
+        # Account-number interlock (Seam 2). Required for every profile so a
+        # service can assert at startup that its credentials point at the
+        # expected brokerage account. Placed in the alpaca block.
+        if not self._config.get('alpaca', {}).get('expected_account_number'):
+            errors.append(
+                "alpaca.expected_account_number is required (pins the service to "
+                "a specific brokerage account; see the account-number interlock)"
+            )
 
         # Alpaca validation
         alpaca = self._config.get('alpaca', {})
@@ -131,33 +158,37 @@ class Config:
         # Strategy validation
         strategy = self._config.get('strategy', {})
 
-        # DTE must be positive
-        put_dte = strategy.get('put_target_dte', 0)
+        # Call DTE + delta apply to every option-writing profile.
         call_dte = strategy.get('call_target_dte', 0)
-        if put_dte <= 0:
-            errors.append(f"put_target_dte must be positive (got {put_dte})")
         if call_dte <= 0:
             errors.append(f"call_target_dte must be positive (got {call_dte})")
-
-        # Delta ranges must be valid
-        put_delta = strategy.get('put_delta_range', [])
         call_delta = strategy.get('call_delta_range', [])
-        if len(put_delta) != 2 or not (0 <= put_delta[0] <= put_delta[1] <= 1):
-            errors.append(f"put_delta_range must be [min, max] with 0 <= min <= max <= 1 (got {put_delta})")
         if len(call_delta) != 2 or not (0 <= call_delta[0] <= call_delta[1] <= 1):
             errors.append(f"call_delta_range must be [min, max] with 0 <= min <= max <= 1 (got {call_delta})")
 
-        # Price ranges
-        min_price = strategy.get('min_stock_price', 0)
-        max_price = strategy.get('max_stock_price', 0)
-        if min_price < 0:
-            errors.append(f"min_stock_price must be non-negative (got {min_price})")
-        if max_price <= 0:
-            errors.append(f"max_stock_price must be positive (got {max_price})")
-        if min_price >= max_price:
-            errors.append(f"min_stock_price ({min_price}) must be less than max_stock_price ({max_price})")
+        # Put parameters and universe price-screening are wheel-only. The
+        # covered-call profile has no put phase and derives its universe from
+        # holdings, so these are not required (and not present) for it. Gating
+        # on strategy_id keeps the wheel's validation path byte-identical.
+        if strategy_id == 'wheel':
+            put_dte = strategy.get('put_target_dte', 0)
+            if put_dte <= 0:
+                errors.append(f"put_target_dte must be positive (got {put_dte})")
 
-        # Position limits
+            put_delta = strategy.get('put_delta_range', [])
+            if len(put_delta) != 2 or not (0 <= put_delta[0] <= put_delta[1] <= 1):
+                errors.append(f"put_delta_range must be [min, max] with 0 <= min <= max <= 1 (got {put_delta})")
+
+            min_price = strategy.get('min_stock_price', 0)
+            max_price = strategy.get('max_stock_price', 0)
+            if min_price < 0:
+                errors.append(f"min_stock_price must be non-negative (got {min_price})")
+            if max_price <= 0:
+                errors.append(f"max_stock_price must be positive (got {max_price})")
+            if min_price >= max_price:
+                errors.append(f"min_stock_price ({min_price}) must be less than max_stock_price ({max_price})")
+
+        # Position limits (both profiles)
         max_positions = strategy.get('max_total_positions', 0)
         if max_positions <= 0:
             errors.append(f"max_total_positions must be positive (got {max_positions})")
@@ -205,11 +236,13 @@ class Config:
             if not (0 < min_target <= max_target <= 1):
                 errors.append(f"profit_taking targets invalid: min={min_target}, max={max_target} (need 0 < min <= max <= 1)")
 
-        # Stock universe validation
-        stocks = self._config.get('stocks', {})
-        symbols = stocks.get('symbols', [])
-        if not symbols:
-            errors.append("No stock symbols configured in stocks.symbols")
+        # Stock universe validation — only the wheel configures a universe;
+        # the covered-call profile derives it from account holdings.
+        if strategy_id == 'wheel':
+            stocks = self._config.get('stocks', {})
+            symbols = stocks.get('symbols', [])
+            if not symbols:
+                errors.append("No stock symbols configured in stocks.symbols")
 
         # Monitoring validation
         monitoring = self._config.get('monitoring', {})
@@ -245,7 +278,48 @@ class Config:
     def paper_trading(self) -> bool:
         """Check if paper trading is enabled."""
         return self._config["alpaca"]["paper_trading"]
-    
+
+    # Strategy identity & isolation (FC-075 Phase 1)
+    @property
+    def strategy_id(self) -> str:
+        """Which strategy profile this config drives ('wheel' | 'covered_call').
+
+        Absent means the legacy wheel profile, so an unmodified settings.yaml
+        keeps working unchanged.
+        """
+        return self._config.get("strategy_id", "wheel")
+
+    @property
+    def expected_account_number(self) -> str:
+        """Alpaca account number this service is pinned to (Seam 2 interlock).
+
+        The startup interlock refuses to trade if the live account number does
+        not match this value — the single control that makes "right code, wrong
+        credentials" impossible across separate-account strategies.
+        """
+        return self._config["alpaca"]["expected_account_number"]
+
+    @property
+    def opportunity_bucket(self) -> str:
+        """GCS bucket for the scan→execute opportunity handoff (Seam 1).
+
+        Strategy-scoped so two services built from the same image cannot read
+        each other's scan output. Defaults to the wheel's historical bucket, so
+        the wheel is untouched when the key is absent.
+        """
+        return self._config.get("gcs", {}).get(
+            "opportunity_bucket", "options-wheel-opportunities"
+        )
+
+    @property
+    def bigquery_dataset(self) -> str:
+        """BigQuery dataset for this strategy's analytics (Seam 4).
+
+        Defaults to ``options_wheel`` so the wheel's writers are unchanged when
+        the key is absent.
+        """
+        return self._config.get("bigquery", {}).get("dataset", "options_wheel")
+
     # Strategy Parameters
     @property
     def opportunity_max_age_minutes(self) -> int:
