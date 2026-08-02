@@ -682,6 +682,125 @@ class TestAtFloorStrikesAreFlaggedTheWayTheGatesTreatThem:
         assert results[0]['assignment_above_cost_basis'] is False
 
 
+class TestAtFloorStrikesAreScoredTheWayTheyAreFlagged:
+    """FC-071: the ``above_cost_basis`` scoring input is the same ``>=``
+    comparison as the flag, so gate, flag, and score all agree that at-floor
+    is good.
+
+    FC-065 Phase 2 moved the flag to ``>=`` but deliberately left the scoring
+    input on strict ``>`` for an operator decision. The result was an at-floor
+    candidate that was *flagged* at-or-above basis while being *scored* as
+    below-basis — 5 points instead of 15, a 10-point swing in a 0-100 score
+    that ranks a genuinely profitable write below its peers. The operator
+    decided to align (2026-08-02).
+
+    Exact equality is near measure-zero on premium-netted floors against
+    $2.50 strike grids, so this is consistency hygiene rather than a shift on
+    today's book. These tests are the pins that keep the two predicates from
+    drifting apart again.
+    """
+
+    def setup_method(self):
+        self.mock_alpaca = Mock()
+        self.mock_market_data = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.call_target_dte = 7
+        self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                                      self.mock_config)
+        self.mock_market_data.get_stock_metrics.return_value = {'current_price': 372.0}
+        # Same GOOGL shape as the flag tests above: floor 368.34.
+        self.mock_alpaca.get_positions.return_value = [{
+            'symbol': 'GOOGL', 'qty': '100', 'cost_basis': '36834.0',
+            'avg_entry_price': '368.34', 'asset_class': 'us_equity',
+            'side': 'long',
+        }]
+
+    def _chain(self, strike):
+        self.mock_market_data.find_suitable_calls.return_value = [{
+            'symbol': 'GOOGL260821C%08d' % int(strike * 1000),
+            'strike_price': strike, 'expiration_date': '2026-08-21', 'dte': 7,
+            'delta': 0.20, 'mid_price': 2.10, 'bid': 2.05, 'ask': 2.15,
+            'volume': 1500, 'open_interest': 6000, 'implied_volatility': 0.24,
+        }]
+
+    def _score_with(self, opportunity, above_cost_basis):
+        """Re-score an emitted opportunity from its own published components,
+        varying only the basis input. Reading the components back off the dict
+        keeps this independent of the scan's internal arithmetic."""
+        return self.scanner._calculate_call_attractiveness_score(
+            opportunity['annual_premium_return_percent'],
+            opportunity['delta'],
+            opportunity['otm_percentage'],
+            opportunity['liquidity_score'],
+            opportunity['dte'],
+            above_cost_basis,
+        )
+
+    def test_a_strike_exactly_at_the_floor_earns_the_above_basis_bonus(self):
+        """The mutation target. Reverted to strict ``>``, the at-floor
+        opportunity carries the 5-point below-basis consolation instead of the
+        15-point bonus and this fails on both assertions."""
+        self._chain(368.34)
+
+        results = self.scanner.scan_for_call_opportunities()
+
+        assert len(results) == 1
+        opportunity = results[0]
+        assert opportunity['strike_price'] == 368.34
+        assert opportunity['cost_basis_per_share'] == 368.34
+
+        with_bonus = self._score_with(opportunity, True)
+        without_bonus = self._score_with(opportunity, False)
+        # The bonus is worth exactly the 15-vs-5 spread; if the weights ever
+        # move (FC-073's territory) this stays honest by deriving the delta.
+        assert with_bonus - without_bonus == 10
+        assert opportunity['attractiveness_score'] == with_bonus
+        assert opportunity['attractiveness_score'] != without_bonus
+
+    def test_an_at_floor_strike_scores_the_same_as_one_cent_above(self):
+        """The boundary is no longer a scoring cliff: a penny of extra capital
+        gain must not be worth 10 points of rank."""
+        self._chain(368.34)
+        at_floor = self.scanner.scan_for_call_opportunities()[0]
+
+        self._chain(368.35)
+        above_floor = self.scanner.scan_for_call_opportunities()[0]
+
+        assert above_floor['assignment_above_cost_basis'] is True
+        # Both sides of the boundary now collect the same 15-point bonus, so
+        # the residual gap is only the OTM/return effect of the extra cent.
+        assert abs(above_floor['attractiveness_score']
+                   - at_floor['attractiveness_score']) < 1
+
+    @pytest.mark.parametrize('strike', [360.00, 368.34, 368.35, 375.00])
+    def test_the_flag_and_the_scoring_input_are_the_same_value(self, strike):
+        """FC-071's real contract: one comparison feeds both surfaces. This
+        fails the moment anyone re-derives either side from its own
+        comparison — which is exactly the drift FC-071 closed. Below-floor is
+        included because the parameter contract survives even though the chain
+        gate would never return such a strike."""
+        self._chain(strike)
+        recorded = {}
+        real_score = self.scanner._calculate_call_attractiveness_score
+
+        def spy(*args, **kwargs):
+            # ``above_cost_basis`` is the 6th positional parameter.
+            recorded['above_cost_basis'] = (
+                kwargs['above_cost_basis'] if 'above_cost_basis' in kwargs
+                else args[5]
+            )
+            return real_score(*args, **kwargs)
+
+        self.scanner._calculate_call_attractiveness_score = spy
+
+        results = self.scanner.scan_for_call_opportunities()
+
+        assert len(results) == 1
+        assert 'above_cost_basis' in recorded, 'scoring was never invoked'
+        assert recorded['above_cost_basis'] is (strike >= 368.34)
+        assert recorded['above_cost_basis'] is results[0]['assignment_above_cost_basis']
+
+
 class TestCallScanFailsClosedOnAnUnusableQuote:
     """FC-065 (folded in from the removed Phase 3): a failed stock quote used
     to fail OPEN — the opportunity was emitted anyway, with every price-derived
