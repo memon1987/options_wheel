@@ -254,10 +254,12 @@ class TestPositionsAndAccount:
         covered-call floor reads, or a replay fails closed on every symbol
         while production does not.
 
-        Interim semantics, accepted in writing in the plan: the backtest broker
-        sets assignment basis = strike (``broker._assign_put``), NOT
-        premium-netted, so the simulated floor sits one put premium above
-        production's until FC-068 repoints the simulator.
+        FC-068 closed the interim gap this test used to record. The basis is
+        now **premium-netted** — ``strike − the assigning put's fill premium``
+        — which is Alpaca's ``avg_entry_price`` semantics, verified to the
+        penny on all four live lots (FC-065 Phase 1). Booking it at the bare
+        strike left the simulated floor one premium ABOVE production's; on
+        IWM's $1 strike grid that is a full rung.
         """
         broker, client = setup
         with _at(D1):
@@ -269,9 +271,15 @@ class TestPositionsAndAccount:
 
         assert "avg_entry_price" in stock, (
             "the covered-call floor field is missing from the simulated broker")
-        assert stock["avg_entry_price"] == pytest.approx(90.0)      # the strike
+        # mark 1.00, bid 0.90, haircut 0.25 -> fill 0.975; 90.00 - 0.975.
+        assert stock["avg_entry_price"] == pytest.approx(89.025)
         assert stock["avg_entry_price"] == pytest.approx(
             stock["cost_basis"] / stock["qty"])
+        # And the cash ledger still moved at the strike — the two numbers are
+        # deliberately different (FC-068 §7).
+        event = [e for e in broker.ledger if e.kind == "put_assignment"][0]
+        assert event.price == pytest.approx(90.0)
+        assert event.cash_delta == pytest.approx(-9000.0)
 
     def test_a_multi_lot_stock_position_reports_the_weighted_average(self, setup):
         """Alpaca's own semantic — and what FC-064's mixed-lot case needed."""

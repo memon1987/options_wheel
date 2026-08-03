@@ -3,7 +3,7 @@
 **Status:** complete as a **measurement tool**, and **live in production** — a monthly Cloud
 Run Job writes to `options_wheel.backtest_runs`. Not wired to any automated *action*:
 `demote` is a column, not a trigger.
-**Last updated:** 2026-07-29
+**Last updated:** 2026-08-01 (FC-068 — the replay now drives the production pipeline)
 
 Programmatic demotion is deliberately **out of scope** — a later motion, once the engine
 has been generating real data for a while. Nothing in this system changes the trading
@@ -14,10 +14,53 @@ universe today. `demote` is a column, not a trigger.
 ## What it is
 
 It replays the **live strategy code** over historical Alpaca data. It does not
-reimplement the strategy — `WheelEngine.run_strategy_cycle()`, `PutSeller`, `CallSeller`,
-`RiskManager` and `GapDetector` are the real objects, driven by a frozen clock against a
-`BacktestAlpacaClient` adapter. That is the whole design premise: a reimplementation would
-drift from production, and a drift you cannot see is worse than no backtest.
+reimplement the strategy — since **FC-068** the replayed objects are exactly the ones
+`/scan` and `/run` use:
+
+```
+WheelEngine.reconcile_positions()          # pre-trade housekeeping, as /run does
+OptionsScanner.scan_for_put_opportunities()
+  + .scan_for_call_opportunities()         # candidate generation  (= /scan)
+ExecutionEngine.filter_* -> rank_opportunities -> select_batch -> execute_batch
+PutSeller.execute_put_sale / CallSeller.execute_call_sale     (= /run)
+WheelEngine.run_rolling_cycle()            # Fridays, as the /roll scheduler does
+```
+
+driven by a frozen clock against a `BacktestAlpacaClient` adapter. That is the whole
+design premise: a reimplementation would drift from production, and a drift you cannot
+see is worse than no backtest.
+
+**Before FC-068 the premise was broken in exactly that way.** The replay called
+`WheelEngine.run_strategy_cycle()` — a path production abandoned on 2025-10-03, three days
+before the live account's first fill. Every backtest run before 2026-08-01 therefore
+measured a strategy with a drawdown pause, gap filtering (stages 2 and 4), wheel-state
+phase gating on a state layer that has never been populated, per-cycle position caps, and
+**single-candidate selection** (first suitable contract per symbol) that production does
+not have — and *without* production's top-3-per-symbol → attractiveness-ranked → two-pool
+batch selection and its committed-share ledger. Rows written by either engine are
+distinguished by `engine_version` (see "things that will mislead you", item 5).
+
+### What changed in the measurement, and why
+
+- **Put leg** — the engine emitted ≤1 put candidate per symbol per cycle behind gap +
+  wheel-state + per-cycle caps. The scanner emits top-3 per suitable symbol; `select_batch`
+  takes puts by ROI, one per underlying, until buying power runs out, with **no global
+  position cap** (production's actual behaviour). Expect more concurrent short puts and
+  faster capital deployment; block attribution moves from "gap filter / wheel state" to
+  "insufficient buying power / sizing".
+- **Call leg** — the drawdown pause is gone (FC-065 OQ-3: it is not ported to the live
+  path), so a symbol 5–15% underwater whose chain still clears floor + delta + premium now
+  writes calls in replays, as production does. Selection moves from `suitable[0]` to
+  ranked-by-`attractiveness_score`, and the FC-038 committed-share ledger applies, so a
+  covered position cannot be double-covered. Net direction is symbol-dependent — which is
+  why verdicts must be **re-run, not extrapolated**.
+- **Gap filter** — stages 2 and 4 no longer run anywhere. Symbols the gap filter excluded
+  in elevated-vol regimes (AMD from 2025-01-13 in the FC-002 study) now trade in replays,
+  as they always did in production.
+- **Assignment basis** — the backtest broker books an assigned lot at `strike − put
+  premium`, matching Alpaca's `avg_entry_price`. It used to book it at `strike`, leaving
+  the simulated covered-call floor one premium **above** production's. On a $1 strike grid
+  (IWM) that was worth a full strike rung.
 
 ```bash
 python main.py --command backtest --symbol NVDA --start 2025-11-01 --end 2025-12-01
@@ -45,10 +88,18 @@ python main.py --command screen --no-persist       # analysis only, writes nothi
 
 ## Fidelity, measured — the two legs are not equal
 
+> ⚠️ **STALE PENDING RE-MEASUREMENT (FC-068, 2026-08-01).** Every number in this section
+> was produced by `parity_check.py` mirroring the *old* selection model (`suitable[0]`,
+> matching the sellers FC-068 deleted). The mirror has been rewritten per leg — calls by
+> `attractiveness_score`, puts by ROI, both over the scanner's top 3 — but **neither leg
+> has been re-run yet**. The *strike-reproduction* figures are the ones directly at risk;
+> the premium ratios and the 100% delta-band result depend on the chain model rather than
+> the selection rule and should move little. Do not quote 81% / 55.2% / 0.676 as current.
+
 | | decisions | strike reproduction | premium on **identical** contracts | delta band |
 |---|---:|---:|---:|---:|
-| **put leg** | 204 | **81%** | ~0.93 of live | 100% |
-| **call leg** | 80 | **55.2%** | **0.676 of live** | 100% |
+| **put leg** (stale) | 204 | **81%** | ~0.93 of live | 100% |
+| **call leg** (stale) | 80 | **55.2%** | **0.676 of live** | 100% |
 
 The call leg's pricing error is roughly **5× the put leg's**, and its cause is unknown —
 DTE mix was the obvious explanation and was **tested and disconfirmed** (FC-056). The call
@@ -88,10 +139,36 @@ failure mode: it cannot flatter a symbol into looking tradeable.
 4. **The engine refuses split-spanning windows** (`UnadjustedCorporateAction`) by design —
    raw bars are correct for point-in-time chain work but cannot span a split. Pick a
    window that avoids the split date; the error message names it.
-5. **`rows in `backtest_runs` before 2026-07-29 describe a put-only engine** (FC-048).
-   Do not compare across that boundary. Provenance is `timestamp` + `config_hash`.
-6. **The stage-2 gap filter is not wired into live trading** (FC-049) — the engine runs
-   it, production does not. Any stage-2 block rate describes the *engine*.
+5. **Two non-comparability boundaries in `backtest_runs`, and only one is machine-queryable.**
+   - Rows before **2026-07-29** describe a **put-only** engine (FC-048 — every backtest
+     this project ever ran before it misrouted covered calls to the put seller). FC-048
+     did not bump `engine_version`, so this boundary is **timestamp-only**.
+   - Rows with `engine_version = 'fc-032-phase-5'` describe the **dead engine path**;
+     `engine_version = 'fc-068-prod-pipeline'` describes the production pipeline
+     (FC-068). Query the version, not the date.
+
+   Do not compare across either boundary. Old rows are never mutated — provenance is
+   `engine_version` + `timestamp` + `config_hash`.
+6. **The stage-2 gap filter is wired into nothing at all** (FC-049, FC-068). Production
+   never ran it; since FC-068 neither does the backtest, because the only caller was the
+   deleted engine path. `GapDetector` and its knobs still exist as unconsumed code
+   (FC-069 item 5). There is no stage-2 or stage-4 block rate any more.
+7. **The put-side "already have a position on this symbol" skip is silent.** The scanner
+   returns early with no log line (`options_scanner.py:_has_existing_position`), so the
+   rejection tally cannot count it — production emits nothing there either, and inventing
+   a synthetic event the live path does not emit would be a worse lie. The old stage-6
+   bucket has no replacement until FC-069 item 12 rewires that check. (It also uses a
+   substring match, `symbol in position['symbol']`, which over-blocks; the replay now
+   reproduces that bug faithfully, which is the point of a replay.)
+8. **The drawdown pause does not exist.** It was never on the live path, and FC-065 OQ-3
+   decided it never will be. A replay showing a call written on an underwater position is
+   reproducing production, not missing a guard — the cost-basis floor is the guard.
+9. **Monitor-cycle churn is unmodeled.** Early profit-taking closed **52%** of real call
+   positions before expiry; the replay holds every contract to expiry or assignment. This
+   was true before FC-068 and is still true.
+10. **Scan time == execution time.** Production scans and executes ~15 minutes apart, so
+    live fills against fresher quotes than it scanned on; the replay uses one snapshot for
+    both. Unchanged by FC-068, stated here for the first time.
 
 ---
 

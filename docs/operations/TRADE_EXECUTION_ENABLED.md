@@ -140,9 +140,15 @@ All 9 filtering stages remain active:
 ```yaml
 max_position_size: 0.40  # Max 40% per position
 max_total_positions: 5   # Max 5 concurrent positions
-max_stocks_evaluated_per_cycle: null  # No limit (evaluates all)
-max_new_positions_per_cycle: null     # No limit (opens all approved)
 ```
+
+> ⚠️ **FC-068 (2026-08-01): `max_stocks_evaluated_per_cycle` and
+> `max_new_positions_per_cycle` were deleted.** Their only consumers were stages 3 and 9
+> of the engine orchestration path, which production abandoned in 2025. Setting them in
+> `settings.yaml` now does **nothing** — see the "First Execution" and "Conservative
+> Start" sections below, whose advice to set them is obsolete. `max_total_positions` also
+> has no enforcement point on the live path today (FC-069 item 1 decides whether to
+> revive it inside `select_batch`).
 
 ---
 

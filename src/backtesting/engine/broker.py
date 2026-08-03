@@ -399,15 +399,56 @@ class BacktestBroker:
             self.stock_lots.pop(underlying, None)
 
     def _assign_put(self, pos: OptionPosition, on_date: date) -> None:
-        """Short put assigned: buy shares at strike, release collateral."""
+        """Short put assigned: buy shares at strike, release collateral.
+
+        **Two different numbers, deliberately (FC-068).**
+
+        The *lot basis* is premium-netted — ``strike − the assigning put's
+        premium per share`` — because that is what Alpaca's ``avg_entry_price``
+        reports, verified to the penny on all four live lots (FC-065 Phase 1),
+        and ``avg_entry_price`` is what the covered-call floor reads. Booking
+        the lot at the bare strike left the simulated floor one put premium
+        ABOVE production's: on IWM's $1 strike grid that is a full rung, so
+        every IWM backtest gated calls one strike tighter than production
+        would. Multi-lot weighting falls out of the existing lot list and
+        ``average_cost_basis``, which is Alpaca's weighted-average semantics
+        exactly.
+
+        The *ledger event* is unchanged: ``price = strike``, ``cash_delta =
+        −strike × shares``. Downstream attribution is built on that convention
+        — ``metrics/cycles.py`` derives the cycle's ``cost_basis``
+        share-weighted from ``event.price`` and books ``stock_pnl`` against it
+        at call-away, while ``option_pnl`` separately counts the put premium at
+        ``sell_to_open``. Netting the premium into ``event.price`` (or the cash
+        delta) would double-count it in every assigned cycle: once in
+        ``option_pnl``, again through a lowered stock basis. Readers, all via
+        ``event.price`` → ``cycle.cost_basis``: ``metrics/cycles.py``,
+        ``metrics/fitness.py`` (``underwater_days``), ``reporting/report.py``
+        ("Assigned at $…" lines and the JSON rows). Production has the same
+        two-number split — Alpaca's floor vs the FC-024 ACB scorekeeping — so
+        the ``detail`` dict carries both explicitly.
+
+        One deliberate residual: ``pos.entry_price`` is the *haircut* fill
+        premium, so the netting reflects this engine's own fill model rather
+        than a hypothetical mid fill. That is consistent with the cash ledger,
+        which credited the same haircut premium at open.
+        """
         shares = 100 * pos.contracts
         cost = pos.strike * shares
         self.cash -= cost
-        self._add_stock(pos.underlying, shares, pos.strike, on_date)
+        # Sanity floor: a premium at or above the strike is not a real fill,
+        # and a zero/negative basis would silently disable the covered-call
+        # floor entirely (find_suitable_calls warns and continues on a
+        # non-positive min_strike_price). Fall back to the strike rather than
+        # book an unprotectable lot.
+        netted = pos.strike - pos.entry_price
+        basis = netted if netted > 0 else pos.strike
+        self._add_stock(pos.underlying, shares, basis, on_date)
         self._record(
             "put_assignment", pos.underlying, pos.symbol, contracts=pos.contracts,
             shares=shares, price=pos.strike, cash_delta=-cost, event_date=on_date,
-            detail={"cost_basis": pos.strike, "collateral_released": pos.collateral},
+            detail={"strike": pos.strike, "basis": basis,
+                    "collateral_released": pos.collateral},
         )
         del self.options[pos.symbol]
 

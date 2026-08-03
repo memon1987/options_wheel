@@ -53,9 +53,14 @@ def _no_production_bigquery(monkeypatch, request):
     The cost-basis layer has exactly one BigQuery chokepoint —
     `CostBasisResolver._lookup_assignment_basis`, which since FC-065 runs the
     divergence cross-check and builds its own client from ambient env/ADC. It
-    is patched on the *class*, so every resolver instance is covered: the one
-    OptionsScanner owns, the one CallSeller owns, the one CallRoller owns
-    (FC-065 Phase 2), and any built inside a test.
+    is patched on the *class*, so every resolver instance is covered. The
+    census, as of FC-068: the one OptionsScanner owns, the one CallRoller owns
+    (FC-065 Phase 2), and any built directly inside a test. CallSeller no
+    longer owns one — FC-068 deleted its resolver with the opportunity-
+    generation half of that class, and `execute_call_sale` reads its floor off
+    the opportunity (`opportunity_floor_per_share`) instead.
+    `TestTheBigQueryChokepoint` in tests/test_cost_basis.py asserts that census
+    explicitly, including CallSeller's *absence*.
     Returning None is the "no comparison available" signal, which keeps
     whatever floor the broker reported rather than inventing one.
 

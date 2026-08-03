@@ -1,8 +1,14 @@
 """Simulator day loop (FC-032 Phase 3).
 
-The golden path: the simulator drives the *real* WheelEngine over canned data.
-Nothing here stubs strategy logic — if a rule is wrong, it is wrong in
-production too.
+The golden path: the simulator drives the *real* production pipeline over
+canned data — ``OptionsScanner`` → ``ExecutionEngine`` (filter → rank →
+select_batch → execute_batch) → ``PutSeller``/``CallSeller``. Nothing here
+stubs strategy logic; if a rule is wrong, it is wrong in production too.
+
+FC-068 repointed the generation half off ``WheelEngine.run_strategy_cycle()``,
+which production abandoned in 2025. These tests are the acceptance criteria of
+that repoint: they passed against the engine path and must pass, with
+assertions unweakened, against the pipeline that actually trades.
 """
 
 from __future__ import annotations
@@ -112,9 +118,10 @@ def _weekdays(start: date, n: int) -> List[date]:
 def falling_then_flat():
     """Price slides enough to put an assigned strike ITM, then stabilizes.
 
-    Includes ~45 sessions of warm-up history before the first decision day:
-    GapDetector indexes positionally into ~30 daily bars and blocks everything
-    on a cold start, exactly as it would in production against a fresh account.
+    Includes ~45 sessions of warm-up history before the first decision day.
+    That was originally GapDetector's positional ~30-bar lookback; post-FC-068
+    the gap stages are gone and what needs the history is stage 1's volatility
+    and average-volume metrics (`market_data.filter_suitable_stocks`).
     """
     warmup = _weekdays(date(2024, 3, 25), 45)
     days = _weekdays(date(2024, 6, 3), 30)
@@ -134,13 +141,15 @@ def dip_then_recovering():
     """Assigns a put, then RECOVERS so the call leg can actually run.
 
     `falling_then_flat` cannot test the call side and never could: it assigns
-    at ~92 and leaves spot at 70, so the 5% drawdown pause and the cost-basis
-    floor block every covered call *even with correct routing*. That fixture
-    documents the call-refusal path; this one exercises the call-sale path.
+    at ~92 and leaves spot at 70, so the cost-basis floor blocks every covered
+    call *even with correct routing*. That fixture documents the call-refusal
+    path; this one exercises the call-sale path. (Pre-FC-068 the drawdown pause
+    blocked it too; the pause is deleted with the engine path — FC-065 OQ-3 —
+    and the floor alone still refuses, which is the live behaviour.)
 
     Shape: warm-up flat at 100 -> slide to put the ~8%-OTM strike ITM ->
     recover to just above cost basis and drift up, so that
-      * spot >= basis, so the drawdown pause does not fire, and
+      * spot >= basis, so strikes above the floor exist at all, and
       * strikes just above basis sit inside call_delta_range [0.15, 0.25], and
       * a later expiry finishes above the sold strike, so the call assigns.
     """
@@ -376,28 +385,106 @@ class TestNoProductionSideEffects:
             sim.run()
         assert analytics_module._instance is before
 
-    def test_call_seller_cannot_query_bigquery_during_a_replay(self, falling_then_flat):
-        """A replay must never mix production trade history into its cost-basis floor."""
-        days, closes, exps = falling_then_flat
-        sim = _simulator("XYZ", closes, exps, days)
-        # Reach into the engine the simulator builds by running a 1-day window.
-        result = sim.run()
-        assert result is not None
-        # Rebuild the same engine wiring the simulator uses and assert the guard.
-        from src.strategy.wheel_engine import WheelEngine
-        from src.strategy.wheel_state_manager import WheelStateManager
-        from unittest.mock import Mock
+    @pytest.mark.real_bq_lookup
+    def test_scanner_cannot_query_bigquery_during_a_replay(self):
+        """A replay must never mix production trade history into its floor.
 
-        engine = WheelEngine(Mock(), alpaca_client=Mock(),
-                             wheel_state=WheelStateManager(),
-                             allow_bigquery_cost_basis=False)
-        assert engine.call_seller.allow_bigquery_cost_basis is False
-        # FC-065: the gate now stops the divergence cross-check, which is the
-        # only BigQuery reader left on this path. "None" is "no comparison
-        # available" — it leaves the simulated broker's floor untouched.
-        assert engine.call_seller._cost_basis_resolver.allow_bigquery is False
-        assert engine.call_seller._cost_basis_resolver._lookup_assignment_basis(
-            "XYZ", 100) is None
+        FC-068 moved this contract from CallSeller to OptionsScanner: the
+        seller's resolver was deleted with the engine path, and the scanner is
+        now the sole producer — and it hardcoded ``allow_bigquery=True``
+        (the PR #75 reviewer's finding), so a repointed replay would have read
+        production ``trades_from_activities`` against ``CURRENT_TIMESTAMP()``
+        on every simulated day.
+
+        Marked ``real_bq_lookup`` deliberately: the conftest hermeticity guard
+        patches the chokepoint on the CLASS, so with it in place this passes
+        whether or not ``__init__`` forwards the gate. Opting out is what makes
+        the *production-code* gate the thing being tested. The discriminating
+        assertion is that no BigQuery client is ever constructed.
+        """
+        from unittest.mock import Mock, patch
+
+        from src.data.options_scanner import OptionsScanner
+
+        scanner = OptionsScanner(Mock(), Mock(), Mock(spec=Config),
+                                 allow_bigquery=False)
+
+        assert scanner.cost_basis_resolver.allow_bigquery is False
+        with patch('google.cloud.bigquery.Client') as mock_client:
+            # "None" is "no comparison available" — it leaves the simulated
+            # broker's floor untouched rather than vetoing it.
+            assert scanner.cost_basis_resolver._lookup_assignment_basis(
+                "XYZ", 100) is None
+        mock_client.assert_not_called()
+
+    def test_the_simulator_builds_its_scanner_with_the_gate_shut(self, falling_then_flat):
+        """The other half of the link: the test above pins the gate working,
+        this pins the simulator actually passing it. Constructing the scanner
+        with the default would leave the gate perfect and unreached."""
+        from unittest.mock import patch
+
+        import src.backtesting.engine.simulator as simulator_module
+
+        days, closes, exps = falling_then_flat
+        seen = []
+        real = simulator_module.OptionsScanner
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs.get('allow_bigquery'))
+            return real(*args, **kwargs)
+
+        with patch.object(simulator_module, 'OptionsScanner', spy):
+            _simulator("XYZ", closes, exps, days).run()
+
+        assert seen == [False], f"simulator built its scanner with {seen!r}"
+
+    @pytest.mark.real_bq_lookup
+    def test_uncovered_days_resolver_is_gated_in_replay(self):
+        """Chokepoint #2 (FC-065 Phase 4): one batched BigQuery query per scan
+        for every held symbol. Ungated, a replay issues it on every simulated
+        day. ``None`` is the honest answer — "could not tell", not zero."""
+        from unittest.mock import Mock, patch
+
+        from src.data.options_scanner import OptionsScanner
+
+        scanner = OptionsScanner(Mock(), Mock(), Mock(spec=Config),
+                                 allow_bigquery=False)
+
+        assert scanner.uncovered_days_resolver.allow_bigquery is False
+        with patch('google.cloud.bigquery.Client') as mock_client:
+            resolved = scanner.uncovered_days_resolver.resolve(["XYZ"], set())
+        mock_client.assert_not_called()
+        assert resolved.get("XYZ") is None
+
+    def test_replay_decision_rows_reach_only_the_noop_writer(self, dip_then_recovering):
+        """FC-065 Phase 4's scan-stage decision records fire inside
+        ``scan_for_call_opportunities`` regardless of who calls it, and
+        ``DecisionRecorder.flush`` resolves the analytics writer from module
+        scope. The simulator's singleton swap is the only thing between a
+        replay and the production ``decision_events`` table.
+
+        Uses the fixture that actually holds shares — with no held symbol the
+        recorder writes nothing and this passes vacuously.
+        """
+        days, closes, exps = dip_then_recovering
+        before = analytics_module._instance
+        sim = _simulator("XYZ", closes, exps, days)
+        result = sim.run()
+
+        assert result.broker.ledger, "fixture never traded"
+        # Rows WERE produced — otherwise this passes by writing nothing.
+        recorded = sim._analytics.calls_named("write_decision_events")
+        assert recorded, (
+            "no decision rows during the replay — the assertion below would "
+            "pass vacuously"
+        )
+        assert any(call[1] and call[1][0] for call in recorded), (
+            "write_decision_events was called with an empty batch only"
+        )
+        # And nothing escaped: the production singleton is the object it was
+        # before the run, untouched throughout.
+        assert analytics_module._instance is before
+        assert isinstance(sim._analytics, NoOpAnalyticsWriter)
 
     def test_call_roller_cannot_query_bigquery_during_a_replay(self):
         """FC-065 Phase 2: the roller resolves its floor through the same shared
@@ -448,17 +535,215 @@ class TestNoProductionSideEffects:
                 'XYZ', 100) is None
         mock_client.assert_not_called()
 
-    def test_bigquery_fallback_stays_enabled_by_default(self):
+    def test_the_live_failed_symbol_set_is_restored_after_a_replay(self, falling_then_flat):
+        """`/backtest/screen` lives on the LIVE trading server (disabled by
+        default, opt-in via ENABLE_SCREEN_ENDPOINT). ExecutionEngine's
+        `_failed_symbols` is a module global, so an in-server replay clearing it
+        would wipe the non-retryable set `/run` depends on — and it also leaked
+        across the 14 sequential per-symbol runs of a screen.
+
+        The set is also NOT the replay's to inherit: a live non-retryable symbol
+        must not suppress a simulated one."""
+        from src.strategy.execution_engine import (
+            clear_failed_symbols, get_failed_symbols)
+
+        days, closes, exps = falling_then_flat
+        clear_failed_symbols()
+        get_failed_symbols().add("LIVE_SENTINEL_240607P00090000")
+        try:
+            _simulator("XYZ", closes, exps, days).run()
+            assert "LIVE_SENTINEL_240607P00090000" in get_failed_symbols(), (
+                "the replay wiped the live non-retryable set"
+            )
+        finally:
+            clear_failed_symbols()
+
+    def test_failed_symbols_are_cleared_each_simulated_day(self, falling_then_flat):
+        """Production's `_failed_symbols` clears roughly daily (Cloud Run cold
+        start). Clearing once per RUN instead would let a day-1 non-retryable
+        failure suppress a symbol for a months-long window — a divergence from
+        production, not fidelity to it."""
+        from unittest.mock import patch
+
+        import src.backtesting.engine.simulator as simulator_module
+
+        days, closes, exps = falling_then_flat
+        clears = []
+        real = simulator_module.clear_failed_symbols
+
+        def counting():
+            clears.append(1)
+            return real()
+
+        with patch.object(simulator_module, "clear_failed_symbols", counting):
+            result = _simulator("XYZ", closes, exps, days).run()
+
+        assert len(clears) == len(result.daily), (
+            f"expected one clear per simulated day ({len(result.daily)}), "
+            f"got {len(clears)} — a once-per-run clear is not production's cadence"
+        )
+
+    def test_scanner_bigquery_stays_enabled_by_default(self):
+        """The gate must not leak into production. ``/scan`` constructs
+        ``OptionsScanner(alpaca_client, market_data, config)`` with no keyword,
+        so the default is what the live path gets — flipping it would silently
+        disable the divergence cross-check and the ``uncovered_days`` label on
+        every real scan."""
         from unittest.mock import Mock
 
+        from src.data.options_scanner import OptionsScanner
         from src.strategy.call_roller import CallRoller
-        from src.strategy.call_seller import CallSeller
 
-        cs = CallSeller(Mock(), Mock(), Mock())
-        assert cs.allow_bigquery_cost_basis is True
+        scanner = OptionsScanner(Mock(), Mock(), Mock(spec=Config))
+        assert scanner.allow_bigquery is True
+        assert scanner.cost_basis_resolver.allow_bigquery is True
+        assert scanner.uncovered_days_resolver.allow_bigquery is True
 
         roller = CallRoller(Mock(), Mock(), Mock(), Mock(), Mock())
         assert roller.cost_basis_resolver.allow_bigquery is True
+
+
+class TestTheReplayRunsTheProductionStages:
+    """FC-068's whole premise is that the replay runs the *live* pipeline, and
+    nothing was pinning that it runs ALL of it, in order, on production's
+    arguments.
+
+    Two adversarial-review mutations survived the 988-test suite:
+      * deleting the ``filter_duplicate_opportunities`` stage from
+        ``_execute_opportunities`` — production runs it on every cycle
+        (``cloud_run_server.py:458``), and the replay would silently stop;
+      * overriding both day-loop scans with ``max_results=50`` — ``/scan``
+        passes no args (``cloud_run_server.py:193,200``), so a replay with a
+        wider cap measures a different strategy. The plan's own words:
+        "Diverging would measure a different strategy."
+
+    Neither is caught by outcome assertions: both change WHAT is measured
+    without breaking the ledger, the equity curve or the tally, which is
+    exactly the class of silent drift this FC exists to end.
+    """
+
+    class _StageSpy:
+        """A recording stand-in for ExecutionEngine.
+
+        Deliberately a spy rather than a ``wraps=`` mock on the real class: the
+        contract being pinned is *which stages the replay invokes and in what
+        order*, and a pass-through would let a dropped stage still produce a
+        plausible run.
+        """
+
+        def __init__(self):
+            self.calls = []
+            self.positions_seen = []
+
+        def filter_failed_opportunities(self, opportunities):
+            self.calls.append("filter_failed_opportunities")
+            return opportunities, 0
+
+        def filter_duplicate_opportunities(self, opportunities, positions):
+            self.calls.append("filter_duplicate_opportunities")
+            self.positions_seen.append(id(positions))
+            return opportunities, 0
+
+        def rank_opportunities(self, opportunities, put_seller,
+                               available_bp, positions=None):
+            self.calls.append("rank_opportunities")
+            self.positions_seen.append(id(positions))
+            self.available_bp = available_bp
+            return list(opportunities)
+
+        def select_batch(self, ranked, available_bp, positions=None):
+            self.calls.append("select_batch")
+            self.positions_seen.append(id(positions))
+            return list(ranked), available_bp
+
+        def execute_batch(self, selected, put_seller, call_seller=None):
+            self.calls.append("execute_batch")
+            self.selected = list(selected)
+            self.put_seller = put_seller
+            self.call_seller = call_seller
+            return [], 0
+
+    class _Client:
+        def __init__(self):
+            self._positions = [{"symbol": "XYZ", "qty": 100.0,
+                                "asset_class": "us_equity"}]
+
+        def get_positions(self):
+            return self._positions
+
+        def get_account(self):
+            return {"buying_power": 50_000.0, "options_buying_power": 40_000.0}
+
+    def test_the_run_half_invokes_every_production_stage_in_order(self):
+        """Kills N1. The order is ``/run``'s, stage for stage."""
+        spy = self._StageSpy()
+        client = self._Client()
+        put_seller, call_seller = object(), object()
+        opportunities = [{"type": "put", "symbol": "XYZ",
+                          "option_symbol": "XYZ240607P00090000",
+                          "strike_price": 90.0, "premium": 1.0}]
+
+        Simulator._execute_opportunities(
+            spy, put_seller, call_seller, opportunities, client)
+
+        assert spy.calls == [
+            "filter_failed_opportunities",
+            "filter_duplicate_opportunities",
+            "rank_opportunities",
+            "select_batch",
+            "execute_batch",
+        ], f"replay stage sequence diverged from /run: {spy.calls}"
+        # FC-038: ONE positions snapshot for the whole cycle. Re-fetching
+        # between sizing and selection lets a fill land in between and produce
+        # a selection the sizing stage never sanctioned.
+        assert len(set(spy.positions_seen)) == 1, (
+            "the duplicate filter, ranking and selection did not share one "
+            "positions snapshot"
+        )
+        # options_buying_power wins over buying_power, as /run does.
+        assert spy.available_bp == 40_000.0
+        # Both sellers reach execution, or the call leg silently dies again
+        # (FC-048).
+        assert spy.put_seller is put_seller and spy.call_seller is call_seller
+
+    def test_the_day_loop_scans_on_production_defaults(self, falling_then_flat):
+        """Kills N2. ``/scan`` passes no ``max_results``; neither may the replay.
+
+        Asserted on the call arguments rather than on any outcome, because a
+        wider cap does not break a run — it quietly widens the candidate pool
+        every simulated day, which is a different strategy measured under the
+        same name.
+        """
+        from unittest.mock import patch
+
+        import src.backtesting.engine.simulator as simulator_module
+
+        days, closes, exps = falling_then_flat
+        put_calls, call_calls = [], []
+        real_cls = simulator_module.OptionsScanner
+
+        class RecordingScanner(real_cls):
+            def scan_for_put_opportunities(self, *args, **kwargs):
+                put_calls.append((args, kwargs))
+                return super().scan_for_put_opportunities(*args, **kwargs)
+
+            def scan_for_call_opportunities(self, *args, **kwargs):
+                call_calls.append((args, kwargs))
+                return super().scan_for_call_opportunities(*args, **kwargs)
+
+        with patch.object(simulator_module, "OptionsScanner", RecordingScanner):
+            result = _simulator("XYZ", closes, exps, days).run()
+
+        assert len(put_calls) == len(result.daily) > 0, "the put scan did not run daily"
+        assert len(call_calls) == len(result.daily), "the call scan did not run daily"
+        assert all(a == () and k == {} for a, k in put_calls), (
+            f"put scan was called with an override: "
+            f"{[c for c in put_calls if c != ((), {})][:3]}"
+        )
+        assert all(a == () and k == {} for a, k in call_calls), (
+            f"call scan was called with an override: "
+            f"{[c for c in call_calls if c != ((), {})][:3]}"
+        )
 
 
 class TestNoOpAnalytics:
@@ -499,9 +784,10 @@ class TestAnalyticsIsolationIsReal:
         sim = _simulator("XYZ", closes, exps, days)
         original = sim._execute_opportunities
 
-        def observing(engine, exec_engine, cycle, client):
+        def observing(exec_engine, put_seller, call_seller, opportunities, client):
             seen.append(type(analytics_module.get_analytics_writer()).__name__)
-            return original(engine, exec_engine, cycle, client)
+            return original(exec_engine, put_seller, call_seller,
+                            opportunities, client)
 
         sim._execute_opportunities = observing
         sim.run()
@@ -668,84 +954,6 @@ class TestStrikeWindowCoversAssignedPositions:
             )
 
 
-# RejectionTally.summary() keys by description (src/backtesting/engine/rejections.py),
-# not by the raw stage_4_blocked event name.
-STAGE_4_LABEL = "execution gap check (stage 4)"
-
-
-class TestStage4ExecutionGapGate:
-    """FC-036 plan tests 9 & 10 — the fixed gate, through the full engine loop.
-
-    Test 9 pins that an ARMED threshold actually blocks inside the day loop
-    (the RejectionTally wiring for stage_4_blocked was never exercised
-    end-to-end). Test 10 pins Phase A's safety property: at the shipped
-    shadow threshold the gate never fires, so behavior is unchanged.
-
-    Thresholds are injected explicitly rather than read from settings.yaml, so
-    these tests keep their meaning when Phase B arms the production default.
-    """
-
-    def _run(self, fixture, threshold):
-        days, closes, exps = fixture
-        provider = ScriptedProvider("XYZ", closes, exps)
-        builder = ChainBuilder(provider, risk_free_rate=0.04)
-        config = Config()
-        # execution_gap_threshold is a read-only property over _config; inject
-        # through the underlying dict so the arm is explicit and independent of
-        # settings.yaml (which is at Phase A's shadow value).
-        config._config["risk"]["gap_risk_controls"]["execution_gap_threshold"] = threshold
-        sim = Simulator(
-            config, provider, builder, ["XYZ"], days[0], days[-1],
-            starting_cash=50_000.0, max_dte=7,
-        )
-        return sim.run()
-
-    def test_armed_threshold_blocks_on_gap_days(self, falling_then_flat):
-        """The slide is -3%/day; a 1.0% gate must reject those decision days."""
-        result = self._run(falling_then_flat, 1.0)
-
-        assert result.rejections.get(STAGE_4_LABEL, 0) > 0, (
-            f"an armed gate must record stage-4 rejections on the slide; "
-            f"got rejections={result.rejections!r}"
-        )
-
-    def test_shadow_blocks_only_on_fail_closed_not_on_gap_size(self, falling_then_flat):
-        """Phase A property, stated precisely.
-
-        The shadow threshold suppresses every *gap-magnitude* block, but stage 4
-        still blocks on missing data / degenerate quotes — that path is
-        fail-closed by design and fires at ANY threshold. So "999 blocks
-        nothing" is false; the true property is that shadow blocks equal the
-        arming-independent floor and are strictly fewer than an armed gate's.
-        """
-        shadow = self._run(falling_then_flat, 999)
-        armed = self._run(falling_then_flat, 1.0)
-        floor = self._run(falling_then_flat, 10_000)
-
-        shadow_blocks = shadow.rejections.get(STAGE_4_LABEL, 0)
-        assert shadow_blocks == floor.rejections.get(STAGE_4_LABEL, 0), (
-            "shadow must add no gap-magnitude blocks over an effectively "
-            f"disabled gate; got {shadow.rejections!r}"
-        )
-        assert shadow_blocks < armed.rejections.get(STAGE_4_LABEL, 0), (
-            "an armed gate must block strictly more than shadow"
-        )
-
-    def test_shadow_matches_the_unarmed_baseline_ledger(self, falling_then_flat):
-        """At 999 the ledger is identical to an effectively-disabled gate.
-
-        This is the property that makes Phase A safe to ship ahead of the
-        study: correcting the math changes nothing until it is armed.
-        """
-        shadow = self._run(falling_then_flat, 999)
-        disabled = self._run(falling_then_flat, 10_000)
-
-        assert [(d.day, d.equity) for d in shadow.daily] == \
-               [(d.day, d.equity) for d in disabled.daily]
-        assert shadow.rejections == disabled.rejections
-        assert shadow.final_equity == disabled.final_equity
-
-
 class TestTheCallLegActuallyRuns:
     """FC-048: every backtest before this modelled a put-only wheel.
 
@@ -769,7 +977,19 @@ class TestTheCallLegActuallyRuns:
         assert kinds.index("sell_call_open") > kinds.index("put_assignment")
 
     def test_no_call_is_sold_below_cost_basis(self, dip_then_recovering):
-        """Enabling the call leg must not enable selling below basis."""
+        """Enabling the call leg must not enable selling below basis.
+
+        Re-based by FC-068 from ``event.price`` (the strike, and the *cash*
+        number) onto ``detail['basis']`` (the premium-netted lot basis, and the
+        number the floor actually gates on). The two are deliberately different
+        now: netting the premium into ``event.price`` would double-count it in
+        every assigned cycle, so both ride the event explicitly.
+
+        Note this is the *weaker* of the two assertions after netting — the
+        netted basis is lower, so a strike passing here would also have passed
+        the old strike-based test. That is correct: the point is to assert the
+        floor production enforces, not a stricter one the backtest invented.
+        """
         days, closes, exps = dip_then_recovering
         result = _simulator("XYZ", closes, exps, days).run()
 
@@ -777,12 +997,44 @@ class TestTheCallLegActuallyRuns:
         calls = [e for e in result.broker.ledger if e.kind == "sell_call_open"]
         if not (assigns and calls):
             pytest.skip("covered by test_a_covered_call_is_sold_after_assignment")
-        basis = assigns[0].price
+        basis = assigns[0].detail["basis"]
+        assert basis < assigns[0].price, (
+            "basis is not premium-netted — FC-068's broker change is missing"
+        )
         for c in calls:
             strike = float(c.symbol[-8:]) / 1000.0
             assert strike >= basis, (
                 f"covered call struck at {strike} below cost basis {basis}"
             )
+
+    def test_attribution_conserves_through_a_full_netted_cycle(self, dip_then_recovering):
+        """The double-count guard for FC-068's premium netting.
+
+        `option_pnl` counts the put premium at `sell_to_open`; `stock_pnl` is
+        booked against the cycle's cost basis, which `metrics/cycles.py`
+        derives from `event.price`. If the netting had been pushed into
+        `event.price` or `cash_delta` instead of the lot basis, the premium
+        would be counted twice — once as option P&L, again through a lowered
+        stock basis — and the attribution would stop reconciling to the equity
+        change. That is exactly what this asserts.
+        """
+        days, closes, exps = dip_then_recovering
+        result = _simulator("XYZ", closes, exps, days).run()
+
+        cycles = build_cycles(result.broker.ledger)
+        assert any(c.called_away for c in cycles), (
+            "no completed wheel — the double-count would not be reachable"
+        )
+        report = compute_fitness(
+            "XYZ", result.daily, cycles, result.starting_cash,
+            benchmark_prices={d: closes[d] for d in days},
+            data_quality={"decision_days": len(result.daily)},
+        )
+        assert report.reconciliation_gap == pytest.approx(0.0, abs=0.01), (
+            f"attribution does not reconcile to the equity change "
+            f"(gap={report.reconciliation_gap}) — a premium double-count looks "
+            f"exactly like this"
+        )
 
     def test_no_opportunity_dies_at_the_router(self, dip_then_recovering):
         """Guards a half-fix: calls found but still rejected at execution."""
@@ -812,3 +1064,86 @@ class TestTheCallLegActuallyRuns:
         # And in that order.
         assert (kinds.index("sell_put_open") < kinds.index("put_assignment")
                 < kinds.index("sell_call_open") < kinds.index("call_assignment"))
+
+    def test_the_friday_roll_seat_is_occupied_and_still_a_no_op(self, dip_then_recovering):
+        """FC-068 tripwire on the kept ``run_rolling_cycle()`` call.
+
+        The Friday call is retained because the production ``/roll`` scheduler
+        invokes that exact code, so the replay reproduces the production week.
+        What it reproduces today is a guaranteed no-op:
+        ``evaluate_roll_opportunity`` reads ``last_price``/``ask_price`` from a
+        client that returns ``bid``/``ask``, so price resolves to 0 and it
+        returns ``None`` at call_roller.py:128-129 — *before* the eligibility
+        gates, the FC-065 P2 floor or its replay-BigQuery gate are reached.
+
+        Asserting it makes the seat load-bearing instead of silent: when
+        FC-066 revives the roller, this test flips rather than every backtest
+        number quietly changing. ``rolls_evaluated >= 0`` is deliberate — the
+        fixture need not hold a short call on a Friday for the point to stand;
+        ``rolls_executed == 0`` is the claim.
+        """
+        days, closes, exps = dip_then_recovering
+        result = _simulator("XYZ", closes, exps, days).run()
+
+        assert result.rolls_evaluated >= 0
+        assert result.rolls_executed == 0, (
+            "the roller executed a roll in a replay. If FC-066 landed, this "
+            "test is the intended tripwire: every post-FC-066 backtest measures "
+            "a different strategy than every pre-FC-066 one, and the "
+            "engine_version stamp must be bumped again."
+        )
+
+    def test_no_dead_path_events_in_replay(self, dip_then_recovering):
+        """A half-deletion would leave the engine path partly alive.
+
+        None of these event types has an emitter after FC-068: the drawdown
+        pause (deleted per FC-065 OQ-3), stages 2/4/5/6 (gap filter, wheel
+        state, the engine's duplicate guard), and the two put-seller events
+        whose home was ``find_put_opportunity``. Seeing any of them in a replay
+        means something was resurrected or never removed.
+        """
+        days, closes, exps = dip_then_recovering
+        seen = []
+
+        import structlog
+
+        def capture(_logger, _name, event_dict):
+            et = event_dict.get("event_type")
+            if et:
+                seen.append(et)
+            return event_dict
+
+        prev = structlog.get_config()
+        structlog.configure(processors=[capture] + list(prev.get("processors", [])))
+        try:
+            result = _simulator("XYZ", closes, exps, days).run()
+        finally:
+            structlog.configure(**prev)
+
+        assert result.broker.ledger, "fixture never traded"
+        dead = {
+            "covered_call_drawdown_pause",
+            "covered_call_quote_missing",
+            "stock_filtered_by_gap_risk",
+            "rejected_high_gap_frequency",
+            "stage_4_blocked",
+            "stage_4_passed",
+            "stage_5_check",
+            "stage_5_blocked",
+            "stage_6_blocked",
+            "stage_6_passed",
+            "stage_3_no_limit",
+            "stage_9_limit_reached",
+            "no_suitable_puts",
+            "position_size_validation_failed",
+            "put_blocked_by_wheel_state",
+            "strategy_cycle_started",
+            "strategy_cycle_completed",
+            "call_opportunity_evaluation",
+        }
+        assert not (dead & set(seen)), (
+            f"dead engine-path events still emitted in a replay: "
+            f"{sorted(dead & set(seen))}"
+        )
+        # And the replay is not vacuously silent — the live vocabulary is there.
+        assert "stage_1_complete" in seen or "stock_rejected_filter" in seen

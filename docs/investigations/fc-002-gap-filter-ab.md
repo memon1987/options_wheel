@@ -1,5 +1,13 @@
 # FC-002 / FC-042 B1 — the stage-2 gap-risk filter, A/B'd
 
+> **⚠️ Wiring conclusions are now past tense (FC-068, 2026-08-01).** Every claim below
+> that the gap filter "lives in `_find_new_opportunities`" describes code this
+> project has **deleted**. The filter ran on the engine path only; production never
+> ran it (FC-049) and, since FC-068, neither do backtests. `GapDetector` survives as
+> unconsumed code — its fate is FC-069 item 5. The engine layers here are
+> non-comparable with post-FC-068 runs and were not re-run.
+
+
 **Date:** 2026-07-29
 **Plan:** [docs/plans/fc-042.md](../plans/fc-042.md) Track B1
 **FC entry:** FC-002 in [docs/FUTURE_CONSIDERATIONS.md](../FUTURE_CONSIDERATIONS.md)

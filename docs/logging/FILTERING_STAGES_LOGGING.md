@@ -1,5 +1,38 @@
 # Complete Filtering Pipeline Logging Coverage
 
+> # ⚠️ STALE — DO NOT DEBUG A SCAN AGAINST THIS DOCUMENT
+>
+> **As of FC-068 (2026-08-01), stages 2, 3, 4, 5, 6 and 9 do not exist.** They were
+> emitted by `WheelEngine._find_new_opportunities`, which production stopped calling on
+> **2025-10-03** — three days before the live account's first fill — and which FC-068
+> deleted. The claim below that they "log during execution attempts" is why this document
+> looked merely under-observed for ten months when the truth was that the code never ran.
+> Searching Cloud Logging for `stage_4_blocked` or `stage_6_passed` returns nothing, and
+> will keep returning nothing.
+>
+> **The stages that actually exist today**, with the events to search on:
+>
+> | Stage | Component | Events |
+> |---|---|---|
+> | 1 — price/volume band | `market_data.filter_suitable_stocks` | `stage_1_complete`, `stock_rejected_filter` |
+> | 7 — put chain | `market_data.find_suitable_puts` | `stage_7_start`, `stage_7_complete_found`, `stage_7_complete_not_found` |
+> | 8 (scan) — call chain | `market_data.find_suitable_calls` | `stage_8_start`, `stage_8_complete_found`, `stage_8_complete_not_found` |
+> | 8 (sizing) — put sizing | `put_seller._calculate_position_size` | `stage_8_calculation`, `stage_8_passed`, `stage_8_blocked` |
+>
+> **Plus the stages this document never covered, which are where decisions are actually
+> made now:**
+>
+> | Stage | Component | Events |
+> |---|---|---|
+> | scan-time call floor | `options_scanner.scan_for_call_opportunities` | `call_scan_skipped_cost_basis_unresolved`, `call_scan_skipped_cost_basis_divergent`, `call_scan_skipped_quote_unavailable`, `cost_basis_cross_check` |
+> | decision records (FC-065 P4) | `options_scanner` / `/run` | `decision_records_written`, `decision_record_deferred` |
+> | idempotency + non-retryable filters | `execution_engine.filter_*` | `idempotency_filter_applied`, `non_retryable_filter_applied` |
+> | **batch selection** | `execution_engine.rank_opportunities` / `select_batch` | `selection_dropped` (carries a `reason` field: `insufficient_available_shares`, `insufficient_buying_power`, `duplicate_underlying`, `sizing_failed`, `positions_unavailable`) |
+> | execution guards | `execution_engine.execute_batch` | `naked_call_blocked`, `unroutable_opportunity`, `call_rejected_by_put_seller`, `put_rejected_by_call_seller` |
+>
+> A full rewrite of the body below is **FC-069 item 14**. Until then, treat everything
+> after this banner as a description of a pipeline that no longer runs.
+
 ## Summary
 
 **ALL 9 filtering stages have comprehensive logging with `event_category="filtering"`**

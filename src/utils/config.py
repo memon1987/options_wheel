@@ -4,7 +4,7 @@ import os
 import yaml
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -381,9 +381,12 @@ class Config:
     def call_drawdown_pause_threshold(self) -> float:
         """FC-029 (R3): drawdown pause threshold for covered call writes.
 
-        When shares are this fraction (or more) below cost basis,
-        ``evaluate_covered_call_opportunity`` skips with reason
-        ``drawdown_pause`` and logs the decision. Default 0.05 (5%).
+        **Orphaned as of FC-068.** Its only consumer was
+        ``CallSeller.evaluate_covered_call_opportunity``, on the engine path
+        this project deleted; the operator decided (FC-065 OQ-3) the pause is
+        not ported to the live path. The knob, its ``/config`` field and its
+        dashboard exposure are FC-069 item 9's to remove — deliberately left
+        here so the removal happens in one place with the UI.
         """
         return self._config["strategy"].get("call_drawdown_pause_threshold", 0.05)
     
@@ -427,15 +430,13 @@ class Config:
         """Maximum exposure per ticker (dollar amount assuming assignment)."""
         return self._config["strategy"]["max_exposure_per_ticker"]
 
-    @property
-    def max_stocks_evaluated_per_cycle(self) -> Optional[int]:
-        """Maximum stocks to evaluate per cycle (None = no limit)."""
-        return self._config["strategy"].get("max_stocks_evaluated_per_cycle")
-
-    @property
-    def max_new_positions_per_cycle(self) -> Optional[int]:
-        """Maximum new positions to open per cycle (None = no limit)."""
-        return self._config["strategy"].get("max_new_positions_per_cycle")
+    # FC-068 deleted `max_stocks_evaluated_per_cycle` and
+    # `max_new_positions_per_cycle`. Their only consumers were stage 3 and
+    # stage 9 of `WheelEngine._find_new_opportunities`, which production
+    # abandoned in 2025 and this FC removed. Both were `null` in
+    # settings.yaml, so neither ever limited anything. Deleted here rather than
+    # left for FC-069 because they are on no inventory line — leaving them
+    # would mint exactly the unowned corpses this FC family exists to end.
 
     # Risk Management
     @property

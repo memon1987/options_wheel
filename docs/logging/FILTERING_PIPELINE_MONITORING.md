@@ -1,5 +1,43 @@
 # Filtering Pipeline Monitoring Guide
 
+> # ⚠️ STALE — SIX OF THE NINE STAGES DO NOT EXIST
+>
+> **FC-068 (2026-08-01).** Stages **2, 3, 4, 5, 6 and 9** were emitted by
+> `WheelEngine._find_new_opportunities`, which production stopped calling on **2025-10-03**
+> — three days before the live account's first fill — and which FC-068 deleted. The
+> `max_stocks_evaluated_per_cycle` and `max_new_positions_per_cycle` knobs went with them.
+>
+> **Every BigQuery recipe below that filters on `stage_2_*`, `stage_3_*`, `stage_4_passed`,
+> `stage_4_blocked`, `stage_5_check`, `stage_6_passed`, `stage_6_blocked` or
+> `stage_9_limit_reached` returns zero rows, permanently.** The "Complete Stage Coverage
+> Summary" immediately below — and the repeated explanation that these stages are merely
+> *unobserved* because a scan ran without an execution phase — is false and was false when
+> written: the code never ran in production, so the absence was never a phase artefact.
+>
+> **The stages that exist**, with the event names to query on:
+>
+> | Stage | Component | Events |
+> |---|---|---|
+> | 1 — price/volume band | `market_data.filter_suitable_stocks` | `stage_1_complete`, `stock_rejected_filter` |
+> | 7 — put chain | `market_data.find_suitable_puts` | `stage_7_start`, `stage_7_complete_found`, `stage_7_complete_not_found` |
+> | 8 (scan) — call chain | `market_data.find_suitable_calls` | `stage_8_start`, `stage_8_complete_found`, `stage_8_complete_not_found` |
+> | 8 (sizing) — put sizing | `put_seller._calculate_position_size` | `stage_8_calculation`, `stage_8_passed`, `stage_8_blocked` |
+>
+> **Plus the stages this guide never covered, which are where trades are actually decided
+> now** — a monitoring doc that omits them is missing the decisive events:
+>
+> | Stage | Component | Events |
+> |---|---|---|
+> | scan-time call floor | `options_scanner.scan_for_call_opportunities` | `call_scan_skipped_cost_basis_unresolved`, `call_scan_skipped_cost_basis_divergent`, `call_scan_skipped_quote_unavailable`, `cost_basis_cross_check` |
+> | decision records (FC-065 P4) | `options_scanner` / `/run` | `decision_records_written`, `decision_record_deferred` |
+> | idempotency + non-retryable filters | `execution_engine.filter_*` | `idempotency_filter_applied`, `non_retryable_filter_applied` |
+> | **batch selection** | `execution_engine.rank_opportunities` / `select_batch` | `selection_dropped` — carries a `reason` field (`insufficient_available_shares`, `insufficient_buying_power`, `duplicate_underlying`, `sizing_failed`, `positions_unavailable`) and `batch_selection_completed` |
+> | execution guards | `execution_engine.execute_batch` | `naked_call_blocked`, `unroutable_opportunity`, `call_rejected_by_put_seller`, `put_rejected_by_call_seller` |
+>
+> Sibling docs carry the same banner: `FILTERING_STAGES_LOGGING.md`,
+> `RISK_FILTERING_STEPS.md`. A full rewrite of all three is **FC-069 item 14**. Until then,
+> treat everything after this banner as a description of a pipeline that no longer runs.
+
 **Quick reference for tracking all 9 filtering stages in BigQuery**
 
 Last Updated: October 15, 2025
@@ -9,6 +47,7 @@ Last Updated: October 15, 2025
 ## Complete Stage Coverage Summary
 
 ✅ **ALL 9 STAGES HAVE COMPREHENSIVE LOGGING** with `event_category="filtering"`
+*(false as of FC-068 — see the banner above; six of the nine stages have no emitter)*
 
 The code already logs every filtering decision. Current BigQuery data only shows Stages 1 & 7 because the test scan (1:08am ET on Oct 15) was a **SCAN phase only** - no execution was attempted.
 
@@ -205,9 +244,14 @@ ORDER BY stage_number
 **Expected**: If no opportunities found in Stage 7, won't see Stages 8-9.
 
 ### "No Stage 2 or 3 events"
-**Reason**:
-- Stage 2 logs once per scan (summary)
-- Stage 3 only logs if `max_stocks_evaluated_per_cycle` is configured (currently `null`)
+**Reason (superseded — FC-068, 2026-08-01)**: stages 2 and 3 **do not exist**. They ran
+only inside `WheelEngine._find_new_opportunities`, which production stopped calling on
+2025-10-03 and FC-068 deleted; `max_stocks_evaluated_per_cycle` was deleted with it.
+Absence of these events is correct and permanent. See the banner on
+`docs/logging/FILTERING_STAGES_LOGGING.md` for the stages that do exist.
+
+~~- Stage 2 logs once per scan (summary)~~
+~~- Stage 3 only logs if `max_stocks_evaluated_per_cycle` is configured (currently `null`)~~
 
 ---
 

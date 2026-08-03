@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """FC-002 / FC-042 B1 — A/B the **stage-2** gap-risk filter.
 
+⚠️ **STALE AS OF FC-068 (2026-08-01).** This tool studies a filter that is no
+longer wired into anything. `GapDetector` was consumed only by
+`WheelEngine._find_new_opportunities` (stages 2 and 4), which FC-068 deleted —
+production stopped calling that path in 2025, so the filter has not affected a
+live trade in over ten months, and it now affects backtests too (it used to run
+in replays only because the replay drove the dead path). The detector class,
+its knobs and its tests remain; their fate is FC-069 item 5.
+
+Consequences for this file, specifically:
+  * the `verify` mode asserts *source properties* of `_find_new_opportunities`,
+    which no longer exists — that mode will fail;
+  * the measured layers below remain valid as history (what the filter WOULD
+    have excluded), not as a description of current behaviour.
+
 SCOPE
 -----
 This studies `GapDetector.analyze_gap_risk` / `_is_suitable_for_trading`

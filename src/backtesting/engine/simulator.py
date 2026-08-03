@@ -2,25 +2,44 @@
 
 Each simulated trading day:
 
-    freeze the clock  ->  wheel_engine.run_strategy_cycle()   (find opportunities)
+    freeze the clock  ->  wheel_engine.reconcile_positions()  (housekeeping)
+                      ->  OptionsScanner.scan_for_put_opportunities()
+                          + scan_for_call_opportunities()      (find candidates)
                       ->  ExecutionEngine: filter -> rank -> select -> execute
                       ->  Friday only: wheel_engine.run_rolling_cycle()
                       ->  settle expirations against today's close
                       ->  record equity
 
-Two orderings here were learned the hard way, and both are load-bearing.
+That is the production pipeline verbatim: ``/scan`` builds candidates with
+``OptionsScanner`` and ``/run`` filters, ranks, batch-selects and executes them
+with ``ExecutionEngine``. FC-068 repointed the generation half here. Before it,
+the replay called ``WheelEngine.run_strategy_cycle()`` — a code path production
+abandoned on 2025-10-03, three days before the live account's first fill — so
+every backtest measured a strategy with a drawdown pause, gap filtering,
+wheel-state phase gating, per-cycle caps and single-candidate selection that
+production does not have, and *without* the two-pool batch selection and
+committed-share ledger it does.
 
-**Execution is a second phase.** ``run_strategy_cycle()`` only *finds*
-opportunities; production executes them separately (cloud_run_server's
-``/execute`` → ``ExecutionEngine``). A day loop that stops after the scan places
-no trades at all and reports a flawless zero-trade backtest.
+Three orderings here were learned the hard way, and all are load-bearing.
+
+**Execution is a second phase.** The scan only *finds* opportunities;
+production executes them separately (``/run`` → ``ExecutionEngine``). A day
+loop that stops after the scan places no trades at all and reports a flawless
+zero-trade backtest.
 
 **Settlement runs after the decision.** A contract expiring today is still held
 when the strategy looks at its book — that is what the live bot sees at 3:45pm —
 and resolves against today's official close. Settling first removes the expiring
-position before the scan, so the engine's stage-6 "already have a position" guard
-waves through a fresh put on the same underlying, expiring the same day, which
-then never settles.
+position before the scan, so the scanner's "already have a position on this
+symbol" check waves through a fresh put on the same underlying, expiring the
+same day, which then never settles.
+
+**The opportunity blob is not simulated.** ``/scan`` and ``/run`` sit ~15
+minutes apart in production, so live executes against fresher quotes than it
+scanned on; the replay scans and executes on one snapshot. That was true before
+FC-068 too — unchanged, and now stated in ``docs/BACKTEST_ENGINE.md``. For the
+same reason ``OpportunityStore`` is never constructed here: the hand-off is
+in-memory, so a replay writes no GCS blobs.
 
 Nothing in here reimplements strategy logic. If a rule is wrong, it is wrong in
 production too — which is the entire point of FC-032.
@@ -35,8 +54,16 @@ from typing import Dict, List, Optional, Sequence
 
 import structlog
 
+from ...api.market_data import MarketDataManager
 from ...data import analytics_writer as analytics_module
-from ...strategy.execution_engine import ExecutionEngine
+from ...data.options_scanner import OptionsScanner
+from ...strategy.call_seller import CallSeller
+from ...strategy.execution_engine import (
+    ExecutionEngine,
+    clear_failed_symbols,
+    get_failed_symbols,
+)
+from ...strategy.put_seller import PutSeller
 from ...strategy.wheel_engine import WheelEngine
 from ...strategy.wheel_state_manager import WheelStateManager
 from ...utils.config import Config
@@ -71,7 +98,7 @@ def _find_chain_quote(snapshot: Optional[ChainSnapshot], symbol: str):
 def restrict_symbols(config: Config, symbols: Sequence[str]) -> Config:
     """A copy of ``config`` whose universe is ``symbols``.
 
-    ``evaluate`` mode runs one symbol at a time, but WheelEngine scans
+    ``evaluate`` mode runs one symbol at a time, but ``OptionsScanner`` scans
     ``config.stock_symbols``. Deep-copied so the caller's config is untouched.
     """
     narrowed = copy.deepcopy(config)
@@ -107,6 +134,13 @@ class SimulationResult:
     # from, so the early-assignment test could not be applied. The residual of
     # C2, reported rather than assumed away.
     unpriced_ex_div_calls: int = 0
+    # FC-068 roller tripwire. The Friday `run_rolling_cycle()` call is kept so
+    # the replay reproduces the production week, and today it is a guaranteed
+    # no-op (the roller's quote-key mismatch returns None before any gate). A
+    # golden replay asserts `rolls_executed == 0`, so FC-066's fix flips a test
+    # rather than silently changing every measurement.
+    rolls_evaluated: int = 0
+    rolls_executed: int = 0
 
     @property
     def final_equity(self) -> float:
@@ -150,12 +184,14 @@ class Simulator:
         self.max_dte = max_dte
         self.fill_haircut = fill_haircut
         self.fees_per_contract = fees_per_contract
-        # GapDetector reads ~30 daily bars and indexes into them positionally; on
-        # day one of a cold window it raises "single positional indexer is
-        # out-of-bounds", which it converts into a conservative
-        # block-everything. Load history *before* `start` so the first decision
-        # day already has the lookback live would have had. 60 calendar days
-        # comfortably covers the 30-session requirement.
+        # Warm-up history, kept after FC-068 for a different reason than it was
+        # introduced with. The original rationale was GapDetector's positional
+        # ~30-bar lookback; the gap stages are gone with the engine path. What
+        # still needs history on day one is `market_data.get_stock_metrics` /
+        # `filter_suitable_stocks` — the volatility and average-volume metrics
+        # stage 1 filters on. Load bars *before* `start` so the first decision
+        # day has the lookback live would have had. 60 calendar days
+        # comfortably covers a 30-session requirement.
         self.warmup_calendar_days = warmup_calendar_days
         # Live earnings gating asks Finnhub for the *next* earnings date, which
         # cannot be answered about a past decision. Default to the committed
@@ -319,6 +355,8 @@ class Simulator:
         )
         client = BacktestAlpacaClient(broker, chains=chains, stock_bars=stock_bars)
 
+        # Post-FC-068 the engine is housekeeping only: reconcile_positions()
+        # before each cycle (as /run does) and the Friday roll.
         engine = WheelEngine(
             self.config,
             alpaca_client=client,
@@ -326,12 +364,26 @@ class Simulator:
             allow_bigquery_cost_basis=False,
             earnings_calendar=self.earnings_calendar,
         )
-        # run_strategy_cycle() only *finds* opportunities — production executes
-        # them in a second phase (cloud_run_server's /execute -> ExecutionEngine).
-        # A day loop that stops after the scan places no trades at all.
+        # ONE MarketDataManager, shared by the scanner and both sellers, on the
+        # same injected adapter client — the single seam that redirects the
+        # whole graph. (WheelEngine keeps its own for the roller.)
+        market_data = MarketDataManager(client, self.config)
+        # allow_bigquery=False: the cost-basis cross-check and the
+        # uncovered_days lookup both query production data against
+        # CURRENT_TIMESTAMP(). See OptionsScanner.__init__ and the plan's
+        # replay-isolation table.
+        scanner = OptionsScanner(client, market_data, self.config, allow_bigquery=False)
+        # The scan only *finds* opportunities — production executes them in a
+        # second phase (/run -> ExecutionEngine). A day loop that stops after
+        # the scan places no trades at all.
         exec_engine = ExecutionEngine(
             client, self.config, logger, trade_journal=NoOpTradeJournal()
         )
+        # Constructed exactly as /run builds them (cloud_run_server.py) — in
+        # particular CallSeller gets NO wheel_state, so the replay mirrors
+        # production's orphaned state layer rather than a richer fiction.
+        put_seller = PutSeller(client, market_data, self.config)
+        call_seller = CallSeller(client, market_data, self.config)
 
         closes_by_day: Dict[date, Dict[str, float]] = {day: {} for day in days}
         for symbol, bars in stock_bars.items():
@@ -343,11 +395,24 @@ class Simulator:
         sim_clock = SimClock(days)
         self._early_assignments = 0
         self._unpriced_ex_div_calls = 0
+        self._rolls_evaluated = 0
+        self._rolls_executed = 0
 
         # Swap the analytics singleton for a recorder: strategy code fetches it
         # from module scope, so there is no injection point. Restored on exit.
         no_op = NoOpAnalyticsWriter()
         previous_writer = analytics_module.set_analytics_writer(no_op)
+        # ExecutionEngine._failed_symbols is a MODULE-GLOBAL set of
+        # non-retryable option symbols. `/backtest/screen` lives on the live
+        # trading server (disabled by default, opt-in via
+        # ENABLE_SCREEN_ENDPOINT), so an in-server replay clearing it would
+        # wipe the set `/run` depends on. Snapshot here, restore in the same
+        # `finally` that restores the analytics singleton — the established
+        # swap pattern. (Standing precondition either way: the endpoint stays
+        # disabled on the trading service; the Cloud Run Job is the sanctioned
+        # screen runner.) It also leaks across the 14 sequential per-symbol
+        # runs of a screen today; the restore ends that too.
+        preserved_failed_symbols = set(get_failed_symbols())
         tally = RejectionTally()
         tally.__enter__()
         try:
@@ -361,21 +426,49 @@ class Simulator:
                 self._credit_dividends(broker, day, days[i - 1] if i else None)
 
                 try:
+                    # Production's `_failed_symbols` clears roughly daily (Cloud
+                    # Run cold start). Clearing once per RUN instead would let a
+                    # day-1 non-retryable failure suppress a symbol for a
+                    # months-long window — a divergence from production, not
+                    # fidelity to it. Per-day is as close to the production
+                    # cadence as a deterministic replay gets.
+                    clear_failed_symbols()
+
                     # Pre-trade housekeeping, exactly as production does before
                     # every cycle (cloud_run_server /run). reconcile_positions()
                     # is what teaches WheelStateManager that yesterday's put
-                    # expired or was assigned — run_strategy_cycle() never calls
-                    # it. Without this the state machine latches after the first
-                    # trade and the replay sells one put and then nothing.
+                    # expired or was assigned. Without this the state machine
+                    # latches after the first trade and the replay sells one put
+                    # and then nothing.
                     engine.reconcile_positions()
 
-                    cycle = engine.run_strategy_cycle()
-                    self._execute_opportunities(engine, exec_engine, cycle, client)
+                    # /scan, verbatim: default max_results on both legs, because
+                    # cloud_run_server passes no args. Diverging would measure a
+                    # different strategy. The call scan mints its own run_id.
+                    opportunities = (
+                        scanner.scan_for_put_opportunities()
+                        + scanner.scan_for_call_opportunities()
+                    )
+                    self._execute_opportunities(
+                        exec_engine, put_seller, call_seller, opportunities, client
+                    )
                     # Production runs the roll cycle Friday afternoon, after the
                     # normal cycle. CallRoller executes its own BTC/STO legs, so
                     # unlike the scan it needs no separate execution phase.
+                    #
+                    # Kept deliberately (FC-068): the Friday /roll scheduler
+                    # invokes this exact code, and the replay reproduces its
+                    # exact no-op — `evaluate_roll_opportunity` reads
+                    # `last_price`/`ask_price` from a client that returns
+                    # `bid`/`ask`, so price resolves to 0 and it returns None
+                    # before any eligibility gate. A golden replay asserts
+                    # `rolls_executed == 0`, so when FC-066 fixes the roller it
+                    # flips a test instead of silently changing every
+                    # measurement.
                     if day.weekday() == self.roll_weekday:
-                        engine.run_rolling_cycle()
+                        rolls = engine.run_rolling_cycle() or {}
+                        self._rolls_evaluated += int(rolls.get('rolls_evaluated', 0) or 0)
+                        self._rolls_executed += int(rolls.get('rolls_executed', 0) or 0)
                 except Exception:
                     logger.exception(
                         "Strategy cycle raised during replay",
@@ -389,10 +482,11 @@ class Simulator:
                 # when the strategy looks at its book — that is what the live bot
                 # sees at 3:45pm — and it resolves against today's official close.
                 #
-                # Settling first instead removes the expiring position before the
-                # scan, so the engine's "already have an option position" guard
-                # (stage 6) waves through a brand-new put on the same underlying,
-                # dated to expire the same day, which then never settles at all.
+                # Settling first instead removes the expiring position before
+                # the scan, so the scanner's "already have a position on this
+                # symbol" check waves through a brand-new put on the same
+                # underlying, dated to expire the same day, which then never
+                # settles at all.
                 broker.settle_expirations(day, closes_by_day[day])
 
                 # Ex-div early assignment, decided at tonight's close: a short
@@ -411,6 +505,11 @@ class Simulator:
         finally:
             tally.__exit__(None, None, None)
             analytics_module.set_analytics_writer(previous_writer)
+            # Restore the module-global non-retryable set in place (the getter
+            # hands back the real object, so mutating it *is* the restore).
+            live_failed = get_failed_symbols()
+            live_failed.clear()
+            live_failed.update(preserved_failed_symbols)
 
         self._analytics = no_op
         return SimulationResult(
@@ -427,6 +526,8 @@ class Simulator:
             ),
             early_assignments=self._early_assignments,
             unpriced_ex_div_calls=self._unpriced_ex_div_calls,
+            rolls_evaluated=self._rolls_evaluated,
+            rolls_executed=self._rolls_executed,
         )
 
     # ------------------------------------------------------------------ #
@@ -549,20 +650,37 @@ class Simulator:
                     )
 
     @staticmethod
-    def _execute_opportunities(engine, exec_engine, cycle, client) -> None:
-        """Run the same scan -> filter -> rank -> select -> execute path as prod.
+    def _execute_opportunities(
+        exec_engine, put_seller, call_seller, opportunities, client
+    ) -> None:
+        """The `/run` half, stage for stage.
 
-        Mirrors cloud_run_server's /execute endpoint. `filter_failed_opportunities`
-        is skipped: it reads the GCS opportunity store of *previous production
-        failures*, which has no meaning inside a replay.
+        Order matches ``cloud_run_server``'s ``/run``: non-retryable filter →
+        idempotency filter → buying power → one positions snapshot → rank →
+        select_batch → execute_batch.
+
+        ``filter_failed_opportunities`` is now CALLED (pre-FC-068 it was
+        skipped, behind a docstring claiming it "reads the GCS opportunity
+        store" — it does not; it reads a module-global set). The set is cleared
+        at the top of every simulated day and restored around the run; see
+        ``run()``.
         """
-        opportunities = [
-            a for a in cycle.get("actions", []) if a.get("action_type") == "new_position"
-        ]
+        if not opportunities:
+            return
+
+        opportunities, _ = exec_engine.filter_failed_opportunities(opportunities)
         if not opportunities:
             return
 
         positions = client.get_positions()
+        # Production passes `get_option_POSITIONS()` here (cloud_run_server.py:458);
+        # the replay passes the full position list. Equivalent ONLY because
+        # `filter_duplicate_opportunities` matches on the OCC `option_symbol`,
+        # which no equity symbol can collide with — so the extra stock rows are
+        # inert. That equivalence is load-bearing: if the filter is ever changed
+        # to match on the UNDERLYING, this line silently starts blocking every
+        # covered call in the replay (the shares are always held when a call is
+        # written). Narrow it to option positions at the same time.
         opportunities, _ = exec_engine.filter_duplicate_opportunities(opportunities, positions)
         if not opportunities:
             return
@@ -574,13 +692,13 @@ class Simulator:
         # One snapshot for the whole cycle, as /run does (FC-038): the two
         # stages must agree on share availability.
         ranked = exec_engine.rank_opportunities(
-            opportunities, engine.put_seller, available_bp, positions=positions
+            opportunities, put_seller, available_bp, positions=positions
         )
         selected, _ = exec_engine.select_batch(ranked, available_bp, positions=positions)
         if not selected:
             return
 
-        exec_engine.execute_batch(selected, engine.put_seller, call_seller=engine.call_seller)
+        exec_engine.execute_batch(selected, put_seller, call_seller=call_seller)
 
     @staticmethod
     def _snapshot_state(

@@ -25,12 +25,6 @@ cp .env.example .env
 
 ## Commands
 
-**Run Strategy:**
-```bash
-python main.py --command run --dry-run  # Test mode
-python main.py --command run            # Live execution
-```
-
 **Analysis Commands:**
 ```bash
 python main.py --command scan    # Scan for opportunities
@@ -52,6 +46,16 @@ mypy src/                        # Type checking
 ```
 
 ## Architecture
+
+> ⚠️ **Interim note (FC-068, 2026-08-01): the engine orchestration path described in
+> step 1 was deleted.** `WheelEngine` no longer orchestrates anything — production runs
+> `/scan` (`OptionsScanner`) → GCS opportunity blob → `/run` (`ExecutionEngine`:
+> filter → rank → `select_batch` → `execute_batch`) → `PutSeller`/`CallSeller`, and has
+> since 2025-10-03. What survives on `WheelEngine` is `reconcile_positions` (pre-trade
+> housekeeping) and `run_rolling_cycle` (Friday `/roll`). Step 5 is also wrong:
+> `RiskManager.validate_new_position` is called on no live path — only `validate_roll`
+> is. **The full rewrite of this section is FC-069 item 14**; this note exists so the
+> known-false claims below do not get *more* false in the interim.
 
 **Core Strategy Flow:**
 1. `WheelEngine` orchestrates the complete strategy
@@ -144,11 +148,14 @@ The rebuilt engine (FC-032) runs **locally by design**: it replays live strategy
 code over historical Alpaca data and needs no cloud round-trip.
 
 **Read `docs/BACKTEST_ENGINE.md` before quoting any backtest number.** It states what
-the engine measures well, what it does not, and the six things that mislead readers who
-don't know them. Two worth knowing here: the headline "81% strike reproduction" is the
-**put leg only** (the call leg is 55.2%, and prices calls at 0.676 of live), and a symbol
-showing 0% days in position is a **filter** result — 8 of 14 configured symbols currently
-cannot trade at all, for reasons unrelated to symbol quality.
+the engine measures well, what it does not, and the ten things that mislead readers who
+don't know them. Three worth knowing here: the fidelity figures (81% put-leg strike
+reproduction, 55.2% / 0.676 on the call leg) are **stale pending re-measurement after
+FC-068**, which changed the selection model they were measured against; a symbol showing
+0% days in position is a **filter** result — 8 of 14 configured symbols currently cannot
+trade at all, for reasons unrelated to symbol quality; and `backtest_runs` rows carry two
+non-comparability boundaries, `engine_version = 'fc-032-phase-5'` (dead engine path) vs
+`'fc-068-prod-pipeline'`, plus the timestamp-only FC-048 put-only boundary at 2026-07-29.
 
 ```bash
 python main.py --command backtest --symbol NVDA --start 2025-10-01 --end 2026-07-01

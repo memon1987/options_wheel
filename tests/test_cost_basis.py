@@ -346,12 +346,15 @@ class TestTheBigQueryChokepoint:
 
     def test_the_hermeticity_guard_covers_every_resolver_instance(self):
         """The autouse conftest fixture patches the class, so a resolver built
-        inside a test — by the scanner, the seller, the roller, or directly —
-        cannot reach BigQuery. If this method is ever renamed, this test fails.
+        inside a test — by the scanner, the roller, or directly — cannot reach
+        BigQuery. If this method is ever renamed, this test fails.
 
         Every construction site belongs here. A new one that is not listed is
         still covered (the patch is on the class), but listing it is what keeps
-        this test an inventory rather than a spot check.
+        this test an inventory rather than a spot check — and an entry left
+        here after its site is deleted is the same rot in the other direction,
+        which is why CallSeller's *absence* is asserted below rather than just
+        dropped (FC-068).
         """
         assert CostBasisResolver(Mock(), Mock(spec=Config))._lookup_assignment_basis(
             'AAPL', 100) is None
@@ -360,14 +363,20 @@ class TestTheBigQueryChokepoint:
         scanner = OptionsScanner(Mock(), Mock(), Mock(spec=Config))
         assert scanner.cost_basis_resolver._lookup_assignment_basis('AAPL', 100) is None
 
-        from src.strategy.call_seller import CallSeller
-        seller = CallSeller(Mock(), Mock(), Mock(spec=Config))
-        assert seller._cost_basis_resolver._lookup_assignment_basis('AAPL', 100) is None
-
         # FC-065 Phase 2: the roller resolves its strike floor here too.
         from src.strategy.call_roller import CallRoller
         roller = CallRoller(Mock(), Mock(), Mock(spec=Config), Mock(), Mock())
         assert roller.cost_basis_resolver._lookup_assignment_basis('AAPL', 100) is None
+
+        # FC-068 dropped the CallSeller leg: `execute_call_sale` reads its
+        # floor off the opportunity (`opportunity_floor_per_share`) and the
+        # class owns no resolver any more. The census must track the real
+        # instance list — a stale entry here is a test asserting a
+        # construction site that no longer exists, which is how an inventory
+        # rots into a spot check.
+        from src.strategy.call_seller import CallSeller
+        assert not hasattr(CallSeller(Mock(), Mock(), Mock(spec=Config)),
+                           '_cost_basis_resolver')
 
     @pytest.mark.real_bq_lookup
     def test_allow_bigquery_false_never_builds_a_client(self):
@@ -542,57 +551,3 @@ class TestOpportunityFloorPerShare:
     ])
     def test_an_underivable_floor_is_zero_not_a_guess(self, opportunity):
         assert opportunity_floor_per_share(opportunity) == 0.0
-
-
-class TestCallSellerDelegationIsBehaviourPreserving:
-    """The seller's floor is the shared resolver's floor — one implementation,
-    one number, on both the scan path and the execute path."""
-
-    def _seller(self, allow_bigquery=True):
-        from src.strategy.call_seller import CallSeller
-        return CallSeller(Mock(), Mock(), Mock(spec=Config),
-                          allow_bigquery_cost_basis=allow_bigquery)
-
-    def test_the_seller_resolves_the_brokers_avg_entry_price(self):
-        seller = self._seller()
-
-        assert seller._resolve_cost_basis_floor(
-            'AMZN', _position(avg_entry_price=261.20), 100) == 261.20
-
-    def test_the_seller_fails_closed_when_the_cross_check_diverges(self):
-        seller = self._seller()
-
-        with patch.object(seller._cost_basis_resolver, '_lookup_assignment_basis',
-                          return_value={'expected_basis_per_share': 200.0,
-                                        'reconstructed_shares': 100, 'lots': []}):
-            assert seller._resolve_cost_basis_floor(
-                'AMZN', _position(avg_entry_price=261.20), 100) == 0.0
-
-    @pytest.mark.real_bq_lookup
-    def test_the_backtest_gate_stops_the_cross_check_before_bigquery(self):
-        """A replay must never reach production trade history.
-
-        Marked ``real_bq_lookup`` deliberately: with the suite's blanket stub
-        in place this would pass whether or not ``__init__`` forwards the gate.
-        The assertion that discriminates is that no client is ever built.
-        """
-        seller = self._seller(allow_bigquery=False)
-
-        with patch('google.cloud.bigquery.Client') as mock_client:
-            basis = seller._resolve_cost_basis_floor(
-                'AMZN', _position(avg_entry_price=261.20), 100)
-
-        mock_client.assert_not_called()
-        assert basis == 261.20          # the gate costs no floor, only the check
-        assert seller._cost_basis_resolver.allow_bigquery is False
-
-    @pytest.mark.real_bq_lookup
-    def test_the_cross_check_does_reach_bigquery_when_the_gate_is_open(self):
-        """The negative above is only meaningful if the positive holds."""
-        seller = self._seller(allow_bigquery=True)
-
-        with patch('google.cloud.bigquery.Client') as mock_client:
-            seller._resolve_cost_basis_floor(
-                'AMZN', _position(avg_entry_price=261.20), 100)
-
-        mock_client.assert_called_once()

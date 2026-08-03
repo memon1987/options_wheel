@@ -7,7 +7,6 @@ import json
 
 from src.utils.config import Config
 from src.utils.logger import setup_logging, get_logger
-from src.strategy.wheel_engine import WheelEngine
 from src.data.options_scanner import OptionsScanner
 from src.data.portfolio_tracker import PortfolioTracker
 from src.api.alpaca_client import AlpacaClient
@@ -20,9 +19,8 @@ def main():
     parser.add_argument('--config', default='config/settings.yaml', help='Configuration file path')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     parser.add_argument('--command', required=True,
-                       choices=['run', 'scan', 'status', 'report', 'backtest', 'screen'],
+                       choices=['scan', 'status', 'report', 'backtest', 'screen'],
                        help='Command to execute')
-    parser.add_argument('--dry-run', action='store_true', help='Run without executing trades')
 
     # backtest (FC-032 evaluate mode)
     parser.add_argument('--symbol', help='backtest: symbol to evaluate')
@@ -53,8 +51,7 @@ def main():
                    event_category="system",
                    event_type="application_started",
                    command=args.command,
-                   config_file=args.config,
-                   dry_run=args.dry_run)
+                   config_file=args.config)
         
         # Backtesting builds its own data stack and must not touch the live
         # trading client, so it dispatches before those are constructed.
@@ -78,10 +75,12 @@ def main():
         portfolio_tracker = PortfolioTracker(alpaca_client, config)
         scanner = OptionsScanner(alpaca_client, market_data, config)
         
-        # Execute command
-        if args.command == 'run':
-            run_strategy(config, args.dry_run, logger)
-        elif args.command == 'scan':
+        # Execute command. FC-068 removed `--command run`: it drove
+        # WheelEngine.run_strategy_cycle() -- a code path production abandoned
+        # in 2025 -- against the LIVE account. `--command scan` is the
+        # read-only equivalent that stays; execution lives on the Cloud Run
+        # server, which is the only thing that trades.
+        if args.command == 'scan':
             scan_opportunities(scanner, logger)
         elif args.command == 'status':
             show_status(portfolio_tracker, logger)
@@ -102,59 +101,6 @@ def main():
         # date to avoid. Console-only; control flow and exit code unchanged.
         print(f"\n{type(e).__name__}: {e}", file=sys.stderr)
         sys.exit(1)
-
-
-def run_strategy(config: Config, dry_run: bool, logger):
-    """Run the wheel strategy."""
-    logger.info("Initializing wheel strategy engine", event_category="system", event_type="engine_initializing", dry_run=dry_run)
-    
-    if dry_run:
-        logger.warning("DRY RUN MODE - No trades will be executed", event_category="system", event_type="dry_run_mode")
-    
-    wheel_engine = WheelEngine(config)
-    
-    try:
-        # Run one strategy cycle
-        cycle_result = wheel_engine.run_strategy_cycle()
-        
-        logger.info("Strategy cycle completed",
-                   event_category="system",
-                   event_type="strategy_cycle_completed",
-                   actions_taken=len(cycle_result['actions']),
-                   new_positions=cycle_result.get('new_positions', 0),
-                   closed_positions=cycle_result.get('closed_positions', 0))
-        
-        # Print summary
-        print("\n" + "="*60)
-        print("STRATEGY CYCLE SUMMARY")
-        print("="*60)
-        print(f"Timestamp: {cycle_result['timestamp']}")
-        print(f"Positions Analyzed: {cycle_result['positions_analyzed']}")
-        print(f"Actions Taken: {len(cycle_result['actions'])}")
-        print(f"New Positions: {cycle_result.get('new_positions', 0)}")
-        print(f"Closed Positions: {cycle_result.get('closed_positions', 0)}")
-        
-        if cycle_result['actions']:
-            print("\nActions:")
-            for i, action in enumerate(cycle_result['actions'], 1):
-                print(f"  {i}. {action.get('strategy', 'N/A')} - {action.get('symbol', 'N/A')}")
-        
-        if cycle_result['errors']:
-            print("\nErrors:")
-            for error in cycle_result['errors']:
-                print(f"  - {error}")
-        
-        # Account summary
-        account = cycle_result.get('account_info', {})
-        if account:
-            print(f"\nAccount Summary:")
-            print(f"  Portfolio Value: ${account.get('portfolio_value', 0):,.2f}")
-            print(f"  Cash: ${account.get('cash', 0):,.2f}")
-            print(f"  Buying Power: ${account.get('buying_power', 0):,.2f}")
-        
-    except Exception as e:
-        logger.error("Strategy execution failed", event_category="error", event_type="strategy_execution_failed", error=str(e))
-        print(f"\nStrategy execution failed: {str(e)}")
 
 
 def scan_opportunities(scanner: OptionsScanner, logger):

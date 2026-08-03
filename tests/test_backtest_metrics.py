@@ -568,26 +568,33 @@ class TestReport:
 
 class TestRejectionTally:
     """Regression: the tally counted EVENTS and labelled them days, printing
-    "335 days" against 206 decision days — impossible on its face. Live emits
-    two events for one logical gap rejection (the inner analyzer and the outer
-    filter), both mapped to the same bucket.
+    "335 days" against 206 decision days — impossible on its face.
+
+    The original vehicle was the gap filter, which emitted two event types for
+    one logical rejection. FC-068 deleted both (the gap stages ran only on the
+    dead engine path), and no two live events share a bucket any more. The
+    contract is unchanged and still worth pinning: the tally keys on
+    ``(day, reason)``, so a reason recurring within a day — across symbols, or
+    across the several opportunities a single stage drops — counts once. Under
+    the live vocabulary that is the common case: a 14-symbol universe emits
+    ``stage_7_complete_not_found`` once per symbol per day.
     """
 
     def _tally(self):
         from src.backtesting.engine.rejections import RejectionTally
         return RejectionTally()
 
-    def _emit(self, tally, event_type):
-        tally.processor(None, "info", {"event_type": event_type})
+    def _emit(self, tally, event_type, **fields):
+        tally.processor(None, "info", dict(event_type=event_type, **fields))
 
-    def test_two_events_for_one_rejection_count_as_one_day(self):
+    def test_many_events_for_one_reason_count_as_one_day(self):
         from datetime import datetime as _dt
 
         t = self._tally()
         with clock.frozen(_dt(2025, 1, 6, 16, 0)):
-            self._emit(t, "rejected_high_gap_frequency")
-            self._emit(t, "stock_filtered_by_gap_risk")
-        assert t.summary() == {"gap-risk filter (stage 2)": 1}
+            for symbol in ("F", "PFE", "KMI", "VZ"):
+                self._emit(t, "stage_7_complete_not_found", symbol=symbol)
+        assert t.summary() == {"no put cleared delta/DTE/premium (stage 7)": 1}
 
     def test_days_never_exceed_the_days_observed(self):
         from datetime import datetime as _dt, timedelta as _td
@@ -595,21 +602,21 @@ class TestRejectionTally:
         t = self._tally()
         for i in range(5):
             with clock.frozen(_dt(2025, 1, 6, 16, 0) + _td(days=i)):
-                # Both events fire every day, as they do in a real run.
-                self._emit(t, "rejected_high_gap_frequency")
-                self._emit(t, "stock_filtered_by_gap_risk")
-        assert t.summary()["gap-risk filter (stage 2)"] == 5
-        assert t.binding_constraint() == "gap-risk filter (stage 2)"
+                # Every symbol reports it every day, as they do in a real run.
+                for symbol in ("F", "PFE", "KMI"):
+                    self._emit(t, "stage_7_complete_not_found", symbol=symbol)
+        assert t.summary()["no put cleared delta/DTE/premium (stage 7)"] == 5
+        assert t.binding_constraint() == "no put cleared delta/DTE/premium (stage 7)"
 
     def test_distinct_reasons_are_tracked_separately(self):
         from datetime import datetime as _dt
 
         t = self._tally()
         with clock.frozen(_dt(2025, 1, 6, 16, 0)):
-            self._emit(t, "stock_filtered_by_gap_risk")
-            self._emit(t, "no_suitable_puts")
+            self._emit(t, "stock_rejected_filter")
+            self._emit(t, "stage_7_complete_not_found")
         assert set(t.summary()) == {
-            "gap-risk filter (stage 2)",
+            "price/volume band (stage 1)",
             "no put cleared delta/DTE/premium (stage 7)",
         }
 
