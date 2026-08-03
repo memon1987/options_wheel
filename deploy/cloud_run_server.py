@@ -118,12 +118,145 @@ def require_api_key(f):
     return decorated
 
 
+# ---------------------------------------------------------------------------
+# Strategy config + account-number interlock (FC-075 Seam 2)
+# ---------------------------------------------------------------------------
+# One process runs one strategy profile, selected by STRATEGY_CONFIG. These
+# module-level caches are process-scoped; tests reset them via
+# reset_strategy_state().
+_CONFIG_CACHE = None
+_INTERLOCK_VERDICT = None  # None = unchecked, True = account matches, False = mismatch
+
+
+def strategy_config():
+    """Return this process's Config, selected by STRATEGY_CONFIG (cached).
+
+    Replaces the former bare ``Config()`` calls so a service can run a non-wheel
+    profile (STRATEGY_CONFIG=config/covered_call.yaml) and so the config is
+    parsed once per process instead of once per request. NOT named ``get_config``
+    — that is the ``/config`` HTTP handler.
+    """
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is None:
+        _CONFIG_CACHE = Config(os.environ.get("STRATEGY_CONFIG", "config/settings.yaml"))
+    return _CONFIG_CACHE
+
+
+def _account_interlock_ok(config):
+    """Verify the live Alpaca account matches ``config.expected_account_number``.
+
+    The single control that makes "right code, wrong credentials" impossible
+    across separate-account strategies. Checked lazily on first use (not at
+    import — an Alpaca outage must not fail a deploy) and the verdict is cached
+    for the process lifetime.
+
+    A genuine result (we obtained an account number, match or mismatch) latches:
+    a real mismatch permanently disables trading until redeploy. A *check
+    failure* (could not reach Alpaca) does NOT latch — it returns False for this
+    request only, so a transient outage on the first request self-heals.
+    """
+    global _INTERLOCK_VERDICT
+    if _INTERLOCK_VERDICT is not None:
+        return _INTERLOCK_VERDICT
+    try:
+        from src.api.alpaca_client import AlpacaClient
+        actual = AlpacaClient(config).get_account().get('account_number')
+    except Exception as e:
+        log_error_event(
+            logger,
+            error_type="account_interlock_check_failed",
+            error_message=f"Could not verify account number: {e}",
+            component="cloud_run_server",
+            recoverable=True,  # not cached; retried next request
+        )
+        return False
+    # A missing account number means we did NOT obtain a genuine result (e.g. an
+    # Alpaca SDK shape change) — treat it as a check failure, not a mismatch, so
+    # it does not latch a permanent "mismatch" halt on a transient/shape problem.
+    if actual is None:
+        log_error_event(
+            logger,
+            error_type="account_interlock_check_failed",
+            error_message="get_account() returned no account_number",
+            component="cloud_run_server",
+            recoverable=True,  # not cached; retried next request
+        )
+        return False
+    expected = config.expected_account_number
+    verdict = (actual == expected)
+    _INTERLOCK_VERDICT = verdict
+    if not verdict:
+        log_error_event(
+            logger,
+            error_type="account_interlock_mismatch",
+            error_message=(
+                f"Live Alpaca account {actual!r} != expected {expected!r} for "
+                f"strategy_id={config.strategy_id!r}; trading disabled"
+            ),
+            component="cloud_run_server",
+            recoverable=False,
+            actual_account=actual,
+            expected_account=expected,
+            strategy_id=config.strategy_id,
+        )
+    return verdict
+
+
+def require_account_match(f):
+    """Refuse a trading endpoint if the live account != expected_account_number."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not _account_interlock_ok(strategy_config()):
+            # Distinguish a latched account mismatch from a transient
+            # check-failure (Alpaca unreachable / no account_number) so the HTTP
+            # body matches the log events and /health, not just alerting.
+            if interlock_status() == 'mismatch':
+                error = 'account_interlock_mismatch'
+                message = ("Service credentials do not match the expected brokerage "
+                           "account; trading is disabled (latched). See "
+                           "account_interlock_mismatch log event.")
+            else:
+                error = 'account_interlock_unverified'
+                message = ("Could not verify the brokerage account this request; "
+                           "trading refused until a check succeeds. See "
+                           "account_interlock_check_failed log event.")
+            return jsonify({'status': 'error', 'error': error, 'message': message}), 503
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def interlock_status():
+    """Report the cached interlock verdict WITHOUT triggering a network check.
+
+    'unchecked' — no trading endpoint has run the check yet (or only transient
+    check-failures, which do not latch); 'ok' — account matched; 'mismatch' — a
+    genuine account mismatch is latched and trading is disabled. Safe to call
+    from health endpoints (no Alpaca call).
+    """
+    if _INTERLOCK_VERDICT is None:
+        return "unchecked"
+    return "ok" if _INTERLOCK_VERDICT else "mismatch"
+
+
+def reset_strategy_state():
+    """Reset process-scoped caches. For tests only."""
+    global _CONFIG_CACHE, _INTERLOCK_VERDICT
+    _CONFIG_CACHE = None
+    _INTERLOCK_VERDICT = None
+
+
 @app.route('/')
 def health_check():
-    """Health check endpoint for Cloud Run."""
+    """Health check endpoint for Cloud Run (liveness).
+
+    Always returns 200 so a latched account-interlock mismatch does not cause
+    Cloud Run to loop-restart the instance; the interlock state is surfaced as a
+    field for visibility. Detailed status/alerting lives on /health.
+    """
     return jsonify({
         'status': 'healthy',
         'service': 'options-wheel-strategy',
+        'account_interlock': interlock_status(),
         'timestamp': datetime.now().isoformat()
     })
 
@@ -134,6 +267,7 @@ def get_status():
 
 @app.route('/scan', methods=['POST'])
 @require_api_key
+@require_account_match
 def trigger_scan():
     """Trigger a market scan for opportunities."""
     with strategy_lock:
@@ -149,7 +283,7 @@ def trigger_scan():
             )
 
             # Initialize trading components
-            config = Config()
+            config = strategy_config()
 
             from src.api.alpaca_client import AlpacaClient
             from src.api.market_data import MarketDataManager
@@ -281,6 +415,7 @@ def trigger_scan():
 
 @app.route('/run', methods=['POST'])
 @require_api_key
+@require_account_match
 def trigger_strategy():
     """Trigger strategy execution."""
     with strategy_lock:
@@ -296,7 +431,7 @@ def trigger_strategy():
             )
 
             # Initialize trading components
-            config = Config()
+            config = strategy_config()
 
             from src.api.alpaca_client import AlpacaClient
             from src.api.market_data import MarketDataManager
@@ -637,6 +772,7 @@ def _is_market_open() -> bool:
 
 @app.route('/monitor', methods=['POST'])
 @require_api_key
+@require_account_match
 def monitor_positions():
     """Monitor existing positions and close profitable ones."""
     with strategy_lock:
@@ -661,7 +797,7 @@ def monitor_positions():
             )
 
             # Initialize trading components
-            config = Config()
+            config = strategy_config()
 
             from src.api.alpaca_client import AlpacaClient
             from src.api.market_data import MarketDataManager
@@ -943,6 +1079,7 @@ def monitor_positions():
 
 @app.route('/roll', methods=['POST'])
 @require_api_key
+@require_account_match
 def trigger_roll():
     """Friday EOW call rolling cycle (FC-006).
 
@@ -973,7 +1110,7 @@ def trigger_roll():
             })
 
         try:
-            config = Config()
+            config = strategy_config()
 
             from src.strategy.wheel_engine import WheelEngine
             engine = WheelEngine(config)
@@ -1008,7 +1145,7 @@ def get_account():
     """Get Alpaca account information."""
     logger.debug("Endpoint called", event_category="system", event_type="get_account", endpoint="/account")
     try:
-        config = Config()
+        config = strategy_config()
         from src.api.alpaca_client import AlpacaClient
 
         client = AlpacaClient(config)
@@ -1034,7 +1171,7 @@ def get_positions():
     """Get current positions."""
     logger.debug("Endpoint called", event_category="system", event_type="get_positions", endpoint="/positions")
     try:
-        config = Config()
+        config = strategy_config()
         from src.api.alpaca_client import AlpacaClient
 
         client = AlpacaClient(config)
@@ -1060,7 +1197,7 @@ def get_config():
     """Get current configuration (sanitized)."""
     logger.debug("Endpoint called", event_category="system", event_type="get_config", endpoint="/config")
     try:
-        config = Config()
+        config = strategy_config()
 
         # Return sanitized config (no secrets)
         config_data = {
@@ -1157,7 +1294,7 @@ def backtest_screen():
 
         from src.backtesting.screen import run_screen
 
-        config = Config()
+        config = strategy_config()
 
         def _parse(param):
             raw = request.args.get(param)
@@ -1271,6 +1408,7 @@ def backtest_screen():
 
 @app.route('/ingest-activities', methods=['POST'])
 @require_api_key
+@require_account_match
 def ingest_activities():
     """Pull Alpaca account activities and append to BigQuery (FC-012 §2.1).
 
@@ -1286,7 +1424,7 @@ def ingest_activities():
         from src.api.alpaca_client import AlpacaClient
         from src.data.activities_ingestor import ActivitiesIngestor
 
-        config = Config()
+        config = strategy_config()
         alpaca_client = AlpacaClient(config)
         ingestor = ActivitiesIngestor(alpaca_client)
 
@@ -1328,6 +1466,7 @@ def ingest_activities():
 
 @app.route('/ingest-portfolio-history', methods=['POST'])
 @require_api_key
+@require_account_match
 def ingest_portfolio_history():
     """Pull Alpaca portfolio/history and append finalized days to BigQuery (FC-012 §2.5).
 
@@ -1342,7 +1481,7 @@ def ingest_portfolio_history():
         from src.api.alpaca_client import AlpacaClient
         from src.data.portfolio_history_ingestor import PortfolioHistoryIngestor
 
-        config = Config()
+        config = strategy_config()
         alpaca_client = AlpacaClient(config)
         ingestor = PortfolioHistoryIngestor(alpaca_client)
 
@@ -1378,6 +1517,7 @@ def ingest_portfolio_history():
 
 @app.route('/ingest-stock-history', methods=['POST'])
 @require_api_key
+@require_account_match
 def ingest_stock_history():
     """Pull daily Alpaca stock bars for the traded universe and append to BQ (FC-018 PR B).
 
@@ -1395,7 +1535,7 @@ def ingest_stock_history():
         from src.api.alpaca_client import AlpacaClient
         from src.data.stock_history_ingestor import StockHistoryIngestor
 
-        config = Config()
+        config = strategy_config()
         alpaca_client = AlpacaClient(config)
         ingestor = StockHistoryIngestor(alpaca_client)
 
@@ -1440,7 +1580,7 @@ def detailed_health():
 
     # Check configuration
     try:
-        config = Config()
+        config = strategy_config()
         health_data['checks']['config'] = 'ok'
     except Exception as e:
         health_data['checks']['config'] = f'error: {str(e)}'
@@ -1458,6 +1598,14 @@ def detailed_health():
         health_data['status'] = 'unhealthy'
     else:
         health_data['checks']['environment'] = 'ok'
+
+    # Account-number interlock (FC-075 Seam 2). A latched mismatch means trading
+    # is disabled (all trading endpoints 503) — surface it here so it is not a
+    # silent red state. 'unchecked' is not unhealthy (no trading call yet).
+    interlock = interlock_status()
+    health_data['checks']['account_interlock'] = interlock
+    if interlock == 'mismatch':
+        health_data['status'] = 'unhealthy'
 
     return jsonify(health_data)
 
@@ -1750,7 +1898,7 @@ if __name__ == '__main__':
 
     # Initialize configuration to verify everything works
     try:
-        config = Config()
+        config = strategy_config()
         logger.info("Configuration loaded successfully",
                    event_category="system",
                    event_type="config_loaded")
