@@ -24,7 +24,43 @@ and in replays.
   collected.** Same trade shape as AAPL's, coin the other way.
 
 The shipped configuration blocks all three. Encoded executable as
-`test_the_incident_geometry_is_blocked`.
+`test_the_incident_geometry_is_blocked`, and pinned in the recurring audit
+script so a future run that cannot locate one stops rather than restating the
+criterion against new numbers.
+
+### Full-book economics — the number the operator decided with
+
+The July-window counterfactual above is a *sample*, and a small one. Against the
+**whole fill history (341 option sell-to-open fills)** the shipped configuration
+blocks **20 fills, 5.9% of the book**:
+
+| Leg | Predicate | Fills blocked | Realized on those fills |
+|---|---|---|---|
+| Puts | `days_until <= 2` | 12 | $2,150 |
+| Calls | SPAN | 8 | $2,841 |
+| **Total** | | **20 (5.9%)** | **$4,991** |
+
+**On realized history alone this gate is net negative: ~$4,991 of realized
+premium forgone against one ~$2,308 tail event.** That is the honest arithmetic
+and it is not close.
+
+The case for shipping it anyway is *not* the backward-looking P&L — it is:
+
+1. **The tail prior.** Realized history contains exactly one gap-through-strike
+   event because the sample is ten months long, not because the frequency is
+   1-in-341. The $4,991 is spread across every earnings cycle; the $2,308 landed
+   in one morning. One AMZN-scale gap-up every few seasons pays for permanent
+   span gating, and the gap-down cushions that make up most of the forgone
+   premium only *stay* cushions while gap-downs outnumber gap-ups.
+2. **Killing the adverse selection (FC-073).** Earnings IV is what pushes
+   marginal strikes over the premium floor — the AMZN 10.9%-OTM trade existed
+   *at all* only because IV was 0.68. The scorer is structurally attracted to
+   the highest-risk day of the cycle. The gate removes that selection pressure,
+   which is a benefit no P&L-on-realized-history calculation captures.
+
+**The operator made the window decision with these numbers on the table**
+(2026-08-03, binding). Recording them here so the record shows the trade-off was
+priced, not overlooked.
 
 ---
 
@@ -172,9 +208,9 @@ bitten by three times.
 
 ## Validation
 
-- **Full suite: 1115 passed** (main baseline 1025, +90). `__pycache__` cleared
-  before the final run — stale `.pyc` from mutation testing has made correct code
-  misbehave on this repo before.
+- **Full suite: 1125 passed** (main baseline 1025, +100; 1115 at build, +10 from
+  the review fixes). `__pycache__` cleared before the final run — stale `.pyc`
+  from mutation testing has made correct code misbehave on this repo before.
 - **Frontend untouched:** the branch diff contains no `dashboard/` files.
   DD-4's cascading-impact check was performed instead: `uncovered_decisions_sql`
   selects `reason` as a free string and `DrawdownPauseCard.tsx` renders it
@@ -202,6 +238,25 @@ tree was verified clean and the full suite re-run green afterwards.
 | 7 | Span reverted — no floor threaded into the chain | `test_the_incident_geometry_is_blocked` | **FAILED** ✓ (4 failures in the file) |
 | 15a | Simulator stops passing `earnings_calendar` to the scanner | `test_replay_uses_the_point_in_time_calendar_never_finnhub` | **FAILED** ✓ — with `AssertionError: a replay must never construct the live Finnhub service` |
 | 15b | Both gates reverted (put call disabled + span floor `None`) | same test | **FAILED** ✓ |
+| **PD** | **Past-date guard removed** from `_is_stale` (the review fix) | 6 of the 9 new past-date tests | **FAILED** ✓ — see below |
+
+**Past-date guard mutation (required by the review), run on commit `0d49eba`:**
+
+Removing the three-line guard failed **6 tests across both layers**:
+
+- `test_a_within_ttl_cached_yesterday_date_is_not_served_as_known` — regression (a)
+- `test_the_stale_past_entry_is_evicted`
+- `test_a_failed_refetch_reports_unknown_not_the_past_date`
+- `test_a_past_dated_l2_entry_is_not_hydrated`
+- `test_candidates_are_emitted_on_the_day_after_earnings` — regression (b)
+- `test_no_false_blackout_row_is_written`
+
+Three tests **correctly kept passing**, which is the control that the guard did
+not over-fire: `test_todays_date_is_still_served` and
+`test_the_still_future_date_is_honoured_the_same_day` (day-of must still block —
+the incident geometry) and `test_parity_with_the_replay_calendar` (the replay
+calendar was already correct). Guard restored, tree verified clean, full suite
+re-run green.
 
 Notes on the record:
 
@@ -217,6 +272,54 @@ Notes on the record:
   06-10 expiring 06-14 spans 06-12; a put sold 07-15 is one day from 07-16), and
   `test_replay_honors_earnings_enabled_false` runs the *same* table with the gate
   config-disabled and asserts both violations DO occur there.
+
+---
+
+## Review disposition
+
+**Two adversarial reviews, both REQUEST_CHANGES. No reviewer-vs-reviewer
+disagreements** — the two verdicts were disjoint in content and consistent in
+direction, so nothing needed to be surfaced for adjudication.
+
+Both reviewers independently re-ran the mutation set above and added their own;
+**all were caught**. The `>=` span boundary was actively **VALIDATED** rather
+than merely accepted: for an AMC reporter, a contract expiring on the report
+date settles that afternoon and contrary exercise lands before the ~5:30pm ET
+cutoff — after the report — so expiry-day-equals-event-day genuinely carries
+the gap and the inclusive comparison is correct. The trade path verified clean.
+
+### Required fixes — all addressed in code (`0d49eba`)
+
+| # | Finding | Severity | Disposition |
+|---|---|---|---|
+| 1 | A cached **past** date was servable; the durable cache made it newly reachable. A date fetched on AMC report day survives the 24h TTL into D+1, threads as `exclude_expiry_on_or_after=yesterday`, span-rejects the entire chain, and produces a false `blocked{earnings_blackout}` on the IV-crush day the plan wants to sell into. Recurs every earnings cycle whenever the fetch anchor sat late on day D. Also a tri-state parity break with `HistoricalEarningsCalendar`, which has always filtered `>= today`. | **HIGH** | **Fixed.** Past-date check added to `_is_stale`, covering the L1 read and L2 hydration alike: evict + refetch. A failed refetch reports `unknown` (fail closed), the honest state. Day-of still blocks. Six new tests; mutation-verified below. |
+| 2 | The broken-GCS test's `monkeypatch.setitem(sys.modules, "google.cloud.storage", …)` does not intercept `from google.cloud import storage` once the real module is imported — attribute binding on the package wins — so on any machine with the package installed it built a **real** client against `test-bucket`. | Medium | **Fixed.** Added `_storage_client()` as a patchable seam mirroring `_build_client`; both `_l2_read` and `_store_to_l2` use it, and the test patches the seam. `conftest` now hard-fails *any* GCS client construction, so even a test restoring the real `_l2_read` cannot reach one. Symmetric write-side test added. |
+| 3 | The audit script pinned 2 incidents while the plan's fail-loudly contract names 3 — the flagship $2,308 AMZN C262.5 was not locatable by the recurring detective run. | Medium | **Fixed.** AMZN added, plus `expect_days_until` / `expect_spans` assertions on all three so a drifting join stops the run instead of quietly restating the acceptance criterion. |
+
+**Environment drift disclosed (finding 2).** This venv is **missing
+`google-cloud-storage`**, which `requirements.txt` declares
+(`google-cloud-storage>=2.10.0,<3.0.0`). That drift is the only reason the
+defective test looked hermetic locally — on CI or any correctly-provisioned
+machine it would have constructed a real client. The seam fix removes the
+dependence on that accident, but **the venv should be reconciled against
+`requirements.txt` independently of this PR.**
+
+### Non-blocking findings — all addressed in code, none deferred
+
+| # | Finding | Disposition |
+|---|---|---|
+| 4 | PR body stated only the July-window economics. | **Fixed** — full-book economics added above: 20/341 fills (5.9%), $4,991 forgone vs one $2,308 tail, and the explicit statement that the gate is net negative on realized history alone. |
+| 5 | `earnings_hour` unused by both predicates; kill-switch blast radius wider than the scanner. | **Fixed** in `docs/gates.md` — both recorded, including that `EARNINGS_ENABLED=false` also darkens `run_rolling_cycle`'s gate (moot per FC-066, stated for whoever revives it). |
+| 6 | Runbook's persistent-case dichotomy was wrong: a revoked key / lapsed plan does **not** fire `earnings_gate_unusable` (the client builds fine). | **Fixed** in the runbook and in the alert policy's documentation content — the dichotomy is now event-shape *plus* `earnings_fetch_failed` error text (401/403 → key, 429 → quota, 5xx/timeout → outage). |
+| 7 | Two undocumented deviations. | **Recorded** — see the two new entries in the plan's Execution §Deviations (L2 write-per-fetch vs the plan's per-batch; the unparseable-expiry labeling nit). |
+| 8 | Rollout did not make the key check mandatory or same-window. | **Fixed** — mandatory pre-flight added to the runbook and to post-merge step 2 below. |
+
+### Confirmation pass
+
+Fixes landed in code for every required finding, so a **scoped confirmation
+review is required before merge** (Fable, fresh context, one of the original
+personas, contract = the three required fixes plus regression check on the
+clock-seam change that rode along with fix 1).
 
 ---
 
@@ -244,12 +347,38 @@ gcloud alpha monitoring policies list --format="value(name,displayName,enabled)"
        | python -c "import json,sys; [print(p['displayName'], p.get('enabled'), p.get('notificationChannels')) for p in json.load(sys.stdin)['alertPolicies']]"
 ```
 
-### 2. Deploy the code — outside market hours
+### 2. Deploy the code — outside market hours, key verified FIRST
 
-Deploy after FC-068's deploy. The first scan after deploy pays up to ~14 Finnhub
-fetches against a cold L1 **and** a cold L2 blob; a transient hiccup then blocks
-symbols as unknown. Deploying outside market hours means the post-deploy
-verification scan populates the blob before the next scheduled scan.
+**MANDATORY, and in this order.** This PR converts a missing `FINNHUB_API_KEY`
+from *invisible* (no gate existed; a missing key changed nothing) into
+*full-book fail-closed* (every symbol unknown, every open blocked, both legs).
+So:
+
+1. **Verify the key is on the live revision** — not in `.env`, not in Secret
+   Manager, on the revision that will serve traffic — **before the first
+   market-hours scan**:
+
+   ```bash
+   gcloud run services describe options-wheel-strategy --region=us-central1 \
+     --format="value(spec.template.spec.containers[0].env)" | tr ',' '\n' | grep -i finnhub
+   ```
+
+   If this returns nothing, do **not** let a market-hours scan run. Set the key
+   first, or ship with `EARNINGS_ENABLED=false` and enable once the key is in.
+2. **Deploy the alert policy in the same maintenance window as the code**, not
+   after. An unalerted fail-closed gate is the failure this FC exists to end,
+   pointed the other way.
+3. Deploy after FC-068's deploy, outside market hours. The first scan pays up to
+   ~14 Finnhub fetches against a cold L1 **and** a cold L2 blob; a transient
+   hiccup then blocks symbols as unknown. Deploying outside market hours means
+   the verification scan populates the blob before the next scheduled scan.
+
+**The pre-merge live check could not run** — there is no Finnhub key available
+in this environment (tests are hermetic by construction, `_no_finnhub` pins a
+fake key). So the **post-deploy Finnhub-vs-table cross-source scan in step 3c is
+mandatory, not optional**: it is the first and only opportunity to confirm the
+live provider agrees with the committed yfinance table on the dates the gate
+will act on.
 
 ### 3. Post-deploy verification, in order
 
@@ -266,6 +395,32 @@ gsutil ls -l gs://options-wheel-opportunities/earnings_cache.json
 # c. Confirm decision rows are normal (no earnings reasons on a clear day).
 #    Expect the usual mix; blocked{earnings_*} should be absent.
 ```
+
+**3c. Cross-source check — MANDATORY, and only possible post-deploy.** The live
+gate reads **Finnhub**; the replay and the audit script read the committed
+**yfinance** table. Two independent providers is what makes the audit
+meaningful, but it also means they can disagree, and a disagreement on a date
+the gate acts on is a silent wrong answer in either direction. Compare what
+Finnhub actually returned against the table:
+
+```bash
+# What the live service cached, per symbol:
+gcloud logging read \
+  'resource.labels.service_name="options-wheel-strategy" AND jsonPayload.event_type="earnings_date_fetched"' \
+  --limit=30 --freshness=1d \
+  --format="value(jsonPayload.symbol,jsonPayload.earnings_date,jsonPayload.calendar_empty)"
+
+# Against the committed table:
+python3 -c "
+import json; d=json.load(open('src/backtesting/data/earnings_dates.json'))['earnings']
+for s in ('AAPL','AMZN','GOOGL','MSFT','NVDA'):
+    print(s, [x for x in d.get(s,[]) if x >= '2026-08-01'][:2])
+"
+```
+
+Any symbol where Finnhub says `calendar_empty=True` but the table has an
+upcoming date is the accepted empty-200 fail-open landing live — investigate
+before trusting the gate on that symbol.
 
 ### 4. Live-fire verification — **the split matters**
 
