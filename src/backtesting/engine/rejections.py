@@ -60,6 +60,17 @@ _REASONS = {
     "call_scan_skipped_cost_basis_unresolved": "cost-basis floor unresolved (scan)",
     "call_scan_skipped_cost_basis_divergent": "cost-basis floor divergent (scan)",
     "call_scan_skipped_quote_unavailable": "stock quote unusable (scan)",
+    # FC-013's two gate events. The `*_earnings_unknown` pair is deliberately
+    # NOT mapped: in a replay the historical calendar never returns unknown
+    # (table-backed, fail-open on gaps and reported instead), so a mapping
+    # would be an entry with no replay emitter — the FC-068 rule this table
+    # was rewritten to enforce. Stated here so a reviewer does not "fix" it.
+    # Partial span rejections do not get a tally entry either; they surface
+    # through the `expires_into_earnings` key in `reason_counts` on
+    # `no_candidates` rows. Only a symbol the gate *terminated* is a no-trade
+    # day with a reason.
+    "put_scan_skipped_earnings_blackout": "earnings blackout (scan, put)",
+    "call_scan_skipped_earnings_blackout": "earnings span emptied the chain (scan, call)",
     # Execution-stage failures (FC-048). Without these the tally cannot see an
     # opportunity that was found and ranked but died at the router or in the
     # wrong seller -- which is exactly how the covered-call misroute stayed
