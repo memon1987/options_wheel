@@ -1340,7 +1340,7 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ### FC-069: decommission the fictional layer — revive-or-delete every dead control, then rewire what remains for continuity
 
-**Status:** Consideration — **filed 2026-07-31 with a pre-tagged inventory; plan + two-reviewer pass + execution to follow after FC-065/FC-068 land**
+**Status:** **Plan SIGNED OFF by operator 2026-08-01** (docs/plans/fc-069.md §Operator sign-off record — all 17 cards decided: item 1 flipped to DELETE, item 4 revived via FC-013 rev 2.1, item 7 sub-decision spawned FC-074, card 16 SYNC, item 5 module deleted with SHA pointer, rest confirmed). Execution queued after FC-068 lands; S1–S6 partition as amended (S4 dropped).
 **Size estimate:** L (many S items; the cost is decisions, not code)
 **Owner:** zeshan + Claude
 **Plan file:** not yet
@@ -1403,7 +1403,7 @@ Doing (2) without (1) is defensible — it is conservative in the direction that
 
 ### FC-071: at-floor candidates are flagged at-or-above basis but scored below it
 
-**Status:** Consideration — filed 2026-08-01 from the FC-065 Phase 2 review (PR #76, reviewer 1, INFO)
+**Status:** Resolved 2026-08-02 — operator chose fix direction (1), align to `>=`. Plan `docs/plans/fc-071.md`, built on branch fc-071/at-floor-scoring (`46f7a28`), dual-APPROVE reviews; PR queued at the tail of the 2026-08-03 merge train. FC-073 records the consequence (basis component becomes constant in production scoring).
 **Size estimate:** XS (one comparison operator; the work is the decision, not the diff)
 **Owner:** unassigned
 **Plan file:** not yet
@@ -1425,6 +1425,64 @@ So an at-floor candidate is now flagged at-or-above basis and simultaneously sco
 Option (1) is the smallest change; option (3) is the one that stops this recurring. **Needs an operator decision** — it is a preference about ranking, not a defect with a right answer.
 
 **Links:** PR #76 (FC-065 Phase 2 review, reviewer 1 INFO), `docs/plans/fc-065.md` §Phase 2 + Execution, `src/data/options_scanner.py:426,447,569-573`, FC-065 (the at-floor policy: "At-floor writes remain allowed").
+
+---
+
+### FC-072: call-side limit pricing never received the put side's spread-aware improvement
+
+**Status:** Consideration — filed 2026-08-01 (spin-off from `docs/plans/fc-065.md` §Spin-offs, deliberately excluded from FC-069 so its economics get reviewed on their own)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** the put side prices sell-to-open limits spread-aware — `mid + 10% of spread`, biased toward the ask for premium collection (`put_seller.py:318-327`, falling back to `mid × 0.95` only when bid/ask are unusable). The call side never got that improvement: every covered-call open is priced at a blunt `mid × 0.95` (`call_seller.py:393`) — roughly 5% of mid donated per open, plus half the spread. A Symmetry Principle violation with a direct, recurring premium cost across every call write (~88 historical writes and counting).
+
+**Fix direction:** port the put side's spread-aware formula to `execute_call_sale`'s limit calculation, with the same unusable-quote fallback. Behavior change on a money path → plan file + two-reviewer gate per ~/CLAUDE.md; the economics (expected $/write recovered, fill-rate risk of pricing closer to the ask) should be estimated from fill history before shipping.
+
+**Links:** `docs/plans/fc-065.md` §Context item 4 + §Spin-offs, `src/strategy/call_seller.py:393`, `src/strategy/put_seller.py:318-327`, FC-069 (explicitly out of its scope), Symmetry Principle (`docs/CLAUDE.md`).
+
+---
+
+### FC-074: should an account-level kill switch exist? (decide deliberately — the dead one is being deleted)
+
+**Status:** Consideration — filed 2026-08-01 by operator decision (FC-069 item 7 sub-decision, option 2)
+**Size estimate:** S (the decision); S–M (the build, if REVIVE)
+**Owner:** zeshan + Claude
+**Plan file:** not yet
+
+**Problem:** FC-069's sweep deletes `RiskManager`'s dead sibling methods — the repo's only *account-level* loss-limit concepts: a 10% portfolio-unrealized-loss "reduce positions" trigger, a 15% portfolio-loss emergency stop, a 5% daily-loss threshold, and an 80% margin ceiling. All were dead code (zero call sites since inception; two of the four conditions were declared but never even computed), with hardcoded thresholds nobody chose. The operator chose to delete them **with this FC filed** rather than letting the concept vanish as a rider: FC-065 OQ-3 decided the *per-symbol* pause question; the *account-level* stop was never decided.
+
+**The question:** should any mechanism exist that halts new opens (or flattens risk) when the account as a whole is losing badly — e.g., portfolio drawdown ≥ X%, or daily P&L ≤ −Y%? Post-sweep, the account's protections are position-scoped (sizing, floors, one-per-underlying, BP exhaustion) plus the earnings gate (FC-013 rev 2); nothing reacts to aggregate drawdown. That lean posture is currently *chosen* (control-matrix sign-off, 2026-08-01) — this FC exists so it gets re-examined with real thresholds and real data rather than re-accumulated.
+
+**Inputs when taken up:** FC-031's equity-curve/drawdown data (dashboard KPIs); the FC-065 P4 decision-record history (how often and how deep the book actually draws down); the FC-030 alert channel (a detective-only "account down X% today" alert is the cheapest first step and may be the right *entire* answer — alert-then-human beats an untested automatic halt for a one-operator book).
+
+**Links:** FC-069 item 7 (the deletion + this sub-decision), FC-065 OQ-3 (per-symbol pause — deliberately not this), FC-033 (Deferred — per-symbol escalation, different scope), `docs/plans/fc-069.md` §control matrix, FC-030 (alert channel).
+
+---
+
+### FC-073: validate the attractiveness score against realized outcomes; tune or simplify
+
+**Status:** Consideration — filed 2026-08-01 at operator request
+**Size estimate:** M (the cost is analysis, not code; any weight change is then S)
+**Owner:** zeshan + Claude
+**Plan file:** not yet
+
+**Problem:** the scanner's attractiveness scores (`_calculate_call_attractiveness_score` / `_calculate_put_attractiveness_score`, `src/data/options_scanner.py:472-591`) decide which strike wins per symbol and — on the call side — which symbols win at selection (`ExecutionEngine._call_rank_score`), yet **the weights are inherited, not chosen, and have never been validated against realized outcomes.** Known structural issues, all verified 2026-08-01:
+
+- **The return component saturates and stops discriminating.** Calls: `min(35, annual_return × 3)` caps at ~11.7% annualized — nearly every 7-DTE candidate clearing the $0.50 premium floor maxes it, so delta-proximity-to-0.20 and the OTM band do almost all the intra-symbol ranking work. Puts: same shape (`min(40, annual_return × 2)`).
+- **The delta component peaks mid-band** (exactly 0.20; the configured band edges 0.15/0.25 score 15/20) — an implicit preference inside the band that nobody decided.
+- **The put score is computed but unused at selection** (puts are re-ranked by ROI per FC-038) — it only orders the blob; either give it a job or document that it's cosmetic.
+- **The at-floor bonus asymmetry is FC-071** (strict `>` into the 15-vs-5 bonus) — resolved 2026-08-02 (aligned to `>=`, dual-APPROVE, queued behind the Monday train). **Consequence for this FC (FC-071 trader review):** post-alignment the basis component carries *zero ranking information in production* — every scored candidate is ≥ floor by construction, so all real candidates collect the same +15 and the `False → +5` arm is dead outside unit tests. Correct end state (safety is the gates' job), but this review should weigh whether a constant 15-point offset earns its slot in the 0–100 budget or should be folded out.
+- Liquidity (10 pts, saturates at ~1,000 blended contracts) and DTE (5 pts) are near-tiebreaks; whether that's right is undecided.
+
+**Evaluation approach (the data now exists or is landing):**
+1. **Historical join:** score-at-scan (opportunity blobs in `gs://options-wheel-opportunities`, ~1,300 objects) × realized outcomes (`trades_from_activities` / `trades_with_outcomes`) — did higher-scored candidates deliver better premium-per-day, fewer called-away-at-loss events, better fill rates? FC-065 P4's `decision_events` (run_id-joined) makes this query clean going forward.
+2. **Counterfactual replay:** the post-FC-068 backtest replays the literal production pipeline including this score — re-run the effective universe under alternative weightings (e.g., de-saturated return component, flat-in-band delta) and compare cycle outcomes. Non-comparability discipline per FC-048/FC-068 applies.
+3. **Decision:** tune weights, simplify (a score most of whose components don't discriminate may reduce to delta+OTM), or keep-and-document — each with the evidence attached. Any behavior change ships under its own plan + two-reviewer gate (money-path ranking).
+
+**Sequencing:** after FC-065 P4 and FC-068 land (both are the measurement instruments); independent of FC-069.
+
+**Links:** FC-071 (at-floor bonus — subset decision), FC-038 (call-rank-by-score / put-rank-by-ROI asymmetry), FC-044 (grid UI reading `decision_events`), FC-048/FC-068 (replay comparability precedent), `docs/BACKTEST_ENGINE.md`, `src/data/options_scanner.py:472-591`, `src/strategy/execution_engine.py:203-215`.
 
 ---
 
@@ -1469,7 +1527,7 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ### FC-064: cost-basis floor should be `max(BQ assigning strike, broker basis)` for mixed lots
 
-**Status:** Consideration
+**Status:** Closed — resolved by FC-065 Phase 1 (2026-08-01, PR #75). The floor is now Alpaca `avg_entry_price` — already the broker's weighted average across lots, which is exactly the semantic the mixed-lot case needed — and BigQuery no longer competes to set the floor (it is a divergence cross-check that fail-closes, with share-count mismatch as its own signal, answering this FC's second open question). The `max()` proposal was a workaround for two sources measuring different quantities; the source unification dissolves it. Lineage: `docs/plans/fc-065.md` §"The floor definition, decided" + §Spin-offs.
 **Size estimate:** S
 **Owner:** unassigned
 **Plan file:** not yet
@@ -1486,6 +1544,21 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 - After FC-039 restores wheel_state, does source 1 make this moot, or does wheel_state carry the same single-assignment assumption?
 
 **Links:** FC-050 Open Question 2 (`docs/plans/fc-050.md`; both PR #74 reviewers), FC-029 (R2 source order), FC-039 (wheel state), `src/strategy/cost_basis.py`.
+
+### FC-075: Standalone covered-call strategy — separate account, shared machinery
+
+**Status:** Plan published
+**Size estimate:** L
+**Owner:** zeshan
+**Plan file:** `docs/plans/fc-075.md`
+
+**Problem / opportunity:** Owner wants covered calls written in a **separate Alpaca account** (paper `PA37XLNWDLB3`, provisioned 2026-07-18) isolated from the wheel, by **reusing mechanical components** (FC-038 two-pool share ledger, FC-050/FC-065 cost-basis floor, OCC utils) rather than duplicating the engine, with **its own tunable parameters** (`config/covered_call.yaml`) and **separate backtests**. Architecture settled by two adversarial reviews: separate account per strategy (no tagging — the wheel's `reconcile_positions` adopts any untracked position), one repo/one image/N config-selected Cloud Run services. Plan ships Phase 1 (isolation seams: strategy-keyed opportunity store, `STRATEGY_CONFIG` accessor + account-number interlock, profile-aware config, BQ dataset threading) now; Phases 2/4 (engine + backtest) are design-gated on FC-068 + FC-069 landing. Supersedes the abandoned plan formerly renumbered FC-032→037→038 (collided with merged two-pool FC-038).
+
+**Open questions:**
+- Post-FC-068/069: reuse `OptionsScanner.scan_for_call_opportunities` with a holdings-derived list, or a thinner holdings-first scanner? (blocking, decided in the Phase 2 design pass)
+- Initial tunables for `covered_call.yaml` (delta band, DTE, min premium, validator thresholds) — operator to set before first sale (non-blocking)
+
+**Links:** `docs/plans/fc-075.md`; gates: FC-068, FC-069; prerequisites/risks: FC-067 (journal put-labeling), FC-061 (ledger vs open orders), FC-056 (backtest call pricing 0.676×), FC-062/FC-066 (roller excluded from scope).
 
 ---
 
@@ -1602,7 +1675,7 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - Date: 2026-07-18
 - Notes: Scope was alerting only — the observability half shipped in FC-031. `POST /api/v2/bot-health/pause-alert-check` runs weekdays 17:45 ET and logs a single `DRAWDOWN_PAUSE_ALERT` line when any symbol is paused >= 7 trading days (threshold declared in `cloudbuild.yaml`); a Cloud Monitoring log-based policy emails the operator via the project's **first notification channel**. Built as a strict consumer of FC-031's `get_drawdown_pauses` — one implementation of pause state, not two. Degraded paths are loud: a live-positions outage logs `DRAWDOWN_PAUSE_ALERT_CHECK_FAILED` rather than reporting "nothing paused". **Cloud Build failure alerting shipped on the same channel** and was prioritized ahead of the pause alert — FC-031 had sat undeployed 11 days behind an unnoticed red build; the new alert then caught three real failures the same session. **The mandatory fire drill caught a fatal defect:** the policy's `severity>=WARNING` clause matched zero entries, because Cloud Run only assigns severity to structured JSON logs while Python's `logging.warning()` writes plain text — the alert would have been silent forever, discoverable only as a missing notification. Pure logic lives in `services/pause_alert.py` (the bot CI image has no FastAPI); a module-level `pytest.importorskip` was rejected after verifying it silently skips the pure tests too.
 - Note on duplicate PRs: two parallel sessions independently found and fixed the same severity-filter defect (#41 and #42). The same collision duplicated this file's entire Completed section, repaired in `fix/dedupe-fc-ledger`. No code conflict resulted; the fixes were equivalent.
-- **Operator action outstanding:** confirm the alert email lands (Cloud Monitoring channels may need one-time verification).
+- ~~**Operator action outstanding:** confirm the alert email lands (Cloud Monitoring channels may need one-time verification).~~ **Resolved 2026-08-01: operator confirmed alert emails are arriving.** Delivery verified end-to-end; FC-030 fully closed. The same channel now also carries FC-065 P1's cost-basis alert policy (`1661285269015921471`).
 
 ### FC-050: the covered-call below-basis floor never ran on the production path
 - Plan: `docs/plans/fc-050.md`
