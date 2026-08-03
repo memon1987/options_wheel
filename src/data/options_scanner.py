@@ -607,10 +607,26 @@ class OptionsScanner:
             open_interest = call_option.get('open_interest', 0)
             liquidity_score = min(100, (volume * 0.3 + open_interest * 0.7) / 10)
             
+            # FC-065 Phase 2 / FC-071: ``>=``, matching the gates. Every floor gate
+            # rejects only ``strike < floor`` (market_data's chain filter,
+            # call_seller's execute-time check, risk_manager.validate_roll),
+            # so an at-floor strike is admitted and sold — GOOGL's 370C was.
+            # With strict ``>`` this read False on exactly those writes: a warning
+            # that gated nothing and contradicted the behaviour. At-floor keeps
+            # both premiums and gives up no capital, which is the decided policy.
+            #
+            # FC-071: single source of truth. This one comparison feeds BOTH the
+            # ``above_cost_basis`` scoring input (at-floor earns the 15-pt bonus,
+            # not the 5-pt below-basis consolation) and the
+            # ``assignment_above_cost_basis`` flag on the opportunity dict below.
+            # Do not re-derive either from a separate comparison — that drift is
+            # exactly what FC-071 closed.
+            assignment_above_cost_basis = strike >= cost_basis_per_share
+
             # Calculate attractiveness score
             attractiveness_score = self._calculate_call_attractiveness_score(
-                annual_premium_return, delta, otm_percentage, liquidity_score, dte, 
-                strike > cost_basis_per_share
+                annual_premium_return, delta, otm_percentage, liquidity_score, dte,
+                assignment_above_cost_basis
             )
             
             opportunity = {
@@ -631,15 +647,10 @@ class OptionsScanner:
                 'otm_percentage': otm_percentage,
                 'liquidity_score': liquidity_score,
                 'attractiveness_score': attractiveness_score,
-                # FC-065 Phase 2: ``>=``, matching the gates. Every floor gate
-                # rejects only ``strike < floor`` (market_data's chain filter,
-                # call_seller's execute-time check, risk_manager.validate_roll),
-                # so an at-floor strike is admitted and sold — GOOGL's 370C was.
-                # With strict ``>`` this flag read False on exactly those
-                # writes: a warning that gated nothing and contradicted the
-                # behaviour. At-floor keeps both premiums and gives up no
-                # capital, which is the decided policy, so the flag says so.
-                'assignment_above_cost_basis': strike >= cost_basis_per_share,
+                # FC-065 Phase 2 / FC-071: the single comparison computed above,
+                # shared with the ``above_cost_basis`` scoring input so the flag
+                # and the score can never disagree at equality.
+                'assignment_above_cost_basis': assignment_above_cost_basis,
                 'expiration_date': call_option['expiration_date'],
                 'bid': call_option.get('bid', 0),
                 'ask': call_option.get('ask', 0),
