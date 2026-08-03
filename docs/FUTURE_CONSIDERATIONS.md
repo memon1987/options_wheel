@@ -1562,6 +1562,54 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
+
+**Status:** Consideration
+**Size estimate:** S–M
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** FC-075 Phase 1 added an account-number interlock that refuses trading when the live Alpaca `account_number` != `config.expected_account_number` — the control that makes "right code, wrong credentials" impossible across separate-account strategies. But it is implemented as a Flask decorator (`require_account_match` in `deploy/cloud_run_server.py`), so it guards **only HTTP routes**. Two entry points bypass it entirely:
+
+- `main.py` (`Config(args.config)` → drives `WheelEngine` directly) — the CLI/local path.
+- Any future **Cloud Run Job** (this repo already uses Jobs for backtests, and Phase 3 of FC-075 may add one for the covered-call service) — Jobs don't go through the Flask app at all.
+
+Both adversarial reviewers of FC-075 Phase 1 (PR #77) flagged this as the design's weakest point: the control derives from per-route decorators a developer must remember to add, rather than from the order-placing layer itself.
+
+**Proposed direction:** move the interlock down into `AlpacaClient` — verify `get_account().account_number == config.expected_account_number` once at client construction (or on first order submission), and refuse to place orders on mismatch. Every current and future entry point (routes, `main.py`, Jobs) then inherits the guard structurally. The HTTP decorator can stay as a fast-fail-with-clean-503 layer on top, or be removed once the structural check exists.
+
+**Open questions:**
+- Check at `AlpacaClient.__init__` (one network call per construction — how often is it constructed?) vs. lazily on first order (cheaper, but read-only endpoints then never verify)?
+- Latch semantics: mirror FC-075's (genuine mismatch latches, check-failure doesn't) at the client layer.
+- Does a read-only construction (dashboard `/account`, `/positions`) need to hard-fail, or only order-placing paths? FC-075 deliberately left those read endpoints unguarded.
+- Interaction with the backtest's `BacktestAlpacaClient` — must be exempt (no real account).
+
+**Links:** FC-075 (introduced the route-level interlock); `docs/plans/fc-075.md` §Seam 2 "Follow-up"; PR #77 review findings.
+
+---
+
+### FC-077: Opportunity-store strategy_id grace window — tighten only under single-account consolidation
+
+**Status:** Consideration (conditional — NOT actionable now)
+**Size estimate:** S
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem / opportunity:** FC-075 Phase 1's opportunity-store isolation treats a blob with no `strategy_id` field as belonging to the `wheel` strategy (`data.get('strategy_id', 'wheel')` in `src/data/opportunity_store.py`). This grace existed so the wheel could consume its own legacy (pre-FC-075) blobs across the deploy boundary. It has no expiry.
+
+Under the current architecture this is **safe-permanent**: each strategy has its own GCS bucket (Seam 1), so the wheel's bucket only ever contains wheel blobs, and a covered-call service reads a different bucket entirely. An absent field can never cause a cross-strategy read.
+
+The grace only becomes a latent weakness **if** we ever consolidate strategies into a single shared bucket (which would accompany single-account consolidation — explicitly out of scope in FC-075, and not planned). At that point an untagged blob in a shared bucket would be silently attributed to the wheel.
+
+**Proposed direction (only if consolidation is pursued):** require `strategy_id` on every blob (drop the default), and reject untagged blobs fail-closed. Trivial change; the reason it isn't done now is that dropping the default today would make the wheel reject its own historical blobs for no benefit.
+
+**Open questions:**
+- Is single-account / shared-bucket consolidation ever going to be pursued? If the answer stays "no," this FC can be closed as won't-do.
+
+**Links:** FC-075 §Seam 1 + §Phase 1 tests "grace-window note"; `src/data/opportunity_store.py` `_blob_belongs_to_strategy`.
+
+---
+
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
