@@ -1,0 +1,24 @@
+{
+  "displayName": "Earnings gate cannot answer — options-wheel",
+  "documentation": {
+    "content": "The FC-013 earnings gate could not determine a symbol's earnings date and therefore skipped it. Fail-closed is CORRECT behaviour here, not a bug to work around — but a persistent unknown state blocks ALL new option sales indefinitely, on both legs, and nothing self-heals it. This alert is the only thing that bounds that.\n\nThree events match:\n- earnings_gate_unusable: earnings.enabled is true but EarningsCalendarService could not build a client at all — FINNHUB_API_KEY missing/empty on the live revision, or finnhub-python not importable. Emitted once per service construction, so it repeats every scan while it lasts. THIS IS THE HIGH-CONFIDENCE PERSISTENT CASE.\n- put_scan_skipped_earnings_unknown: the put leg skipped a symbol because the calendar returned 'unknown'.\n- call_scan_skipped_earnings_unknown: the covered-call leg did the same, before spending a cost-basis resolver call.\n\nDistinguish transient from persistent:\n- TRANSIENT (Finnhub outage / rate limit): the per-symbol events fire, earnings_gate_unusable does NOT. The L2 GCS cache means only symbols whose cached dates are >24h stale are affected, and a 1h failure cache retries. Expect it to clear within an hour or two. Cost is foregone 7-DTE premium for part of a day.\n- PERSISTENT (key wiped by a --set-env-vars deploy, key revoked, Finnhub plan lapsed): earnings_gate_unusable fires on EVERY scan and every symbol reports unknown. Nothing recovers this without intervention.\n\nTriage:\n1. gcloud logging read 'resource.labels.service_name=\"options-wheel-strategy\" AND (jsonPayload.event_type=\"earnings_gate_unusable\" OR jsonPayload.event_type=\"put_scan_skipped_earnings_unknown\" OR jsonPayload.event_type=\"call_scan_skipped_earnings_unknown\")' --limit=20 --freshness=1d\n2. Check the key is present on the LIVE revision: gcloud run services describe options-wheel-strategy --region=us-central1 --format=\"value(spec.template.spec.containers[0].env)\" — and remember --set-env-vars wipes the whole env set, which is itself one of this alert's causes.\n3. Check Finnhub status and the account's plan/quota (free tier: 60 calls/min; steady state here is ~14 fetches/day).\n4. Also check earnings_fetch_failed events for the underlying API error text.\n\nEMERGENCY LEVER (FC-013 DD-7) — if the book must trade while the calendar is being fixed, disable the gate at runtime rather than through a build:\n\n  gcloud run services update options-wheel-strategy --region=us-central1 --update-env-vars EARNINGS_ENABLED=false\n\nUse --update-env-vars, NEVER --set-env-vars (the latter wipes the whole env set). New revision in ~1 minute, no Cloud Build — which matters because that pipeline has sat silently red for 11 days before (FC-031). Re-enable by removing the override once the calendar answers again. Disabling the gate means trading through earnings ungated; that is a deliberate, temporary, operator-owned trade-off.\n\nNOT alerted: *_skipped_earnings_blackout. A blackout skip is the gate working — normal operation, visible in decision records (blocked{earnings_blackout}) and in the expires_into_earnings rejection stat.\n\nNOTE: the filter deliberately does NOT constrain severity. Cloud Run captures the app's stderr as plain text with EMPTY severity, so a severity>=WARNING clause matches nothing (verified by the FC-030 fire drill 2026-07-18). Payload shape is matched both ways.\n\nPlan: docs/plans/fc-013.md. Gate inventory: docs/gates.md. Runbook: deploy/monitoring/drawdown_pause_alert.md",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "Earnings calendar returned unknown, or is unusable",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"options-wheel-strategy\" AND (jsonPayload.event_type=\"earnings_gate_unusable\" OR jsonPayload.event_type=\"put_scan_skipped_earnings_unknown\" OR jsonPayload.event_type=\"call_scan_skipped_earnings_unknown\" OR textPayload:\"earnings_gate_unusable\" OR textPayload:\"put_scan_skipped_earnings_unknown\" OR textPayload:\"call_scan_skipped_earnings_unknown\")"
+      }
+    }
+  ],
+  "alertStrategy": {
+    "notificationRateLimit": {"period": "86400s"},
+    "autoClose": "172800s"
+  },
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ]
+}
