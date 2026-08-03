@@ -1,7 +1,8 @@
 # PR body draft — FC-071: at-floor scoring bonus aligned to the gate (`>=`)
 
-> Draft only. **Do not open this PR until after the Monday 2026-08-03 merge train**
-> (PR #76 → P4 → FC-068). See *Merge slot* below. Paste the body below the line when opening.
+> **Ready to open (2026-08-03).** The Monday train is through — PR #76 (P2), #78 (P4), #79
+> (FC-068) and #77 (FC-075 P1) are all on `main`, and this branch has been merged with
+> post-train `main` (`3e5b0e8`). Paste the body below the line when opening.
 
 ---
 
@@ -69,18 +70,22 @@ GOOGL 368.34-floor fixture from the FC-065 P2 flag class directly above it:
 
 1. **`test_a_strike_exactly_at_the_floor_earns_the_above_basis_bonus`** — re-scores the emitted
    opportunity from its own published components with the basis input forced True and False,
-   asserts the spread is exactly 10 points and that the opportunity carries the with-bonus
-   score. Derives the 10 rather than hardcoding 15, so it stays honest if FC-073 moves weights.
+   asserts the spread is 10 points (`pytest.approx`) and that the opportunity carries the
+   with-bonus score. This is a **pin, not a derivation**: if FC-073 retunes the basis weights
+   the assert must be updated deliberately, which is the intended prompt to re-confirm that
+   at-floor still ranks with the above-basis cohort.
 2. **`test_an_at_floor_strike_scores_the_same_as_one_cent_above`** — the boundary is no longer a
    scoring cliff: 368.34 and 368.35 score within 1 point (residual is the OTM/return effect of
    the extra cent), not 10 apart.
-3. **`test_the_flag_and_the_scoring_input_are_the_same_value`** — the anti-drift pin. Spies on
-   the scoring call and asserts the recorded `above_cost_basis` argument **is the same value**
-   as the emitted `assignment_above_cost_basis` flag, parametrized across
-   `[360.00, 368.34, 368.35, 375.00]` (below / at / just-above / above). Fails the moment
-   anyone re-derives either surface from its own comparison.
+3. **`test_the_flag_and_the_scoring_input_are_the_same_value`** — the boundary-semantics pin.
+   Spies on the scoring call and asserts the recorded `above_cost_basis` argument **is the same
+   value** as the emitted `assignment_above_cost_basis` flag, parametrized across
+   `[360.00, 368.34, 368.35, 375.00]` (below / at / just-above / above). Fails on any semantic
+   divergence (`>` vs `>=`) at the boundary. It does **not** catch a semantics-preserving
+   refactor that re-derives one side from an equivalent comparison — the single-source shape in
+   the scanner is what guards against that.
 
-**Full suite: 996 passed** (990 baseline + 6 new). No existing assertion moved.
+**Full suite: 1025 passed** (post-train baseline 1019 + 6 new). No existing assertion moved.
 
 ## Mutation record
 
@@ -94,17 +99,52 @@ has burned a prior mutation exercise on this repo).
 | Mutated (`strike > cost_basis_per_share` into scoring) | **3 failed, 3 passed** |
 | Failing | Test 1; test 2; test 3's `[368.34]` case **only** |
 | Still passing under mutation | Test 3's `[360.00]`, `[368.35]`, `[375.00]` |
-| Predicate restored | **6/6 pass**, full suite 996 green |
+| Predicate restored | **6/6 pass**, full suite 1025 green |
 
 The failure is confined precisely to the equality boundary — which is the intended blast radius,
 and confirms the tests pin the boundary itself rather than the surrounding arithmetic.
 
-## Merge slot
+The mutation was re-run on the merged tree after the cosmetic batch, with caches cleared:
+identical outcome — same 3 failures, same 3 survivors, same boundary confinement.
 
-**After the Monday 2026-08-03 train** (PR #76 → P4 → FC-068). This branch was built on
-`fc-068/engine-path-deletion` @ `c72127a` — the post-FC-068-review tip, i.e. the post-train shape
-of the scanner code this change touches. **Rebase-verify against post-train main before opening
-the PR** so the diff stays exact and contains only the FC-071 predicate plus its tests.
+## Merge record
+
+Built on `fc-068/engine-path-deletion` @ `c72127a` (2026-08-02), then merged with post-train
+`main` @ `3e5b0e8` on 2026-08-03. Six conflicts — more than expected, because the branch was
+built on the *unsquashed* FC-068 branch and FC-068's content re-conflicted against its squashed
+form on `main`. Resolutions:
+
+- **`src/data/options_scanner.py`** — my shared-variable flag line vs main's FC-065 P2 inline
+  `>=`. Took mine; this is the FC-071 change. The hoisted comparison and the scoring call
+  auto-merged above the conflict and survived intact.
+- **`tests/test_options_scanner.py`** — my new class vs nothing on main. Took mine.
+- **`docs/plans/fc-071.md`** (add/add) — took mine, after verifying it is byte-identical to
+  main's copy apart from the Status/Execution additions.
+- **`docs/FUTURE_CONSIDERATIONS.md`** — took main's "Resolved" Status for the FC-071 entry;
+  unioned in main's new FC-072 / FC-073 / FC-074 entries.
+- **`docs/plans/fc-065.md`** — took main's Status line; another FC's bookkeeping.
+- **`src/data/opportunity_store.py`** — comment-only conflict, took main's richer version.
+
+Verified post-merge: zero conflict markers repo-wide, and `_create_call_opportunity` swept for
+the git auto-merge duplication artifact seen on a previous merge in this repo — clean, with
+`assignment_above_cost_basis` assigned exactly once and consumed exactly twice.
+
+## Reviewer cosmetic batch
+
+Both reviewers APPROVEd with four cosmetic conditions; all applied on the merged tree:
+
+- **(a)** Softened the anti-drift claim in the test docstrings and this draft — the original
+  "fails the moment anyone re-derives either surface" overclaimed, since a semantics-preserving
+  refactor would not trip it. Now scoped to semantic divergence at the boundary.
+- **(b)** Test 1's comment claimed it "derives the delta" while the assert pins `== 10`; now
+  states honestly that it is a pin FC-073 must update deliberately. Exact float comparisons
+  moved to `pytest.approx`.
+- **(c)** Corrected date strings — the Execution section had claimed a build date of 2026-08-01,
+  a day before the plan was authored and approved.
+- **(d)** OCC fixture uses `round(strike * 1000)` instead of `int(...)`. **Latent, not active:**
+  none of the four fixture strikes actually truncate (verified), so no test outcome changed.
+  Applied only within the FC-071 class; the identical line in the FC-065 P2 class above was
+  left alone to keep this diff inside FC-071's scope.
 
 ## Review + rollout
 

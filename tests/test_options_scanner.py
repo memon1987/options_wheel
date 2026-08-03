@@ -696,8 +696,8 @@ class TestAtFloorStrikesAreScoredTheWayTheyAreFlagged:
 
     Exact equality is near measure-zero on premium-netted floors against
     $2.50 strike grids, so this is consistency hygiene rather than a shift on
-    today's book. These tests are the pins that keep the two predicates from
-    drifting apart again.
+    today's book. These tests pin the boundary semantics: they fail on any
+    ``>`` vs ``>=`` divergence between the flag and the scoring input.
     """
 
     def setup_method(self):
@@ -717,7 +717,10 @@ class TestAtFloorStrikesAreScoredTheWayTheyAreFlagged:
 
     def _chain(self, strike):
         self.mock_market_data.find_suitable_calls.return_value = [{
-            'symbol': 'GOOGL260821C%08d' % int(strike * 1000),
+            # round(), not int(): the OCC strike field is in thousandths and
+            # strike * 1000 can land a hair below the integer in float, which
+            # int() would truncate down by a tenth of a cent.
+            'symbol': 'GOOGL260821C%08d' % round(strike * 1000),
             'strike_price': strike, 'expiration_date': '2026-08-21', 'dte': 7,
             'delta': 0.20, 'mid_price': 2.10, 'bid': 2.05, 'ask': 2.15,
             'volume': 1500, 'open_interest': 6000, 'implied_volatility': 0.24,
@@ -751,11 +754,14 @@ class TestAtFloorStrikesAreScoredTheWayTheyAreFlagged:
 
         with_bonus = self._score_with(opportunity, True)
         without_bonus = self._score_with(opportunity, False)
-        # The bonus is worth exactly the 15-vs-5 spread; if the weights ever
-        # move (FC-073's territory) this stays honest by deriving the delta.
-        assert with_bonus - without_bonus == 10
-        assert opportunity['attractiveness_score'] == with_bonus
-        assert opportunity['attractiveness_score'] != without_bonus
+        # This pins the current 15-vs-5 spread at 10 points. It is a pin, not
+        # a derivation: if FC-073 retunes the basis weights this assert must
+        # be updated deliberately — which is the intended prompt to re-confirm
+        # that at-floor still ranks with the above-basis cohort.
+        assert with_bonus - without_bonus == pytest.approx(10)
+        # The emitted score is the with-bonus one, not the consolation.
+        assert opportunity['attractiveness_score'] == pytest.approx(with_bonus)
+        assert opportunity['attractiveness_score'] != pytest.approx(without_bonus)
 
     def test_an_at_floor_strike_scores_the_same_as_one_cent_above(self):
         """The boundary is no longer a scoring cliff: a penny of extra capital
@@ -775,10 +781,13 @@ class TestAtFloorStrikesAreScoredTheWayTheyAreFlagged:
     @pytest.mark.parametrize('strike', [360.00, 368.34, 368.35, 375.00])
     def test_the_flag_and_the_scoring_input_are_the_same_value(self, strike):
         """FC-071's real contract: one comparison feeds both surfaces. This
-        fails the moment anyone re-derives either side from its own
-        comparison — which is exactly the drift FC-071 closed. Below-floor is
-        included because the parameter contract survives even though the chain
-        gate would never return such a strike."""
+        fails on any semantic divergence (``>`` vs ``>=``) at the boundary —
+        the drift FC-071 closed. It does not, and cannot, catch a
+        semantics-preserving refactor that merely re-derives one side from an
+        equivalent comparison; the single-source shape in the scanner is what
+        guards against that. Below-floor is included because the parameter
+        contract survives even though the chain gate would never return such
+        a strike."""
         self._chain(strike)
         recorded = {}
         real_score = self.scanner._calculate_call_attractiveness_score

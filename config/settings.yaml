@@ -1,5 +1,9 @@
 # Options Wheel Strategy Configuration
 
+# Which strategy profile this config drives (FC-075). 'wheel' is the historical
+# default; the covered-call strategy runs from config/covered_call.yaml.
+strategy_id: wheel
+
 # Alpaca API Settings
 alpaca:
   # Controls which Alpaca API endpoints to use (paper vs live)
@@ -9,7 +13,11 @@ alpaca:
   # API credentials (use environment variables)
   api_key_id: "${ALPACA_API_KEY}"
   secret_key: "${ALPACA_SECRET_KEY}"
-  
+  # Account-number interlock (FC-075 Seam 2): the service refuses to trade if the
+  # live Alpaca account number does not match this. Pins right-code to
+  # right-credentials. This is the wheel's paper account.
+  expected_account_number: "PA3D36DVXSZ2"
+
 # Trading Strategy Parameters
 strategy:
   # Scan-to-execution coordination
