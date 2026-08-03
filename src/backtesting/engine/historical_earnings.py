@@ -21,10 +21,15 @@ from __future__ import annotations
 import json
 import os
 from datetime import date, datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import structlog
 
+from ...api.earnings_calendar import (
+    EARNINGS_CLEAR,
+    EARNINGS_KNOWN,
+    EARNINGS_UNKNOWN,
+)
 from ...utils import clock
 
 logger = structlog.get_logger(__name__)
@@ -42,6 +47,13 @@ class HistoricalEarningsCalendar:
             symbol: sorted(dates) for symbol, dates in earnings_by_symbol.items()
         }
         self.symbols_without_data: set = set()
+        # FC-013: symbols the table *has* but has run out of dates for. Without
+        # this they answer exactly like a genuinely-clear symbol — silent
+        # fail-open at the table's edge, and the 2026-07-18 table had most
+        # reporters' last dates already in the past by 08-01. ETFs never land
+        # here: they are present-with-empty by design, which `horizon_for`
+        # reports as None rather than as an exhausted horizon.
+        self.symbols_past_horizon: set = set()
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -89,6 +101,55 @@ class HistoricalEarningsCalendar:
             result["next_earnings_date"] = nxt.isoformat()
             result["days_until"] = (nxt - self._today()).days
         return result
+
+    # ------------------------------------------------------------------ #
+    # FC-013 — the tri-state surface the scanner gate consumes
+    # ------------------------------------------------------------------ #
+    def next_earnings_info(self, symbol: str) -> Tuple[str, Optional[date]]:
+        """Same contract as ``EarningsCalendarService.next_earnings_info``.
+
+        **This class never returns ``'unknown'``, and that asymmetry with live
+        is deliberate.** Live fails closed because an outage means the risk is
+        unverifiable while real money is at stake. A replay "outage" is not a
+        live risk — it is a table gap, and returning ``'unknown'`` (block)
+        for a symbol missing from the table would silently zero out that
+        symbol's entire replay: a pessimistic measurement bias that corrupts
+        the verdict rather than protecting anything. So the replay fails OPEN
+        and *reports* instead: ``symbols_without_data`` for absent symbols,
+        ``symbols_past_horizon`` for present ones whose dates have run out.
+        The simulator surfaces both, so the operator refreshes the table
+        rather than reading a biased number.
+        """
+        nxt = self.next_earnings_date(symbol)
+        if nxt is None:
+            self._note_horizon_exhaustion(symbol)
+            return (EARNINGS_CLEAR, None)
+        return (EARNINGS_KNOWN, nxt)
+
+    def earnings_within(self, symbol: str, n_days: int) -> Optional[bool]:
+        """The put leg's tri-state predicate — never ``None`` here, per above."""
+        status, nxt = self.next_earnings_info(symbol)
+        if status == EARNINGS_UNKNOWN:  # unreachable by construction; kept honest
+            return None
+        if status == EARNINGS_CLEAR:
+            return False
+        return 0 <= (nxt - self._today()).days <= n_days
+
+    def horizon_for(self, symbol: str) -> Optional[date]:
+        """The last date the table covers for ``symbol``.
+
+        ``None`` for an absent symbol and for a present-but-empty one (the
+        ETFs), so a caller can tell "we have no coverage to compare against"
+        from "coverage ended on this date".
+        """
+        dates = self._earnings.get(symbol)
+        return dates[-1] if dates else None
+
+    def _note_horizon_exhaustion(self, symbol: str) -> None:
+        """Flag a present symbol whose dates are all in the past."""
+        horizon = self.horizon_for(symbol)
+        if horizon is not None and horizon < self._today():
+            self.symbols_past_horizon.add(symbol)
 
     # ------------------------------------------------------------------ #
     @staticmethod

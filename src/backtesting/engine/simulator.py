@@ -141,6 +141,15 @@ class SimulationResult:
     # rather than silently changing every measurement.
     rolls_evaluated: int = 0
     rolls_executed: int = 0
+    # FC-013 earnings-table coverage, both reported rather than assumed away.
+    # `without_data`: the symbol is absent from the table entirely.
+    # `past_horizon`: the symbol IS in the table but every date it carries is
+    # already behind the simulated day — which otherwise answers exactly like
+    # a genuinely-clear symbol, so the gate silently stops gating at the
+    # table's edge. Non-empty means "refresh the table before trusting this
+    # run's earnings behaviour", not "the run failed".
+    earnings_symbols_without_data: List[str] = field(default_factory=list)
+    earnings_symbols_past_horizon: List[str] = field(default_factory=list)
 
     @property
     def final_equity(self) -> float:
@@ -372,7 +381,17 @@ class Simulator:
         # uncovered_days lookup both query production data against
         # CURRENT_TIMESTAMP(). See OptionsScanner.__init__ and the plan's
         # replay-isolation table.
-        scanner = OptionsScanner(client, market_data, self.config, allow_bigquery=False)
+        # FC-013 discharges the seam obligation FC-068 created: post-FC-068 the
+        # replay drives the scanner pipeline, so a scanner-layer gate is only
+        # in the replay if it is handed the point-in-time calendar here. The
+        # SAME instance already serves the roller through WheelEngine above —
+        # one point-in-time truth per replay, and one place its horizon/gap
+        # reporting accumulates. Note the scanner still consults
+        # `config.earnings_enabled` itself (DD-8): injection supplies the data
+        # source, never the policy, so a replay honours a live rolloff.
+        scanner = OptionsScanner(client, market_data, self.config,
+                                 allow_bigquery=False,
+                                 earnings_calendar=self.earnings_calendar)
         # The scan only *finds* opportunities — production executes them in a
         # second phase (/run -> ExecutionEngine). A day loop that stops after
         # the scan places no trades at all.
@@ -528,6 +547,10 @@ class Simulator:
             unpriced_ex_div_calls=self._unpriced_ex_div_calls,
             rolls_evaluated=self._rolls_evaluated,
             rolls_executed=self._rolls_executed,
+            earnings_symbols_without_data=sorted(
+                getattr(self.earnings_calendar, 'symbols_without_data', set()) or []),
+            earnings_symbols_past_horizon=sorted(
+                getattr(self.earnings_calendar, 'symbols_past_horizon', set()) or []),
         )
 
     # ------------------------------------------------------------------ #

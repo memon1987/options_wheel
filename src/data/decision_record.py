@@ -93,6 +93,14 @@ OUTCOMES = (
 # blocked{...}
 REASON_FLOOR_UNRESOLVED = "floor_unresolved"
 REASON_FLOOR_DIVERGENT = "floor_divergent"
+# FC-013 DD-4. Two reasons, not one: a row that says "earnings blackout" when
+# Finnhub was down is a mislabel, and the closed vocabulary exists precisely so
+# rows cannot misfile. `earnings_blackout` means the span predicate emptied the
+# symbol's candidate set — every qualifying strike expired into the event.
+# `earnings_unknown` means the calendar could not answer, so the gate failed
+# closed without knowing whether there was anything to block.
+REASON_EARNINGS_BLACKOUT = "earnings_blackout"
+REASON_EARNINGS_UNKNOWN = "earnings_unknown"
 # not_eligible{...}
 REASON_INSUFFICIENT_SHARES = "insufficient_shares"
 # no_candidates{...}
@@ -118,7 +126,9 @@ ALLOWED_REASONS: Dict[str, frozenset] = {
         {REASON_NO_QUALIFYING_STRIKES, REASON_QUOTE_UNAVAILABLE,
          REASON_OPPORTUNITY_BUILD_FAILED}),
     OUTCOME_DROPPED: _DROPPED_REASONS,
-    OUTCOME_BLOCKED: frozenset({REASON_FLOOR_UNRESOLVED, REASON_FLOOR_DIVERGENT}),
+    OUTCOME_BLOCKED: frozenset(
+        {REASON_FLOOR_UNRESOLVED, REASON_FLOOR_DIVERGENT,
+         REASON_EARNINGS_BLACKOUT, REASON_EARNINGS_UNKNOWN}),
     OUTCOME_NOT_ELIGIBLE: frozenset({REASON_INSUFFICIENT_SHARES}),
 }
 

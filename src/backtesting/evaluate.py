@@ -170,4 +170,10 @@ def _data_quality(result: SimulationResult, cycles: Sequence) -> Dict:
         # to price extrinsic from, so the early-assignment test could not run.
         # Non-zero means some early assignments may be missing.
         "ex_div_calls_with_no_mark": result.unpriced_ex_div_calls,
+        # FC-013. A replay whose window reaches past a traded symbol's last
+        # table date silently stops gating that symbol — same class of defect
+        # as a data gap, so it is reported the same way. Empty lists are the
+        # healthy state.
+        "earnings_symbols_missing_from_table": result.earnings_symbols_without_data,
+        "earnings_symbols_past_table_horizon": result.earnings_symbols_past_horizon,
     }

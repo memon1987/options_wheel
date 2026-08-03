@@ -364,6 +364,176 @@ step 2 above is the check: every held symbol should show `status=ok`, not
 
 ---
 
+## Alert 4 — Earnings gate cannot answer (FC-013)
+
+**Why it exists:** the earnings gate fails **closed**. When the calendar cannot
+answer for a symbol, that symbol is skipped on both legs. That is the correct
+posture — this codebase's signature disease is controls that read as live and
+fail open — but it means a *persistent* cause blocks **all new option sales
+indefinitely**, and nothing self-heals it. The alert is the only thing that
+bounds that window. Without it, FC-013 would recreate the exact "gate reads as
+protective, operator learns weeks later" failure it exists to end, pointed the
+other direction.
+
+Rev 2 of the plan claimed these events "flow through the existing FC-030
+error-event alerting baseline." That was **verified false**: no deployed policy
+matched any earnings string, and `alert-policy.yaml` carries empty
+`notificationChannels`. Hence this policy is a required deliverable of FC-013,
+not a follow-up.
+
+| Event | Meaning |
+|---|---|
+| `earnings_gate_unusable` | `earnings.enabled: true` but no Finnhub client could be built — `FINNHUB_API_KEY` missing/empty on the live revision, or `finnhub-python` not importable. **The high-confidence persistent case.** |
+| `put_scan_skipped_earnings_unknown` | the put leg skipped a symbol on an unanswerable calendar |
+| `call_scan_skipped_earnings_unknown` | the call leg did the same, before spending a cost-basis resolver call and a BigQuery cross-check |
+
+**Which event fired tells you which failure you have — but it does NOT sort
+transient from persistent on its own.** Getting this backwards costs a
+market day, so read carefully:
+
+| Event pattern | What it means | Persistence |
+|---|---|---|
+| `earnings_gate_unusable` on every scan | **No client could be built at all**: `FINNHUB_API_KEY` missing or empty on the live revision, or `finnhub-python` not importable. | **Always persistent.** Nothing recovers this without intervention. |
+| Per-symbol `*_skipped_earnings_unknown` **without** `earnings_gate_unusable` | The client built fine and the *calls* are failing. Covers **both** a transient outage **and** a revoked key / lapsed plan / exhausted quota. | **Ambiguous — must be diagnosed.** |
+
+The second row is the one the first draft of this runbook got wrong. A **revoked
+key or a lapsed plan does not fire `earnings_gate_unusable`**: `finnhub.Client`
+merely stores the key at construction, so the client builds, and the failure
+surfaces per symbol at call time — indistinguishable at the event level from a
+Finnhub outage.
+
+**Sort them with the error text, not the event name:**
+
+```bash
+gcloud logging read \
+  'resource.labels.service_name="options-wheel-strategy" AND jsonPayload.error_type="earnings_fetch_failed"' \
+  --limit=20 --freshness=1d \
+  --format="value(timestamp,jsonPayload.symbol,jsonPayload.error_message)"
+```
+
+- **401 / 403 / "invalid API key" / "you don't have access"** → the key is bad
+  or the plan lapsed. **Persistent.** Fix the key or the subscription.
+- **429** → quota exhausted. Persistent within the quota window; steady state
+  here is ~14 fetches/day against a 60/min free-tier limit, so a 429 means
+  something is refetching far more than it should — check whether the L2 blob
+  is being written (`gsutil ls -l gs://options-wheel-opportunities/earnings_cache.json`).
+- **5xx / timeout / connection errors** → genuine outage. **Transient.** The L2
+  cache means only symbols whose cached dates are >24h stale are affected, and
+  the 1h failure cache retries. Expect it to clear within an hour or two; cost
+  is foregone 7-DTE premium for part of a day.
+
+If the events are still firing after two hours, treat it as persistent
+regardless of the error text and reach for the lever below.
+
+**Not alerted:** `*_skipped_earnings_blackout`. A blackout skip is the gate
+working — normal operation, visible in `decision_events` as
+`blocked{earnings_blackout}` and in the `expires_into_earnings` rejection stat.
+
+**Policy:** `deploy/monitoring/earnings_gate_alert_policy.json`, created the
+same way as Alerts 2 and 3 (Monitoring REST API — `gcloud alpha` is not
+installed):
+
+```bash
+TOKEN=$(gcloud auth print-access-token)
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d @deploy/monitoring/earnings_gate_alert_policy.json \
+  "https://monitoring.googleapis.com/v3/projects/gen-lang-client-0607444019/alertPolicies"
+```
+
+**Match filter** — bot service, `jsonPayload.event_type` plus `textPayload:`
+substrings, and **no `severity>=` clause** (see Alert 2 for why):
+
+```
+resource.type="cloud_run_revision"
+AND resource.labels.service_name="options-wheel-strategy"
+AND (jsonPayload.event_type="earnings_gate_unusable"
+  OR jsonPayload.event_type="put_scan_skipped_earnings_unknown"
+  OR jsonPayload.event_type="call_scan_skipped_earnings_unknown"
+  OR textPayload:"earnings_gate_unusable"
+  OR textPayload:"put_scan_skipped_earnings_unknown"
+  OR textPayload:"call_scan_skipped_earnings_unknown")
+```
+
+**Triage:**
+
+```bash
+# 1. What fired, and which of the three events?
+gcloud logging read \
+  'resource.labels.service_name="options-wheel-strategy" AND (jsonPayload.event_type="earnings_gate_unusable" OR jsonPayload.event_type:"skipped_earnings_unknown")' \
+  --limit=20 --freshness=1d \
+  --format="value(timestamp,jsonPayload.event_type,jsonPayload.symbol)"
+
+# 2. Is the key present on the LIVE revision?
+gcloud run services describe options-wheel-strategy --region=us-central1 \
+  --format="value(spec.template.spec.containers[0].env)"
+
+# 3. The underlying API error text, if any.
+gcloud logging read \
+  'resource.labels.service_name="options-wheel-strategy" AND jsonPayload.error_type="earnings_fetch_failed"' \
+  --limit=10 --freshness=1d --format="value(timestamp,jsonPayload.symbol,jsonPayload.error_message)"
+```
+
+**Emergency lever (DD-7).** If the book must trade while the calendar is being
+fixed, disable the gate at runtime rather than through a build:
+
+```bash
+gcloud run services update options-wheel-strategy --region=us-central1 \
+  --update-env-vars EARNINGS_ENABLED=false
+```
+
+`--update-env-vars`, **never** `--set-env-vars` — the latter wipes the whole env
+set, which is itself one of this alert's causes. New revision in ~1 minute, no
+Cloud Build, which matters because that pipeline has sat silently red for 11
+days before (FC-031). Remove the override once the calendar answers again.
+Disabling the gate means trading through earnings ungated: a deliberate,
+temporary, operator-owned trade-off, not a fix.
+
+**MANDATORY pre-flight, before the first market-hours scan on the new
+revision.** FC-013 converts a missing `FINNHUB_API_KEY` from *invisible*
+(the gate did not exist; a missing key changed nothing) into *full-book
+fail-closed* (every symbol unknown, every open blocked, both legs). Verify the
+key is present on the **live revision** — not in `.env`, not in Secret Manager,
+on the revision that will serve traffic — and deploy this alert policy in the
+**same** maintenance window as the code:
+
+```bash
+# 1. The key is on the live revision.
+gcloud run services describe options-wheel-strategy --region=us-central1 \
+  --format="value(spec.template.spec.containers[0].env)" | tr ',' '\n' | grep -i finnhub
+
+# 2. The policy exists and is enabled (deploy it BEFORE the first scan, not after).
+TOKEN=$(gcloud auth print-access-token)
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "https://monitoring.googleapis.com/v3/projects/gen-lang-client-0607444019/alertPolicies" \
+  | python3 -c "import json,sys; [print(p['displayName'], p.get('enabled')) for p in json.load(sys.stdin)['alertPolicies']]"
+```
+
+If step 1 returns nothing, **do not let a market-hours scan run** — set the key
+first, or ship with `EARNINGS_ENABLED=false` and fix the key before enabling.
+
+**Fire drill** (day one — untested alerting is worse than none). The healthy
+steady state emits none of these events, so provoke the match from the logs
+side and confirm the policy catches it:
+
+```bash
+# 1. Confirm the events are ABSENT in a healthy book (expected).
+gcloud logging read \
+  'resource.labels.service_name="options-wheel-strategy" AND jsonPayload.event_type:"earnings"' \
+  --limit=10 --freshness=1d --format="value(timestamp,jsonPayload.event_type,jsonPayload.symbol)"
+
+# 2. Emit one synthetic matching line (the FC-030 drill pattern) and confirm
+#    the email arrives. Adjust the log name to the bot's if it differs.
+gcloud logging write earnings-gate-drill \
+  '{"event_type":"earnings_gate_unusable","message":"FC-013 alert fire drill — synthetic, ignore"}' \
+  --payload-type=json \
+  --severity=ERROR
+```
+
+If no email arrives, re-check the notification channel's verification state
+(see the Alert 2 fire-drill note).
+
+---
+
 ## Alert inventory
 
 | Alert | Signal | Threshold | Rate limit |
@@ -371,6 +541,7 @@ step 2 above is the check: every held symbol should show `status=ok`, not
 | Cloud Build failure | `resource.type="build" AND severity>=ERROR` | any failure | 5 min |
 | Extended drawdown pause | `DRAWDOWN_PAUSE_ALERT` in dashboard logs | ≥7 trading days | 24 h |
 | Cost-basis floor blocked a call | `call_scan_skipped_cost_basis_{unresolved,divergent}` in bot logs | any occurrence | 24 h |
+| Earnings gate cannot answer | `earnings_gate_unusable`, `{put,call}_scan_skipped_earnings_unknown` in bot logs | any occurrence | 24 h |
 
 Candidates to add on this channel (each a small follow-up): reconciliation
 banner `warn`, `critical`-severity bot-health anomalies, ingest staleness.

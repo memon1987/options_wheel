@@ -10,6 +10,20 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 
+_TRUE_TOKENS = {"1", "true", "t", "yes", "y", "on"}
+_FALSE_TOKENS = {"0", "false", "f", "no", "n", "off"}
+
+
+def _parse_bool(raw: str):
+    """Parse an env-var boolean, or None when the token is not a boolean."""
+    token = str(raw).strip().lower()
+    if token in _TRUE_TOKENS:
+        return True
+    if token in _FALSE_TOKENS:
+        return False
+    return None
+
+
 def _load_secret(secret_id: str, fallback_env_var: str) -> str:
     """Load secret from env var, falling back to GCP Secret Manager.
 
@@ -191,6 +205,24 @@ class Config:
         call_delta = strategy.get('call_delta_range', [])
         if len(call_delta) != 2 or not (0 <= call_delta[0] <= call_delta[1] <= 1):
             errors.append(f"call_delta_range must be [min, max] with 0 <= min <= max <= 1 (got {call_delta})")
+
+        # FC-013 DD-3 lookahead invariant. The call leg's span test asks "does
+        # this candidate's expiry fall on or after the next earnings date" — a
+        # question the calendar can only answer for expiries inside its own
+        # lookahead. With call DTE <= 45 the default 90-day lookahead covers it
+        # structurally; this assertion exists so a future DTE extension cannot
+        # silently outrun the calendar and turn the gate into a no-op for the
+        # longest-dated (highest-exposure) candidates. Checked only when the
+        # gate is on, so a disabled-earnings config is unaffected.
+        earnings_cfg = self._config.get('earnings', {}) or {}
+        if self.earnings_enabled and call_dte > 0:
+            lookahead = earnings_cfg.get('lookahead_days', 90)
+            if lookahead < call_dte + 7:
+                errors.append(
+                    f"earnings.lookahead_days ({lookahead}) must be at least "
+                    f"call_target_dte + 7 ({call_dte + 7}) so the FC-013 span "
+                    "test can see every candidate's expiry"
+                )
 
         # Put parameters and universe price-screening are wheel-only. The
         # covered-call profile has no put phase and derives its universe from
@@ -674,7 +706,38 @@ class Config:
 
     @property
     def earnings_enabled(self) -> bool:
-        """Whether earnings calendar service is enabled."""
+        """Whether the earnings calendar service — and therefore the FC-013
+        scanner gate — is on.
+
+        **``EARNINGS_ENABLED`` wins over the yaml key when it is set** (FC-013
+        DD-7). The yaml value is baked into the image, so "roll the config back"
+        actually means commit -> Cloud Build -> deploy, behind the same pipeline
+        that once sat silently red for 11 days (FC-031). The gate's persistent-
+        failure mode (Finnhub key wiped or revoked) blocks *all* opens until
+        someone intervenes, so the intervention must not need a build:
+
+            gcloud run services update options-wheel-strategy \\
+                --update-env-vars EARNINGS_ENABLED=false
+
+        ``--update-env-vars``, never ``--set-env-vars`` — the latter wipes the
+        whole env set, which is itself one of this gate's failure scenarios.
+
+        The yaml key remains the default and the documented home; the env var is
+        the emergency lever. An unparseable value is ignored (yaml wins) rather
+        than silently read as false — a typo must not disable a risk control.
+        """
+        override = os.getenv("EARNINGS_ENABLED")
+        if override is not None:
+            parsed = _parse_bool(override)
+            if parsed is not None:
+                return parsed
+            logger.warning(
+                "EARNINGS_ENABLED is set but unparseable; falling back to settings.yaml",
+                event_category="system",
+                event_type="config_env_override_ignored",
+                variable="EARNINGS_ENABLED",
+                value=override,
+            )
         return self._config.get("earnings", {}).get("enabled", False)
 
     @property

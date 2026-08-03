@@ -1,11 +1,17 @@
 """Options scanning utilities for wheel strategy opportunity identification."""
 
+from datetime import date
 from typing import Dict, List, Any, Optional, Tuple
 import pandas as pd
 import structlog
 import numpy as np
 
 from ..api.alpaca_client import AlpacaClient
+from ..api.earnings_calendar import (
+    EARNINGS_CLEAR,
+    EARNINGS_KNOWN,
+    EARNINGS_UNKNOWN,
+)
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils import clock
@@ -16,6 +22,8 @@ from .decision_record import (
     OUTCOME_BLOCKED,
     OUTCOME_NOT_ELIGIBLE,
     OUTCOME_NO_CANDIDATES,
+    REASON_EARNINGS_BLACKOUT,
+    REASON_EARNINGS_UNKNOWN,
     REASON_FLOOR_DIVERGENT,
     REASON_FLOOR_UNRESOLVED,
     REASON_INSUFFICIENT_SHARES,
@@ -39,13 +47,32 @@ class OptionsScanner:
     """Scanner for identifying options wheel trading opportunities."""
     
     def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager,
-                 config: Config, allow_bigquery: bool = True):
+                 config: Config, allow_bigquery: bool = True,
+                 earnings_calendar: Optional[object] = None):
         """Initialize options scanner.
 
         Args:
             alpaca_client: Alpaca API client
             market_data: Market data manager
             config: Configuration instance
+            earnings_calendar: FC-013 — the calendar the earnings gate consults.
+                Same explicit-injection seam as ``allow_bigquery`` below, and
+                for the same reason: a ``clock.is_frozen()``-keyed data-source
+                policy is action at a distance, and ``is_frozen`` is
+                thread-local.
+
+                **Config supplies policy; injection supplies only data**
+                (DD-8). ``config.earnings_enabled`` decides whether the gate
+                exists *at all*, even when a calendar was injected — otherwise
+                a live rolloff (``earnings.enabled: false``) would leave
+                replays gated, a live/replay divergence on exactly the FC-048
+                fidelity axis. A what-if replay with the gate forced on or off
+                is a config override, like every other knob.
+
+                Enabled + injected -> use it (the simulator passes
+                ``HistoricalEarningsCalendar``). Enabled + ``None`` ->
+                construct ``EarningsCalendarService``. Disabled -> ``None``,
+                and every gate site is a no-op, byte-identical to pre-FC-013.
             allow_bigquery: whether this scanner's BigQuery readers may run.
                 Production ``/scan`` passes nothing and gets ``True``. FC-068
                 repointed the backtest onto this scanner, and both readers
@@ -80,6 +107,16 @@ class OptionsScanner:
         self.uncovered_days_resolver = UncoveredDaysResolver(
             allow_bigquery=allow_bigquery
         )
+        # FC-013: resolved once, here, so every gate site downstream is a
+        # single `if self.earnings_calendar is None` — there is no second place
+        # where "is the gate on" gets re-derived and can drift.
+        if not getattr(config, 'earnings_enabled', False):
+            self.earnings_calendar = None
+        elif earnings_calendar is not None:
+            self.earnings_calendar = earnings_calendar
+        else:
+            from ..api.earnings_calendar import EarningsCalendarService
+            self.earnings_calendar = EarningsCalendarService(config)
 
     def scan_for_put_opportunities(self, max_results: int = 10) -> List[Dict[str, Any]]:
         """Scan for cash-secured put opportunities across all configured stocks.
@@ -100,11 +137,29 @@ class OptionsScanner:
             
             for stock in suitable_stocks:
                 symbol = stock['symbol']
-                
+
+                # FC-013 put leg: N=2 days-until, symbol-level. Checked BEFORE
+                # `_has_existing_position` — both are network-or-cache checks,
+                # and gating first makes the event count read as the earnings
+                # exposure of the post-`filter_suitable_stocks` candidate set:
+                # the symbols that could otherwise have produced puts this
+                # scan, held or not. Stage-1 rejects are upstream and never
+                # reach the gate.
+                #
+                # Why N=2 and not span (DD-3): ten months of fills put put-side
+                # realized-loss risk in *immediate pre-event entries* (the GOOGL
+                # 04-28 shape, days_until=1), while wide-window pre-earnings put
+                # income was the book's best bucket — 100% win rate, $301
+                # average. A wide put window would forfeit the best trades to
+                # block a risk that lives in the last two days. The legs
+                # diverging is the deliberate choice, not an oversight.
+                if self._put_leg_blocked_by_earnings(symbol):
+                    continue
+
                 # Skip if we already have positions in this stock
                 if self._has_existing_position(symbol):
                     continue
-                
+
                 # Get put opportunities for this stock
                 puts = self.market_data.find_suitable_puts(symbol)
                 
@@ -203,6 +258,28 @@ class OptionsScanner:
                     recorded_symbols.append(symbol)
                     continue
 
+                # FC-013 call leg, part 1 of 2: the symbol-level UNKNOWN skip.
+                # Sits before cost-basis resolution deliberately — an
+                # unanswerable symbol should not spend a resolver call and a
+                # BigQuery cross-check to reach the same skip. There is NO
+                # symbol-level blackout skip on this leg (rev 2.2): a symbol
+                # reporting in three days may legally sell a call expiring in
+                # two, and that legality is DD-3's whole point. Blocking here
+                # is only for "we could not tell", where no candidate can be
+                # cleared because the span test has no date to test against.
+                earnings_status, earnings_date = self._call_leg_earnings(symbol)
+                if earnings_status == EARNINGS_UNKNOWN:
+                    logger.warning("Skipping call scan - earnings calendar could not answer",
+                                   event_category="trade",
+                                   event_type="call_scan_skipped_earnings_unknown",
+                                   symbol=symbol,
+                                   shares=shares,
+                                   **self._earnings_enrichment(symbol))
+                    recorder.record(symbol, OUTCOME_BLOCKED,
+                                    REASON_EARNINGS_UNKNOWN, **labels)
+                    recorded_symbols.append(symbol)
+                    continue
+
                 # CRITICAL: Resolve cost basis per share for protection.
                 # This ensures we never sell calls below cost basis (guaranteed loss).
                 # FC-065: the floor is Alpaca's avg_entry_price, verified inline
@@ -278,21 +355,58 @@ class OptionsScanner:
                             tolerance=cross_check.get('tolerance'),
                             reason=cross_check.get('reason'))
 
-                # Get call opportunities filtered by cost basis
+                # Get call opportunities filtered by cost basis — and, FC-013
+                # call leg part 2 of 2, by the earnings SPAN predicate. The
+                # date threads into the criteria chain exactly the way the
+                # floor does; a 'clear' symbol passes None and is
+                # unconstrained, byte-identical to pre-FC-013. The per-
+                # candidate test reuses this symbol's single date fetch, so
+                # candidate count adds zero Finnhub calls.
                 calls = self.market_data.find_suitable_calls(
                     symbol,
-                    min_strike_price=cost_basis_per_share
+                    min_strike_price=cost_basis_per_share,
+                    exclude_expiry_on_or_after=earnings_date
                 )
 
                 logger.debug("Filtering calls for cost basis protection",
                             symbol=symbol,
                             cost_basis_per_share=cost_basis_per_share,
+                            next_earnings_date=(
+                                earnings_date.isoformat() if earnings_date else None),
                             calls_found=len(calls))
 
                 floor_labels = dict(labels)
                 floor_labels['cost_basis_per_share'] = cost_basis_per_share
                 floor_labels['underwater'] = underwater_pct(
                     mark_price, cost_basis_per_share)
+
+                # The span predicate emptied the symbol's candidate set: every
+                # qualifying strike expired into the event. That is a policy
+                # gate terminating the symbol, so it is `blocked`, not
+                # `no_candidates` — the reason a reader gets must survive to
+                # the row, or this repeats the NVDA silent-exclusion failure.
+                # Carries basis/underwater because the chain had to be fetched
+                # to know it emptied (DD-4), matching the no_candidates shape
+                # at this ladder position. Empty with ZERO span rejections is
+                # the ordinary no_candidates path below, untouched.
+                span_rejections = self._symbol_rejection_counts(symbol).get(
+                    'expires_into_earnings', 0)
+                if not calls and span_rejections > 0:
+                    logger.info("Skipping call scan - every qualifying strike spans earnings",
+                                event_category="trade",
+                                event_type="call_scan_skipped_earnings_blackout",
+                                symbol=symbol,
+                                shares=shares,
+                                cost_basis_per_share=cost_basis_per_share,
+                                spanning_candidates_rejected=span_rejections,
+                                **self._earnings_enrichment(symbol))
+                    recorder.record(symbol, OUTCOME_BLOCKED,
+                                    REASON_EARNINGS_BLACKOUT,
+                                    candidates=0,
+                                    reason_counts=self._symbol_rejection_counts(symbol),
+                                    **floor_labels)
+                    recorded_symbols.append(symbol)
+                    continue
 
                 if not calls:
                     # THE "nothing happened" CASE. Before this record, an
@@ -391,6 +505,71 @@ class OptionsScanner:
             # investigating.
             if recorder is not None:
                 recorder.flush(expected_symbols=recorded_symbols)
+
+    # ------------------------------------------------------------------ #
+    # FC-013 — the earnings gate
+    # ------------------------------------------------------------------ #
+    def _earnings_enrichment(self, symbol: str) -> Dict[str, Any]:
+        """Proximity fields for the skip events, or empty when unavailable.
+
+        Best-effort by design: enrichment must never be able to turn a gate
+        decision into an exception. A calendar seam that lacks the method (a
+        test double, a future implementation) simply logs less.
+        """
+        try:
+            proximity = self.earnings_calendar.get_earnings_proximity(symbol)
+        except Exception:
+            return {}
+        return proximity if isinstance(proximity, dict) else {}
+
+    def _call_leg_earnings(self, symbol: str) -> Tuple[str, Optional[date]]:
+        """The call leg's calendar answer: ``(status, date_or_None)``.
+
+        With the gate off this reports ``('clear', None)``, which threads a
+        ``None`` span floor into ``find_suitable_calls`` — the pre-FC-013
+        behaviour, byte-identical.
+        """
+        if self.earnings_calendar is None:
+            return (EARNINGS_CLEAR, None)
+        status, earnings_date = self.earnings_calendar.next_earnings_info(symbol)
+        return (status, earnings_date if status == EARNINGS_KNOWN else None)
+
+    def _put_leg_blocked_by_earnings(self, symbol: str) -> bool:
+        """Whether the put leg skips ``symbol`` this scan. Emits the event.
+
+        Tri-state, and the third state is the point: ``None`` from
+        ``earnings_within`` means the calendar could not answer, and an
+        unanswerable symbol is skipped (fail closed) under a *different* event
+        name than a real blackout. Blocking on an outage and blocking on
+        earnings look identical in a P&L; they need completely different
+        operator responses, so they get different events — and only the
+        unknown one is alerted (DD-6).
+        """
+        if self.earnings_calendar is None:
+            return False
+
+        within = self.earnings_calendar.earnings_within(
+            symbol, self.config.earnings_blackout_days)
+
+        if within is None:
+            logger.warning("Skipping put scan - earnings calendar could not answer",
+                           event_category="trade",
+                           event_type="put_scan_skipped_earnings_unknown",
+                           symbol=symbol,
+                           blackout_days=self.config.earnings_blackout_days,
+                           **self._earnings_enrichment(symbol))
+            return True
+
+        if within:
+            logger.info("Skipping put scan - earnings blackout",
+                        event_category="trade",
+                        event_type="put_scan_skipped_earnings_blackout",
+                        symbol=symbol,
+                        blackout_days=self.config.earnings_blackout_days,
+                        **self._earnings_enrichment(symbol))
+            return True
+
+        return False
 
     @staticmethod
     def _call_rejection_counts(stats: Optional[Dict[str, Any]] = None) -> Dict[str, int]:

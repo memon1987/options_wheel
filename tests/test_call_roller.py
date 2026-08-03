@@ -468,3 +468,66 @@ class TestWheelStateRollTracking:
     def test_get_active_call_details_no_state(self):
         wsm = WheelStateManager()
         assert wsm.get_active_call_details('NONEXISTENT') is None
+
+
+class TestRollerEarningsGateUnchanged:
+    """FC-013 test 14 — the operator decided the roller keeps its gate as-is.
+
+    FC-013 introduces fail-CLOSED tri-state semantics for the scanner's gate.
+    Those must not leak here: the roll path still consumes the boolean
+    `is_earnings_within_n_days` surface and still fails OPEN. Two different
+    postures on one service object, deliberately (FC-069 item 4 sign-off,
+    unification handed to FC-066's pre-revival checklist).
+    """
+
+    def test_the_roller_still_calls_the_boolean_surface_not_the_tristate(
+            self, roller, mock_earnings):
+        today = datetime.now().strftime('%y%m%d')
+        call_pos = {'symbol': f'AMD{today}C00100000', 'qty': '-1'}
+        stock_pos = {'symbol': 'AMD', 'qty': '100', 'cost_basis': '9500'}
+
+        roller.should_roll(call_pos, stock_pos, 105.0)
+
+        assert mock_earnings.is_earnings_within_n_days.called
+        assert not mock_earnings.next_earnings_info.called
+        assert not mock_earnings.earnings_within.called
+
+    def test_it_still_uses_the_rolling_knob_not_the_scanner_gates(
+            self, roller, mock_earnings, rolling_config):
+        """Two knobs stay separate (DD-5). Unifying them would reach into the
+        roller's config surface while FC-069 item 13 holds all `rolling.*`
+        keys for FC-066."""
+        today = datetime.now().strftime('%y%m%d')
+        call_pos = {'symbol': f'AMD{today}C00100000', 'qty': '-1'}
+        stock_pos = {'symbol': 'AMD', 'qty': '100', 'cost_basis': '9500'}
+
+        roller.should_roll(call_pos, stock_pos, 105.0)
+
+        _, kwargs = mock_earnings.is_earnings_within_n_days.call_args
+        args, _ = mock_earnings.is_earnings_within_n_days.call_args
+        assert args[1] == rolling_config.rolling_earnings_blackout_days == 2
+
+    def test_a_real_service_still_fails_open_for_the_roller(self):
+        """The live service's boolean surface must keep allowing the roll when
+        the calendar cannot answer — the exact case FC-013 makes the scanner
+        BLOCK on. If this flips, FC-013 changed the roller against the
+        operator's decision.
+        """
+        from unittest.mock import patch as _patch
+        from src.api.earnings_calendar import (
+            EARNINGS_UNKNOWN, EarningsCalendarService)
+
+        cfg = Mock()
+        cfg.finnhub_api_key = "test_finnhub_key"
+        cfg.earnings_enabled = True
+        cfg.earnings_cache_ttl_hours = 24
+        cfg.earnings_lookahead_days = 90
+        cfg.opportunity_bucket = "test-bucket"
+
+        with _patch.object(EarningsCalendarService, "_fetch_earnings",
+                           lambda self, symbol: None):
+            svc = EarningsCalendarService(cfg)
+
+            assert svc.next_earnings_info("AMD") == (EARNINGS_UNKNOWN, None)
+            assert svc.earnings_within("AMD", 2) is None       # scanner: block
+            assert svc.is_earnings_within_n_days("AMD", 2) is False  # roller: allow
