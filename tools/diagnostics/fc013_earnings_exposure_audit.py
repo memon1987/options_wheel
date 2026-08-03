@@ -180,9 +180,9 @@ def report(df, calendar_meta: Dict) -> None:
         f"{', '.join(sorted(calendar_meta['empty_symbols'])) or '—'})")
     out(f"Fills          : {len(df)} option sell-to-open fills, "
         f"{df['fill_date'].min()} -> {df['fill_date'].max()}")
-    out(f"  by leg       : " + ", ".join(
+    out("  by leg       : " + ", ".join(
         f"{k}={v}" for k, v in sorted(df["option_type"].value_counts().items())))
-    out(f"  by side      : " + ", ".join(
+    out("  by side      : " + ", ".join(
         f"{k}={v}" for k, v in sorted(df["side"].value_counts().items())))
 
     # ---- data quality -----------------------------------------------------
