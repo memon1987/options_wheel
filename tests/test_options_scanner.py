@@ -304,7 +304,7 @@ class TestOptionsScannerCallScan:
         assert results[0]['max_contracts'] == 1
         # Should filter by cost basis
         self.mock_market_data.find_suitable_calls.assert_called_once_with(
-            'AAPL', min_strike_price=160.0
+            'AAPL', min_strike_price=160.0, exclude_expiry_on_or_after=None
         )
 
     def test_multiple_round_lots_size_to_every_lot(self):
@@ -455,7 +455,7 @@ class TestCallScanFailsClosedOnUnresolvedCostBasis:
         assert len(results) == 1
         assert results[0]['symbol'] == 'AAPL'
         self.mock_market_data.find_suitable_calls.assert_called_once_with(
-            'AAPL', min_strike_price=160.0)
+            'AAPL', min_strike_price=160.0, exclude_expiry_on_or_after=None)
 
     def test_one_bad_position_does_not_suppress_a_good_one(self):
         self.mock_alpaca.get_positions.return_value = [
@@ -516,7 +516,7 @@ class TestCallScanFloorIsTheBrokerBasisCrossCheckedAgainstBigQuery:
         assert len(results) == 1
         # The broker's number filtered the chain scan...
         self.mock_market_data.find_suitable_calls.assert_called_once_with(
-            'AAPL', min_strike_price=303.50)
+            'AAPL', min_strike_price=303.50, exclude_expiry_on_or_after=None)
         # ...and is the same number carried on the opportunity, which is what
         # call_seller enforces at execution.
         assert results[0]['cost_basis_per_share'] == 303.50
@@ -580,7 +580,7 @@ class TestCallScanFloorIsTheBrokerBasisCrossCheckedAgainstBigQuery:
 
         assert len(results) == 1
         self.mock_market_data.find_suitable_calls.assert_called_once_with(
-            'AAPL', min_strike_price=303.50)
+            'AAPL', min_strike_price=303.50, exclude_expiry_on_or_after=None)
         events = [c.kwargs for c in mock_logger.info.call_args_list
                   if c.kwargs.get("event_type") == "cost_basis_cross_check"]
         assert len(events) == 1
@@ -662,7 +662,7 @@ class TestAtFloorStrikesAreFlaggedTheWayTheGatesTreatThem:
         self.scanner.scan_for_call_opportunities()
 
         self.mock_market_data.find_suitable_calls.assert_called_once_with(
-            'GOOGL', min_strike_price=368.34)
+            'GOOGL', min_strike_price=368.34, exclude_expiry_on_or_after=None)
 
     def test_a_strike_above_the_floor_is_still_flagged_above(self):
         self._chain(375.00)

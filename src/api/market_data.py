@@ -1,7 +1,7 @@
 """Market data utilities for options wheel strategy."""
 
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import pandas as pd
 import numpy as np
 import structlog
@@ -21,6 +21,27 @@ logger = structlog.get_logger(__name__)
 # happily propose a contract that expired weeks ago. Measuring age in
 # simulated time makes the cache expire between simulated days, as intended.
 _DEFAULT_CACHE_TTL = timedelta(seconds=300)
+
+
+def _coerce_date(value) -> Optional[date]:
+    """Normalize an expiration to a plain ``date``, or None if unusable.
+
+    Contracts arrive with ``expiration_date`` as an ISO string from both the
+    live client (``parse_option_symbol``) and the backtest adapter
+    (``quote.expiration.isoformat()``), but ``get_option_chain_with_analysis``
+    also tolerates ``datetime``, and test fixtures pass ``date``. One coercion
+    so the FC-013 span comparison cannot silently compare a str to a date.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.fromisoformat(str(value)[:10].replace('Z', '')).date()
+    except (TypeError, ValueError):
+        return None
 
 
 class MarketDataManager:
@@ -381,16 +402,36 @@ class MarketDataManager:
 
         return suitable_puts[:5]  # Return top 5
     
-    def find_suitable_calls(self, symbol: str, min_strike_price: float = 0.0) -> List[Dict[str, Any]]:
+    def find_suitable_calls(self, symbol: str, min_strike_price: float = 0.0,
+                            exclude_expiry_on_or_after: Optional[date] = None
+                            ) -> List[Dict[str, Any]]:
         """Find call options suitable for selling in wheel strategy.
 
         Args:
             symbol: Underlying stock symbol
             min_strike_price: Minimum strike price (typically cost basis to avoid guaranteed losses)
+            exclude_expiry_on_or_after: FC-013 DD-3 — the earnings **span**
+                predicate. When set, a candidate whose ``expiration_date`` falls
+                on or after this date is rejected: any call whose expiry covers
+                the report carries the full gap (AMZN C262.5, +12.3% gap
+                *through* the strike, $2,308 surrendered against $222
+                collected). Candidates expiring strictly *before* the event
+                proceed untouched — that allowed case is what makes span
+                DTE-invariant, and it is why the operator rejected both a
+                hardcoded N and a derive-N-from-DTE proxy.
+
+                ``>=`` is inclusive on purpose: assignment on an expiry that
+                lands on the report date resolves *after* the report, so
+                expiry-day-equals-event-day carries the gap like any other
+                spanning contract.
+
+                ``None`` (the default) is today's behaviour, byte-identical —
+                the parameter is inert for every caller that does not pass it.
 
         Returns:
             List of suitable call options, sorted by attractiveness
         """
+        span_floor = _coerce_date(exclude_expiry_on_or_after)
         options_data = self.get_option_chain_with_analysis(symbol)
         calls = options_data['calls']
 
@@ -402,7 +443,9 @@ class MarketDataManager:
                    target_dte=self.config.call_target_dte,
                    min_premium=self.config.min_call_premium,
                    delta_range=self.config.call_delta_range,
-                   min_strike_price=min_strike_price)
+                   min_strike_price=min_strike_price,
+                   exclude_expiry_on_or_after=(
+                       span_floor.isoformat() if span_floor else None))
 
         # Warn if cost basis protection is not being used. Pre-FC-029 this
         # warning fired for legitimate put-only scans too (no shares held);
@@ -426,6 +469,13 @@ class MarketDataManager:
             'premium_too_low': 0,
             'delta_out_of_range': 0,
             'no_liquidity': 0,
+            # FC-013: counted LAST in the chain, so it means "a strike that
+            # otherwise qualified was removed because it expires into
+            # earnings" — not "some contract in the chain happens to span".
+            # OptionsScanner reads exactly that meaning: an empty result with
+            # this counter > 0 is a span-emptied symbol (a decision row),
+            # while an empty result with it at 0 is ordinary `no_candidates`.
+            'expires_into_earnings': 0,
             'total_rejected': 0
         }
 
@@ -473,6 +523,35 @@ class MarketDataManager:
                 rejected_calls_data['strikes'].append(call['strike_price'])
                 continue
 
+            # FC-013 DD-3: the earnings SPAN predicate, applied last so the
+            # counter answers "how many QUALIFYING strikes did the event take".
+            # A contract that would have failed delta/DTE/premium anyway is
+            # attributed to that reason, not to earnings — otherwise a symbol
+            # with no tradeable strikes at all would be filed as span-emptied.
+            if span_floor is not None:
+                expiry = _coerce_date(call.get('expiration_date'))
+                # An expiry we cannot parse is rejected too: this is a risk
+                # control, and "we could not tell whether it spans" must not
+                # resolve to "sell it". Structurally unreachable today —
+                # get_option_chain_with_analysis already drops contracts with
+                # no expiration_date — which is exactly why it must not be the
+                # one path that fails open if that ever changes.
+                if expiry is None or expiry >= span_floor:
+                    rejection_stats['total_rejected'] += 1
+                    rejection_stats['expires_into_earnings'] += 1
+                    rejected_calls_data['premiums'].append(call['mid_price'])
+                    rejected_calls_data['deltas'].append(abs(call.get('delta', 0)))
+                    rejected_calls_data['dtes'].append(call['dte'])
+                    rejected_calls_data['strikes'].append(call['strike_price'])
+                    logger.debug("Call rejected - expiry spans earnings",
+                                 event_category="filtering",
+                                 event_type="call_rejected_expires_into_earnings",
+                                 symbol=symbol,
+                                 option_symbol=call.get('symbol'),
+                                 expiration_date=expiry.isoformat() if expiry else None,
+                                 next_earnings_date=span_floor.isoformat())
+                    continue
+
             # Calculate annualized return
             if call['dte'] > 0 and call['mid_price'] > 0:
                 annual_return = (call['mid_price'] / call['strike_price']) * (365 / call['dte'])
@@ -507,7 +586,8 @@ class MarketDataManager:
                        rejected_dte_too_high=rejection_stats['dte_too_high'],
                        rejected_premium_too_low=rejection_stats['premium_too_low'],
                        rejected_delta_out_of_range=rejection_stats['delta_out_of_range'],
-                       rejected_no_liquidity=rejection_stats['no_liquidity'])
+                       rejected_no_liquidity=rejection_stats['no_liquidity'],
+                       rejected_expires_into_earnings=rejection_stats['expires_into_earnings'])
         else:
             # Calculate stats for rejected calls
             avg_premium = sum(rejected_calls_data['premiums']) / len(rejected_calls_data['premiums']) if rejected_calls_data['premiums'] else 0
@@ -529,6 +609,7 @@ class MarketDataManager:
                        rejected_premium_too_low=rejection_stats['premium_too_low'],
                        rejected_delta_out_of_range=rejection_stats['delta_out_of_range'],
                        rejected_no_liquidity=rejection_stats['no_liquidity'],
+                       rejected_expires_into_earnings=rejection_stats['expires_into_earnings'],
                        # Stats on rejected calls
                        rejected_avg_premium=round(avg_premium, 2),
                        rejected_avg_delta=round(avg_delta, 4),
