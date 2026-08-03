@@ -168,6 +168,12 @@ def _no_finnhub(monkeypatch, request):
     # Storage or leaking module-scope cache entries.
     monkeypatch.setattr(EarningsCalendarService, "_l2_read", lambda self: None)
     monkeypatch.setattr(EarningsCalendarService, "_store_to_l2", lambda self: None)
+    # A stand-in client, so "does this test see a working gate" never depends on
+    # whether `finnhub-python` happens to be installed. It is never called: the
+    # only method that touches it is `_fetch_earnings`, chokepointed below.
+    monkeypatch.setattr(
+        EarningsCalendarService, "_build_client",
+        staticmethod(lambda api_key: object()))
 
     if not request.node.get_closest_marker("real_finnhub_fetch"):
         monkeypatch.setattr(

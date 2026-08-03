@@ -201,3 +201,47 @@ class TestSelectionDropsAreBucketedByReason:
         with clock.frozen(datetime(2026, 3, 2, 16, 0)):
             tally.processor(None, "info", {"event_type": "selection_dropped"})
         assert tally.summary() == {}
+
+
+class TestTheEarningsGateEventsAreNamed:
+    """FC-013 §5 — test 18.
+
+    A replay day where the earnings gate blocked everything must say so. The
+    FC-057 failure mode is a verdict that reads "this symbol did nothing" when
+    the truth is "a filter excluded it" — and an earnings-week symbol is
+    excluded on every scan of that week.
+    """
+
+    def _one(self, event_type, symbol="AMZN"):
+        tally = RejectionTally()
+        with clock.frozen(datetime(2026, 7, 30, 16, 0)):
+            tally.processor(None, "info", {"event_type": event_type,
+                                           "symbol": symbol})
+        return tally.summary()
+
+    def test_a_put_side_blackout_becomes_a_named_reason(self):
+        """Fails against the pre-FC-013 table, where this event was unmapped."""
+        assert self._one("put_scan_skipped_earnings_blackout") == {
+            "earnings blackout (scan, put)": 1}
+
+    def test_a_call_side_span_emptied_chain_becomes_a_named_reason(self):
+        """The label says what the event now MEANS post-rev-2.2: the span
+        predicate removed every qualifying strike, not "the symbol is within
+        N days"."""
+        assert self._one("call_scan_skipped_earnings_blackout") == {
+            "earnings span emptied the chain (scan, call)": 1}
+
+    @pytest.mark.parametrize("event", [
+        "put_scan_skipped_earnings_unknown",
+        "call_scan_skipped_earnings_unknown",
+    ])
+    def test_the_unknown_events_are_deliberately_unmapped(self, event):
+        """Not an oversight — do not "fix" this.
+
+        In a replay the historical calendar never returns unknown (table-backed,
+        fail-open on gaps and reported instead), so a mapping would be an entry
+        with no replay emitter: coverage that counts nothing, which is exactly
+        what FC-068's rewrite of this table removed.
+        """
+        assert event not in _REASONS
+        assert self._one(event) == {}

@@ -1188,3 +1188,485 @@ class TestScanStageDecisionRecords:
 
         assert len(captured) == 1
         assert is_run_id(captured[0]['run_id'])
+
+
+# =========================================================================== #
+# FC-013 — the earnings gate
+#
+# Plan: docs/plans/fc-013.md. Per-leg semantics (DD-3, operator 2026-08-03):
+#   puts  = N=2 days-until, symbol-level
+#   calls = TRUE SPAN per candidate (expiry >= next earnings date)
+#   unknown = symbol-level on BOTH legs, fail closed, its own event/reason
+# =========================================================================== #
+
+from datetime import date as _date, timedelta
+from src.api.earnings_calendar import (
+    EARNINGS_CLEAR, EARNINGS_KNOWN, EARNINGS_UNKNOWN,
+)
+
+_TODAY = _date(2026, 8, 3)
+
+
+class FakeCalendar:
+    """An injectable calendar with the tri-state surface, no network.
+
+    Constructed from per-symbol answers so a test can say exactly what the
+    calendar knows: a date, ``'clear'``, or ``'unknown'``.
+    """
+
+    def __init__(self, answers, today=_TODAY):
+        # answers: {symbol: date | 'clear' | 'unknown'}
+        self.answers = answers
+        self.today = today
+        self.queried = []
+
+    def next_earnings_info(self, symbol):
+        self.queried.append(symbol)
+        answer = self.answers.get(symbol, 'clear')
+        if answer == 'unknown':
+            return (EARNINGS_UNKNOWN, None)
+        if answer == 'clear':
+            return (EARNINGS_CLEAR, None)
+        return (EARNINGS_KNOWN, answer)
+
+    def earnings_within(self, symbol, n_days):
+        status, earnings_date = self.next_earnings_info(symbol)
+        if status == EARNINGS_UNKNOWN:
+            return None
+        if status == EARNINGS_CLEAR:
+            return False
+        return 0 <= (earnings_date - self.today).days <= n_days
+
+    def get_earnings_proximity(self, symbol):
+        status, earnings_date = self.next_earnings_info(symbol)
+        if status != EARNINGS_KNOWN:
+            return {"next_earnings_date": None, "days_until": None,
+                    "earnings_hour": None}
+        return {"next_earnings_date": earnings_date.isoformat(),
+                "days_until": (earnings_date - self.today).days,
+                "earnings_hour": "amc"}
+
+
+def _events(mock_logger, event_type):
+    calls = (list(mock_logger.info.call_args_list)
+             + list(mock_logger.warning.call_args_list))
+    return [c.kwargs for c in calls if c.kwargs.get("event_type") == event_type]
+
+
+class TestPutLegEarningsGate:
+    """Tests 1 and 2 — N=2 days-until, symbol-level."""
+
+    def setup_method(self):
+        self.mock_alpaca = Mock()
+        self.mock_market_data = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.stock_symbols = ['AAPL', 'MSFT']
+        self.mock_config.put_target_dte = 7
+        self.mock_config.call_target_dte = 7
+        self.mock_config.earnings_enabled = True
+        self.mock_config.earnings_blackout_days = 2
+        self.mock_alpaca.get_positions.return_value = []
+        self.mock_market_data.filter_suitable_stocks.return_value = [
+            {'symbol': 'AAPL', 'current_price': 300.0},
+            {'symbol': 'MSFT', 'current_price': 400.0},
+        ]
+        self.mock_market_data.find_suitable_puts.side_effect = lambda symbol: [{
+            'symbol': '%s260810P00280000' % symbol, 'strike_price': 280.0,
+            'expiration_date': '2026-08-10', 'dte': 7, 'delta': -0.15,
+            'mid_price': 2.50, 'bid': 2.45, 'ask': 2.55, 'volume': 1500,
+            'open_interest': 5000, 'implied_volatility': 0.25,
+        }]
+
+    def _scan(self, calendar):
+        scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                                 self.mock_config, earnings_calendar=calendar)
+        return scanner.scan_for_put_opportunities()
+
+    def test_put_scan_skips_symbol_in_earnings_blackout(self):
+        """Test 1 — the GOOGL incident geometry (days_until = 1 <= 2).
+
+        MUTATION CHECK: with the gate reverted (the
+        `_put_leg_blocked_by_earnings` call removed from the loop), AAPL
+        produces a put opportunity and this test FAILS.
+        """
+        calendar = FakeCalendar({'AAPL': _TODAY + timedelta(days=1)})
+
+        with patch('src.data.options_scanner.logger') as mock_logger:
+            results = self._scan(calendar)
+
+        assert [r['symbol'] for r in results] == ['MSFT']
+        blocked = _events(mock_logger, 'put_scan_skipped_earnings_blackout')
+        assert len(blocked) == 1
+        assert blocked[0]['symbol'] == 'AAPL'
+        assert blocked[0]['days_until'] == 1
+        assert blocked[0]['blackout_days'] == 2
+
+    @pytest.mark.parametrize("days_until,blocked", [(0, True), (2, True), (3, False)])
+    def test_put_window_boundary(self, days_until, blocked):
+        """Test 2 — inclusive at both ends; day-of is blocked."""
+        calendar = FakeCalendar({'AAPL': _TODAY + timedelta(days=days_until)})
+
+        results = self._scan(calendar)
+
+        emitted = [r['symbol'] for r in results]
+        assert ('AAPL' in emitted) is (not blocked)
+        assert 'MSFT' in emitted
+
+    def test_the_gate_runs_before_the_existing_position_check(self):
+        """Placement matters: the event count must read as the earnings exposure
+        of the post-stage-1 candidate set, held or not."""
+        calendar = FakeCalendar({'AAPL': _TODAY + timedelta(days=1)})
+        scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                                 self.mock_config, earnings_calendar=calendar)
+        scanner._has_existing_position = Mock(return_value=False)
+
+        scanner.scan_for_put_opportunities()
+
+        # AAPL was gated before `_has_existing_position` was ever consulted for it.
+        assert [c.args[0] for c in scanner._has_existing_position.call_args_list] == [
+            'MSFT']
+
+
+class TestCallLegEarningsSpanGate:
+    """Tests 3, 4, 5, 6, 7, 8 at the scanner — a REAL MarketDataManager, so the
+    span predicate under test is the shipped one and not a mock's opinion."""
+
+    def setup_method(self):
+        from src.api.market_data import MarketDataManager
+
+        self.mock_alpaca = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.call_target_dte = 45
+        self.mock_config.call_delta_range = [0.10, 0.25]
+        self.mock_config.min_call_premium = 0.30
+        self.mock_config.earnings_enabled = True
+        self.mock_config.earnings_blackout_days = 2
+
+        self.market_data = MarketDataManager(self.mock_alpaca, self.mock_config)
+        self.market_data.get_stock_metrics = Mock(
+            return_value={'current_price': 236.73})
+
+        self.mock_alpaca.get_positions.return_value = [{
+            'symbol': 'AMZN', 'qty': '100', 'cost_basis': '26120.0',
+            'avg_entry_price': '261.20', 'market_value': '23673.0',
+            'asset_class': 'us_equity', 'side': 'long',
+        }]
+
+    def _chain(self, expiries, strike=262.5):
+        calls = [{
+            'symbol': 'AMZN%sC00262500' % e.strftime("%y%m%d"),
+            'underlying_symbol': 'AMZN', 'option_type': 'call',
+            'strike_price': strike, 'expiration_date': e.isoformat(),
+            'dte': (e - _TODAY).days, 'delta': 0.17, 'mid_price': 2.22,
+            'bid': 2.17, 'ask': 2.27, 'last_price': 2.22, 'volume': 900,
+            'open_interest': 4000, 'implied_volatility': 0.68,
+        } for e in expiries]
+        self.market_data.get_option_chain_with_analysis = Mock(
+            return_value={'puts': [], 'calls': calls})
+
+    def _scanner(self, calendar):
+        return OptionsScanner(self.mock_alpaca, self.market_data,
+                              self.mock_config, earnings_calendar=calendar)
+
+    def _rows(self, scanner, run_id="20260803T140000Z-abcdef12"):
+        captured = []
+        with patch('src.data.decision_record.DecisionRecorder.flush',
+                   autospec=True,
+                   side_effect=lambda self, **_: captured.extend(self.rows)):
+            results = scanner.scan_for_call_opportunities(run_id=run_id)
+        return results, captured
+
+    def test_a_spanning_candidate_is_dropped_and_a_sibling_survives(self):
+        """Test 3, through the scanner: the date threads into the chain."""
+        earnings = _TODAY + timedelta(days=5)
+        self._chain([_TODAY + timedelta(days=7), _TODAY + timedelta(days=3)])
+
+        scanner = self._scanner(FakeCalendar({'AMZN': earnings}))
+        results, _ = self._rows(scanner)
+
+        assert len(results) == 1
+        assert results[0]['expiration_date'] == (
+            _TODAY + timedelta(days=3)).isoformat()
+        assert self.market_data.last_call_rejection_stats['AMZN'][
+            'expires_into_earnings'] == 1
+
+    def test_call_candidate_expiring_before_earnings_is_allowed(self):
+        """Test 4 — the DTE-extension pin, end to end.
+
+        MUTATION CHECK (both must be caught): a hardcoded N=7 symbol-level
+        block, or one deriving N from DTE, blocks AMZN entirely at
+        days_until = 5 and this test FAILS.
+        """
+        self._chain([_TODAY + timedelta(days=3)])
+
+        scanner = self._scanner(FakeCalendar({'AMZN': _TODAY + timedelta(days=5)}))
+        results, rows = self._rows(scanner)
+
+        assert len(results) == 1
+        assert rows == []  # terminated by /run, not by the gate
+
+    def test_span_boundary_expiry_on_earnings_day_is_blocked(self):
+        """Test 5 at the scanner."""
+        earnings = _TODAY + timedelta(days=5)
+        self._chain([earnings, earnings - timedelta(days=1)])
+
+        scanner = self._scanner(FakeCalendar({'AMZN': earnings}))
+        results, _ = self._rows(scanner)
+
+        assert [r['expiration_date'] for r in results] == [
+            (earnings - timedelta(days=1)).isoformat()]
+
+    def test_call_set_emptied_by_span_writes_blocked_row(self):
+        """Test 6 — the span-emptied symbol must NOT go silent.
+
+        A `no_candidates{no_qualifying_strikes}` row here would be a mislabel:
+        strikes qualified, the event took them. The NVDA-silent-exclusion
+        failure mode in a new costume.
+        """
+        earnings = _TODAY + timedelta(days=2)
+        self._chain([_TODAY + timedelta(days=4), _TODAY + timedelta(days=11)])
+
+        scanner = self._scanner(FakeCalendar({'AMZN': earnings}))
+        with patch('src.data.options_scanner.logger') as mock_logger:
+            results, rows = self._rows(scanner)
+
+        assert results == []
+        assert len(rows) == 1
+        row = rows[0]
+        assert (row['outcome'], row['reason']) == ('blocked', 'earnings_blackout')
+        # Carries the floor labels: the chain had to be fetched to know it emptied.
+        assert row['cost_basis_per_share'] == 261.20
+        assert row['underwater_pct'] is not None
+        assert {'reason': 'expires_into_earnings', 'count': 2} in row['reason_counts']
+
+        blocked = _events(mock_logger, 'call_scan_skipped_earnings_blackout')
+        assert len(blocked) == 1
+        assert blocked[0]['spanning_candidates_rejected'] == 2
+
+    def test_an_empty_chain_with_no_span_rejections_is_still_no_candidates(self):
+        """The ordinary path must not be swallowed by the new one."""
+        self._chain([])
+
+        scanner = self._scanner(FakeCalendar({'AMZN': _TODAY + timedelta(days=5)}))
+        _, rows = self._rows(scanner)
+
+        assert [(r['outcome'], r['reason']) for r in rows] == [
+            ('no_candidates', 'no_qualifying_strikes')]
+
+    def test_a_chain_emptied_by_delta_is_not_filed_as_earnings(self):
+        """Attribution: earnings must not absorb a symbol it did not terminate."""
+        self._chain([_TODAY + timedelta(days=3)])
+        self.market_data.get_option_chain_with_analysis.return_value[
+            'calls'][0]['delta'] = 0.85
+
+        scanner = self._scanner(FakeCalendar({'AMZN': _TODAY + timedelta(days=5)}))
+        _, rows = self._rows(scanner)
+
+        assert [(r['outcome'], r['reason']) for r in rows] == [
+            ('no_candidates', 'no_qualifying_strikes')]
+
+    def test_the_incident_geometry_is_blocked(self):
+        """Test 7 — the corrected record (rev 2.2).
+
+        AMZN C262.5 and AAPL C347.5 were both sold on 2026-07-30, the DAY OF
+        their AMC reports (`days_until = 0`), both with expiries after the
+        event. AMZN gapped +12.3% through the strike: $2,308 of upside
+        surrendered against $222 collected. AAPL gapped -8.5% and the identical
+        trade shape profited $165 — same geometry, coin the other way.
+
+        (The rev 2.1 "Monday fill at days_until = 3" premise is falsified and
+        deliberately not encoded here.)
+
+        MUTATION CHECK: revert span and the spanning candidate is emitted, so
+        this test FAILS.
+        """
+        earnings_today = _TODAY  # AMC report tonight
+        self._chain([_TODAY + timedelta(days=4)])  # the 7-DTE spanner
+
+        scanner = self._scanner(FakeCalendar({'AMZN': earnings_today}))
+        results, rows = self._rows(scanner)
+
+        assert results == []
+        assert [(r['outcome'], r['reason']) for r in rows] == [
+            ('blocked', 'earnings_blackout')]
+
+    def test_clear_symbol_candidates_unconstrained(self):
+        """Test 8 at the scanner: a 'clear' answer constrains nothing."""
+        self._chain([_TODAY + timedelta(days=4), _TODAY + timedelta(days=11)])
+
+        scanner = self._scanner(FakeCalendar({}))  # everything clear
+        results, rows = self._rows(scanner)
+
+        assert len(results) == 2
+        assert rows == []
+        assert self.market_data.last_call_rejection_stats['AMZN'][
+            'expires_into_earnings'] == 0
+
+
+class TestEarningsGateFailureSemantics:
+    """Tests 9, 10, 11, 11b."""
+
+    def setup_method(self):
+        self.mock_alpaca = Mock()
+        self.mock_market_data = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.stock_symbols = ['AAPL']
+        self.mock_config.put_target_dte = 7
+        self.mock_config.call_target_dte = 7
+        self.mock_config.earnings_enabled = True
+        self.mock_config.earnings_blackout_days = 2
+        self.mock_config.finnhub_api_key = "test_finnhub_key"
+        self.mock_config.earnings_cache_ttl_hours = 24
+        self.mock_config.earnings_lookahead_days = 90
+        self.mock_market_data.last_call_rejection_stats = {}
+        self.mock_market_data.get_stock_metrics.return_value = {'current_price': 310.0}
+        self.mock_market_data.filter_suitable_stocks.return_value = [
+            {'symbol': 'AAPL', 'current_price': 310.0}]
+        self.mock_market_data.find_suitable_puts.return_value = [{
+            'symbol': 'AAPL260810P00300000', 'strike_price': 300.0,
+            'expiration_date': '2026-08-10', 'dte': 7, 'delta': -0.15,
+            'mid_price': 2.50, 'bid': 2.45, 'ask': 2.55, 'volume': 1500,
+            'open_interest': 5000, 'implied_volatility': 0.25,
+        }]
+        self.mock_market_data.find_suitable_calls.return_value = [{
+            'symbol': 'AAPL260821C00320000', 'strike_price': 320.0,
+            'expiration_date': '2026-08-21', 'dte': 7, 'delta': 0.20,
+            'mid_price': 1.80, 'bid': 1.75, 'ask': 1.85, 'volume': 2000,
+            'open_interest': 8000, 'implied_volatility': 0.22,
+        }]
+        self.mock_alpaca.get_positions.return_value = [{
+            'symbol': 'AAPL', 'qty': '100', 'cost_basis': '30350.0',
+            'avg_entry_price': '303.50', 'market_value': '31000.0',
+            'asset_class': 'us_equity', 'side': 'long',
+        }]
+
+    def _scanner(self, **kw):
+        return OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                              self.mock_config, **kw)
+
+    def _rows(self, scanner):
+        captured = []
+        with patch('src.data.decision_record.DecisionRecorder.flush',
+                   autospec=True,
+                   side_effect=lambda self, **_: captured.extend(self.rows)):
+            results = scanner.scan_for_call_opportunities(
+                run_id="20260803T140000Z-abcdef12")
+        return results, captured
+
+    def test_earnings_gate_fails_closed_on_unknown(self):
+        """Test 9 — both legs skip, with the UNKNOWN event, not the blackout one.
+
+        And on the call side the cost-basis resolver is never called: the
+        unknown skip sits before it, so an unanswerable symbol spends neither a
+        resolver call nor a BigQuery cross-check.
+        """
+        scanner = self._scanner(earnings_calendar=FakeCalendar({'AAPL': 'unknown'}))
+        scanner.cost_basis_resolver.resolve_detailed = Mock(
+            side_effect=AssertionError("resolver must not run on an unknown symbol"))
+
+        with patch('src.data.options_scanner.logger') as mock_logger:
+            calls, rows = self._rows(scanner)
+            # Flat book for the put leg, so only the gate can suppress AAPL.
+            self.mock_alpaca.get_positions.return_value = []
+            puts = scanner.scan_for_put_opportunities()
+
+        assert puts == []
+        assert calls == []
+        assert len(_events(mock_logger, 'put_scan_skipped_earnings_unknown')) == 1
+        assert len(_events(mock_logger, 'call_scan_skipped_earnings_unknown')) == 1
+        assert _events(mock_logger, 'put_scan_skipped_earnings_blackout') == []
+        assert _events(mock_logger, 'call_scan_skipped_earnings_blackout') == []
+        assert [(r['outcome'], r['reason']) for r in rows] == [
+            ('blocked', 'earnings_unknown')]
+
+    def test_enabled_with_no_key_degrades_loudly_not_crash(self):
+        """Test 10 — DEFAULT-constructed service (no injection), empty key.
+
+        Regression: the half-built-constructor AttributeError being swallowed
+        as `scan_failure`, producing zero opportunities and zero gate telemetry
+        — a state indistinguishable from a broken scanner.
+        """
+        self.mock_config.finnhub_api_key = ""
+
+        scanner = self._scanner()  # no injection: builds the real service
+        assert scanner.earnings_calendar is not None
+        assert scanner.earnings_calendar._client is None
+
+        with patch('src.data.options_scanner.logger') as mock_logger:
+            calls, rows = self._rows(scanner)
+            self.mock_alpaca.get_positions.return_value = []
+            puts = scanner.scan_for_put_opportunities()
+
+        assert puts == []
+        assert calls == []
+        assert len(_events(mock_logger, 'put_scan_skipped_earnings_unknown')) == 1
+        assert len(_events(mock_logger, 'call_scan_skipped_earnings_unknown')) == 1
+        assert [(r['outcome'], r['reason']) for r in rows] == [
+            ('blocked', 'earnings_unknown')]
+        # And crucially: no exception was swallowed as a scan failure.
+        assert [c.kwargs for c in mock_logger.error.call_args_list
+                if c.kwargs.get('error_type') == 'scan_failure'] == []
+
+    def test_gate_absent_when_earnings_disabled(self):
+        """Test 11 — config off restores pre-FC-013 behaviour byte-identically."""
+        self.mock_config.earnings_enabled = False
+
+        scanner = self._scanner(
+            earnings_calendar=FakeCalendar({'AAPL': _TODAY}))  # injected AND ignored
+        assert scanner.earnings_calendar is None
+
+        calls, rows = self._rows(scanner)
+        # The put leg is exercised against a flat book, so the only thing that
+        # could suppress AAPL is the gate — which is off.
+        self.mock_alpaca.get_positions.return_value = []
+        puts = scanner.scan_for_put_opportunities()
+
+        assert [p['symbol'] for p in puts] == ['AAPL']
+        assert len(calls) == 1
+        self.mock_market_data.find_suitable_calls.assert_called_once_with(
+            'AAPL', min_strike_price=303.50, exclude_expiry_on_or_after=None)
+
+    def test_env_override_disables_the_gate(self, monkeypatch, tmp_path):
+        """Test 11b (DD-7) — EARNINGS_ENABLED beats the baked yaml value.
+
+        The emergency lever must not lose to baked config: rolling the yaml key
+        back rides Cloud Build, the pipeline that once sat silently red for 11
+        days (FC-031).
+        """
+        import yaml as _yaml
+        from src.utils.config import Config as _RealConfig
+
+        with open('config/settings.yaml') as fh:
+            settings = _yaml.safe_load(fh)
+        path = tmp_path / "settings.yaml"
+        path.write_text(_yaml.safe_dump(settings))
+        assert settings['earnings']['enabled'] is True
+
+        monkeypatch.delenv("EARNINGS_ENABLED", raising=False)
+        assert _RealConfig(str(path)).earnings_enabled is True
+
+        monkeypatch.setenv("EARNINGS_ENABLED", "false")
+        assert _RealConfig(str(path)).earnings_enabled is False
+
+        monkeypatch.setenv("EARNINGS_ENABLED", "TRUE")
+        assert _RealConfig(str(path)).earnings_enabled is True
+
+        # A typo must not silently disable a risk control.
+        monkeypatch.setenv("EARNINGS_ENABLED", "maybe")
+        assert _RealConfig(str(path)).earnings_enabled is True
+
+    def test_the_env_override_reaches_the_scanner(self, monkeypatch, tmp_path):
+        import yaml as _yaml
+        from src.utils.config import Config as _RealConfig
+
+        with open('config/settings.yaml') as fh:
+            settings = _yaml.safe_load(fh)
+        path = tmp_path / "settings.yaml"
+        path.write_text(_yaml.safe_dump(settings))
+
+        monkeypatch.setenv("EARNINGS_ENABLED", "false")
+        scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                                 _RealConfig(str(path)),
+                                 earnings_calendar=FakeCalendar({'AAPL': _TODAY}))
+
+        assert scanner.earnings_calendar is None

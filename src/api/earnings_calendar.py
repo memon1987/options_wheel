@@ -123,8 +123,7 @@ class EarningsCalendarService:
             return
 
         try:
-            import finnhub
-            self._client = finnhub.Client(api_key=api_key)
+            self._client = self._build_client(api_key)
         except ImportError as exc:
             logger.error(
                 "finnhub-python package not installed",
@@ -134,6 +133,19 @@ class EarningsCalendarService:
                 recoverable=True,
             )
             self._degraded(f"finnhub-python not importable: {exc}")
+
+    @staticmethod
+    def _build_client(api_key: str):
+        """Construct the Finnhub client. A patchable seam, deliberately.
+
+        Kept separate from ``__init__`` so ``tests/conftest.py`` can guarantee
+        a usable client without the ``finnhub-python`` package being installed.
+        Otherwise the whole suite's default gate behaviour would hinge on
+        whether a third-party package happens to be present — the
+        ambient-environment defect this suite has been bitten by three times.
+        """
+        import finnhub
+        return finnhub.Client(api_key=api_key)
 
     def _degraded(self, why: str) -> None:
         """Record an enabled-but-unusable calendar, loudly.

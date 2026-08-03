@@ -844,3 +844,47 @@ class TestMintRunIdTimezone:
     def test_an_aware_time_round_trips(self):
         aware = datetime(2026, 8, 3, 14, 0, 0, tzinfo=timezone.utc)
         assert run_ts_from_run_id(mint_run_id(aware)) == aware
+
+
+class TestEarningsReasonsAreScopedToBlocked:
+    """FC-013 DD-4 — test 17.
+
+    Two reasons, not one. A row that says "earnings blackout" when Finnhub was
+    down is a mislabel, and the closed vocabulary exists precisely so rows
+    cannot misfile. Both are `blocked` reasons only.
+    """
+
+    def test_both_earnings_reasons_are_accepted_under_blocked(self):
+        from src.data.decision_record import (
+            REASON_EARNINGS_BLACKOUT, REASON_EARNINGS_UNKNOWN)
+
+        validate_outcome(OUTCOME_BLOCKED, REASON_EARNINGS_BLACKOUT)
+        validate_outcome(OUTCOME_BLOCKED, REASON_EARNINGS_UNKNOWN)
+
+    def test_cross_pairing_still_raises(self):
+        """The closed enum must not silently widen while it is being extended."""
+        from src.data.decision_record import (
+            OUTCOME_NO_CANDIDATES, REASON_EARNINGS_BLACKOUT,
+            REASON_EARNINGS_UNKNOWN)
+
+        with pytest.raises(UnknownDecisionOutcome):
+            validate_outcome(OUTCOME_DROPPED, REASON_EARNINGS_BLACKOUT)
+        with pytest.raises(UnknownDecisionOutcome):
+            validate_outcome(OUTCOME_NO_CANDIDATES, REASON_EARNINGS_UNKNOWN)
+
+    def test_the_pre_existing_floor_reasons_are_unweakened(self):
+        from src.data.decision_record import (
+            REASON_FLOOR_DIVERGENT, REASON_FLOOR_UNRESOLVED)
+
+        validate_outcome(OUTCOME_BLOCKED, REASON_FLOOR_UNRESOLVED)
+        validate_outcome(OUTCOME_BLOCKED, REASON_FLOOR_DIVERGENT)
+        with pytest.raises(UnknownDecisionOutcome):
+            validate_outcome(OUTCOME_DROPPED, REASON_FLOOR_DIVERGENT)
+
+    def test_the_two_reasons_are_distinct_strings(self):
+        """Collapsing them to one value would make a Finnhub outage and a real
+        blackout indistinguishable in the table forever."""
+        from src.data.decision_record import (
+            REASON_EARNINGS_BLACKOUT, REASON_EARNINGS_UNKNOWN)
+
+        assert REASON_EARNINGS_BLACKOUT != REASON_EARNINGS_UNKNOWN
