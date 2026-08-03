@@ -11,7 +11,9 @@ Two jobs, one script:
    inherited. This joins every historical option sell-to-open fill against the
    committed point-in-time earnings table and reports, for each candidate window
    N, how many fills it would have blocked, what those fills earned, and whether
-   it blocks the two incidents on record (DD-3's binding acceptance criterion).
+   it blocks the three incidents on record (DD-3's binding acceptance criterion):
+   the GOOGL put (days_until=1), the AAPL C347.5 day-of spanner, and the AMZN
+   C262.5 day-of spanner that surrendered $2,308.
 2. **Recurring detective query.** Once the gate ships, re-running this answers
    "did anything trade inside a window this week?" — which matters because the
    log sink to BigQuery is dead and Cloud Logging events age out in 30 days.
@@ -59,14 +61,19 @@ DEFAULT_DATASET = "options_wheel"
 # "expiry >= earnings date" converge — N=7 is the span predicate as a knob value.
 N_BUCKETS = (1, 2, 3, 5, 7)
 
-# The two incidents FC-013 exists to prevent. The chosen configuration must block
-# both (DD-3 acceptance criterion), so a run that cannot find them is a broken
-# join, not an absence of incidents.
+# The THREE incidents FC-013 exists to prevent. The chosen configuration must
+# block all of them (DD-3 acceptance criterion), so a run that cannot find one is
+# a broken join, not an absence of incidents.
 # An incident is identified by (underlying, leg, the earnings event it was opened
 # ahead of) — NOT by a calendar window around the fill. Windowing alone sweeps in
 # post-earnings fills from the same week, whose next earnings is a quarter out;
 # those are deliberately allowed (DD-3: post-earnings is IV-crush territory) and
 # would corrupt the "smallest N that blocks this" arithmetic.
+#
+# `expect_days_until` / `expect_spans` pin the geometry the plan's acceptance
+# criterion rests on. They are asserted, not printed: if the join starts
+# returning a different fill for a pinned incident, that must stop the run rather
+# than quietly restate the criterion against new numbers.
 INCIDENTS = (
     {
         "name": "GOOGL put, opened ahead of 2026-04-29 earnings",
@@ -74,13 +81,32 @@ INCIDENTS = (
         "option_type": "put",
         "earnings_date": date(2026, 4, 29),
         "window": (date(2026, 4, 20), date(2026, 4, 29)),
+        "expect_days_until": 1,
+        "expect_spans": True,
     },
     {
-        "name": "AAPL covered call, opened ahead of 2026-07-30 earnings",
+        "name": "AAPL covered call C347.5, opened ahead of 2026-07-30 earnings",
         "underlying": "AAPL",
         "option_type": "call",
         "earnings_date": date(2026, 7, 30),
         "window": (date(2026, 7, 20), date(2026, 7, 30)),
+        "expect_days_until": 0,
+        "expect_spans": True,
+    },
+    # The flagship. $2,308 of upside surrendered against $222 collected on a
+    # +12.3% gap THROUGH the strike — the single largest demonstrated cost on
+    # record, and the reason the call leg ships the span predicate rather than a
+    # numeric N. It was missing from this list while the plan's fail-loudly
+    # contract named three incidents: the recurring detective run must be able to
+    # locate the one that justified the gate. Caught in review.
+    {
+        "name": "AMZN covered call C262.5, opened ahead of 2026-07-30 earnings",
+        "underlying": "AMZN",
+        "option_type": "call",
+        "earnings_date": date(2026, 7, 30),
+        "window": (date(2026, 7, 20), date(2026, 7, 30)),
+        "expect_days_until": 0,
+        "expect_spans": True,
     },
 )
 
@@ -245,6 +271,21 @@ def report(df, calendar_meta: Dict) -> None:
                 f"expiry {row.expiration}  spans={row.spans_earnings}  "
                 f"premium ${row.premium_total:>8,.2f}  realized {pnl}")
         pinned_days = int(pinned["days_to_next_earnings"])
+        expected_days = incident.get("expect_days_until")
+        if expected_days is not None and pinned_days != expected_days:
+            raise SystemExit(
+                f"FATAL: incident geometry changed — {incident['name']}: pinned "
+                f"fill has days_until={pinned_days}, expected {expected_days}. "
+                "The DD-3 acceptance criterion is stated against the expected "
+                "value; re-derive it before trusting this run."
+            )
+        expected_spans = incident.get("expect_spans")
+        if expected_spans is not None and bool(pinned["spans_earnings"]) != expected_spans:
+            raise SystemExit(
+                f"FATAL: incident geometry changed — {incident['name']}: pinned "
+                f"fill spans_earnings={bool(pinned['spans_earnings'])}, expected "
+                f"{expected_spans}."
+            )
         blocking_ns.append({n for n in N_BUCKETS if n >= pinned_days})
         out(f"    -> pinned fill (*) at days_until={pinned_days}: blocked by N >= "
             f"{pinned_days}   (span predicate blocks it: {bool(pinned['spans_earnings'])})")
@@ -253,10 +294,12 @@ def report(df, calendar_meta: Dict) -> None:
             out(f"    -> blocking EVERY fill opened ahead of this event needs "
                 f"N >= {widest} ({len(sub)} fills)")
 
-    both = set.intersection(*blocking_ns) if blocking_ns else set()
+    all_blocked = set.intersection(*blocking_ns) if blocking_ns else set()
     out("")
-    out(f"  N values from {list(N_BUCKETS)} that block BOTH incidents: "
-        f"{sorted(both) if both else 'NONE — escalate to the span predicate'}")
+    out(f"  N values from {list(N_BUCKETS)} that block ALL {len(INCIDENTS)} "
+        f"incidents: "
+        f"{sorted(all_blocked) if all_blocked else 'NONE — escalate to the span predicate'}")
+    out("  (shipped config: puts N=2 symbol-level; calls TRUE SPAN per candidate)")
     out("=" * 86)
 
 

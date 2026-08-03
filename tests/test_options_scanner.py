@@ -1199,7 +1199,8 @@ class TestScanStageDecisionRecords:
 #   unknown = symbol-level on BOTH legs, fail closed, its own event/reason
 # =========================================================================== #
 
-from datetime import date as _date, timedelta
+from datetime import date as _date, time as dtime, timedelta
+from src.utils import clock as _clock
 from src.api.earnings_calendar import (
     EARNINGS_CLEAR, EARNINGS_KNOWN, EARNINGS_UNKNOWN,
 )
@@ -1670,3 +1671,143 @@ class TestEarningsGateFailureSemantics:
                                  earnings_calendar=FakeCalendar({'AAPL': _TODAY}))
 
         assert scanner.earnings_calendar is None
+
+
+class TestTheDayAfterEarningsIsTradeable:
+    """Reliability review, HIGH — the false blackout on the IV-crush day.
+
+    End-to-end form of the past-date guard. Seeds the module cache exactly the
+    way a real day-D fetch would leave it (AMC report day, fetched late,
+    comfortably inside the 24h TTL), advances the clock one day, and runs a
+    real scan.
+
+    Without the guard the cached 07-30 date threads into the chain as
+    `exclude_expiry_on_or_after=2026-07-30`, every candidate expires on or
+    after that, the chain empties, and the symbol is falsely reported
+    `blocked{earnings_blackout}` — on the post-report day DD-3 explicitly wants
+    the wheel selling into. It would recur every earnings cycle.
+    """
+
+    REPORT_DAY = _date(2026, 7, 30)
+    NEXT_DAY = _date(2026, 7, 31)
+    NEXT_QUARTER = _date(2026, 10, 29)
+
+    def setup_method(self):
+        from src.api.market_data import MarketDataManager
+
+        self.mock_alpaca = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.call_target_dte = 45
+        self.mock_config.call_delta_range = [0.10, 0.25]
+        self.mock_config.min_call_premium = 0.30
+        self.mock_config.earnings_enabled = True
+        self.mock_config.earnings_blackout_days = 2
+        self.mock_config.finnhub_api_key = "test_finnhub_key"
+        self.mock_config.earnings_cache_ttl_hours = 24
+        self.mock_config.earnings_lookahead_days = 90
+
+        self.market_data = MarketDataManager(self.mock_alpaca, self.mock_config)
+        self.market_data.get_stock_metrics = Mock(
+            return_value={'current_price': 264.80})
+        # A 7-DTE call, sold the morning after the report. Expiry 08-07 is
+        # after the (now past) 07-30 date and before the next quarter's.
+        expiry = _date(2026, 8, 7)
+        self.market_data.get_option_chain_with_analysis = Mock(return_value={
+            'puts': [],
+            'calls': [{
+                'symbol': 'AMZN260807C00280000',
+                'underlying_symbol': 'AMZN', 'option_type': 'call',
+                'strike_price': 280.0, 'expiration_date': expiry.isoformat(),
+                'dte': 7, 'delta': 0.17, 'mid_price': 1.90,
+                'bid': 1.85, 'ask': 1.95, 'last_price': 1.90, 'volume': 900,
+                'open_interest': 4000, 'implied_volatility': 0.31,
+            }],
+        })
+        self.mock_alpaca.get_positions.return_value = [{
+            'symbol': 'AMZN', 'qty': '100', 'cost_basis': '26120.0',
+            'avg_entry_price': '261.20', 'market_value': '26480.0',
+            'asset_class': 'us_equity', 'side': 'long',
+        }]
+
+    def _seed_day_d_fetch(self):
+        """Exactly what a real report-day scan leaves behind: the report date,
+        fetched at 16:00 that day — ~18h old on the next morning, well inside
+        the 24h TTL, so the TTL alone does NOT evict it."""
+        from src.api import earnings_calendar as ec_module
+
+        ec_module._EARNINGS_CACHE['AMZN'] = {
+            'date': self.REPORT_DAY, 'hour': 'amc',
+            'fetched_at': datetime(2026, 7, 30, 16, 0),
+        }
+
+    def _scan_on_the_next_day(self, monkeypatch):
+        from src.api.earnings_calendar import EarningsCalendarService
+
+        # A refetch answers with the NEXT quarter, as Finnhub would.
+        monkeypatch.setattr(
+            EarningsCalendarService, "_fetch_earnings",
+            lambda svc, symbol: {'date': self.NEXT_QUARTER, 'hour': 'amc',
+                                 'fetched_at': _clock.now()})
+
+        scanner = OptionsScanner(self.mock_alpaca, self.market_data,
+                                 self.mock_config)
+        captured = []
+        with _clock.frozen(datetime.combine(self.NEXT_DAY, dtime(10, 0))):
+            with patch('src.data.decision_record.DecisionRecorder.flush',
+                       autospec=True,
+                       side_effect=lambda self, **_: captured.extend(self.rows)):
+                results = scanner.scan_for_call_opportunities(
+                    run_id="20260731T140000Z-abcdef12")
+        return results, captured
+
+    def test_candidates_are_emitted_on_the_day_after_earnings(self, monkeypatch):
+        self._seed_day_d_fetch()
+
+        results, rows = self._scan_on_the_next_day(monkeypatch)
+
+        assert len(results) == 1, (
+            "the day after the report produced no candidate — the stale "
+            "past-dated cache entry span-rejected the whole chain")
+        assert rows == [], "the symbol should terminate at /run, not at the gate"
+        assert self.market_data.last_call_rejection_stats['AMZN'][
+            'expires_into_earnings'] == 0
+
+    def test_no_false_blackout_row_is_written(self, monkeypatch):
+        """The specific mislabel: a `blocked{earnings_blackout}` row naming an
+        event that already happened."""
+        self._seed_day_d_fetch()
+
+        with patch('src.data.options_scanner.logger') as mock_logger:
+            _, rows = self._scan_on_the_next_day(monkeypatch)
+
+        assert [(r['outcome'], r['reason']) for r in rows] == []
+        assert _events(mock_logger, 'call_scan_skipped_earnings_blackout') == []
+
+    def test_the_still_future_date_is_honoured_the_same_day(self, monkeypatch):
+        """The other half of the boundary: on report day itself the date is
+        still ahead, so the spanning candidate IS blocked. The guard must not
+        have weakened day-of blocking, which is the incident geometry."""
+        from src.api import earnings_calendar as ec_module
+        from src.api.earnings_calendar import EarningsCalendarService
+
+        ec_module._EARNINGS_CACHE['AMZN'] = {
+            'date': self.REPORT_DAY, 'hour': 'amc',
+            'fetched_at': datetime(2026, 7, 30, 9, 0),
+        }
+        monkeypatch.setattr(
+            EarningsCalendarService, "_fetch_earnings",
+            lambda svc, symbol: pytest.fail("must be served from cache"))
+
+        scanner = OptionsScanner(self.mock_alpaca, self.market_data,
+                                 self.mock_config)
+        captured = []
+        with _clock.frozen(datetime.combine(self.REPORT_DAY, dtime(10, 0))):
+            with patch('src.data.decision_record.DecisionRecorder.flush',
+                       autospec=True,
+                       side_effect=lambda self, **_: captured.extend(self.rows)):
+                results = scanner.scan_for_call_opportunities(
+                    run_id="20260730T140000Z-abcdef12")
+
+        assert results == []
+        assert [(r['outcome'], r['reason']) for r in captured] == [
+            ('blocked', 'earnings_blackout')]

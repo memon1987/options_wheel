@@ -331,10 +331,48 @@ class EarningsCalendarService:
         return entry
 
     def _is_stale(self, entry: Dict) -> bool:
+        """Whether a cache entry must be discarded and refetched.
+
+        Two independent conditions, and the second one is not redundant:
+
+        1. **Age beyond the TTL** — the ordinary rule.
+        2. **The cached date is already in the PAST** (reliability review,
+           HIGH). ``next_earnings_info`` answers "when is the *next* report",
+           so a date behind us is not a stale-but-usable answer, it is a wrong
+           one. Before FC-013 this was unreachable: the cache was instance
+           scoped and `/scan` built a fresh service per request, so within one
+           request a date fetched with ``_from=today`` could never be in the
+           past. **The durable L1+L2 cache is what makes it reachable**, and
+           the failure is ugly: a date fetched on report day D survives the 24h
+           TTL into D+1, threads into the chain as
+           ``exclude_expiry_on_or_after=yesterday``, and every candidate has an
+           expiry >= yesterday — so the whole chain is span-rejected and the
+           symbol gets a false ``blocked{earnings_blackout}`` on exactly the
+           IV-crush day DD-3 says the wheel should be selling into. It would
+           recur every earnings cycle whenever the fetch anchor happened to sit
+           late on day D. This also restores tri-state parity with
+           ``HistoricalEarningsCalendar``, which has always filtered ``>= today``.
+
+        Evicting rather than answering means the caller refetches; if that
+        refetch fails, the symbol reports ``unknown`` and the gate fails closed,
+        which is the correct posture for "we genuinely do not know the next date".
+
+        **Time source.** Every cache path in this module reads ``clock.now()``
+        rather than ``datetime.now()``. Production is unchanged — the two are
+        identical there, and this service is never the one a replay uses
+        (that is ``HistoricalEarningsCalendar``). The point is coherence: a
+        past-date check on one clock and a TTL check on another would disagree
+        under a freeze, which is a trap for whoever next writes a
+        time-dependent test against this class.
+        """
+        earnings_date = entry.get("date")
+        if isinstance(earnings_date, date) and earnings_date < clock.now().date():
+            return True
+
         fetched_at = entry.get("fetched_at")
         if not isinstance(fetched_at, datetime):
             return True
-        age_hours = (datetime.now() - fetched_at).total_seconds() / 3600
+        age_hours = (clock.now() - fetched_at).total_seconds() / 3600
         return age_hours > self._cache_ttl_hours
 
     def _fetch_earnings(self, symbol: str) -> Optional[Dict]:
@@ -346,7 +384,7 @@ class EarningsCalendarService:
         """
         if symbol in _EARNINGS_FAILURE_CACHE:
             failure_age = (
-                datetime.now() - _EARNINGS_FAILURE_CACHE[symbol]
+                clock.now() - _EARNINGS_FAILURE_CACHE[symbol]
             ).total_seconds() / 3600
             if failure_age < 1.0:
                 return None
@@ -363,7 +401,7 @@ class EarningsCalendarService:
 
             calendar = result.get("earningsCalendar", [])
             if not calendar:
-                entry = {"date": None, "hour": None, "fetched_at": datetime.now()}
+                entry = {"date": None, "hour": None, "fetched_at": clock.now()}
                 _EARNINGS_CACHE[symbol] = entry
                 # A 200 with an empty calendar is cached as known-CLEAR. That is
                 # correct for ETFs (IWM/QQQ/SPY) and genuine quiet windows, but a
@@ -387,7 +425,7 @@ class EarningsCalendarService:
             entry = {
                 "date": earnings_date,
                 "hour": earliest.get("hour", ""),
-                "fetched_at": datetime.now(),
+                "fetched_at": clock.now(),
             }
             _EARNINGS_CACHE[symbol] = entry
 
@@ -404,7 +442,7 @@ class EarningsCalendarService:
             return entry
 
         except Exception as e:
-            _EARNINGS_FAILURE_CACHE[symbol] = datetime.now()
+            _EARNINGS_FAILURE_CACHE[symbol] = clock.now()
             from ..utils.logging_events import log_error_event
             log_error_event(
                 logger,
@@ -444,11 +482,26 @@ class EarningsCalendarService:
                 continue
             _EARNINGS_CACHE.setdefault(symbol, entry)
 
+    @staticmethod
+    def _storage_client():
+        """Construct the GCS client. A patchable seam, like ``_build_client``.
+
+        Tests must be able to simulate a broken GCS without reaching one, and
+        patching ``sys.modules["google.cloud.storage"]`` does NOT achieve that:
+        ``from google.cloud import storage`` binds the attribute on the
+        ``google.cloud`` package once the real module has been imported, so the
+        import inside this method would still resolve to the real client. That
+        is a test that passes for the wrong reason on any machine with
+        ``google-cloud-storage`` installed — and would build a REAL client
+        against the configured bucket. One seam, patched explicitly instead.
+        """
+        from google.cloud import storage
+        return storage.Client()
+
     def _l2_read(self) -> Optional[Dict[str, Dict]]:
         """Read and parse the durable cache blob, or None on any trouble."""
         try:
-            from google.cloud import storage
-            client = storage.Client()
+            client = self._storage_client()
             blob = client.bucket(self._l2_bucket_name()).blob(L2_BLOB_NAME)
             if not blob.exists():
                 return None
@@ -468,12 +521,11 @@ class EarningsCalendarService:
     def _store_to_l2(self) -> None:
         """Write L1 through to the durable blob. Never raises."""
         try:
-            from google.cloud import storage
-            client = storage.Client()
+            client = self._storage_client()
             blob = client.bucket(self._l2_bucket_name()).blob(L2_BLOB_NAME)
             blob.upload_from_string(
                 json.dumps({
-                    "written_at": datetime.now().isoformat(),
+                    "written_at": clock.now().isoformat(),
                     "entries": {
                         symbol: _encode_entry(entry)
                         for symbol, entry in _EARNINGS_CACHE.items()

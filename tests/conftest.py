@@ -168,6 +168,13 @@ def _no_finnhub(monkeypatch, request):
     # Storage or leaking module-scope cache entries.
     monkeypatch.setattr(EarningsCalendarService, "_l2_read", lambda self: None)
     monkeypatch.setattr(EarningsCalendarService, "_store_to_l2", lambda self: None)
+    # Belt and braces: even a test that restores the real `_l2_read` (to
+    # exercise its exception handling) must not be able to construct a client.
+    def _no_storage_client(*args, **kwargs):
+        raise AssertionError("no test may construct a GCS client")
+    monkeypatch.setattr(
+        EarningsCalendarService, "_storage_client",
+        staticmethod(_no_storage_client))
     # A stand-in client, so "does this test see a working gate" never depends on
     # whether `finnhub-python` happens to be installed. It is never called: the
     # only method that touches it is `_fetch_earnings`, chokepointed below.

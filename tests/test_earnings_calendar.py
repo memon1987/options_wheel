@@ -28,6 +28,7 @@ from src.utils import clock
 # Captured at import, BEFORE the `_no_finnhub` fixture no-ops it, so the real
 # GCS read can be exercised where that is the point.
 _REAL_L2_READ = EarningsCalendarService.__dict__["_l2_read"]
+_REAL_L2_STORE = EarningsCalendarService.__dict__["_store_to_l2"]
 
 
 def _config(**overrides):
@@ -45,10 +46,13 @@ def _config(**overrides):
 
 
 def _entry(earnings_date, fetched_at=None, hour="amc"):
+    # `clock.now()`, matching the service: every cache path there reads the
+    # seam, so a helper stamping wall-clock time would make any frozen-clock
+    # test compute a nonsense age.
     return {
         "date": earnings_date,
         "hour": hour,
-        "fetched_at": fetched_at or datetime.now(),
+        "fetched_at": fetched_at or clock.now(),
     }
 
 
@@ -188,6 +192,119 @@ class TestCachedDatesAnswerCorrectlyAcrossDays:
 # Test 13 / 13b — the two-layer cache
 # =========================================================================== #
 
+class TestACachedPastDateIsNeverServed:
+    """Reliability review, HIGH — the durable cache made this reachable.
+
+    `next_earnings_info` answers "when is the NEXT report". A date behind us is
+    not a stale-but-usable answer, it is a wrong one, and the wrongness has
+    teeth: threaded into the chain as `exclude_expiry_on_or_after=yesterday`,
+    EVERY candidate has expiry >= yesterday, so the whole chain is
+    span-rejected and the symbol is falsely `blocked{earnings_blackout}` on the
+    IV-crush day DD-3 explicitly wants to sell into.
+
+    Pre-FC-013 this could not happen: the cache was instance scoped and `/scan`
+    built a fresh service per request, so within one request a date fetched with
+    `_from=today` was never in the past. L1-at-module-scope plus the L2 blob is
+    what makes a day-D fetch survive into D+1.
+    """
+
+    def test_a_within_ttl_cached_yesterday_date_is_not_served_as_known(
+            self, monkeypatch):
+        """Regression (a). The entry is FRESH by the TTL and still must not be used."""
+        today = date(2026, 7, 31)                  # D+1, the morning after
+        report_day = today - timedelta(days=1)     # AMZN reported 07-30 AMC
+        next_quarter = date(2026, 10, 29)
+
+        # Fetched at 16:00 on report day: ~18h old, comfortably inside a 24h TTL.
+        ec_module._EARNINGS_CACHE["AMZN"] = _entry(
+            report_day, fetched_at=datetime(2026, 7, 30, 16, 0))
+
+        refetches = []
+
+        def _refetch(self, symbol):
+            refetches.append(symbol)
+            entry = _entry(next_quarter)
+            ec_module._EARNINGS_CACHE[symbol] = entry
+            return entry
+
+        monkeypatch.setattr(EarningsCalendarService, "_fetch_earnings", _refetch)
+        svc = EarningsCalendarService(_config())
+
+        with clock.frozen(datetime.combine(today, time(10, 0))):
+            status, earnings_date = svc.next_earnings_info("AMZN")
+
+        assert (status, earnings_date) == (EARNINGS_KNOWN, next_quarter)
+        assert earnings_date >= today, "a past date was served as the NEXT report"
+        assert refetches == ["AMZN"], "the stale-past entry must be refetched"
+
+    def test_the_stale_past_entry_is_evicted(self, monkeypatch):
+        monkeypatch.setattr(
+            EarningsCalendarService, "_fetch_earnings", lambda self, symbol: None)
+        svc = EarningsCalendarService(_config())
+        ec_module._EARNINGS_CACHE["AMZN"] = _entry(
+            date(2026, 7, 30), fetched_at=datetime(2026, 7, 30, 16, 0))
+
+        with clock.frozen(datetime(2026, 7, 31, 10, 0)):
+            assert svc._get_cached("AMZN") is None
+        assert "AMZN" not in ec_module._EARNINGS_CACHE
+
+    def test_a_failed_refetch_reports_unknown_not_the_past_date(self, monkeypatch):
+        """Fail closed on "we genuinely do not know the next date" — which is
+        the honest state once the cached one has gone by."""
+        monkeypatch.setattr(
+            EarningsCalendarService, "_fetch_earnings", lambda self, symbol: None)
+        svc = EarningsCalendarService(_config())
+        ec_module._EARNINGS_CACHE["AMZN"] = _entry(
+            date(2026, 7, 30), fetched_at=datetime(2026, 7, 30, 16, 0))
+
+        with clock.frozen(datetime(2026, 7, 31, 10, 0)):
+            assert svc.next_earnings_info("AMZN") == (EARNINGS_UNKNOWN, None)
+
+    def test_todays_date_is_still_served(self, monkeypatch):
+        """The boundary: day-of must remain `known`. The AMC report has not
+        happened yet when the scan runs, and blocking day-of is the whole point
+        of the AMZN/AAPL incident geometry."""
+        monkeypatch.setattr(
+            EarningsCalendarService, "_fetch_earnings",
+            lambda self, symbol: pytest.fail("must be served from cache"))
+        svc = EarningsCalendarService(_config())
+        ec_module._EARNINGS_CACHE["AMZN"] = _entry(
+            date(2026, 7, 30), fetched_at=datetime(2026, 7, 30, 9, 0))
+
+        with clock.frozen(datetime(2026, 7, 30, 10, 0)):
+            assert svc.next_earnings_info("AMZN") == (
+                EARNINGS_KNOWN, date(2026, 7, 30))
+
+    def test_a_past_dated_l2_entry_is_not_hydrated(self, monkeypatch):
+        """The blob is the other way a past date reaches a fresh process."""
+        clear_earnings_cache()
+        monkeypatch.setattr(
+            EarningsCalendarService, "_l2_read",
+            lambda self: {"AMZN": {
+                "date": "2026-07-30", "hour": "amc",
+                "fetched_at": datetime(2026, 7, 30, 16, 0).isoformat()}})
+        monkeypatch.setattr(
+            EarningsCalendarService, "_fetch_earnings",
+            lambda self, symbol: _entry(date(2026, 10, 29)))
+
+        svc = EarningsCalendarService(_config())
+        with clock.frozen(datetime(2026, 7, 31, 10, 0)):
+            assert svc.next_earnings_info("AMZN") == (
+                EARNINGS_KNOWN, date(2026, 10, 29))
+
+    def test_parity_with_the_replay_calendar(self):
+        """`HistoricalEarningsCalendar` has always filtered `>= today`. The live
+        service diverging from that was a tri-state parity break."""
+        from src.backtesting.engine.historical_earnings import (
+            HistoricalEarningsCalendar)
+
+        replay = HistoricalEarningsCalendar(
+            {"AMZN": [date(2026, 7, 30), date(2026, 10, 29)]})
+        with clock.frozen(datetime(2026, 7, 31, 10, 0)):
+            assert replay.next_earnings_info("AMZN") == (
+                EARNINGS_KNOWN, date(2026, 10, 29))
+
+
 class TestTheCacheIsSharedAndDurable:
     @pytest.mark.real_finnhub_fetch
     def test_l1_is_shared_across_instances(self):
@@ -243,23 +360,42 @@ class TestTheCacheIsSharedAndDurable:
         assert svc.next_earnings_info("NVDA") == (EARNINGS_KNOWN, date(2026, 8, 26))
 
     def test_a_broken_gcs_client_is_a_cache_miss_not_an_error(self, monkeypatch):
-        """The REAL `_l2_read`, against a storage client that raises.
+        """The REAL `_l2_read`, against a client constructor that raises.
 
         Exercised with the genuine implementation (the conftest no-op is
         swapped back out), because the swallow is the whole contract: GCS
         trouble must degrade to a miss, never propagate.
+
+        The seam is `_storage_client`, NOT `sys.modules`. Patching
+        `sys.modules["google.cloud.storage"]` does not intercept
+        `from google.cloud import storage` once the real module has been
+        imported — attribute binding on the `google.cloud` package wins — so
+        that version of this test constructed a REAL client against the
+        configured bucket on any machine with `google-cloud-storage`
+        installed, and only looked hermetic here because this venv is missing
+        the package that `requirements.txt` declares. Caught in review.
         """
+        def _boom():
+            raise RuntimeError("GCS 403: no credentials")
+
         monkeypatch.setattr(EarningsCalendarService, "_l2_read", _REAL_L2_READ)
-
-        class _BrokenStorage:
-            def Client(self, *a, **kw):
-                raise RuntimeError("GCS 403: no credentials")
-
-        monkeypatch.setitem(
-            __import__("sys").modules, "google.cloud.storage", _BrokenStorage())
+        monkeypatch.setattr(
+            EarningsCalendarService, "_storage_client", staticmethod(_boom))
 
         svc = EarningsCalendarService(_config())
         assert svc._l2_read() is None
+
+    def test_a_broken_gcs_client_does_not_break_the_write_either(self, monkeypatch):
+        """Symmetry: a failed write must leave the entry cached in L1 and move on."""
+        def _boom():
+            raise RuntimeError("GCS 403: no credentials")
+
+        monkeypatch.setattr(EarningsCalendarService, "_store_to_l2", _REAL_L2_STORE)
+        monkeypatch.setattr(
+            EarningsCalendarService, "_storage_client", staticmethod(_boom))
+
+        svc = EarningsCalendarService(_config())
+        assert svc._store_to_l2() is None
 
     def test_an_l2_miss_falls_through_to_finnhub_and_never_blocks(self, monkeypatch):
         """The blob can never block a trade by itself — only Finnhub's answer,

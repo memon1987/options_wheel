@@ -387,15 +387,43 @@ not a follow-up.
 | `put_scan_skipped_earnings_unknown` | the put leg skipped a symbol on an unanswerable calendar |
 | `call_scan_skipped_earnings_unknown` | the call leg did the same, before spending a cost-basis resolver call and a BigQuery cross-check |
 
-**Transient vs persistent — the triage that matters:**
+**Which event fired tells you which failure you have — but it does NOT sort
+transient from persistent on its own.** Getting this backwards costs a
+market day, so read carefully:
 
-- **Transient** (Finnhub outage, rate limit): the per-symbol events fire,
-  `earnings_gate_unusable` does *not*. The L2 GCS cache means only symbols
-  whose cached dates are >24h stale are affected, and the 1h failure cache
-  retries. Cost is foregone 7-DTE premium for part of a day.
-- **Persistent** (key wiped by a `--set-env-vars` deploy, key revoked, Finnhub
-  plan lapsed): `earnings_gate_unusable` fires on *every* scan and *every*
-  symbol reports unknown. This does not recover without intervention.
+| Event pattern | What it means | Persistence |
+|---|---|---|
+| `earnings_gate_unusable` on every scan | **No client could be built at all**: `FINNHUB_API_KEY` missing or empty on the live revision, or `finnhub-python` not importable. | **Always persistent.** Nothing recovers this without intervention. |
+| Per-symbol `*_skipped_earnings_unknown` **without** `earnings_gate_unusable` | The client built fine and the *calls* are failing. Covers **both** a transient outage **and** a revoked key / lapsed plan / exhausted quota. | **Ambiguous — must be diagnosed.** |
+
+The second row is the one the first draft of this runbook got wrong. A **revoked
+key or a lapsed plan does not fire `earnings_gate_unusable`**: `finnhub.Client`
+merely stores the key at construction, so the client builds, and the failure
+surfaces per symbol at call time — indistinguishable at the event level from a
+Finnhub outage.
+
+**Sort them with the error text, not the event name:**
+
+```bash
+gcloud logging read \
+  'resource.labels.service_name="options-wheel-strategy" AND jsonPayload.error_type="earnings_fetch_failed"' \
+  --limit=20 --freshness=1d \
+  --format="value(timestamp,jsonPayload.symbol,jsonPayload.error_message)"
+```
+
+- **401 / 403 / "invalid API key" / "you don't have access"** → the key is bad
+  or the plan lapsed. **Persistent.** Fix the key or the subscription.
+- **429** → quota exhausted. Persistent within the quota window; steady state
+  here is ~14 fetches/day against a 60/min free-tier limit, so a 429 means
+  something is refetching far more than it should — check whether the L2 blob
+  is being written (`gsutil ls -l gs://options-wheel-opportunities/earnings_cache.json`).
+- **5xx / timeout / connection errors** → genuine outage. **Transient.** The L2
+  cache means only symbols whose cached dates are >24h stale are affected, and
+  the 1h failure cache retries. Expect it to clear within an hour or two; cost
+  is foregone 7-DTE premium for part of a day.
+
+If the events are still firing after two hours, treat it as persistent
+regardless of the error text and reach for the lever below.
 
 **Not alerted:** `*_skipped_earnings_blackout`. A blackout skip is the gate
 working — normal operation, visible in `decision_events` as
@@ -459,6 +487,29 @@ Cloud Build, which matters because that pipeline has sat silently red for 11
 days before (FC-031). Remove the override once the calendar answers again.
 Disabling the gate means trading through earnings ungated: a deliberate,
 temporary, operator-owned trade-off, not a fix.
+
+**MANDATORY pre-flight, before the first market-hours scan on the new
+revision.** FC-013 converts a missing `FINNHUB_API_KEY` from *invisible*
+(the gate did not exist; a missing key changed nothing) into *full-book
+fail-closed* (every symbol unknown, every open blocked, both legs). Verify the
+key is present on the **live revision** — not in `.env`, not in Secret Manager,
+on the revision that will serve traffic — and deploy this alert policy in the
+**same** maintenance window as the code:
+
+```bash
+# 1. The key is on the live revision.
+gcloud run services describe options-wheel-strategy --region=us-central1 \
+  --format="value(spec.template.spec.containers[0].env)" | tr ',' '\n' | grep -i finnhub
+
+# 2. The policy exists and is enabled (deploy it BEFORE the first scan, not after).
+TOKEN=$(gcloud auth print-access-token)
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "https://monitoring.googleapis.com/v3/projects/gen-lang-client-0607444019/alertPolicies" \
+  | python3 -c "import json,sys; [print(p['displayName'], p.get('enabled')) for p in json.load(sys.stdin)['alertPolicies']]"
+```
+
+If step 1 returns nothing, **do not let a market-hours scan run** — set the key
+first, or ship with `EARNINGS_ENABLED=false` and fix the key before enabling.
 
 **Fire drill** (day one — untested alerting is worse than none). The healthy
 steady state emits none of these events, so provoke the match from the logs

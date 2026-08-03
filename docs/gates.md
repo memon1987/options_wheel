@@ -87,6 +87,25 @@ deliberately.**
   blackout, with a different event, a different decision reason, and its own
   alert. A span test needs a date; no date means no candidate can be cleared.
 
+**`earnings_hour` is fetched, cached and logged — and deliberately unused by
+both predicates.** Finnhub returns `bmo` / `amc` / `dmh`, and the service
+carries it through to the enrichment fields, but neither the N=2 window nor the
+span test reads it. Consequences, stated so this is a recorded decision rather
+than an oversight:
+
+- A **BMO** reporter is blocked for the whole of day D even though the report
+  lands before the open, so the post-report session is treated as pre-report.
+  That is conservative, not dangerous.
+- **Immaterial today:** every reporter that has actually filled on this book is
+  AMC (AAPL, AMZN, GOOGL, MSFT, NVDA). It becomes real the day a tradeable BMO
+  reporter joins the universe, at which point the fix is to let `earnings_hour`
+  narrow the day-of case — the field is already plumbed for it.
+- The `>=` span boundary was reviewed against this and **validated**: for an AMC
+  reporter, a contract expiring on the report date settles that afternoon, and
+  contrary exercise lands before the ~5:30pm ET cutoff — after the report. So
+  expiry-day-equals-event-day genuinely carries the gap and the inclusive
+  comparison is right.
+
 **Fail-closed blast radius, and what bounds it.** A transient Finnhub outage is
 bounded by the two-layer cache (L1 module scope, L2 a GCS blob — only symbols
 whose cached dates are >24h stale block) and the 1h failure cache. A
@@ -203,6 +222,17 @@ config rollback rides Cloud Build — the same pipeline that once sat silently
 red for 11 days (FC-031). Use `--update-env-vars`, **never** `--set-env-vars`
 (the latter wipes the whole env set, which is itself one of this gate's
 persistent-failure scenarios).
+
+**Kill-switch blast radius — wider than the scanner.** `earnings_enabled` is
+read in two places, not one: the scanner's gate construction (rows 2/4/9 above)
+**and** `WheelEngine.run_rolling_cycle`, which consults it before constructing
+its own `EarningsCalendarService`. So `EARNINGS_ENABLED=false` also takes the
+**roller's** earnings blackout dark. That is moot today — the roller is
+structurally no-op'd by the quote-key bug (FC-066 cause 1), so it evaluates
+nothing to gate — but it must be stated: whoever revives the roller inherits a
+kill switch that silently disarms their gate too. (Note the roll path's inverse
+quirk below: an *injected* calendar bypasses the `enabled` check entirely, so
+the switch only bites on the self-constructed path.)
 
 ---
 
