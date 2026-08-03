@@ -1403,7 +1403,7 @@ Doing (2) without (1) is defensible — it is conservative in the direction that
 
 ### FC-071: at-floor candidates are flagged at-or-above basis but scored below it
 
-**Status:** Resolved 2026-08-02 — operator chose fix direction (1), align to `>=`. Plan `docs/plans/fc-071.md`, built on branch fc-071/at-floor-scoring (`46f7a28`), dual-APPROVE reviews; PR queued at the tail of the 2026-08-03 merge train. FC-073 records the consequence (basis component becomes constant in production scoring).
+**Status:** Closed — merged 2026-08-03 (PR #80, `965e819`). Aligned to `>=` per operator decision; dual-APPROVE reviews. FC-073 records the consequence (basis component now constant in production scoring). Plan: `docs/plans/fc-071.md`.
 **Size estimate:** XS (one comparison operator; the work is the decision, not the diff)
 **Owner:** unassigned
 **Plan file:** not yet
