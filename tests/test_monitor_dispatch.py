@@ -43,6 +43,11 @@ def _dispatch(server, symbol):
 
     alpaca = Mock()
     alpaca.get_positions.return_value = [_option(symbol)]
+    # FC-075 Seam 2: /monitor now runs the account-number interlock before
+    # dispatch. Satisfy it (settings.yaml pins PA3D36DVXSZ2) and clear any
+    # cached verdict so this test starts clean.
+    alpaca.get_account.return_value = {"account_number": "PA3D36DVXSZ2"}
+    server.reset_strategy_state()
 
     with patch("src.api.alpaca_client.AlpacaClient", return_value=alpaca), \
          patch("src.api.market_data.MarketDataManager", return_value=Mock()), \
