@@ -1262,9 +1262,15 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 **Fix direction:** fix the quote keys (bid/ask mid); derive `original_premium` **statelessly** from the opening sell's `filled_avg_price` in Alpaca order history rather than depending on state persistence production has never had; move eligibility (DTE ≤ 1 + ITM ratio) into the daily monitor cycle sequenced *before* profit-taking (near-disjoint states: profit-taking fires on OTM winners, rolling on ITM losers), while retaining a ~15:30 ET expiry-day check since the last monitor runs 14:55 ET; log every skip with a reason.
 
-**Must land with FC-062** — the roller's own cost-basis floor fails open and `execute_roll` bypasses FC-050's execute-time guard entirely. Reviving the roller without that fix ships a guaranteed-loss path on the leg most likely to be near basis.
+**Must land with FC-062** — `execute_roll` bypasses FC-050's execute-time guard entirely. Reviving the roller without that fix ships a guaranteed-loss path on the leg most likely to be near basis. *(Update 2026-08-01: the roller's floor half of FC-062 is now fixed — FC-065 Phase 2, PR #76 — so what remains of FC-062 here is the `execute_roll` gate routing.)*
 
-**Links:** FC-062 (roller floor — paired), FC-039 (cause 3 only), FC-011 (item 1 — delivered by the cadence change), FC-033 (escalation interaction), `docs/investigations/covered-call-starvation-2026-07-18.md`, `src/strategy/call_roller.py:102-104,148,487,506-508`, `src/api/alpaca_client.py:317-324`.
+**Pre-revival checklist — added 2026-08-01 from the FC-065 Phase 2 two-reviewer pass (PR #76).** Phase 2 fixed the roller's floor (shared `CostBasisResolver`, fail-closed) while the roller is still dead, so these three items are **latent today and become load-bearing the moment cause (1) is fixed**. Do them *before* the first live roll, not after:
+
+1. **Wire both roll-path cost-basis skip events into the deployed alert policy.** `deploy/monitoring/cost_basis_alert_policy.json` matches `call_scan_skipped_cost_basis_unresolved` / `_divergent` **only** — the scan path. Phase 2 added `call_roll_skipped_cost_basis_unresolved` and `call_roll_skipped_cost_basis_divergent`, and nothing alerts on either. A roller that fails closed on every position would be silent, which is the exact FC-030 failure shape (a control nobody watches). Add both to the filter's `jsonPayload.event_type` **and** `textPayload` clauses — Cloud Run emits plain-text logs with empty severity, so the payload-shape duplication is required, not belt-and-braces.
+2. **Give the pre-guard silent skips structured events.** `call_roller.py:126` (falsy quote), `:129` (zero/missing price) and `:210` (zero BTC ask) all `return None` with **no log line at all**. Friday 2026-07-31's live run is the proof this matters: `rolls_evaluated=3` with **zero per-position events emitted** — the quote-key bug (cause 1) kills every evaluation at `:127-129`, upstream of the floor guard. The operational trap: after Phase 2, "no floor-skip events in the logs" reads as "every floor resolved cleanly" when it actually means "nothing ever reached the floor." Every early return on this path needs a reason code before the roller is trusted.
+3. **The roller's replay BigQuery-gate forwarding is now load-bearing.** `WheelEngine` forwards `allow_bigquery_cost_basis` to `CallRoller` (PR #76), because `run_rolling_cycle()` runs inside the backtest replay and the roller now owns a resolver that can query production trade history against `CURRENT_TIMESTAMP()`. Both halves of that link are pinned by test (engine→roller, roller→resolver), each mutation-verified. Do not remove the forwarding when reviving the roller; the hazard is latent only because the path dies upstream.
+
+**Links:** FC-062 (roller floor — the floor half is done, PR #76; `execute_roll` gate routing remains), FC-039 (cause 3 only), FC-011 (item 1 — delivered by the cadence change), FC-033 (escalation interaction), FC-071 (at-floor scoring asymmetry), `docs/investigations/covered-call-starvation-2026-07-18.md`, `docs/plans/fc-065.md` §Phase 2, `src/strategy/call_roller.py:102-104,148,487,506-508`, `src/api/alpaca_client.py:317-324`.
 
 ---
 
@@ -1392,6 +1398,33 @@ Explicitly out of scope: call-side limit pricing drift (`mid × 0.95` vs the put
 Doing (2) without (1) is defensible — it is conservative in the direction that matters — but (1) is what turns the tolerance choice from a guess into a measurement.
 
 **Links:** PR #75 (FC-065 Phase 1 review, reviewer 2 HIGH-1), `docs/plans/fc-065.md` §Phase 1, `src/strategy/cost_basis.py` (`reconstruct_expected_basis`, `_cross_check`), `deploy/monitoring/drawdown_pause_alert.md` §"Divergence triage" cause (a).
+
+---
+
+### FC-071: at-floor candidates are flagged at-or-above basis but scored below it
+
+**Status:** Resolved 2026-08-02 — operator chose fix direction (1), align to `>=`. Plan `docs/plans/fc-071.md`, built on branch fc-071/at-floor-scoring (`46f7a28`), dual-APPROVE reviews; PR queued at the tail of the 2026-08-03 merge train. FC-073 records the consequence (basis component becomes constant in production scoring).
+**Size estimate:** XS (one comparison operator; the work is the decision, not the diff)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** FC-065 Phase 2 reconciled `assignment_above_cost_basis` with the gates by changing it to `strike >= cost_basis_per_share` (`options_scanner.py:447`) — at-floor writes are permitted and correct, so the flag now says so. But the **scoring** input three lines earlier was left alone: `options_scanner.py:426` still passes `strike > cost_basis_per_share` into `_calculate_call_attractiveness_score` as its `above_cost_basis` argument, which awards **15 points when true and 5 when false** (`:569-573`).
+
+So an at-floor candidate is now flagged at-or-above basis and simultaneously scored as if it were below it — a 10-point penalty out of 100 on a strike the plan explicitly calls "genuinely profitable" (GOOGL's 370C). The two readings of the same predicate disagree by construction.
+
+**Why it was not fixed in Phase 2:** the plan named only the flag, and FC-065's non-goals exclude changing scoring. A ranking change is a behavior change that deserves its own review rather than being swept in under a consistency fix. Deliberately left for a decision — recorded here so it is not rediscovered as a bug.
+
+**Why it is ranking-only, not a safety issue:** the score orders candidates, it does not gate them. No floor, delta band, premium floor or DTE check consults it. The worst case is that an at-floor strike loses a close ranking contest to a slightly-above-floor one — a mild conservative bias, not an unprotected write. Nothing here can cause a below-basis call.
+
+**Fix directions:**
+
+1. **Change `:426` to `>=`** so both readings agree. Simplest, and consistent with the decided policy that at-floor is a good write.
+2. **Leave it, deliberately, and document the asymmetry** — arguing the bonus should reward genuine capital gain, of which an at-floor write has exactly none. Defensible: the flag answers "is this permitted?" and the score answers "how attractive is it?", which are different questions.
+3. **Retire the binary bonus entirely** in favour of scoring the actual capital gain per share (continuous), which makes the boundary question disappear rather than moving it.
+
+Option (1) is the smallest change; option (3) is the one that stops this recurring. **Needs an operator decision** — it is a preference about ranking, not a defect with a right answer.
+
+**Links:** PR #76 (FC-065 Phase 2 review, reviewer 1 INFO), `docs/plans/fc-065.md` §Phase 2 + Execution, `src/data/options_scanner.py:426,447,569-573`, FC-065 (the at-floor policy: "At-floor writes remain allowed").
 
 ---
 

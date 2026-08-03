@@ -54,7 +54,8 @@ def _no_production_bigquery(monkeypatch, request):
     `CostBasisResolver._lookup_assignment_basis`, which since FC-065 runs the
     divergence cross-check and builds its own client from ambient env/ADC. It
     is patched on the *class*, so every resolver instance is covered: the one
-    OptionsScanner owns, the one CallSeller owns, and any built inside a test.
+    OptionsScanner owns, the one CallSeller owns, the one CallRoller owns
+    (FC-065 Phase 2), and any built inside a test.
     Returning None is the "no comparison available" signal, which keeps
     whatever floor the broker reported rather than inventing one.
 

@@ -207,6 +207,230 @@ class TestValidateRoll:
         assert valid is False
         assert 'Premium' in reason
 
+    def test_a_strike_exactly_at_the_floor_is_allowed(self):
+        """FC-065 Phase 2, the gate half of the at-floor reconciliation: every
+        floor gate rejects only ``strike < floor``. Called away at cost is flat
+        on the shares plus both premiums — the guard blocks losses, not
+        break-even — so the scanner's ``assignment_above_cost_basis`` flag now
+        uses ``>=`` to say the same thing."""
+        config = Mock()
+        config.call_delta_range = [0.30, 0.70]
+        config.min_call_premium = 0.30
+        config.call_target_dte = 7
+        new_call = {'strike_price': 110.0, 'delta': 0.40, 'mid_price': 1.50, 'dte': 7}
+
+        valid, reason = RiskManager(config).validate_roll(new_call, 100.0, 110.0)
+
+        assert valid is True, reason
+
+
+# === FC-065 Phase 2: the roll's strike floor ===
+
+class TestTheRollFloorComesFromTheSharedResolver:
+    """Rolling places orders without passing ``execute_call_sale``, so its
+    strike floor is the *only* below-basis protection on that path. FC-065
+    Phase 2 routes it through the shared ``CostBasisResolver`` — the same
+    number the scanner and the seller use — and fails closed when there is no
+    usable floor.
+
+    What it replaced: ``cost_basis / qty`` computed inline, which yielded 0
+    whenever Alpaca reported no cost basis and left
+    ``min_strike = current_strike + 0.01``. That is not a weak floor, it is no
+    floor: it permits any strike a penny above the call being closed,
+    regardless of what the shares cost. Every test in this class fails if that
+    degradation is restored.
+    """
+
+    def _call_position(self):
+        # DTE 0 so the rolling_max_current_dte gate passes on any run date.
+        today = datetime.now().strftime('%y%m%d')
+        return {'symbol': f'AMD{today}C00100000', 'qty': '-1'}
+
+    def _stock_position(self, **overrides):
+        """An assigned 100-share AMD lot.
+
+        ``cost_basis``/``qty`` deliberately imply $95.00/share, which is *not*
+        any floor these tests expect: it is the number the replaced derivation
+        would produce, so a revert is visible rather than coincidentally
+        passing.
+        """
+        position = {'symbol': 'AMD', 'qty': '100', 'cost_basis': '9500.0',
+                    'asset_class': 'us_equity', 'side': 'long'}
+        position.update(overrides)
+        return position
+
+    def _arm(self, mock_alpaca, mock_market_data, candidate_strike):
+        """Wire a roll that succeeds on every gate except the floor.
+
+        Stock at 105 against the 100 strike clears the ITM trigger; the
+        replacement is a credit roll (BTC 1.20 / STC 1.40) well inside the
+        debit tolerance. The floor is the only variable left.
+        """
+        mock_alpaca.get_stock_quote.return_value = {'last_price': 105.0}
+        mock_alpaca.get_option_quote.return_value = {'ask_price': 1.20}
+        mock_market_data.find_suitable_calls.return_value = [{
+            'symbol': 'AMD260424C%08d' % int(candidate_strike * 1000),
+            'strike_price': candidate_strike, 'delta': 0.40,
+            'mid_price': 1.50, 'bid': 1.40, 'dte': 7,
+        }]
+
+    def test_an_unresolved_basis_blocks_the_roll(self, roller, mock_alpaca,
+                                                 mock_market_data):
+        """No ``avg_entry_price`` means no floor, and no floor means no roll.
+
+        Reverting to ``max(cost_basis / qty, current_strike + 0.01)`` makes
+        this fail loudly: with the field absent the old code floors at $100.01
+        and returns a fully-formed opportunity to sell the 105 strike against
+        shares whose cost is unknown.
+        """
+        self._arm(mock_alpaca, mock_market_data, candidate_strike=105.0)
+        position = self._stock_position()
+        position.pop('avg_entry_price', None)
+
+        with patch('src.strategy.call_roller.logger') as mock_logger:
+            result = roller.evaluate_roll_opportunity(self._call_position(), position)
+
+        assert result is None
+        # The chain was never even scanned — fail closed, not "scan and hope".
+        mock_market_data.find_suitable_calls.assert_not_called()
+        mock_alpaca.place_option_order.assert_not_called()
+
+        skips = [c.kwargs for c in mock_logger.info.call_args_list
+                 if c.kwargs.get('event_type')
+                 == 'call_roll_skipped_cost_basis_unresolved']
+        assert len(skips) == 1
+        assert skips[0]['event_category'] == 'trade'
+        assert skips[0]['underlying'] == 'AMD'
+        assert skips[0]['success'] is False
+        assert skips[0]['skip_reason'] == 'cost_basis_unresolved'
+        assert skips[0]['cost_basis_source'] == 'unresolved'
+
+    def test_a_zero_avg_entry_price_blocks_the_roll(self, roller, mock_alpaca,
+                                                    mock_market_data):
+        """FC-029 observed Alpaca reporting zero for assigned positions. A
+        regression to that must halt rolling, not roll unprotected."""
+        self._arm(mock_alpaca, mock_market_data, candidate_strike=105.0)
+
+        result = roller.evaluate_roll_opportunity(
+            self._call_position(), self._stock_position(avg_entry_price='0'))
+
+        assert result is None
+        mock_market_data.find_suitable_calls.assert_not_called()
+
+    def test_a_divergent_cross_check_blocks_the_roll(self, roller, mock_alpaca,
+                                                     mock_market_data):
+        """The broker gave a number and the assignment history contradicts it.
+
+        ``resolve_detailed`` returns a zero basis for that verdict too, so the
+        same fail-closed branch catches it — but under its **own** event name.
+        "Resolved and vetoed" is not "unresolved": labelling it so is wrong on
+        its face and hides the symbol from every ``*_divergent`` taxonomy, which
+        is the one that means "the broker's number may be wrong" rather than
+        "the broker said nothing". Mirrors the scanner's two-event split.
+        """
+        self._arm(mock_alpaca, mock_market_data, candidate_strike=115.0)
+
+        with patch.object(roller.cost_basis_resolver, '_lookup_assignment_basis',
+                          return_value={'expected_basis_per_share': 90.00,
+                                        'reconstructed_shares': 100, 'lots': []}):
+            with patch('src.strategy.call_roller.logger') as mock_logger:
+                result = roller.evaluate_roll_opportunity(
+                    self._call_position(),
+                    self._stock_position(avg_entry_price='110.00'))
+
+        assert result is None
+        mock_market_data.find_suitable_calls.assert_not_called()
+
+        skips = [c.kwargs for c in mock_logger.info.call_args_list
+                 if c.kwargs.get('event_type')
+                 == 'call_roll_skipped_cost_basis_divergent']
+        assert len(skips) == 1
+        assert skips[0]['skip_reason'] == 'cost_basis_divergent'
+        assert skips[0]['cost_basis_source'] == 'divergent'
+        assert skips[0]['broker_basis'] == 110.00
+        assert skips[0]['expected_basis'] == 90.00
+        assert skips[0]['basis_delta'] == pytest.approx(20.00)
+        assert skips[0]['cross_check_reason'] == 'basis_mismatch'
+
+        # ...and it does NOT also fire the unresolved event. The two are
+        # distinct failures and a divergence must not be double-counted as one.
+        assert not [c.kwargs for c in mock_logger.info.call_args_list
+                    if c.kwargs.get('event_type')
+                    == 'call_roll_skipped_cost_basis_unresolved']
+
+    def test_an_unresolved_basis_is_not_labelled_divergent(self, roller,
+                                                           mock_alpaca,
+                                                           mock_market_data):
+        """The other side of the split: nothing to floor against is not a
+        contradicted floor. Swapping the two labels fails here and in the
+        divergent test above."""
+        self._arm(mock_alpaca, mock_market_data, candidate_strike=105.0)
+
+        with patch('src.strategy.call_roller.logger') as mock_logger:
+            result = roller.evaluate_roll_opportunity(
+                self._call_position(), self._stock_position(avg_entry_price='0'))
+
+        assert result is None
+        events = [c.kwargs.get('event_type') for c in mock_logger.info.call_args_list]
+        assert 'call_roll_skipped_cost_basis_unresolved' in events
+        assert 'call_roll_skipped_cost_basis_divergent' not in events
+
+    def test_the_fallback_re_floor_still_honours_the_basis(self, roller,
+                                                          mock_alpaca,
+                                                          mock_market_data):
+        """FC-065 Phase 2 (review, R1 LOW): ``_attempt_stc`` re-derives the floor
+        when both direct STO attempts fail, and that is the **second** live
+        application of the basis floor on the roll path — untested until now.
+
+        Basis $110.00 against a $100 old strike, so the basis term is the one
+        that must win the ``max()``. Dropping it floors the fallback search at
+        $100.01 and lets the retry sell strikes below what the shares cost —
+        precisely the hole the evaluation-time floor was fixed to close.
+        """
+        opportunity = {'cost_basis_per_share': 110.00, 'old_strike': 100.0}
+        # Both direct attempts fail, so the fallback re-floor runs. A rejected
+        # order returns immediately — no polling, no sleep.
+        mock_alpaca.place_option_order.return_value = {'success': False}
+        mock_market_data.find_suitable_calls.return_value = []
+
+        roller._attempt_stc('AMD260424C00105000', 'AMD', 1, 1.40, opportunity, {})
+
+        mock_market_data.find_suitable_calls.assert_called_once_with(
+            'AMD', min_strike_price=110.00)
+
+    def test_the_resolved_basis_is_the_strike_floor(self, roller, mock_alpaca,
+                                                    mock_market_data):
+        """The positive case, and the one that pins *which* number is used.
+
+        Alpaca says $110.00/share; ``cost_basis / qty`` says $95.00. The floor
+        handed to the chain scan must be the resolver's $110.00 — a revert to
+        the old derivation floors at $95.00 and admits strikes between the two.
+        """
+        self._arm(mock_alpaca, mock_market_data, candidate_strike=112.0)
+
+        result = roller.evaluate_roll_opportunity(
+            self._call_position(), self._stock_position(avg_entry_price='110.00'))
+
+        mock_market_data.find_suitable_calls.assert_called_once_with(
+            'AMD', min_strike_price=110.00)
+        assert result is not None
+        assert result['cost_basis_per_share'] == 110.00
+        assert result['new_strike'] == 112.0
+
+    def test_the_roll_up_rule_still_floors_a_low_basis(self, roller, mock_alpaca,
+                                                       mock_market_data):
+        """Below-basis protection is a floor, not the only floor: a basis under
+        the call being closed must not let the roll go sideways or down."""
+        self._arm(mock_alpaca, mock_market_data, candidate_strike=105.0)
+
+        result = roller.evaluate_roll_opportunity(
+            self._call_position(), self._stock_position(avg_entry_price='90.00'))
+
+        mock_market_data.find_suitable_calls.assert_called_once_with(
+            'AMD', min_strike_price=100.01)
+        assert result is not None
+        assert result['cost_basis_per_share'] == 90.00
+
 
 # === WheelStateManager roll tracking tests ===
 
