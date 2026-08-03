@@ -127,6 +127,61 @@ def _deterministic_alpaca_credentials(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_finnhub(monkeypatch, request):
+    """No test may reach Finnhub or the earnings L2 blob, whatever is in .env.
+
+    Three separate defects in this suite's history were "the test depends on
+    ambient environment" (live BigQuery, missing FastAPI, missing Alpaca
+    credentials). The earnings gate adds a fourth surface, so it gets the same
+    treatment the other two got:
+
+    1. **The env var is pinned unconditionally.** ``Config.finnhub_api_key``
+       reads ``os.getenv`` directly and ``Config.__init__`` calls
+       ``load_dotenv()``, so without this a developer's real key leaks into
+       tests and CI diverges from dev. Pinned to a fake value rather than
+       cleared, because "enabled with a key" is the shape production runs and
+       the degraded path deserves its own explicit test, not the default.
+    2. **``_fetch_earnings`` is patched on the CLASS**, so every instance —
+       including one a test constructs directly — answers "known clear" with
+       zero network. FC-013's tri-state maps ``{"date": None}`` to
+       ``('clear', None)``: an unmocked test sees an unconstrained gate, which
+       is the pre-gate behaviour and therefore the safe default.
+    3. **Both L2/GCS helpers are no-ops.** No unit test touches Cloud Storage;
+       a read that returns None is a cache miss, which is exactly the contract.
+
+    ``clear_earnings_cache()`` runs before *and* after each test: the L1 cache
+    is module-scope by design (FC-013 §1), so without this an entry cached by
+    one test would answer for another. Same principle as ``_reset_time_seam``.
+
+    Escape hatch: ``@pytest.mark.real_finnhub_fetch`` keeps the real
+    ``_fetch_earnings`` for the service's own unit tests, which mock the finnhub
+    *client object* instead (still no network). Without the marker the blanket
+    patch would make those tests vacuous — the ``real_bq_lookup`` lesson.
+    """
+    from src.api.earnings_calendar import EarningsCalendarService, clear_earnings_cache
+
+    monkeypatch.setenv("FINNHUB_API_KEY", "test_finnhub_key")
+
+    # The GCS no-ops and the cache reset apply to EVERY test, marker or not:
+    # the escape hatch is about Finnhub's client, never about touching Cloud
+    # Storage or leaking module-scope cache entries.
+    monkeypatch.setattr(EarningsCalendarService, "_l2_read", lambda self: None)
+    monkeypatch.setattr(EarningsCalendarService, "_store_to_l2", lambda self: None)
+
+    if not request.node.get_closest_marker("real_finnhub_fetch"):
+        monkeypatch.setattr(
+            EarningsCalendarService, "_fetch_earnings",
+            lambda self, symbol: {
+                "date": None, "hour": None, "fetched_at": datetime.now(),
+            },
+        )
+
+    clear_earnings_cache()
+    yield
+    clear_earnings_cache()
+
+
 # ==================== Configuration Fixtures ====================
 
 @pytest.fixture
