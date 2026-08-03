@@ -8,6 +8,7 @@ from google.cloud import storage
 
 from ..utils.config import Config
 from ..utils.logging_events import log_system_event, log_error_event
+from .decision_record import stamp_run_id
 
 logger = structlog.get_logger(__name__)
 
@@ -82,12 +83,20 @@ class OpportunityStore:
                           bucket=self.bucket_name, error=str(e))
 
     def store_opportunities(self, opportunities: List[Dict[str, Any]],
-                           scan_time: datetime) -> bool:
+                           scan_time: datetime,
+                           run_id: Optional[str] = None) -> bool:
         """Store opportunities from a market scan.
 
         Args:
             opportunities: List of opportunity dictionaries from scan
             scan_time: When the scan was performed
+            run_id: FC-065 Phase 4 — the cycle identifier minted at ``/scan``.
+                Stamped onto **every** opportunity as well as onto the blob
+                envelope, because ``get_pending_opportunities`` hands ``/run``
+                the opportunity list and nothing else; putting it only in the
+                envelope would have meant changing that return shape and every
+                caller with it. Until this existed, the blob itself was the
+                sole correlator between the two stateless requests (FC-044).
 
         Returns:
             True if stored successfully
@@ -96,11 +105,16 @@ class OpportunityStore:
             # Create storage object with timestamp-based path
             blob_path = self._get_blob_path(scan_time)
 
+            stamp_run_id(opportunities, run_id or '')
+
             # Add metadata. strategy_id (FC-075 Seam 1) tags the blob so the
             # consuming service can refuse blobs written by another strategy.
+            # run_id (FC-065 Phase 4) correlates the scan and run halves of one
+            # cycle; it is stamped onto each opportunity above as well as here.
             storage_data = {
                 'strategy_id': self.strategy_id,
                 'scan_time': scan_time.isoformat(),
+                'run_id': run_id or '',
                 'expires_at': (scan_time + timedelta(minutes=20)).isoformat(),
                 'opportunity_count': len(opportunities),
                 'opportunities': opportunities,
@@ -121,6 +135,7 @@ class OpportunityStore:
                 status="success",
                 opportunity_count=len(opportunities),
                 blob_path=blob_path,
+                run_id=run_id or '',
                 expires_at=storage_data['expires_at']
             )
 

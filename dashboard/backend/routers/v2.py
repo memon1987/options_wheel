@@ -17,8 +17,8 @@ from services.bigquery import get_bigquery_service
 from services.pause_alert import (
     CHECK_FAILED_MARKER,
     DEFAULT_THRESHOLD_DAYS,
-    format_pause_alert,
-    select_alertable_pauses,
+    format_uncovered_alert,
+    select_alertable_uncovered,
 )
 
 router = APIRouter()
@@ -58,13 +58,10 @@ async def _bot_config() -> Dict[str, Any]:
         return {}
 
 
-async def _drawdown_pause_threshold() -> tuple:
-    """Single source of truth: the bot's own /config (review F8)."""
-    cfg = await _bot_config()
-    v = cfg.get("call_drawdown_pause_threshold")
-    if v is not None:
-        return float(v), "bot /config"
-    return float(os.getenv("DRAWDOWN_PAUSE_THRESHOLD", "0.05")), "env fallback"
+# `_drawdown_pause_threshold` was removed by FC-065 Phase 4. It read the bot's
+# `call_drawdown_pause_threshold` to describe a gate the bot no longer has
+# (OQ-3), against a reference price Phase 1 replaced. The config key itself is
+# left alone — decommissioning dead knobs is FC-069's sweep, not this phase's.
 
 
 # ----------------------------------------------------------------------
@@ -272,48 +269,68 @@ async def bot_health_anomalies() -> List[Dict[str, Any]]:
     return bq.get_bot_anomalies()
 
 
-async def _evaluate_drawdown_pauses() -> Dict[str, Any]:
-    """Shared pause evaluation — one computation, two consumers (the Bot
-    Health card and the FC-030 alert check)."""
-    import asyncio
+def _alert_threshold_days() -> int:
+    """Trading-day threshold for the uncovered alert.
+
+    Read from the same ``PAUSE_ALERT_THRESHOLD_DAYS`` env var FC-030 declared
+    in ``cloudbuild.yaml`` — the repoint changes the alert's data source, not
+    its deployment surface, so no env or scheduler edit is required.
+    """
+    try:
+        return int(os.getenv("PAUSE_ALERT_THRESHOLD_DAYS",
+                             str(DEFAULT_THRESHOLD_DAYS)))
+    except (TypeError, ValueError):
+        return DEFAULT_THRESHOLD_DAYS
+
+
+async def _evaluate_uncovered_symbols() -> Dict[str, Any]:
+    """Shared evaluation — one computation, two consumers (the Bot Health
+    card and the daily alert check).
+
+    FC-065 Phase 4: sourced from the bot's decision records rather than from
+    an OPASN-strike price inference. The old ``call_drawdown_pause_threshold``
+    percentage is no longer consulted here at all: there is no pause gate for
+    it to describe, and after Phase 1 it would have been compared against the
+    wrong floor anyway.
+    """
     bq = get_bigquery_service()
-    positions, (threshold, source) = await asyncio.gather(
-        _live_positions(), _drawdown_pause_threshold())
-    result = bq.get_drawdown_pauses(live_positions=positions,
-                                    threshold=threshold,
-                                    threshold_source=source)
-    # Distinguish "no symbol is paused" from "we could not tell" — the
+    positions = await _live_positions()
+    result = bq.get_uncovered_symbols(live_positions=positions,
+                                      threshold_days=_alert_threshold_days())
+    # Distinguish "no symbol is uncovered" from "we could not tell" — the
     # alert path must not read a proxy outage as all-clear.
     result["positions_available"] = positions is not None
     return result
 
 
 @router.get("/bot-health/drawdown-pauses")
-async def bot_health_drawdown_pauses() -> Dict[str, Any]:
-    """Symbols the R3 drawdown pause is inferred to be blocking (assignment-
-    strike referenced, live share counts; labeled inferred-not-telemetry)."""
-    return await _evaluate_drawdown_pauses()
+async def bot_health_uncovered_symbols() -> Dict[str, Any]:
+    """Held symbols with no covered call written, from the bot's decision
+    records (FC-065 Phase 4 — was pause inference off the OPASN strike).
+
+    The route path is unchanged on purpose: it is the frontend's contract and
+    a bookmarkable URL. The payload is the new uncovered shape, and
+    ``types/v2.ts`` + ``DrawdownPauseCard.tsx`` move with it.
+    """
+    return await _evaluate_uncovered_symbols()
 
 
 @router.post("/bot-health/pause-alert-check")
 async def pause_alert_check() -> Dict[str, Any]:
-    """FC-030: evaluate drawdown pauses and log an alert if any are extended.
+    """Log an alert when a held symbol has been uncovered too long.
 
-    Triggered daily post-close by Cloud Scheduler. Emits ONE structured
+    Triggered daily post-close by Cloud Scheduler (route and schedule
+    unchanged by FC-065 Phase 4 — only the data source moved). Emits ONE
     WARNING line carrying the marker `DRAWDOWN_PAUSE_ALERT` when any symbol
-    has been paused >= PAUSE_ALERT_THRESHOLD_DAYS trading days; a Cloud
+    has been uncovered >= PAUSE_ALERT_THRESHOLD_DAYS trading days; a Cloud
     Monitoring log-based policy turns that into an operator email.
 
     Returns the evaluation either way so the check is manually invokable.
     """
-    try:
-        threshold_days = int(os.getenv("PAUSE_ALERT_THRESHOLD_DAYS",
-                                       str(DEFAULT_THRESHOLD_DAYS)))
-    except (TypeError, ValueError):
-        threshold_days = DEFAULT_THRESHOLD_DAYS
+    threshold_days = _alert_threshold_days()
 
     try:
-        result = await _evaluate_drawdown_pauses()
+        result = await _evaluate_uncovered_symbols()
     except Exception as exc:  # noqa: BLE001 - must never raise past the scheduler
         # A silent evaluator is the FC-006 failure mode. Log loudly.
         logger.warning("%s evaluation raised: %s", CHECK_FAILED_MARKER, exc)
@@ -321,19 +338,40 @@ async def pause_alert_check() -> Dict[str, Any]:
                 "threshold_days": threshold_days}
 
     if not result.get("positions_available"):
-        logger.warning("%s live positions unavailable; pause state "
+        logger.warning("%s live positions unavailable; uncovered state "
                        "could not be evaluated", CHECK_FAILED_MARKER)
         return {"status": "degraded", "reason": "live positions unavailable",
                 "threshold_days": threshold_days}
 
-    alertable = select_alertable_pauses(result.get("paused", []), threshold_days)
+    # The decision table is now the alert's source of truth, so its
+    # unavailability is an unevaluated check — not a quiet all-clear. Reported
+    # with the same marker as a positions outage; both mean "unknown".
+    if not result.get("decision_source_available", True):
+        logger.warning("%s decision records unavailable; uncovered state "
+                       "could not be evaluated", CHECK_FAILED_MARKER)
+        return {"status": "degraded", "reason": "decision records unavailable",
+                "threshold_days": threshold_days}
+
+    alertable = select_alertable_uncovered(result.get("uncovered", []),
+                                           threshold_days)
     if alertable:
-        logger.warning(format_pause_alert(alertable, threshold_days))
+        logger.warning(format_uncovered_alert(alertable, threshold_days))
+
+    # A symbol whose uncovered_days could not be derived is reported as
+    # degraded, not as clear: the bot is holding shares and we cannot say
+    # whether it has written a call against them, which is the state this
+    # alert exists to make impossible to miss.
+    unknown = result.get("unknown_uncovered_days", [])
+    if unknown:
+        logger.warning("%s uncovered_days underivable for %s",
+                       CHECK_FAILED_MARKER,
+                       ",".join(str(r.get("symbol")) for r in unknown))
 
     return {
         "status": "ok",
         "threshold_days": threshold_days,
         "alerted": bool(alertable),
         "alert_symbols": alertable,
-        "paused_total": len(result.get("paused", [])),
+        "uncovered_total": len(result.get("uncovered", [])),
+        "unknown_total": len(unknown),
     }

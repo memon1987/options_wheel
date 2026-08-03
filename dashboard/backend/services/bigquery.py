@@ -29,6 +29,53 @@ DATASET_ID = "options_wheel"
 # same env var so a benchmark change is one setting, not two code edits.
 BENCHMARK_SYMBOL = os.getenv("BENCHMARK_SYMBOL", "SPY")
 
+# FC-065 Phase 4. How far back to look for a symbol's most recent decision.
+# Generous on purpose: a weekend plus a holiday plus a scheduler outage is
+# several days, and an empty card during an outage is exactly the "silence
+# reads as all-clear" failure this record exists to end.
+DECISION_LOOKBACK_DAYS = 7
+
+
+def uncovered_decisions_sql(dataset: str) -> str:
+    """Latest decision row per symbol, **deduped on ``dedup_key``**.
+
+    The dedup is not optional and not cosmetic. Rows are written with
+    ``dedup_key = run_id|symbol|stage`` as the streaming ``insertId``, which
+    de-duplicates only within BigQuery's short streaming window; a Cloud
+    Scheduler retry minutes later inserts a second copy. Reading without this
+    ``QUALIFY`` would double-count a retried cycle — the same failure that put
+    36 duplicate ``wheel_cycles`` rows in the table per assignment.
+
+    Kept as a module-level builder rather than an inline f-string so the dedup
+    is pinned by a test that does not need BigQuery credentials.
+
+    **Within a dedup key, `sold` wins regardless of write order.** A `/run`
+    retry after a failed `mark_executed` recovers the *same* `run_id` from the
+    blob and re-derives the symbol as `dropped/already_positioned` — the
+    position it finds is the one it just opened. Under a pure
+    `ORDER BY timestamp DESC` that later row would permanently shadow the real
+    `sold` row, in this reader and in every future one (FC-044's grid, the
+    OQ-1 in-gap retro-analysis). A write that reached the broker is the more
+    terminal fact, so it sorts first.
+    """
+    return f"""
+    WITH deduped AS (
+      SELECT *
+      FROM `{dataset}.decision_events`
+      WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),
+                                       INTERVAL @lookback_days DAY)
+        AND symbol IN UNNEST(@symbols)
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY dedup_key
+        ORDER BY IF(outcome = 'sold', 0, 1), timestamp DESC) = 1
+    )
+    SELECT symbol, run_id, run_ts, stage, outcome, reason, shares,
+           cost_basis_per_share, current_price, underwater_pct, uncovered_days
+    FROM deduped
+    QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY symbol ORDER BY run_ts DESC, timestamp DESC) = 1
+    """
+
 
 class BigQueryService:
     """Service for querying BigQuery trading data."""
@@ -1498,15 +1545,34 @@ class BigQueryService:
             out[sym] = basis
         return out
 
-    def get_drawdown_pauses(self, live_positions: Optional[List[Dict[str, Any]]],
-                            threshold: float,
-                            threshold_source: str) -> Dict[str, Any]:
-        """Symbols the R3 drawdown pause is (inferred to be) blocking.
+    def get_uncovered_symbols(self, live_positions: Optional[List[Dict[str, Any]]],
+                             threshold_days: int) -> Dict[str, Any]:
+        """Held symbols carrying no covered call, from the bot's own decisions.
 
-        Inferred from prices, not bot telemetry — labeled as such in the UI.
-        Reference price = latest OPASN put strike (what the bot compares
-        against per FC-029), shares from LIVE positions, pause window bounded
-        at the open lot's acquisition date (review F8).
+        **FC-065 Phase 4 repoint.** This used to be ``get_drawdown_pauses``,
+        which *inferred* pause state from the latest OPASN put strike. Two
+        things broke that:
+
+        1. **There is no pause.** OQ-3 removed the drawdown gate entirely —
+           the floor is the only gate — so a card reporting "paused" was
+           reporting a state the bot does not have.
+        2. **The reference price was wrong.** Since Phase 1 the bot's floor is
+           Alpaca's ``avg_entry_price``, which is one put premium BELOW the
+           assignment strike this query used. Near any threshold the dashboard
+           and the bot would have disagreed about the same position.
+
+        The replacement reads the decision records the bot now writes, so the
+        card and the alert report what the bot *decided*, not what a proxy
+        calculation guesses it decided. What matters operationally is
+        unchanged and is the thing FC-030 was really about: **idle capital** —
+        shares held with no call written against them.
+
+        Two dedup layers, deliberately: rows are keyed
+        ``(run_id, symbol, stage)`` at write time as a streaming ``insertId``,
+        and this query dedups on that key again. insertId dedup is best-effort
+        over a short window, and a Cloud Scheduler retry minutes later slips
+        straight through it — which is how 36 duplicate ``wheel_cycles`` rows
+        per assignment happened.
         """
         held: Dict[str, float] = {}
         if live_positions:
@@ -1521,8 +1587,8 @@ class BigQueryService:
                         held[sym] = held.get(sym, 0.0) + qty
 
         # View-vs-live share mismatches surface here too (the AMD anomaly is
-        # invisible as a pause row because live shares are 0 — the badge is
-        # the only trace; review C3).
+        # invisible as a row because live shares are 0 — the badge is the only
+        # trace; FC-031 review C3).
         mismatches: List[Dict[str, Any]] = []
         try:
             view_rows = self._run_query(f"""
@@ -1541,82 +1607,91 @@ class BigQueryService:
         except Exception:
             pass
 
-        result = {"threshold": threshold, "threshold_source": threshold_source,
-                  "paused": [], "share_count_mismatches": mismatches}
+        result: Dict[str, Any] = {
+            "threshold_days": threshold_days,
+            "source": "decision_events",
+            # Explicit, and consumed by the alert path. Silence here has three
+            # causes — query failure, a rolled-back bot that stopped writing,
+            # and a table that never got created — and NONE of them mean
+            # "every symbol is covered". The FC-046 sink died silently for
+            # eight months on exactly this shape of assumption.
+            "decision_source_available": True,
+            "uncovered": [],
+            "unknown_uncovered_days": [],
+            "share_count_mismatches": mismatches,
+        }
         if not held:
             return result
 
-        from google.cloud.bigquery import ArrayQueryParameter
+        from google.cloud.bigquery import ArrayQueryParameter, ScalarQueryParameter
         held_syms = sorted(held)
         try:
-            strikes = {r["underlying"]: float(r["strike"])
-                       for r in self._run_query(f"""
-                SELECT underlying,
-                       ARRAY_AGG(strike_price ORDER BY transaction_time DESC LIMIT 1)[OFFSET(0)] AS strike
-                FROM `{self.dataset}.trades_from_activities`
-                WHERE activity_type = 'OPASN' AND option_type = 'put'
-                  AND underlying IN UNNEST(@symbols)
-                GROUP BY underlying
-            """, params=[ArrayQueryParameter("symbols", "STRING", held_syms)])
-                       if r.get("strike") is not None}
+            rows = self._run_query(
+                uncovered_decisions_sql(self.dataset),
+                params=[
+                    ArrayQueryParameter("symbols", "STRING", held_syms),
+                    ScalarQueryParameter("lookback_days", "INT64",
+                                         DECISION_LOOKBACK_DAYS),
+                ])
         except Exception:
-            strikes = {}
+            logger.warning("decision_events query failed — uncovered state unknown",
+                           exc_info=True)
+            result["decision_source_available"] = False
+            return result
 
-        lot_bases = {}
-        try:
-            lot_bases = self.get_open_lot_bases(symbols=held_syms)
-        except Exception:
-            pass
+        seen = set()
+        for row in rows:
+            symbol = row.get("symbol")
+            if symbol not in held:
+                continue
+            seen.add(symbol)
+            days = row.get("uncovered_days")
+            outcome = row.get("outcome") or ""
+            entry = {
+                "symbol": symbol,
+                "shares": held[symbol],
+                "cost_basis_per_share": (float(row["cost_basis_per_share"])
+                                         if row.get("cost_basis_per_share") is not None
+                                         else None),
+                "last_price": (float(row["current_price"])
+                               if row.get("current_price") is not None else None),
+                "underwater_pct": (float(row["underwater_pct"])
+                                   if row.get("underwater_pct") is not None else None),
+                "uncovered_days": int(days) if days is not None else None,
+                "outcome": outcome,
+                "reason": row.get("reason") or "",
+                "run_id": row.get("run_id") or "",
+                "last_decision_at": str(row.get("run_ts") or ""),
+            }
+            if outcome == "sold":
+                # A call was written against these shares this cycle. Covered
+                # by definition — never "unknown", whatever the label says.
+                continue
+            if days is None:
+                # "We could not tell" is NOT "covered". It gets its own list so
+                # a broken uncovered-days lookup cannot read as an all-clear.
+                result["unknown_uncovered_days"].append(entry)
+            elif int(days) > 0:
+                result["uncovered"].append(entry)
 
-        # One batched bars query for every held symbol (was one query per
-        # symbol — review E2's N+1).
-        bars_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
-        try:
-            bar_rows = self._run_query(f"""
-                SELECT symbol, date, close
-                FROM `{self.dataset}.stock_history_from_alpaca`
-                WHERE symbol IN UNNEST(@symbols)
-                QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) <= 90
-                ORDER BY symbol, date DESC
-            """, params=[ArrayQueryParameter("symbols", "STRING", held_syms)])
-            for r in bar_rows:
-                bars_by_symbol.setdefault(r["symbol"], []).append(r)
-        except Exception:
-            pass
-
-        for sym, qty in held.items():
-            ref = strikes.get(sym)
-            if not ref or ref <= 0:
+        # A held symbol with NO row in the whole lookback window is the
+        # dead-writer case: a rollback to a pre-Phase-4 revision, a failed
+        # table auto-create, a BigQuery outage on the write side. It used to
+        # vanish from both lists and read as covered. It is now explicitly
+        # unknown, which trips CHECK_FAILED within one daily check.
+        for symbol in held_syms:
+            if symbol in seen:
                 continue
-            pause_floor = (1.0 - threshold) * ref
-            acquired = (lot_bases.get(sym) or {}).get("acquired_at")
-            acquired_date = str(acquired)[:10] if acquired else "1900-01-01"
-            bars = [b for b in bars_by_symbol.get(sym, [])
-                    if str(b["date"]) >= acquired_date]
-            if not bars:
-                continue
-            latest = bars[0]
-            if float(latest["close"]) >= pause_floor:
-                continue
-            days_paused = 0
-            for b in bars:
-                if float(b["close"]) < pause_floor:
-                    days_paused += 1
-                else:
-                    break
-            result["paused"].append({
-                "symbol": sym,
-                "shares": qty,
-                "assignment_strike": ref,
-                "pause_floor": round(pause_floor, 2),
-                "last_close": float(latest["close"]),
-                "last_close_date": str(latest["date"]),
-                "trading_days_paused": days_paused,
-                "pct_below_strike": round(1.0 - float(latest["close"]) / ref, 4),
+            result["unknown_uncovered_days"].append({
+                "symbol": symbol, "shares": held[symbol],
+                "cost_basis_per_share": None, "last_price": None,
+                "underwater_pct": None, "uncovered_days": None,
+                "outcome": "", "reason": "no_decision_records",
+                "run_id": "", "last_decision_at": "",
             })
 
+        result["uncovered"].sort(key=lambda r: r["uncovered_days"], reverse=True)
         return result
-
 
 # Singleton instance
 _bq_service: Optional[BigQueryService] = None

@@ -449,3 +449,74 @@ def opportunity_floor_per_share(opportunity: Dict[str, Any]) -> float:
         return 0.0
 
     return 0.0
+
+
+def opportunity_shares_covered(opportunity: Dict[str, Any]) -> int:
+    """Shares this covered call actually covers, across both shapes.
+
+    FC-065 Phase 4, same root cause as ``opportunity_floor_per_share``: the
+    ``call_sale_executed`` event read ``shares_covered`` — a wheel-engine-only
+    key — so **every production covered-call fill logged
+    ``shares_covered=0``**, and FC-029's standing production-validation item
+    ("confirm the floor held on a real write") has been unsatisfiable ever
+    since.
+
+    Resolution order, first positive wins:
+      1. ``shares_covered`` (wheel-engine shape).
+      2. ``contracts * 100`` — the quantity actually being sold, which is the
+         number the event should report.
+      3. ``max_contracts * 100`` (scanner shape, pre-sizing).
+
+    Never falls back to ``shares_owned``: a 300-share position writing one
+    contract covers 100 shares, not 300, and the event is about the write.
+    Returns 0 when nothing is derivable.
+    """
+    try:
+        shares = float(opportunity.get('shares_covered') or 0)
+        if shares > 0:
+            return int(shares)
+
+        for key in ('contracts', 'max_contracts'):
+            contracts = float(opportunity.get(key) or 0)
+            if contracts > 0:
+                return int(contracts * 100)
+    except (TypeError, ValueError):
+        return 0
+
+    return 0
+
+
+def opportunity_total_return_if_called(opportunity: Dict[str, Any]) -> float:
+    """Premium plus capital gain to the floor, if the call is exercised.
+
+    Derived from the quantities actually being sold rather than read off the
+    opportunity, because neither producer carries a usable figure at execution
+    time: the wheel-engine key ``total_return_if_called`` is absent on scanner
+    opportunities (the FC-050 shape bug), and the scanner's own
+    ``total_return_if_assigned`` is scaled by ``max_contracts``, which
+    overstates the number whenever selection sizes down to fewer contracts.
+
+    ``premium * shares + (strike - floor) * shares``.  Negative when the
+    strike sits below the floor — which the execute-time gate blocks, so a
+    negative value in this table means the gate was bypassed and is worth
+    an investigation.
+
+    Falls back to a positive declared ``total_return_if_called`` only when the
+    derivation has no inputs; returns 0.0 when neither is available.
+    """
+    try:
+        shares = opportunity_shares_covered(opportunity)
+        floor = opportunity_floor_per_share(opportunity)
+        strike = float(opportunity.get('strike_price') or 0)
+        premium = float(opportunity.get('premium') or 0)
+
+        if shares > 0 and floor > 0 and strike > 0:
+            return premium * shares + (strike - floor) * shares
+
+        declared = float(opportunity.get('total_return_if_called') or 0)
+        if declared:
+            return declared
+    except (TypeError, ValueError):
+        return 0.0
+
+    return 0.0

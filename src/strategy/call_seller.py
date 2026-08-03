@@ -10,7 +10,12 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils.logging_events import log_trade_event, log_error_event, log_position_update
 from ..utils.option_symbols import parse_option_symbol
-from .cost_basis import CostBasisResolver, opportunity_floor_per_share
+from .cost_basis import (
+    CostBasisResolver,
+    opportunity_floor_per_share,
+    opportunity_shares_covered,
+    opportunity_total_return_if_called,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -420,7 +425,18 @@ class CallSeller:
                     'timestamp': clock.now().isoformat()
                 }
 
-                # Enhanced logging for BigQuery analytics
+                # Enhanced logging for BigQuery analytics.
+                #
+                # FC-065 Phase 4: these three economics fields used to read
+                # `shares_covered` / `stock_cost_basis` / `total_return_if_called`
+                # straight off the opportunity. Those are wheel-engine-only
+                # keys, and production runs the scanner path, so EVERY live
+                # `call_sale_executed` logged 0/0/0 — the fourth instance of
+                # the untyped-shape root cause and the reason FC-029's
+                # production-validation item could not be satisfied. They now
+                # go through the same shape-tolerant accessors FC-050
+                # introduced for the floor itself.
+                shares_covered = opportunity_shares_covered(opportunity)
                 log_trade_event(
                     logger,
                     event_type="call_sale_executed",
@@ -433,9 +449,14 @@ class CallSeller:
                     contracts=contracts,
                     limit_price=limit_price,
                     order_id=order_result.get('order_id'),
-                    shares_covered=opportunity.get('shares_covered', 0),
-                    stock_cost_basis=opportunity.get('stock_cost_basis', 0),
-                    total_return_if_called=opportunity.get('total_return_if_called', 0),
+                    shares_covered=shares_covered,
+                    # Total basis of the covered shares, so the field keeps its
+                    # documented (wheel-engine) units while being derived from
+                    # the per-share floor the gate actually enforced above.
+                    stock_cost_basis=round(cost_basis_per_share * shares_covered, 2),
+                    cost_basis_per_share=cost_basis_per_share,
+                    total_return_if_called=round(
+                        opportunity_total_return_if_called(opportunity), 2),
                     dte=opportunity.get('dte', 0)
                 )
 

@@ -94,6 +94,18 @@ class ExecutionEngine:
         self.config = config
         self.logger = log or logger
         self.trade_journal = trade_journal or TradeJournal()
+        # FC-065 Phase 4: underlying -> the reason its last CALL opportunity
+        # was dropped this cycle. A read-only side channel for the decision
+        # record, populated at the single `_log_drop` chokepoint so ranking
+        # and selection cannot diverge from it. Last write wins: the later
+        # stage is the more specific verdict. Cleared per cycle by
+        # `rank_opportunities`, which always runs first on the /run path.
+        #
+        # CALLS ONLY, and the name says so. Only one position per underlying is
+        # allowed across both pools, so a call selected on AAPL drops the AAPL
+        # put as `duplicate_underlying` — a symbol-keyed map holding both would
+        # hand the covered-call decision record the PUT's reason.
+        self.last_call_drop_reasons: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -244,6 +256,10 @@ class ExecutionEngine:
         total = (per_share * 100 * contracts
                  if per_share is not None and contracts else None)
 
+        underlying = opportunity.get('symbol')
+        if underlying and self._opportunity_type(opportunity) == 'call':
+            self.last_call_drop_reasons[underlying] = reason
+
         self.logger.info(
             "Opportunity dropped before execution",
             event_category="filtering",
@@ -369,6 +385,11 @@ class ExecutionEngine:
         Returns:
             List of metric dicts, calls first then puts.
         """
+        # FC-065 Phase 4: one cycle's drop reasons, and only one cycle's. The
+        # engine is constructed per request today, but a reused instance must
+        # not report last hour's reason as this hour's decision.
+        self.last_call_drop_reasons = {}
+
         typed = [(opp, self._opportunity_type(opp)) for opp in opportunities]
 
         if positions is None:

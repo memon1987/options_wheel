@@ -79,10 +79,20 @@ def _no_production_bigquery(monkeypatch, request):
         return
 
     from src.strategy.cost_basis import CostBasisResolver
+    from src.data.decision_record import UncoveredDaysResolver
 
     monkeypatch.setattr(
         CostBasisResolver, "_lookup_assignment_basis",
         lambda self, symbol, shares_held: None,
+    )
+    # FC-065 Phase 4 adds a SECOND BigQuery chokepoint: the decision record's
+    # `uncovered_days` label, batched once per scan. Patched on the class for
+    # the same reason as the resolver above — every instance is covered, and
+    # None is the honest "we could not tell" signal (never 0 days, which would
+    # read as "covered today").
+    monkeypatch.setattr(
+        UncoveredDaysResolver, "_lookup_uncovered_days",
+        lambda self, symbols: None,
     )
     yield
 

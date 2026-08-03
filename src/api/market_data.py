@@ -39,6 +39,11 @@ class MarketDataManager:
         self._metrics_cache: Dict[str, Tuple[Dict[str, Any], datetime]] = {}
         self._options_chain_cache: Dict[str, Tuple[Dict[str, List[Dict[str, Any]]], datetime]] = {}
         self._cache_ttl = _DEFAULT_CACHE_TTL
+        # FC-065 Phase 4: last call-chain rejection breakdown per symbol, so a
+        # `no_candidates` decision record can say WHICH filter emptied the
+        # chain. Read-only side channel — `find_suitable_calls` keeps its
+        # List[...] return type, so no caller or test has to change shape.
+        self.last_call_rejection_stats: Dict[str, Dict[str, int]] = {}
         
     def get_stock_metrics(self, symbol: str) -> Dict[str, Any]:
         """Get comprehensive stock metrics for wheel strategy evaluation.
@@ -477,6 +482,11 @@ class MarketDataManager:
 
         # Sort by return score (higher is better)
         suitable_calls.sort(key=lambda x: x.get('return_score', 0), reverse=True)
+
+        # FC-065 Phase 4: publish the breakdown for the decision record. Same
+        # numbers the STAGE 8 log line carries, but reachable by the caller
+        # instead of only by log archaeology.
+        self.last_call_rejection_stats[symbol] = dict(rejection_stats)
 
         if suitable_calls:
             best_call = suitable_calls[0]

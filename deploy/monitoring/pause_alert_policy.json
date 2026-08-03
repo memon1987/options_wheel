@@ -1,19 +1,21 @@
 {
-  "displayName": "Drawdown pause extended — options-wheel",
+  "displayName": "Symbol uncovered too long \u2014 options-wheel",
   "documentation": {
-    "content": "One or more held symbols have been in FC-029 R3 drawdown pause for >= the alert threshold (default 7 trading days). The bot is not writing covered calls on them, so that capital is idle.\n\nPrecedent: AMZN's 62-day implicit pause (Feb-Apr 2026) cost an estimated $1,500-3,000 in foregone premium.\n\nAlso matches DRAWDOWN_PAUSE_ALERT_CHECK_FAILED - the daily check could not evaluate pause state. Treat that as 'unknown', not 'all clear'.\n\nNOTE: the filter deliberately does NOT constrain severity. Cloud Run captures the app's stderr as plain text with EMPTY severity, so a severity>=WARNING clause matches nothing (verified by fire drill 2026-07-18). Payload shape is matched both ways so structured logging can be adopted later without breaking the alert.\n\nRunbook: deploy/monitoring/drawdown_pause_alert.md",
+    "content": "One or more held symbols have had NO covered call written against them for >= the alert threshold (default 7 trading days), so that capital is idle.\n\nPrecedent: AMZN's 62-day gap (Feb-Apr 2026) cost an estimated $1,500-3,000 in foregone premium.\n\nREPOINTED 2026-08-01 (FC-065 Phase 4). This alert used to report an 'FC-029 R3 drawdown pause' inferred from price vs the latest OPASN put strike. There is no drawdown gate any more (OQ-3), and since FC-065 Phase 1 the bot's floor is Alpaca's avg_entry_price - one put premium BELOW the strike that inference used - so near the threshold the alert and the bot disagreed. It now reads the bot's own options_wheel.decision_events records. The marker string, filter, channel and scheduler job are deliberately UNCHANGED: renaming the marker would silently disarm the alert.\n\nAlso matches DRAWDOWN_PAUSE_ALERT_CHECK_FAILED - the daily check could not evaluate, or could not derive uncovered_days for a held symbol. Treat that as 'unknown', not 'all clear'.\n\nTriage:\n1. Dashboard -> Bot Health -> Uncovered Positions.\n2. Run the fill-rate query in docs/operations/DECISION_RECORDS.md. An EMPTY decision table means the bot is not writing records (rolled-back revision, BigQuery outage), not that everything is covered.\n3. A symbol uncovered while ABOVE its floor means the delta/premium bands emptied the chain, not the floor - check reason_counts on its no_candidates row.\n\nNOTE: the filter deliberately does NOT constrain severity. Cloud Run captures the app's stderr as plain text with EMPTY severity, so a severity>=WARNING clause matches nothing (verified by fire drill 2026-07-18). Payload shape is matched both ways so structured logging can be adopted later without breaking the alert.\n\nPlan: docs/plans/fc-065.md. Runbook: deploy/monitoring/drawdown_pause_alert.md",
     "mimeType": "text/markdown"
   },
   "conditions": [
     {
-      "displayName": "Symbol paused beyond threshold",
+      "displayName": "Symbol uncovered beyond threshold",
       "conditionMatchedLog": {
         "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"options-wheel-dashboard\" AND (textPayload:\"DRAWDOWN_PAUSE_ALERT\" OR jsonPayload.message:\"DRAWDOWN_PAUSE_ALERT\")"
       }
     }
   ],
   "alertStrategy": {
-    "notificationRateLimit": {"period": "86400s"},
+    "notificationRateLimit": {
+      "period": "86400s"
+    },
     "autoClose": "172800s"
   },
   "combiner": "OR",

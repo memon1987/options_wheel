@@ -5,11 +5,13 @@ writes to purpose-built, time-partitioned tables.  Each table has a
 code-defined schema — no auto-detection, no wildcard query conflicts.
 
 Manages these tables in the ``options_wheel`` dataset:
-  - errors        (error events)
-  - executions    (endpoint run summaries)
-  - wheel_cycles  (completed wheel cycles — dashboard now reads from
-                   wheel_cycles_from_activities view; this remains as
-                   a secondary audit)
+  - errors          (error events)
+  - executions      (endpoint run summaries)
+  - wheel_cycles    (completed wheel cycles — dashboard now reads from
+                     wheel_cycles_from_activities view; this remains as
+                     a secondary audit)
+  - decision_events (FC-065 Phase 4 — one covered-call decision per held
+                     symbol per cycle, keyed (run_id, symbol, stage))
 Post-FC-012 (2026-04-24) removals:
   - write_scan_result / write_scan_results_batch (never called)
   - write_position_snapshot / write_position_snapshots_batch (migrated
@@ -100,6 +102,57 @@ if _HAS_BIGQUERY:
         # position_snapshots: removed in FC-012. PORTFOLIO rows migrated to
         # equity_history_from_alpaca; non-PORTFOLIO rows dropped entirely
         # (frontend never consumed /metrics/stock-snapshots).
+        #
+        # FC-065 Phase 4. Adopts FC-044 Phase 1's `decision_events` design,
+        # with its "metrics JSON" column deliberately NOT adopted: the metrics
+        # are typed scalars here and the chain-rejection breakdown is a
+        # REPEATED RECORD. String-ifying arrays or structs into a BigQuery
+        # column is the 2026-04-07 schema lesson (it produced a dataset whose
+        # wildcard queries could not be run at all).
+        "decision_events": [
+            bigquery.SchemaField("timestamp", "TIMESTAMP",
+                                 description="Write time (partition field)"),
+            bigquery.SchemaField("run_id", "STRING",
+                                 description="Minted at /scan, threaded to /run"),
+            bigquery.SchemaField("run_ts", "TIMESTAMP",
+                                 description="Cycle start — stable across stages"),
+            bigquery.SchemaField("stage", "STRING", description="scan | run"),
+            bigquery.SchemaField("endpoint", "STRING", description="/scan | /run"),
+            bigquery.SchemaField("symbol", "STRING", description="Underlying"),
+            bigquery.SchemaField(
+                "outcome", "STRING",
+                description=("Closed enum: sold | no_candidates | dropped | "
+                             "blocked | not_eligible")),
+            bigquery.SchemaField("reason", "STRING",
+                                 description="Sub-reason scoped to outcome"),
+            bigquery.SchemaField("shares", "INTEGER"),
+            bigquery.SchemaField("cost_basis_per_share", "FLOAT",
+                                 description="Resolved floor (avg_entry_price)"),
+            bigquery.SchemaField("current_price", "FLOAT"),
+            bigquery.SchemaField(
+                "underwater_pct", "FLOAT",
+                description="(price - floor) / floor; NEGATIVE is underwater"),
+            bigquery.SchemaField(
+                "uncovered_days", "INTEGER",
+                description="Trading days since the last covered call; NULL = unknown"),
+            bigquery.SchemaField("candidates", "INTEGER",
+                                 description="Qualifying call contracts found"),
+            bigquery.SchemaField("option_symbol", "STRING"),
+            bigquery.SchemaField("strike_price", "FLOAT"),
+            bigquery.SchemaField("premium", "FLOAT"),
+            bigquery.SchemaField("contracts", "INTEGER"),
+            bigquery.SchemaField("order_id", "STRING"),
+            bigquery.SchemaField(
+                "reason_counts", "RECORD", mode="REPEATED",
+                description="Chain-rejection breakdown — REPEATED, never a JSON string",
+                fields=[
+                    bigquery.SchemaField("reason", "STRING"),
+                    bigquery.SchemaField("count", "INTEGER"),
+                ]),
+            bigquery.SchemaField(
+                "dedup_key", "STRING",
+                description="run_id|symbol|stage — also the streaming insertId"),
+        ],
     }
 
 
@@ -190,8 +243,17 @@ class AnalyticsWriter:
             logger.debug("AnalyticsWriter insert failed",
                         table=table_name, exc_info=True)
 
-    def _write_batch(self, table_name: str, rows: List[dict]) -> None:
-        """Insert multiple rows into a named table."""
+    def _write_batch(self, table_name: str, rows: List[dict],
+                     row_ids: Optional[List[str]] = None) -> None:
+        """Insert multiple rows into a named table.
+
+        ``row_ids`` are passed to BigQuery as streaming ``insertId``s, which
+        gives best-effort de-duplication of an identical row re-sent inside
+        the streaming window — the first line of defence against a Cloud
+        Scheduler retry.  It is only the first line: the window is short, so
+        any table written with row_ids must ALSO be read through a
+        dedup-on-key query.  See ``write_decision_events``.
+        """
         if not self._enabled or not rows or table_name not in self._tables:
             return
         now = datetime.now(timezone.utc).isoformat()
@@ -199,7 +261,9 @@ class AnalyticsWriter:
             if "timestamp" not in row:
                 row["timestamp"] = now
         try:
-            errors = self._client.insert_rows_json(self._tables[table_name], rows)
+            kwargs = {"row_ids": row_ids} if row_ids else {}
+            errors = self._client.insert_rows_json(
+                self._tables[table_name], rows, **kwargs)
             if errors:
                 logger.error("AnalyticsWriter batch insert errors",
                             table=table_name, count=len(rows),
@@ -274,6 +338,33 @@ class AnalyticsWriter:
             "duration_days": duration_days,
             "shares": shares,
         })
+
+    def write_decision_events(self, rows: List[dict]) -> None:
+        """Write FC-065 Phase 4 decision records, keyed for idempotency.
+
+        Each row carries ``dedup_key = run_id|symbol|stage``; that string is
+        handed to BigQuery as the streaming ``insertId``.  Rows arriving
+        without one are refused rather than written unkeyed — an unkeyed
+        fire-and-forget writer is exactly what produced 36 duplicate
+        ``wheel_cycles`` rows per assignment, and a decision table that
+        double-counts is worse than no decision table.
+
+        Readers must still dedup on ``dedup_key`` (insertId dedup is
+        best-effort over a short window; a scheduler retry minutes later
+        slips through it).  The canonical reading pattern lives in
+        ``dashboard/backend/services/bigquery.py`` and the runbook.
+        """
+        if not rows:
+            return
+        keyed = [r for r in rows if r.get("dedup_key")]
+        if len(keyed) != len(rows):
+            logger.error("Refusing unkeyed decision rows",
+                         table="decision_events",
+                         refused=len(rows) - len(keyed))
+        if not keyed:
+            return
+        self._write_batch("decision_events", keyed,
+                          row_ids=[r["dedup_key"] for r in keyed])
 
     def query(self, table_name: str, query_sql: str) -> List[dict]:
         """Run a query and return results as list of dicts."""

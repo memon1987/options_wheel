@@ -24,8 +24,24 @@ sys.path.append('/app/src')
 from src.utils.config import Config
 from src.utils.logging_events import log_system_event, log_performance_metric, log_error_event, log_trade_event
 from src.utils.option_symbols import strict_option_type
+from src.data.decision_record import (
+    RunDecisionFlusher,
+    is_call_opportunity,
+    mint_run_id,
+    run_id_from_opportunities,
+)
 
 logger = structlog.get_logger(__name__)
+
+
+def _underlyings_removed(before, after):
+    """Underlyings of call opportunities present in ``before`` but not ``after``."""
+    remaining = {o.get('option_symbol') for o in after if isinstance(o, dict)}
+    return {
+        o.get('symbol') for o in before
+        if isinstance(o, dict) and is_call_opportunity(o)
+        and o.get('option_symbol') not in remaining and o.get('symbol')
+    }
 
 app = Flask(__name__)
 
@@ -293,10 +309,19 @@ def trigger_scan():
             market_data = MarketDataManager(alpaca_client, config)
             scanner = OptionsScanner(alpaca_client, market_data, config)
 
+            # FC-065 Phase 4: mint the cycle identifier HERE, once. /scan and
+            # /run are separate stateless requests ~15 minutes apart and
+            # `request_id` is bound per HTTP request, so nothing joined them
+            # before this — the opportunity blob was the only correlator
+            # (FC-044's survey). The id rides the blob into /run.
+            run_id = mint_run_id(start_time)
+            structlog.contextvars.bind_contextvars(run_id=run_id)
+
             # Perform market scan
             logger.info("Starting options market scan",
                        event_category="system",
-                       event_type="market_scan_starting")
+                       event_type="market_scan_starting",
+                       run_id=run_id)
 
             # Scan for put opportunities
             put_opportunities = scanner.scan_for_put_opportunities()
@@ -306,7 +331,7 @@ def trigger_scan():
                        count=len(put_opportunities))
 
             # Scan for call opportunities (if we have stock positions)
-            call_opportunities = scanner.scan_for_call_opportunities()
+            call_opportunities = scanner.scan_for_call_opportunities(run_id=run_id)
             logger.info("Call opportunities found",
                        event_category="system",
                        event_type="call_scan_completed",
@@ -317,13 +342,15 @@ def trigger_scan():
             opportunity_store = OpportunityStore(config)
 
             all_opportunities = put_opportunities + call_opportunities
-            stored = opportunity_store.store_opportunities(all_opportunities, start_time)
+            stored = opportunity_store.store_opportunities(
+                all_opportunities, start_time, run_id=run_id)
 
             # Update status with scan results
             strategy_status['last_scan'] = datetime.now().isoformat()
             strategy_status['status'] = 'scan_completed'
 
             scan_results = {
+                'run_id': run_id,
                 'put_opportunities': len(put_opportunities),
                 'call_opportunities': len(call_opportunities),
                 'total_opportunities': len(all_opportunities),
@@ -420,6 +447,18 @@ def trigger_strategy():
     """Trigger strategy execution."""
     with strategy_lock:
         start_time = datetime.now()
+        # FC-065 Phase 4 decision-record state, initialised BEFORE the try so
+        # the `finally` below can always read it. A crash inside execute_batch
+        # used to 500 with zero run-stage rows — including for orders that had
+        # already reached the broker, which is the cycle you most want a
+        # record of. Mirrors the scanner's flush-in-finally.
+        decisions = RunDecisionFlusher()
+        blob_opportunities = decisions.opportunities
+        selected_opportunities = []
+        execution_results = []
+        already_positioned_symbols = set()
+        previously_failed_symbols = set()
+
         try:
             # Removed duplicate - already logged below with log_system_event()
 
@@ -496,10 +535,25 @@ def trigger_strategy():
                     }
                 })
 
+            # FC-065 Phase 4: the scan's run_id rides in on the opportunities.
+            # A blob written before this shipped carries none — mint an orphan
+            # id and say so, rather than dropping the cycle's telemetry.
+            blob_opportunities[:] = list(opportunities)
+            run_id = run_id_from_opportunities(blob_opportunities)
+            if not run_id:
+                run_id = mint_run_id(start_time)
+                logger.warning("Opportunity blob carries no run_id — orphan cycle",
+                               event_category="system",
+                               event_type="run_id_missing_on_blob",
+                               run_id=run_id)
+            decisions.run_id = run_id
+            structlog.contextvars.bind_contextvars(run_id=run_id)
+
             logger.info("Retrieved opportunities for execution",
                        event_category="system",
                        event_type="opportunities_retrieved",
                        count=len(opportunities),
+                       run_id=run_id,
                        execution_time=start_time.isoformat())
 
             # Initialize execution engine, put seller, and call seller
@@ -514,10 +568,14 @@ def trigger_strategy():
             opportunities, non_retryable_filtered = exec_engine.filter_failed_opportunities(
                 opportunities
             )
+            previously_failed_symbols = _underlyings_removed(
+                blob_opportunities, opportunities)  # noqa: F841 - read in finally
             if non_retryable_filtered > 0 and not opportunities:
                 logger.info("All opportunities previously failed with non-retryable errors",
                            event_category="system",
                            event_type="all_opportunities_non_retryable")
+                decisions.flush(
+                    previously_failed=previously_failed_symbols)
                 return jsonify({
                     'message': 'All opportunities previously failed (non-retryable)',
                     'timestamp': datetime.now().isoformat(),
@@ -530,17 +588,24 @@ def trigger_strategy():
 
             # IDEMPOTENCY CHECK: Filter out opportunities where positions already exist
             # This prevents duplicate trades if execution runs twice (e.g., mark_executed failed)
+            already_positioned_symbols = set()
             try:
                 existing_positions = alpaca_client.get_option_positions()
                 original_count = len(opportunities)
+                pre_idempotency = list(opportunities)
                 opportunities, filtered_count = exec_engine.filter_duplicate_opportunities(
                     opportunities, existing_positions
                 )
+                already_positioned_symbols = _underlyings_removed(
+                    pre_idempotency, opportunities)
 
                 if filtered_count > 0 and not opportunities:
                     logger.info("All opportunities already have positions - likely duplicate execution",
                                event_category="system",
                                event_type="duplicate_execution_prevented")
+                    decisions.flush(
+                        already_positioned=already_positioned_symbols,
+                        previously_failed=previously_failed_symbols)
                     return jsonify({
                         'message': 'All opportunities already executed (idempotency check)',
                         'timestamp': datetime.now().isoformat(),
@@ -600,6 +665,17 @@ def trigger_strategy():
             # Execute orders sequentially with real-time buying power validation
             execution_results, trades_executed = exec_engine.execute_batch(
                 selected_opportunities, put_seller, call_seller=call_seller
+            )
+
+            # FC-065 Phase 4: the terminal per-symbol decision for every
+            # covered-call candidate this cycle carried. Emitted before the
+            # mark-executed step, which has its own 500 exit.
+            decisions.flush(
+                selected=selected_opportunities,
+                execution_results=execution_results,
+                drop_reasons=exec_engine.last_call_drop_reasons,
+                already_positioned=already_positioned_symbols,
+                previously_failed=previously_failed_symbols,
             )
 
             # Mark opportunities as executed in Cloud Storage
@@ -749,6 +825,18 @@ def trigger_strategy():
                 'error': f"Strategy execution failed: {str(e)}"
             })
             return jsonify({'error': f"Strategy execution failed: {str(e)}"}), 500
+
+        finally:
+            # A cycle that crashed is the cycle most worth a record — not
+            # least because orders may already have reached the broker before
+            # the exception. Whatever partial state exists is written; the
+            # once-guard makes the normal paths' explicit flush win.
+            decisions.flush(
+                selected=selected_opportunities,
+                execution_results=execution_results,
+                already_positioned=already_positioned_symbols,
+                previously_failed=previously_failed_symbols,
+            )
 
 def _is_market_open() -> bool:
     """Check if the US stock market is currently open.
