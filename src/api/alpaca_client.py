@@ -226,6 +226,7 @@ class AlpacaClient:
         try:
             account = self.trading_client.get_account()
             return {
+                'account_number': getattr(account, 'account_number', None),
                 'buying_power': float(account.buying_power),
                 'cash': float(account.cash),
                 'portfolio_value': float(account.portfolio_value),

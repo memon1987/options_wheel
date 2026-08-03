@@ -2,6 +2,7 @@
 
 import pytest
 import os
+import sys
 import tempfile
 from unittest.mock import Mock, MagicMock, patch
 from datetime import datetime, timezone
@@ -13,6 +14,25 @@ from src.utils import clock as _time_seam
 
 
 # ==================== Global isolation ====================
+
+@pytest.fixture(autouse=True)
+def _reset_cloud_run_caches():
+    """Reset the server's process-scoped caches between tests (FC-075 Seam 2).
+
+    ``deploy.cloud_run_server`` caches the Config and the account-interlock
+    verdict at module scope. Without a reset, a verdict cached by one test
+    (e.g. a mismatch → 503) would leak into the next. Only touches the module if
+    a test already imported it, so non-server tests (and flask-less envs) are
+    unaffected.
+    """
+    def _reset():
+        mod = sys.modules.get("deploy.cloud_run_server")
+        if mod is not None and hasattr(mod, "reset_strategy_state"):
+            mod.reset_strategy_state()
+    _reset()
+    yield
+    _reset()
+
 
 @pytest.fixture(autouse=True)
 def _reset_time_seam():
@@ -108,10 +128,12 @@ def _deterministic_alpaca_credentials(monkeypatch):
 def test_config_data() -> Dict[str, Any]:
     """Return a complete, valid test configuration dictionary."""
     return {
+        'strategy_id': 'wheel',  # FC-075: required top-level key
         'alpaca': {
             'paper_trading': True,
             'api_key_id': 'test_api_key',
-            'secret_key': 'test_secret_key'
+            'secret_key': 'test_secret_key',
+            'expected_account_number': 'PA_TEST_ACCT'  # FC-075 Seam 2 interlock
         },
         'strategy': {
             'put_target_dte': 7,
