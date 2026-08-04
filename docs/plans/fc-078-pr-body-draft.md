@@ -3,7 +3,7 @@
 **Plan:** `docs/plans/fc-078.md` (rev 2, two adversarial plan reviews dispositioned)
 **Branch:** `fc-078/roller-revival`
 **Base:** `origin/main @ ec53933`
-**Status:** built, validated, mutation-checked. **No PR opened; nothing merged.**
+**Status:** built, validated, mutation-checked, **two adversarial code reviews dispositioned**. **No PR opened; nothing merged.** Confirmation pass still required (fixes landed in code).
 
 > ⚠️ **This code places live orders on the paper account the moment it merges.**
 > The operator explicitly waived a log-only launch gate, so build correctness is
@@ -145,7 +145,7 @@ the same reason.
 | Check | Result |
 |---|---|
 | Full suite, baseline `ec53933` | **1125 passed** |
-| Full suite, this branch | **1223 passed** (+98) |
+| Full suite, this branch | **1237 passed** (+112; 1223 pre-review, +14 from the review fixes) |
 | Working tree after mutation runs | clean; `git diff` empty |
 | Entry-profile byte-identical pin | **proven** — 400 randomized chains diffed against the `ec53933` implementation; results *and* published rejection stats identical (harness run then removed) |
 | Deleted-knob grep across `src/ tools/ deploy/ tests/ config/ docs/` | only intentional hits remain: the deletion-assertion tests, `docs/gates.md`'s explicit "Deleted by FC-078" list, and the historical FC-066 diagnosis in `FUTURE_CONSIDERATIONS.md` |
@@ -170,7 +170,19 @@ Cycle-level paths (`cycle_budget_exhausted`, `open_orders_unavailable`,
 
 ---
 
-## Mutation record — 31 mutations, **31 killed, 0 survived**
+## Mutation record — 44 mutations, **44 killed, 0 survived**
+
+Round 1 (31, pre-review) + round 2 (10, the review fixes) + 3 round-1 mutations
+re-anchored because the H-1 fix rewrote their target code. Two mutations
+survived at some point and both were then closed:
+
+- **M39** (anchor rungs 3+ on `btc_limit` instead of the actual fill) — the
+  trader's finding L-3. Survived because every prior test filled the BTC exactly
+  at its limit, where the two numbers coincide. Now killed.
+- **M21'** (set the shipped settle bound to 0 — one read, no polling: the H-1
+  defect restored) — survived because the autouse test fixture drives that
+  constant to 0 so tests don't sleep, which made the *production* value
+  invisible to the entire suite. Closed by asserting the literal from source.
 
 Procedure per mutation: apply to source → clear `__pycache__` → run targeted
 tests → record → `git checkout --` the file → clear `__pycache__`. The stale-`.pyc`
@@ -210,7 +222,66 @@ lesson from FC-032's review is why the cache is cleared on both sides.
 | M30 | T-11 | swallow a per-position exception without a terminal event | wheel_engine | KILLED (2) |
 | M31 | T-17b | fail **open** when the open-order book is unreadable | wheel_engine | KILLED (1) |
 
+### Round 2 — the review fixes
+
+| # | Finding | Mutation | File | Result |
+|---|---|---|---|---|
+| M32 | H-1 | revert cancel-and-settle to a **single** post-cancel re-read | call_roller | KILLED (6) |
+| M33 | H-1 | treat `pending_cancel` as a **terminal** status | call_roller | KILLED (4) |
+| M34 | H-1 | let the STO ladder continue after an unsettled rung | call_roller | KILLED (1) |
+| M35 | H-1 | treat an unsettled BTC cancel as a verified zero fill | call_roller | KILLED (2) |
+| M36 | H-1 | swallow order-refetch failures silently (no breadcrumb) | call_roller | KILLED (2) |
+| M37 | H-2 | restore the **mixed-quantity** `net_credit` | call_roller | KILLED (1) |
+| M38 | H-2 | drop the uncovered-remainder terminal (report `completed`) | call_roller | KILLED (2) |
+| M39 | L-3 | anchor rungs 3+ on `btc_limit` instead of the **actual fill** | call_roller | KILLED (1) — *survived pre-fix* |
+| M40 | L-2 | report a post-placement rejection as a timeout-cancel | call_roller | KILLED (1) |
+| M41 | L-1 | silently drop short calls with no covering shares | wheel_engine | KILLED (1) |
+
+### Re-anchored round-1 mutations (target code rewritten by the H-1 fix)
+
+| # | Plan test | Mutation | Result |
+|---|---|---|---|
+| M20' | T-10a | drop the cancel entirely from cancel-and-settle (both legs) | KILLED (4) |
+| M21' | T-10b | settle with a **zero** bound (one read, no polling) | KILLED (1) — *survived until the source-literal assertion* |
+| M25' | T-18 | drop the inter-rung settle (assume every rung is dead) | KILLED (4) |
+
 Parenthesised numbers are failing tests under the mutation.
+
+---
+
+## Two-review disposition
+
+Both reviews returned **REQUEST_CHANGES**. They were strongly convergent and
+**there were no reviewer-vs-reviewer disagreements** — two findings were the
+same defect reached from different directions (exec H-2 = trader M-1; exec H-3 =
+trader M-2). The trader re-derived DD-8 against live marks and re-ran the round-1
+mutation harness independently.
+
+**Core money path verified clean by both.** The credit invariant, BTC-first
+ordering, the span gate, the floor routing and max-credit selection were
+confirmed against live data. The trader's re-derivation put **GOOGL C375 8/21 at
+exactly +$248/contract, ranked 14th of 170 by `return_score`** — direct
+confirmation that the `[:5]` truncation would have hidden it and that the
+deviation was necessary. **Sign-off granted on that deviation.**
+
+| # | Finding | Sev | Disposition |
+|---|---|---|---|
+| Exec H-1 | Cancel-then-verify did a single re-read and dispatched on `filled_qty` ignoring a non-terminal status. Alpaca cancels are **queued**; `pending_cancel` is a real intermediate state and such an order can still fill. Probe: STO ladder placed 3 sells that **all filled** while reporting `naked_exposure` "no naked position" (two genuinely naked calls); BTC reported `btc_timeout_canceled` with `order_status=pending_cancel` while the DAY order kept working | BLOCKER | **FIXED.** `_cancel_and_settle` cancels then polls to a terminal status (bound 15 s, 5 s interval). Non-terminal at the bound → fail safe: never place another sell, emit alert-wired `call_roll_unknown_disposition`, stop touching the position. Same for unreadable orders (an API blip used to mint a "verified zero fill"). Mutations M32–M36, M20', M21', M25' |
+| Exec H-2 = Trader M-1 | STO partial fill: uncovered remainder invisible; `net_credit` computed across **mixed quantities** → BTC 2 / STO 1 reported `call_roll_completed` with **net_credit = −$590**, a blended debit labelled a credit, 100 shares uncovered, no naked-exposure-class event. Contradicts plan §1's own text | HIGH | **FIXED.** `net_credit` computed on the **replaced** quantity; both legs' qty × price reported explicitly; remainder raises alert-wired `call_roll_partial_naked_exposure`. Mutations M37, M38 |
+| Exec H-3 = Trader M-2 | `call_roll_execution_error` and `call_roll_order_refetch_failed` not alert-wired, despite the build's own Gap-2 rationale saying execution_error carries naked-exposure weight | HIGH | **FIXED.** Both added to `roll_executed_alert_policy.json` (jsonPayload + textPayload), along with the two new terminals. Doc 2841/4000 chars |
+| Exec M-1 | `strategy_lock` is in-process; Cloud Run can run 2 instances, so a manual `POST /roll` racing the 15:30 job on a different instance bypasses it — now wrapping a two-leg sequence | MEDIUM | **NOTED + runbook.** `--max-instances=1` added to the rollout as a required step, plus an explicit "manual triggers must not race the 15:30 slot" runbook line. Not enforced in code: the repo has no service-config-as-code, so the concurrency bound is a deploy-time property |
+| Trader L-3 | A mutation anchoring rungs 3+ on `btc_limit` instead of `btc_filled_price` **SURVIVED** the suite (every prior test filled the BTC exactly at its limit, where the two coincide) | LOW | **FIXED.** Test added with BTC filling at 7.00 against an 8.40 limit and a fallback quoted at 8.00 — legal against the actual fill, rejected against the stale limit. Mutation M39 now KILLED |
+| Trader L-2 | A broker rejection reaching terminal `rejected` reported `btc_timeout_canceled` with `disposition=terminal_no_fill` | LOW | **FIXED.** Now emits `call_roll_btc_rejected` with `rejected_after_placement=True`. Mutation M40 |
+| Trader L-1 | A short call with no matching stock position was dropped silently pre-evaluation — the one shape nobody wants (a genuinely naked short call) was the one never mentioned | LOW | **FIXED.** Emits `call_roll_skipped{no_covering_shares}` and counts as evaluated. Mutation M41 |
+| Exec L-1 | `settings.yaml` stale `# Call Rolling (Friday EOW) — FC-006` header | LOW | **FIXED** |
+| Exec L-2 | `docs/gates.md` stale injected-calendar quirk paragraph (the rewritten roller gates span on `config.earnings_enabled`, so the quirk is gone) | LOW | **FIXED** |
+| Exec L-3 + Trader L-5 | Deterministic `client_order_id` duplicate-rejection behaviour; off-tick `mid ± 0.05` limits | LOW | **NOTED in runbook** (below) |
+| Trader (runbook) | A rolled position re-pins just above the money (Δ≈0.47) and is re-eligible next day → expect daily `no_credit_candidate` noise; watch `stock_quote_unusable` frequency in week 1 | — | **NOTED in runbook** (below) |
+
+**Residual risk accepted:** exec M-1's instance race is mitigated by
+configuration and procedure, not by code. If the operator wants it enforced, the
+follow-up is a distributed lock (Firestore/GCS lease) — out of scope here, worth
+an FC if manual triggers become routine.
 
 ---
 
@@ -267,6 +338,21 @@ If the old contract's expiry will not parse there is no horizon to bound the
 replacement by. Fails closed with its own reason rather than being mislabelled
 `invalid_strike`.
 
+### Gap 4b — the STO partial remainder diverged from the plan (**found by review, not by me**)
+
+Plan §1 says, of a rung's partial fill: *"the uncovered remainder falls through
+to the naked-exposure terminal if no later rung covers it."* The shipped build
+did not implement that — it reported `call_roll_completed` and computed
+`net_credit` across mixed quantities, so a 2-contract BTC against a 1-contract
+STO produced **net_credit = −$590**, a blended debit labelled a credit, with 100
+shares uncovered and no naked-exposure-class event at all.
+
+**This was a plan-contract violation I missed and did not list among my
+deviations** — the original list claimed partial-fill truth was handled, which
+was true for the *BTC* leg only. Latent on today's 1-lot book, but a money-path
+contract violation regardless. Fixed per the disposition table; recorded here
+because "the deviations list was incomplete" is itself a finding worth carrying.
+
 ### Gap 5 — fallback rungs whose natural price violates the invariant are skipped, not repriced
 
 The plan says each rung re-passes "`validate_roll` + the invariant". A rung
@@ -322,7 +408,7 @@ the daily job exist — the first live roll would happen unwatched.
 gcloud scheduler jobs pause options-wheel-roll-friday --location us-central1
 ```
 
-### Step 2 — deploy, and verify the request timeout covers the cycle budget
+### Step 2 — deploy, verify the request timeout, and PIN THE INSTANCE COUNT
 
 ```bash
 gcloud run services describe options-wheel-strategy \
@@ -331,6 +417,20 @@ gcloud run services describe options-wheel-strategy \
 # must be >= 1800; raise it if lower — the cycle budget guard assumes the
 # request survives to the 1800s attempt deadline.
 ```
+
+**Required (review exec M-1): `--max-instances=1`.**
+
+```bash
+gcloud run services update options-wheel-strategy \
+  --region us-central1 --max-instances=1
+```
+
+`strategy_lock` is an **in-process** lock. It serialises `/roll` against
+`/monitor` and `/run` only within a single container. Cloud Run will happily run
+two instances, and two concurrent `/roll` requests landing on different
+instances bypass the lock entirely — which now wraps a two-leg order sequence
+against the same positions. `--max-instances=1` is what makes the lock mean what
+the plan assumed it meant.
 
 Env changes, if any, via `--update-env-vars` only — **never** `--set-env-vars`
 (it wipes the whole env set).
@@ -401,10 +501,48 @@ gcloud logging read \
 
 The next scheduled cycle is live regardless — no gate, per operator decision.
 
+> ⚠️ **Manual triggers must not race the 15:30 slot.** Even with
+> `--max-instances=1`, trigger manually only *well before* 15:30 (or after the
+> scheduled run has completed). The in-process lock is the only serialisation
+> there is, and a second instance — from a deploy rolling over, a scaling event,
+> or a raised max-instances — would bypass it while a two-leg sequence is in
+> flight. If a manual run is still executing at 15:30, let it finish and skip
+> the scheduled trigger.
+
 **Known bound:** a manual trigger plus the 15:30 scheduled run can produce **two
 rolls on one position in one day**. Each is independently credit-≥ 0 and
 strike-increasing, so the composite is still profitable and monotone, but "one
 roll per day" is a per-*cycle* claim, not a hard invariant.
+
+### What is NORMAL in week 1 (from the trader review — do not debug these)
+
+- **Daily `no_credit_candidate` on a freshly rolled position.** A completed roll
+  re-pins the strike just above the money (Δ≈0.47), so the position is
+  **re-eligible the very next day** (ratio ≥ 0.98) and will be evaluated every
+  cycle until the stock moves. Expect a steady drip of `no_credit_candidate`
+  skips on it. That is the credit invariant refusing marginal rolls, working as
+  designed — not a stuck position.
+- **Duplicate-order rejections are benign.** `place_option_order` mints a
+  deterministic `client_order_id` from (symbol, qty, side, price). A retried
+  HTTP request therefore *rejects* rather than double-placing — which is the
+  point — but it surfaces as a rejection in the logs. A rejection whose
+  `client_order_id` matches an order already on the book is the guard working.
+  This also means a rung re-priced to *exactly* the same limit within a cycle
+  will be refused; the ladder treats that as a dead rung and moves on.
+- **Off-tick limits from imminence mode.** `mid ± $0.05` can land off the
+  contract's tick grid (many options tick at $0.05 above $3.00, $0.01 below).
+  Alpaca rounds or rejects depending on the contract. A rejected STO rung is
+  handled (the ladder advances); a rounded one shifts the limit by up to a tick
+  — always in a direction the invariant already tested at the *unrounded* price,
+  so it cannot turn a credit into a debit by more than a rounding step. Worth
+  watching in week 1; if it produces noise, quantising the pad to the tick grid
+  is the follow-up.
+- **Watch `skip_reason=stock_quote_unusable` frequency.** The two-sided +
+  spread-sanity guard reads IEX, which is thin. A symbol whose IEX book is
+  chronically wide will be skipped *every* cycle and never roll — silently, as
+  far as the roller is concerned, because a skip is a correct outcome. If one
+  symbol dominates this reason in week 1, the fix is a better quote source for
+  the gate, not a looser bound.
 
 **Instant stop, no deploy:**
 ```bash
@@ -436,13 +574,13 @@ follow-up FC (DD-5, deferred not dismissed); update the FC index and this plan's
 
 ---
 
-## DD-8 — first-cycle expectation table (restated)
+## DD-8 — first-cycle expectation table (re-derived live by the trader reviewer)
 
-**Mark-dependent. Re-derive at execution time; do not treat as a promise.**
+**Mark-dependent. Re-derive again at execution time; do not treat as a promise.**
 
 | Position | Expected outcome | Why |
 |---|---|---|
-| GOOGL C370 8/07 (ITM) | **the expected roll.** Legal candidates at 8/04 marks: C375 8/21 ≈ **+$248**/contract (+$5 strike); C380 8/21 ≈ +$13 (+$10 strike) — both ≤ old-expiry + 14 (8/21). Max-credit selection picks **C375 8/21**; expect `call_roll_completed` | the GOOGL-class window this FC is expedited for, and the exact trade an eval-relative DTE frame would have excluded |
+| GOOGL C370 8/07 (ITM) | **the expected roll.** Re-derived live: C375 8/21 = **exactly +$248**/contract (+$5 strike), **ranked 14th of 170 by `return_score`**; C380 8/21 ≈ +$13 (+$10 strike). Both ≤ old-expiry + 14 (8/21). Max-credit selection picks **C375 8/21**; expect `call_roll_completed` | the GOOGL-class window this FC is expedited for. The rank-14-of-170 figure is the direct proof that the entry-shaped top-5 slice would have hidden it, and that an eval-relative DTE frame would have excluded it outright |
 | AMZN C262.5 8/07 (deep ITM) | `call_roll_skipped {no_credit_candidate}` | every strike-improving roll is a four-figure debit; **this skip event is itself the launch verification that credit-only holds** |
 | AAPL C312.5 8/05 (OTM) | `call_roll_skipped {not_itm_enough}` — or the position is already gone (expired 8/05) | profit-taker's territory |
 | NVDA C220 8/10 (OTM) | `call_roll_skipped {not_itm_enough}` | same; note NVDA earnings 8/26 — any replacement expiring ≥ 8/26 would be span-blocked if it were ITM |
@@ -464,21 +602,32 @@ follow-up FC (DD-5, deferred not dismissed); update the FC index and this plan's
 
 ---
 
-## Review gate (not yet run)
+## Review gate
 
-Per house rules this is plan-driven work on a money path: **two independent
-adversarial reviews, fresh contexts, Fable, different domain personas**, then a
-scoped confirmation pass if any required fix lands in code. Neither has been run.
-Suggested persona split, given where the risk actually sits:
+**Both adversarial reviews: DONE.** Trader (with live re-derivation) and
+execution-lifecycle, fresh contexts, different personas. Both REQUEST_CHANGES,
+strongly convergent, no reviewer-vs-reviewer disagreements. Every finding is
+dispositioned in the table above — all fixed in code except exec M-1
+(`--max-instances=1`), which is a deploy-time property noted in the runbook.
 
-1. **Senior options trader who has watched a roll go wrong with real money** —
-   pricing modes, the imminence override, max-credit vs strike-gain selection,
-   the stranded-BTC residual, whether Δ ≤ 0.60 and old-expiry + 14 are the right
-   rails.
-2. **Order-execution / production-reliability engineer** — the two-leg state
-   machine: cancel-then-verify, partial-fill accounting, the at-most-one-live-STO
-   invariant, the budget guard and the deadline seam, and every place an event
-   could report something that did not happen.
+**Still required before merge: the confirmation pass.** Fixes landed in code, so
+house rules require a scoped confirmation review — Fable, fresh context, reusing
+one of the original personas, handed the combined required-fix list as the
+contract. Its job is narrow: verify each fix landed, and check for regressions
+introduced *while* fixing. Output sections: CONFIRMED / STILL BROKEN / NEW
+REGRESSIONS / VERDICT.
 
-Give at least one of them live Alpaca/BigQuery access and require the DD-8
-expectations to be re-derived against current marks rather than believed.
+The execution-lifecycle persona is the right one to reuse — the H-1 fix rewrote
+the two-leg state machine's disposition logic, which is where a fix-time
+regression would hide. Points worth its attention:
+
+- `_attempt_stc` now returns three shapes (success / unknown / None); every
+  caller branch must handle all three.
+- The unknown-disposition path returns *before* the naked-exposure path — check
+  that a genuinely exhausted ladder still reaches `call_roll_naked_exposure`.
+- `call_roll_partial_naked_exposure` replaced `call_roll_completed` for the
+  partial case; confirm a fully-matched roll still reports `completed` with the
+  right `net_credit`.
+- The autouse settle-timeout fixture makes the production constant invisible to
+  every other test — confirm the source-literal assertion is the only thing
+  standing between that and a silent regression to one-read behaviour.
