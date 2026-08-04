@@ -168,23 +168,32 @@ For each suitable stock, performs historical analysis:
 
 ---
 
-### STAGE 5: Wheel State Check
-**Component**: `wheel_state.can_sell_puts()` / `can_sell_calls()`
-**Location**: [src/strategy/wheel_engine.py:291-304](../src/strategy/wheel_engine.py#L291-L304)
+### STAGE 5: Wheel State Check — **DELETED, does not exist**
 
-**Checks**:
-
-1. **For Calls**: `wheel_state.can_sell_calls(symbol)`
-   - Only if we're in `HOLDING_STOCK` phase
-   - Already own the underlying stock
-   - Used for covered calls
-
-2. **For Puts**: `wheel_state.can_sell_puts(symbol)`
-   - Only if NOT in `HOLDING_STOCK` or `SELLING_CALLS` phase
-   - Don't already have stock position
-   - Used for cash-secured puts
-
-**Skip if**: Wrong wheel phase for the trade type
+> **This stage never ran on the live path, and its code is now gone.**
+>
+> It was described as `wheel_state.can_sell_puts()` / `can_sell_calls()` gating
+> trades by wheel phase, called from the `WheelEngine` orchestration path. Two
+> things ended it:
+>
+> - **FC-068 (2026-08-01)** deleted that orchestration path. It had not been
+>   called by production since 2025-10-03 — three days *before* the live
+>   account's first fill. Production runs `/scan` → `/run` → `ExecutionEngine`
+>   → `PutSeller`/`CallSeller`, none of which ever consulted wheel state.
+> - **FC-069 item 8 stage 2 (2026-08-04)** deleted `can_sell_puts` and
+>   `can_sell_calls` themselves, along with the rest of the fictional state
+>   layer. The state they read was never persisted (`STATE_STORAGE_BUCKET`
+>   unset since inception — FC-039), so even had the gate been called it would
+>   have been evaluating an empty dict rebuilt on every request.
+>
+> **What actually prevents selling a put on a symbol you already hold** is the
+> scanner-level held-position skip (FC-069 item 12, event
+> `put_scan_skipped_existing_position`) and `select_batch`'s ledgers — not a
+> phase machine. `WheelPhase` survives only as a label on assignment
+> telemetry.
+>
+> The full rewrite of this document is FC-069 item 14; this note exists so the
+> stage is not read as a live control in the meantime.
 
 ---
 

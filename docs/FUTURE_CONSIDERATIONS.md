@@ -484,36 +484,6 @@ Note this is *not* true of the Stage-2 gap-risk analysis (`_detect_current_gap`,
 
 ---
 
-### FC-039: Wheel state persistence has never worked in production
-
-**Status:** Consideration
-**Size estimate:** M
-**Owner:** unassigned
-**Plan file:** not yet — changes runtime behavior of the live wheel, so a plan is required
-
-**Problem / opportunity:** `WheelStateManager` has been running with `storage_bucket=None` since inception. Its GCS save/load are therefore unconditional no-ops (`src/strategy/wheel_state_manager.py:60-62, 84-86`), and wheel state is in-memory per Cloud Run instance — lost on every scale-to-zero.
-
-Verified four independent ways on 2026-07-18:
-
-1. `src/strategy/wheel_engine.py:40` resolves the bucket as `getattr(config, 'state_storage_bucket', None) or os.getenv('STATE_STORAGE_BUCKET')`.
-2. `Config` has **no** `state_storage_bucket` property — `grep` over all of `src/utils/config.py` returns nothing, so the `getattr` yields `None`.
-3. `STATE_STORAGE_BUCKET` is **not set** on the live Cloud Run service. `gcloud run services describe options-wheel-strategy` shows the env is exactly `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `FINNHUB_API_KEY`, `ALPACA_PAPER_TRADING`, `GCP_PROJECT`. `cloudbuild.yaml:75` sets only the last two, and `--set-env-vars` is replace-semantics, so any hand-added value is wiped on the next deploy.
-4. **No `wheel_state/current_state.json` object exists in any bucket in the project** — checked all three (`...-options-data`, `..._cloudbuild`, `options-wheel-opportunities`).
-
-**Consequence — this silently disabled a control we believe is running.** Source #1 of the FC-029 R2 cost-basis chain is `wheel_state.symbol_states[symbol]['stock_cost_basis']` (`src/strategy/call_seller.py:429-441`), documented as *canonical*. It never resolves. The chain has been running on source #2 (BigQuery OPASN lookup) and source #3 (Alpaca `cost_basis`, empirically broken for assigned positions — that finding is what motivated FC-029 R2 in the first place). The cost-basis floor is therefore weaker in production than the FC-029 plan claims, on exactly the path FC-029 was written to harden.
-
-Same family as FC-035 (`poll_order_statuses` latent `NameError`) and FC-015 (`_entry_times` is in-process, so the 4h min-hold gate is dead): code that has never executed in production while appearing healthy.
-
-**Open questions:**
-- Enable persistence, or accept in-memory state and delete the dead code? `reconcile_positions` rebuilds state from Alpaca each cycle, so persistence may be genuinely unnecessary — in which case the fix is removing the illusion, not the bucket.
-- If we enable it: this is a **behavior change**, not a config fix. Cost-basis floors would begin resolving from source #1 and change which strikes are sellable. Needs its own canary and rollback.
-- Add `state_storage_bucket` to `Config`, or set `STATE_STORAGE_BUCKET` in `cloudbuild.yaml`? The former is testable; the latter is one line.
-- Should there be a startup assertion that any configured-but-unresolvable persistence target is fatal rather than silently no-op? This bug class keeps recurring.
-
-**Links:** found during the covered-call-**extensibility** two-reviewer plan pass (a concurrent 07-18 project formerly numbered FC-038 — see the FC-038 numbering note; its review doc `fc-038-plan-review-2026-07-18.md` never landed on `main`), BLOCKER B2. Related: FC-029 (R2 cost-basis chain), FC-035, FC-015.
-
----
-
 ### FC-040: Unit tests make live BigQuery calls against production data — ALREADY FIXED, entry withdrawn
 
 **Status:** Withdrawn 2026-07-18 — the bug was real but had already been fixed on `main` before this entry was filed.
@@ -1646,6 +1616,12 @@ _Move entries here once a plan has been published, executed, and merged. Include
 - PR: https://github.com/memon1987/options_wheel/pull/83
 - Closed: 2026-08-04 by FC-069 item 6 (operator decision: delete)
 - Notes: `_entry_times` never survived a request (sellers are constructed per request, not per cold start as this entry assumed), so the 4h gate has been open since inception — 2026-05-12 evidence: 4 of 35 sub-4h closes. The raised DTE-band thresholds carry the hold discipline. The knob (`risk.profit_taking.min_hold_hours`), both dicts, their population sites and the gate code are deleted. If a hold gate is ever wanted, derive entry time statelessly from Alpaca order history (`filled_at`) — do not persist process state; that answer supersedes this entry's GCS-vs-Alpaca open question, and its "share infrastructure with FC-009" question is moot for the same reason.
+
+### FC-039: Wheel state persistence has never worked in production
+- Plan: `docs/plans/fc-069.md` (item 8, stage 2)
+- PR: https://github.com/memon1987/options_wheel/pull/87
+- Closed: 2026-08-04 by FC-069 item 8 (operator decision: delete the illusion, per the coherence principle — derive from durable truth)
+- Notes: Persistence was never enabled and is not wanted: `reconcile_positions` rebuilds from Alpaca per request (this entry's own observation), the floor now resolves from Alpaca `avg_entry_price` (FC-065 P1) with no wheel_state source, and FC-066's roller direction is stateless-from-Alpaca — FC-078 shipped exactly that, which is what unblocked this stage. Stage 1 (S5, PR #86) removed the orphaned CallSeller state plumbing; stage 2 shrank `WheelStateManager` to reconcile's in-request bookkeeping: 747 → 331 lines, keeping only `symbol_states`, `handle_put_assignment`, `handle_call_assignment`, `get_position_summary` and the derived `get_wheel_phase` label, and deleting the GCS save/load, the `storage_bucket` parameter, the engine's `state_storage_bucket`/`STATE_STORAGE_BUCKET` lookup, the six roller state methods, the `can_sell_*` gates, the premium accumulators, the roll counters, and the in-memory `wheel_cycles` list. This entry's open questions are answered: **do not enable it** (question 1 — the fix was removing the illusion, not the bucket); questions 2 and 3 are moot with the code gone. Question 4 — the startup assertion — generalizes beyond this FC and is recorded as a standing rule in FC-069's plan (item 8(b)) and in `wheel_state_manager.py`'s module docstring: **any future configured-but-unresolvable persistence target must fail loudly at startup, never silently no-op.** The silent `storage_bucket=None` is how this layer stayed fictional for a year while the docs called it canonical; whoever next adds a durable-state target (FC-009's dedup, anything else) inherits that as a requirement, not a suggestion.
 
 ### FC-006: Covered call rolling engine (Friday EOW)
 - Plan: `docs/plans/fc-006.md`
