@@ -59,7 +59,6 @@ class TestAlpacaClientInjection:
         """Production path is untouched."""
         with patch("src.strategy.wheel_engine.AlpacaClient") as real_client:
             config = Mock()
-            config.state_storage_bucket = None
             engine = WheelEngine(config)
         real_client.assert_called_once_with(config)
         assert engine.alpaca is real_client.return_value

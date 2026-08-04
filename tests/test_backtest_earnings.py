@@ -134,7 +134,6 @@ class TestRollingSeam:
         config = Mock()
         config.rolling_enabled = True
         config.earnings_enabled = True
-        config.state_storage_bucket = None
         engine = WheelEngine(config, alpaca_client=Mock(),
                              wheel_state=WheelStateManager())
         assert engine._injected_earnings_calendar is None

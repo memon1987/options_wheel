@@ -151,7 +151,6 @@ class _CycleFixture:
         config = Mock(spec=Config)
         config.rolling_enabled = True
         config.earnings_enabled = False
-        config.state_storage_bucket = None
 
         alpaca = Mock()
         alpaca.get_positions.return_value = self._book(symbols)
@@ -407,7 +406,6 @@ class TestReconcileCallAssignmentAfterWheelCyclesRemoval:
 
     def _engine(self, *, activities, positions, state):
         config = Mock(spec=Config)
-        config.state_storage_bucket = None
 
         alpaca = Mock()
         alpaca.get_account_activities.return_value = activities
@@ -528,3 +526,201 @@ class TestReconcileCallAssignmentAfterWheelCyclesRemoval:
                 self._reconcile(engine)
             assert gw.call_count == 0, (
                 "reconcile_positions built an analytics writer")
+
+
+# =========================================================================== #
+# FC-069 S6 (item 8 stage 2) — the untracked-position sweep, end to end, on a
+# REAL WheelStateManager.
+#
+# Every reconcile test above hands the engine a Mock wheel_state, which makes
+# the *seeding dict* in reconcile's loop 2 unfalsifiable: a Mock accepts any
+# shape, so dropping or renaming a key there passes the whole suite while
+# breaking production. The S6 adversarial review demonstrated exactly that —
+# deleting `'stock_cost_basis': 0.0` from that dict survived all 1258 tests.
+#
+# It is not a cosmetic gap. The seeded entry is what a LATER reconcile reads
+# when the same instance sees those shares called away, and the consumer sits
+# inside a swallow-all `try/except`:
+#
+#     handle_call_assignment -> state['stock_cost_basis']   # KeyError
+#     -> caught -> logger.warning(call_assignment_state_update_failed)
+#     -> NO call_assignment event, NO wheel_cycle_complete event
+#
+# i.e. plan item 8(e)'s named failure mode — "a shrink bug breaks pre-trade
+# reconciliation" — arriving silently, as a missing log line rather than an
+# error. So this class drives the real object through both halves and asserts
+# the seeded shape exactly, key for key.
+#
+# Plan: docs/plans/fc-069.md item 8.
+# =========================================================================== #
+
+from src.strategy.wheel_state_manager import WheelStateManager  # noqa: E402
+
+
+class TestTheUntrackedPositionSweepSeedsAUsableEntry:
+
+    HELD_CALL = 'MSFT260116C00190000'   # MSFT, call, strike 190.0
+
+    # The contract. Not a subset: an entry missing a key breaks a consumer,
+    # and an entry with a *surplus* key means the shrink grew something back.
+    SEEDED_KEYS = {
+        'stock_shares',
+        'stock_cost_basis',
+        'acquisition_date',
+        'active_puts',
+        'active_calls',
+        'wheel_cycle_start',
+    }
+
+    def _engine(self, positions):
+        """A real WheelStateManager, deliberately — see the class comment."""
+        config = Mock(spec=Config)
+        alpaca = Mock()
+        alpaca.get_account_activities.return_value = []
+        alpaca.get_positions.return_value = positions
+
+        state = WheelStateManager()
+        with patch('src.strategy.wheel_engine.MarketDataManager'):
+            engine = WheelEngine(config, alpaca_client=alpaca, wheel_state=state)
+        return engine, state, alpaca
+
+    def _held_stock_and_call(self):
+        return [
+            {'symbol': 'MSFT', 'qty': '100', 'asset_class': 'us_equity',
+             'cost_basis': '18000', 'current_price': '185.0'},
+            {'symbol': self.HELD_CALL, 'qty': '-1', 'asset_class': 'us_option'},
+        ]
+
+    # -- half 1: the seeding itself ---------------------------------------- #
+
+    def test_an_untracked_alpaca_position_is_seeded_with_the_exact_key_set(self):
+        engine, state, _ = self._engine(self._held_stock_and_call())
+
+        stats = engine.reconcile_positions()
+        assert 'error' not in stats, stats
+
+        entry = state.symbol_states['MSFT']
+        assert set(entry) == self.SEEDED_KEYS, (
+            "the untracked-position seeding dict drifted from the shape its "
+            "consumers read; see reconcile_positions loop 2")
+        assert entry == {
+            'stock_shares': 100,
+            'stock_cost_basis': 0.0,
+            'acquisition_date': None,
+            'active_puts': 0,
+            'active_calls': 1,
+            'wheel_cycle_start': None,
+        }
+        assert stats['state_updates'] == 1
+        assert stats['discrepancies_found'] == 1
+
+    def test_the_seeded_entry_survives_a_round_trip_through_both_read_paths(self):
+        """Loops 1 and 3 both read the seeded entry back — loop 1 through
+        `get_position_summary` plus direct `symbol_states` writes, loop 3
+        through the summary again. Neither read is inside a try/except, so a
+        shape mismatch raises out to reconcile's outer handler and the whole
+        pass returns `{'error': ...}` — silently, since `/run` ignores the
+        return value. Hence the `'error' not in stats` assertion.
+
+        Observed while writing this (pre-existing, not introduced by the
+        shrink): loop 3's *clearing* branch is unreachable. Loop 1 runs first
+        over every tracked symbol, including ones Alpaca no longer reports, and
+        zeroes shares/puts/calls on any mismatch — so by the time loop 3 asks
+        `has_anything`, the answer is always False and
+        `orphaned_state_entries_cleared` can never increment. Recorded, not
+        fixed here: it is engine logic, outside this PR's test-only scope.
+        """
+        engine, state, alpaca = self._engine([
+            {'symbol': 'MSFT', 'qty': '100', 'asset_class': 'us_equity',
+             'cost_basis': '18000', 'current_price': '185.0'},
+        ])
+        engine.reconcile_positions()
+        assert state.symbol_states['MSFT']['stock_shares'] == 100
+
+        # Alpaca now reports nothing at all.
+        alpaca.get_positions.return_value = []
+        stats = engine.reconcile_positions()
+
+        assert 'error' not in stats, stats
+        assert state.symbol_states['MSFT']['stock_shares'] == 0
+        assert state.symbol_states['MSFT']['active_puts'] == 0
+        assert state.symbol_states['MSFT']['active_calls'] == 0
+        # Key set unchanged by the sync-back writes.
+        assert set(state.symbol_states['MSFT']) == self.SEEDED_KEYS
+        # The dead branch, pinned as dead so a future fix is a deliberate act.
+        assert stats['orphaned_state_entries_cleared'] == 0
+
+    # -- half 2: a call assignment driven through the seeded entry ---------- #
+
+    def _reconcile_capturing_events(self, engine):
+        """Collect the state manager's own position events, and any warning
+        the engine's swallow-all handlers emit."""
+        events = []
+        with patch('src.strategy.wheel_state_manager.log_position_update',
+                   side_effect=lambda logger, **kw: events.append(kw)), \
+             patch.object(wheel_engine_module, 'logger') as engine_logger:
+            stats = engine.reconcile_positions()
+
+        swallowed = [
+            call.kwargs.get('event_type')
+            for call in engine_logger.warning.call_args_list
+            if str(call.kwargs.get('event_type', '')).endswith(
+                '_state_update_failed')
+        ]
+        return stats, events, swallowed
+
+    def test_a_call_away_on_a_seeded_entry_still_emits_its_events(self):
+        """The end-to-end path: reconcile seeds the entry from Alpaca, then a
+        later reconcile on the same instance sees the shares called away and
+        must transition that entry — emitting the assignment telemetry rather
+        than dying inside the swallowed try/except.
+        """
+        engine, state, alpaca = self._engine(self._held_stock_and_call())
+        engine.reconcile_positions()
+        assert state.symbol_states['MSFT']['active_calls'] == 1
+
+        # The call is exercised: both legs vanish from Alpaca.
+        alpaca.get_positions.return_value = []
+        stats, events, swallowed = self._reconcile_capturing_events(engine)
+
+        assert 'error' not in stats, stats
+        assert swallowed == [], (
+            f"reconcile swallowed a state-update failure: {swallowed}. The "
+            "seeded entry is missing a key handle_call_assignment reads.")
+
+        assigned = [e for e in events if e['event_type'] == 'call_assignment']
+        assert len(assigned) == 1, events
+        assert assigned[0]['shares'] == 100
+        assert assigned[0]['remaining_shares'] == 0
+        assert assigned[0]['phase_before'] == 'selling_calls'
+        assert assigned[0]['phase_after'] == 'selling_puts'
+        # Seeded entries carry no wheel_cycle_start (reconcile cannot know when
+        # the lot was acquired), so the cycle event correctly does NOT fire.
+        assert assigned[0]['cycle_duration_days'] == 0
+        assert not [e for e in events
+                    if e['event_type'] == 'wheel_cycle_complete']
+
+        assert stats['call_assignments_detected'] == 1
+        assert state.symbol_states['MSFT']['stock_shares'] == 0
+
+    def test_a_call_away_after_a_put_assignment_completes_the_cycle(self):
+        """The other seeding route — `handle_put_assignment` creates the entry
+        — must produce an entry of the same shape, and one that DOES carry a
+        cycle start, so `wheel_cycle_complete` fires. That is the event with a
+        live BigQuery consumer (`options_wheel_logs.wheel_cycles`).
+        """
+        engine, state, alpaca = self._engine([])
+        state.handle_put_assignment('MSFT', 100, 180.0, datetime(2026, 7, 1))
+        assert set(state.symbol_states['MSFT']) == self.SEEDED_KEYS, (
+            "handle_put_assignment and reconcile's seeding dict must agree on "
+            "the entry shape — reconcile reads both through the same code")
+        state.symbol_states['MSFT']['active_calls'] = 1
+
+        alpaca.get_positions.return_value = []
+        stats, events, swallowed = self._reconcile_capturing_events(engine)
+
+        assert 'error' not in stats, stats
+        assert swallowed == []
+        cycle = [e for e in events if e['event_type'] == 'wheel_cycle_complete']
+        assert len(cycle) == 1, events
+        assert cycle[0]['cost_basis'] == 180.0
