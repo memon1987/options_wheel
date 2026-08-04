@@ -29,8 +29,9 @@ Post-FC-069 (2026-08-04) removals:
     and that state does not survive a cold start (``_save_state`` is a
     no-op, FC-039) — and the same assignments were re-detected from a
     rolling 7-day activity window on every cold start, so the rows also
-    duplicated: 78 rows, 74 of them zero-gain, when the writer was
-    stopped. Completed cycles come from the
+    duplicated: 78 rows when the writer was stopped, 72 of them
+    zero-gain writer artifacts (74 total zero-gain, of which two are
+    hand-backfilled breakeven cycles that are legitimately $0). Completed cycles come from the
     ``wheel_cycles_from_activities`` VIEW (FC-012 / FC-018), derived
     from ``trades_from_activities`` and untouched by this removal; the
     raw table had no readers at all.

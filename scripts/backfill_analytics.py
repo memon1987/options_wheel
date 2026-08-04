@@ -119,10 +119,12 @@ def main():
 
     # ------------------------------------------------------------------ #
     # 4. Backfill wheel cycles — REMOVED in FC-069 (item 10).
-    #    The wheel_cycles table it inserted into was snapshotted and
-    #    dropped; the six hand-identified cycles it wrote are recoverable
-    #    from git history and from trades_from_activities, which is the
-    #    authoritative source the wheel_cycles_from_activities view reads.
+    #    The wheel_cycles table it inserted into is being retired;
+    #    snapshot + drop are operator-executed post-merge (FC-069
+    #    §Rollback). The six hand-identified cycles it wrote are
+    #    recoverable from git history and from trades_from_activities,
+    #    which is the authoritative source the
+    #    wheel_cycles_from_activities view reads.
     # ------------------------------------------------------------------ #
 
     print("\nBackfill complete.")
