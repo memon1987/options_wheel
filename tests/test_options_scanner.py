@@ -1811,3 +1811,190 @@ class TestTheDayAfterEarningsIsTradeable:
         assert results == []
         assert [(r['outcome'], r['reason']) for r in captured] == [
             ('blocked', 'earnings_blackout')]
+
+
+class TestPutSideExistingPositionSkip:
+    """FC-069 item 12 — the put-side existing-position check.
+
+    Two changes under test. (1) The option limb parses the underlying
+    (``parse_option_symbol(...)['underlying'] == symbol``) instead of asking
+    whether the scanned ticker appears *anywhere* inside the OCC contract
+    symbol — the 7th instance of the substring family behind
+    FC-041/043/045/048/052, which made a held ``PFE…`` contract block every F
+    put. (2) The skip is no longer silent: it emits
+    ``put_scan_skipped_existing_position``, closing the tally gap FC-068 §5
+    accepted "until FC-069 item 12 rewires that check".
+    """
+
+    def setup_method(self):
+        self.mock_alpaca = Mock()
+        self.mock_market_data = Mock()
+        self.mock_config = Mock(spec=Config)
+        self.mock_config.stock_symbols = ['F', 'MSFT']
+        self.mock_config.put_target_dte = 7
+        self.mock_config.call_target_dte = 7
+        # The earnings gate is a separate stage with its own tests; off here so
+        # the only thing that can skip a symbol is the check under test.
+        self.mock_config.earnings_enabled = False
+        self.mock_market_data.filter_suitable_stocks.return_value = [
+            {'symbol': 'F', 'current_price': 11.0},
+            {'symbol': 'MSFT', 'current_price': 400.0},
+        ]
+        self.mock_market_data.find_suitable_puts.side_effect = lambda symbol: [{
+            'symbol': '%s260821P00010000' % symbol, 'strike_price': 10.0,
+            'expiration_date': '2026-08-21', 'dte': 7, 'delta': -0.15,
+            'mid_price': 0.60, 'bid': 0.55, 'ask': 0.65, 'volume': 1500,
+            'open_interest': 5000, 'implied_volatility': 0.25,
+        }]
+        self.scanner = OptionsScanner(self.mock_alpaca, self.mock_market_data,
+                                      self.mock_config)
+
+    def _scan(self, positions):
+        self.mock_alpaca.get_positions.return_value = positions
+        with patch('src.data.options_scanner.logger') as mock_logger:
+            results = self.scanner.scan_for_put_opportunities()
+        return [r['symbol'] for r in results], mock_logger
+
+    def test_a_held_stock_position_still_skips_that_symbol(self):
+        """The exact-match equity limb is untouched by the rewire."""
+        emitted, mock_logger = self._scan([
+            {'symbol': 'F', 'asset_class': 'us_equity', 'qty': 100},
+        ])
+
+        assert emitted == ['MSFT']
+        skips = _events(mock_logger, 'put_scan_skipped_existing_position')
+        assert [(s['symbol'], s['reason']) for s in skips] == [
+            ('F', 'stock_position')]
+
+    def test_a_held_option_on_the_symbol_still_blocks_it(self):
+        """The parse-exact match must keep the real per-underlying block."""
+        emitted, mock_logger = self._scan([
+            {'symbol': 'F260821P00010000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        assert emitted == ['MSFT']
+        skips = _events(mock_logger, 'put_scan_skipped_existing_position')
+        assert [(s['symbol'], s['reason']) for s in skips] == [
+            ('F', 'option_position')]
+
+    def test_a_held_pfe_option_no_longer_blocks_f(self):
+        """MUTATION CHECK — the whole point of item 12.
+
+        Against the pre-fix ``symbol in position['symbol']`` this FAILS:
+        ``'F' in 'PFE260821P00025000'`` is True, so F is skipped and
+        ``emitted`` comes back as ``['MSFT']``. Verified by reverting the fix
+        before the commit landed. Live behavior change, deliberate: this is a
+        loosening, and it is the correct one.
+        """
+        emitted, mock_logger = self._scan([
+            {'symbol': 'PFE260821P00025000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        assert emitted == ['F', 'MSFT']
+        assert _events(mock_logger, 'put_scan_skipped_existing_position') == []
+
+    def test_the_api_error_path_is_still_fail_closed(self):
+        """A positions call that raises blocks every symbol, and emits no skip
+        event — it fires ``position_check_failed`` instead, because an outage
+        is not a holding and must not share the tally bucket with one."""
+        self.mock_alpaca.get_positions.side_effect = RuntimeError("alpaca 500")
+
+        with patch('src.data.options_scanner.logger') as mock_logger:
+            assert self.scanner._has_existing_position('F') is True
+            results = self.scanner.scan_for_put_opportunities()
+
+        assert results == []
+        assert _events(mock_logger, 'put_scan_skipped_existing_position') == []
+        errors = [c.kwargs for c in mock_logger.error.call_args_list
+                  if c.kwargs.get('event_type') == 'position_check_failed']
+        assert [e['symbol'] for e in errors] == ['F', 'F', 'MSFT']
+
+    def test_the_skip_event_carries_symbol_reason_and_the_held_contract(self):
+        """The event's full shape — the ride-along exists to make the skip
+        countable *and* debuggable, so the held contract rides along too."""
+        _emitted, mock_logger = self._scan([
+            {'symbol': 'MSFT260821P00380000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        skips = _events(mock_logger, 'put_scan_skipped_existing_position')
+        assert len(skips) == 1
+        assert skips[0]['symbol'] == 'MSFT'
+        assert skips[0]['reason'] == 'option_position'
+        assert skips[0]['position_symbol'] == 'MSFT260821P00380000'
+        assert skips[0]['event_category'] == 'trade'
+
+    @pytest.mark.parametrize("held", ['', 'NOT_AN_OCC', '123456'])
+    def test_an_unparseable_option_symbol_fails_closed(self, held):
+        """Documented decision: a held option we cannot identify is treated as
+        potentially-matching, the same posture as the API-error path. The cost
+        is a skipped put; the alternative is writing a second position on an
+        underlying we may already hold."""
+        emitted, mock_logger = self._scan([
+            {'symbol': held, 'asset_class': 'us_option', 'qty': -1},
+        ])
+
+        assert emitted == []
+        skips = _events(mock_logger, 'put_scan_skipped_existing_position')
+        assert [(s['symbol'], s['reason']) for s in skips] == [
+            ('F', 'option_position'), ('MSFT', 'option_position')]
+
+    def test_a_held_short_CALL_blocks_puts_on_the_same_underlying(self):
+        """Review fix 3 — pin the option-type dimension.
+
+        Every other held-option fixture here is a P contract, so the mutation
+        `underlying == symbol and option_type == 'put'` survived the whole
+        suite: a held covered CALL would silently stop blocking new puts on the
+        same underlying, and the wheel would stack a short put under a short
+        call it is already carrying. The check is deliberately type-BLIND —
+        the invariant is one option position per underlying, whichever leg it
+        is. MUTATION CHECK: adding a `'put'` type condition fails this test.
+        """
+        emitted, mock_logger = self._scan([
+            {'symbol': 'F260821C00012000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        assert emitted == ['MSFT']
+        skips = _events(mock_logger, 'put_scan_skipped_existing_position')
+        assert [(s['symbol'], s['position_symbol']) for s in skips] == [
+            ('F', 'F260821C00012000')]
+
+    def test_the_match_is_equality_not_a_prefix_relation(self):
+        """Review fix 4 — kill the `startswith` survivor.
+
+        A held F contract must not block FDX, and a held FDX contract must not
+        block F. Both directions, because `underlying.startswith(symbol)` and
+        `symbol.startswith(underlying)` are different bugs and each passes the
+        other's test. MUTATION CHECK: either startswith form fails one of these.
+        """
+        self.mock_config.stock_symbols = ['F', 'FDX']
+        self.mock_market_data.filter_suitable_stocks.return_value = [
+            {'symbol': 'F', 'current_price': 11.0},
+            {'symbol': 'FDX', 'current_price': 130.0},
+        ]
+
+        held_f, _ = self._scan([
+            {'symbol': 'F260821P00010000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+        held_fdx, _ = self._scan([
+            {'symbol': 'FDX260821P00125000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        assert held_f == ['FDX']
+        assert held_fdx == ['F']
+
+    def test_an_adjusted_root_still_resolves_to_its_underlying(self):
+        """The parser's leading-letters fallback is the wanted answer here, not
+        a guess to fail closed on: an adjusted MSFT contract still blocks MSFT
+        and still leaves F alone."""
+        emitted, _logger = self._scan([
+            {'symbol': 'MSFT1260821P00380000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        assert emitted == ['F']

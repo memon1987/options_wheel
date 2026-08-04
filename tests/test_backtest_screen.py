@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
+from src.backtesting.engine.rejections import HOLDS_UNDERLYING_REASON
 from src.backtesting.reporting.bq_writer import build_row, config_hash
 from src.backtesting.screen import (
     ScreenResult,
@@ -167,6 +168,45 @@ class TestProvenance:
         row = build_row(run_id="r", symbol="X", report=_FakeReport(),
                         sensitivity=None, cfg_hash="h", engine_version="v")
         assert row["binding_constraint"] == "gap-risk filter (stage 2)"
+
+    def test_deployment_never_becomes_the_binding_constraint(self):
+        """FC-069 item 12, review fix 1 — the honest-metric guard.
+
+        "already holds this underlying (scan, put)" fires on nearly every day
+        of a *healthy* deployment (a golden-path fixture puts it at 40 of 45),
+        so it dominates `blocked_days_by_reason` by count and would otherwise
+        be stamped as the binding constraint on almost every row. A demotion
+        read off that column would be reading "the wheel held positions" as
+        "the wheel could not trade" — the FC-057 dishonest-metric class,
+        reintroduced from the other side.
+
+        MUTATION CHECK: drop the `stand_down_reasons` filter from
+        `_binding()` and this test fails with
+        `'already holds this underlying (scan, put)' != 'no put cleared ...'`.
+        """
+        report = _FakeReport()
+        report.data_quality = {"blocked_days_by_reason": {
+            HOLDS_UNDERLYING_REASON: 40,
+            "no put cleared delta/DTE/premium (stage 7)": 5,
+        }}
+
+        row = build_row(run_id="r", symbol="X", report=report,
+                        sensitivity=None, cfg_hash="h", engine_version="v")
+
+        assert row["binding_constraint"] == (
+            "no put cleared delta/DTE/premium (stage 7)")
+
+    def test_a_run_blocked_only_by_deployment_has_no_binding_constraint(self):
+        """None is the honest answer — the label would say the strategy was
+        blocked when it was invested."""
+        report = _FakeReport()
+        report.data_quality = {
+            "blocked_days_by_reason": {HOLDS_UNDERLYING_REASON: 40}}
+
+        row = build_row(run_id="r", symbol="X", report=report,
+                        sensitivity=None, cfg_hash="h", engine_version="v")
+
+        assert row["binding_constraint"] is None
 
     def test_fill_sensitivity_flip_is_recorded(self):
         row = build_row(run_id="r", symbol="X", report=_FakeReport(),

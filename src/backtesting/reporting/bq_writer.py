@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
+from ..engine.rejections import stand_down_reasons
+
 logger = structlog.get_logger(__name__)
 
 try:  # pragma: no cover - exercised only where the dep is installed
@@ -334,5 +336,17 @@ def build_row(*, run_id: str, symbol: str, report, sensitivity: Optional[dict],
 
 
 def _binding(report) -> Optional[str]:
-    blocked = report.data_quality.get("blocked_days_by_reason") or {}
+    """The stamped `binding_constraint` — the top *stand-down* reason, or None.
+
+    FC-069 item 12 (review fix 1): `stand_down_reasons` drops the buckets that
+    mean the strategy was deployed rather than blocked. Without it the
+    "already holds this underlying" bucket — which on a healthy wheel is the
+    most common day type there is — would be stamped as the binding constraint
+    on nearly every row, and a demotion decision read off this column would be
+    reading "the wheel held positions" as "the wheel could not trade".
+
+    A run whose only bucket is a deployment bucket has no binding constraint:
+    None is the honest answer, not the deployment label.
+    """
+    blocked = stand_down_reasons(report.data_quality.get("blocked_days_by_reason"))
     return next(iter(blocked), None) if blocked else None

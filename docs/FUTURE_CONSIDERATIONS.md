@@ -1579,6 +1579,8 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 **Fix direction:** `strict_option_type` / `parse_option_symbol` (`src/utils/option_symbols.py`) at both sites, with tests pinning AAPL call-assignment detection on the position-diff path (must FAIL pre-fix). Family lineage: FC-041/043/045/048/052, FC-069 item 12 (S1 monitor sync, S3 scanner rewire). Not fixed inside FC-069's sweep because both S2 reviews agreed a live reconcile behavior change cannot ride a behaviorally-inert retirement PR.
 
+**Ride-along from the S3 review (PR #85, trader LOW — accepted in writing there, deferred here):** give `OptionsScanner._has_existing_position`'s skip event a third `reason` value, `unparseable_position`, so a fail-closed skip caused by a garbage option symbol is distinguishable from a genuine holding. Today both emit `reason='option_position'`, which means a symbol we could not parse tallies as "already holds this underlying". Expected live frequency is **zero** (Alpaca returns well-formed OCC symbols; the branch exists as posture, not as an observed case), which is why it was not worth a second round on S3 — but it belongs with this FC's parser work, since the same rewire touches how an unparseable symbol is recognized.
+
 ---
 
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes

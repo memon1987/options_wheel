@@ -47,7 +47,7 @@ gate applies identically in production, on the CLI, and in replays.
 |---|---|---|---|---|---|---|
 | 1 | Price / volume band | `market_data.filter_suitable_stocks` | puts | `strategy.min_stock_price`, `max_stock_price`, `min_avg_volume` | `stock_rejected_filter` (tally: "price/volume band (stage 1)") | n/a — a missing metric drops the symbol |
 | 2 | **Earnings blackout, put leg** | `OptionsScanner._put_leg_blocked_by_earnings` | puts | `earnings.enabled` (+ `EARNINGS_ENABLED` env), `earnings.blackout_days: 2` | `put_scan_skipped_earnings_blackout` / `..._unknown` | **closed** on unknown |
-| 3 | Existing position skip | `OptionsScanner._has_existing_position` | puts | — | (silent `continue`) | **closed** — an exception returns `True` |
+| 3 | Existing position skip | `OptionsScanner._has_existing_position` | puts | — | `put_scan_skipped_existing_position` (`reason`: `stock_position` / `option_position`; tally: "already holds this underlying (scan, put)") — silent until FC-069 item 12; the API-error limb fires `position_check_failed` instead | **closed** — an exception returns `True`, as does an unparseable option symbol |
 | 4 | **Earnings unknown, call leg** | `OptionsScanner.scan_for_call_opportunities` | calls | as row 2 | `call_scan_skipped_earnings_unknown` + row `blocked{earnings_unknown}` | **closed** |
 | 5 | ≥100 shares | `scan_for_call_opportunities` | calls | — | row `not_eligible{insufficient_shares}` | n/a |
 | 6 | Cost-basis floor — divergent | `CostBasisResolver.resolve_detailed` | calls | tolerance `max($0.10, 0.1%)` | `call_scan_skipped_cost_basis_divergent` + row `blocked{floor_divergent}` | **closed** |

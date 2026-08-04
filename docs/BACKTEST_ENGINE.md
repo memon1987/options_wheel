@@ -146,16 +146,27 @@ failure mode: it cannot flatter a symbol into looking tradeable.
 4. **The engine refuses split-spanning windows** (`UnadjustedCorporateAction`) by design —
    raw bars are correct for point-in-time chain work but cannot span a split. Pick a
    window that avoids the split date; the error message names it.
-5. **Two non-comparability boundaries in `backtest_runs`, and only one is machine-queryable.**
+5. **Three non-comparability boundaries in `backtest_runs`, and only two are machine-queryable.**
    - Rows before **2026-07-29** describe a **put-only** engine (FC-048 — every backtest
      this project ever ran before it misrouted covered calls to the put seller). FC-048
      did not bump `engine_version`, so this boundary is **timestamp-only**.
    - Rows with `engine_version = 'fc-032-phase-5'` describe the **dead engine path**;
      `engine_version = 'fc-068-prod-pipeline'` describes the production pipeline
      (FC-068). Query the version, not the date.
+   - `engine_version = 'fc-069-scanner-rewire'` (FC-069 item 12, **2026-08-04**) changes
+     the replayed scanner *and* the rejection vocabulary. The put-side existing-position
+     check no longer substring-matches OCC symbols, so a symbol the replay used to skip
+     on a spelling coincidence (`'F' ⊂ 'PFE…'`, `'F' ⊂ 'MSFT…'`) is now scanned. And
+     `blocked_days_by_reason` gained an "already holds this underlying (scan, put)"
+     bucket which is deliberately **excluded from `binding_constraint` selection** — it
+     means the wheel was deployed, not blocked. So pre/post rows differ in
+     `blocked_days_by_reason` *and* in `binding_constraint` semantics even where the
+     verdict is unchanged: a pre-bump row's `binding_constraint` was chosen from a
+     vocabulary that did not contain this bucket, and a post-bump `NULL` can now mean
+     "the only thing that stopped it was already holding it."
 
-   Do not compare across either boundary. Old rows are never mutated — provenance is
-   `engine_version` + `timestamp` + `config_hash`.
+   Do not compare across any of the three boundaries. Old rows are never mutated —
+   provenance is `engine_version` + `timestamp` + `config_hash`.
 6. **There is no gap filter** (FC-049, FC-068, FC-069). Production never ran the stage-2
    filter; FC-068 removed the backtest's only caller with the engine path; **FC-069 item 5
    then deleted `GapDetector` and all twelve `gap_risk_controls` knobs outright** (the code
@@ -165,13 +176,18 @@ failure mode: it cannot flatter a symbol into looking tradeable.
    `config_hash`, which is a **second non-comparability boundary** on `backtest_runs`
    alongside the `engine_version` one above: hashes computed before and after 2026-08-04
    differ even when every surviving parameter is identical.
-7. **The put-side "already have a position on this symbol" skip is silent.** The scanner
-   returns early with no log line (`options_scanner.py:_has_existing_position`), so the
-   rejection tally cannot count it — production emits nothing there either, and inventing
-   a synthetic event the live path does not emit would be a worse lie. The old stage-6
-   bucket has no replacement until FC-069 item 12 rewires that check. (It also uses a
-   substring match, `symbol in position['symbol']`, which over-blocks; the replay now
-   reproduces that bug faithfully, which is the point of a replay.)
+7. **~~The put-side "already have a position on this symbol" skip is silent.~~ CLOSED by
+   FC-069 item 12 (2026-08-04).** `_has_existing_position` now emits
+   `put_scan_skipped_existing_position` (`reason`: `stock_position` / `option_position`)
+   on the live path, so the replay emits it too and the tally counts it as "already holds
+   this underlying (scan, put)" — the old stage-6 bucket's replacement. The same change
+   replaced the substring match (`symbol in position['symbol']`, which over-blocked: a
+   held `PFE…` contract suppressed every F put) with `parse_option_symbol(...)
+   ['underlying'] == symbol`, so replays from 2026-08-04 forward reproduce the *fixed*
+   check. Two residual limits: the API-error limb still fails closed under its own
+   `position_check_failed` event, which is deliberately unmapped (an outage is not a
+   holding); and the skip remains positions-based, so a submitted-but-unfilled put is
+   invisible to it (FC-009 territory).
 8. **The drawdown pause does not exist.** It was never on the live path, and FC-065 OQ-3
    decided it never will be. A replay showing a call written on an underwater position is
    reproducing production, not missing a guard — the cost-basis floor is the guard.
