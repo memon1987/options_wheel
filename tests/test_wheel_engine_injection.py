@@ -59,7 +59,6 @@ class TestAlpacaClientInjection:
         """Production path is untouched."""
         with patch("src.strategy.wheel_engine.AlpacaClient") as real_client:
             config = Mock()
-            config.state_storage_bucket = None
             engine = WheelEngine(config)
         real_client.assert_called_once_with(config)
         assert engine.alpaca is real_client.return_value
@@ -100,16 +99,57 @@ class TestWheelStateInjection:
         # earnings_calendar). The state used to sit at index 3.
         assert roller.call_args.args[3].__class__.__name__ == 'RiskManager'
 
-    def test_injected_state_never_touches_cloud_storage(self):
-        """A bucket-less manager must not construct a GCS client."""
-        state = WheelStateManager()
-        assert getattr(state, "_storage_client", None) is None
+    def test_the_state_manager_cannot_touch_cloud_storage_at_all(self):
+        """FC-069 item 8 stage 2 deleted the persistence, not just disabled it.
 
-    def test_default_state_still_reads_the_configured_bucket(self):
+        The old assertion was ``_storage_client is None`` — which passed for a
+        year *while the layer was fictional*, because the bucket was never
+        configured. A None-valued attribute is not evidence of absence, so the
+        replacement checks the attributes and the module source instead: there
+        is nothing left to configure.
+        """
+        state = WheelStateManager()
+        for attr in ("_storage_client", "_bucket_name", "_save_state",
+                     "_load_state"):
+            assert not hasattr(state, attr), (
+                f"WheelStateManager.{attr} is back; FC-039 closed on the "
+                "premise that this layer has no persistence target")
+
+        import inspect
+        import src.strategy.wheel_state_manager as wsm_module
+        # Docstrings deliberately still *narrate* the deleted persistence
+        # (that history is the point of FC-039), so the ban is on the
+        # mechanisms, which no prose has reason to name.
+        source = inspect.getsource(wsm_module)
+        for banned in ("google.cloud", "upload_from_string",
+                       "download_as_string", "blob("):
+            assert banned not in source, (
+                f"{banned!r} reappeared in wheel_state_manager")
+        # And the constructor is the actual contract: no arguments to give.
+        params = list(inspect.signature(WheelStateManager).parameters)
+        assert params == [], params
+
+    def test_default_state_takes_no_storage_argument(self):
+        """The engine builds a plain, empty bookkeeping instance.
+
+        Pre-FC-069 this asserted the constructor was handed
+        ``storage_bucket=<config value>``; the config key
+        (``state_storage_bucket`` / ``STATE_STORAGE_BUCKET``) never existed in
+        production, which is exactly what FC-039 found.
+        """
         with patch("src.strategy.wheel_engine.AlpacaClient"), patch(
             "src.strategy.wheel_engine.WheelStateManager"
         ) as wsm:
-            config = Mock()
-            config.state_storage_bucket = "prod-bucket"
-            WheelEngine(config)
-        wsm.assert_called_once_with(storage_bucket="prod-bucket")
+            WheelEngine(Mock())
+        wsm.assert_called_once_with()
+
+    def test_the_engine_no_longer_reads_a_state_bucket_setting(self):
+        """Mutation guard for the deletion above: a resurrected bucket lookup
+        in ``wheel_engine`` would re-create the silent no-op FC-039 named."""
+        import inspect
+        import src.strategy.wheel_engine as engine_module
+        source = inspect.getsource(engine_module)
+        for banned in ("state_storage_bucket", "STATE_STORAGE_BUCKET",
+                       "storage_bucket", "_save_state"):
+            assert banned not in source, (
+                f"{banned!r} reappeared in wheel_engine")

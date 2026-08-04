@@ -370,7 +370,12 @@ class Simulator:
         engine = WheelEngine(
             self.config,
             alpaca_client=client,
-            wheel_state=WheelStateManager(storage_bucket=None),
+            # Its own bookkeeping instance, so a replay's reconciliation can
+            # never share a scratch pad with anything else in the process.
+            # (Pre-FC-069 this passed storage_bucket=None to keep the replay
+            # off GCS; stage 2 deleted the persistence outright — there is no
+            # longer a bucket to opt out of.)
+            wheel_state=WheelStateManager(),
             allow_bigquery_cost_basis=False,
             earnings_calendar=self.earnings_calendar,
         )
@@ -458,11 +463,13 @@ class Simulator:
                     clear_failed_symbols()
 
                     # Pre-trade housekeeping, exactly as production does before
-                    # every cycle (cloud_run_server /run). reconcile_positions()
-                    # is what teaches WheelStateManager that yesterday's put
-                    # expired or was assigned. Without this the state machine
-                    # latches after the first trade and the replay sells one put
-                    # and then nothing.
+                    # every cycle (cloud_run_server /run): diff the broker's
+                    # positions against the in-request bookkeeping and emit the
+                    # assignment/expiration telemetry. It is here because
+                    # production runs it here, not because the scan depends on
+                    # it — FC-068 removed the last trading-path reader of wheel
+                    # state, and FC-069 item 8 deleted the phase gates that
+                    # used to make this call load-bearing.
                     engine.reconcile_positions()
 
                     # /scan, verbatim: default max_results on both legs, because

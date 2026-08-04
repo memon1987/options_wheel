@@ -2,7 +2,6 @@
 
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
-import os
 import structlog
 
 from ..utils import clock
@@ -62,9 +61,12 @@ class WheelEngine:
                 A backtest injects an adapter here; because every downstream
                 component already takes the client by constructor injection,
                 this single seam redirects the whole graph.
-            wheel_state: State manager. Defaults to the configured GCS bucket
-                (or in-memory when unset). A backtest injects a bucket-less
-                instance so a replay can never touch production state.
+            wheel_state: Reconciliation's in-request position bookkeeping.
+                Defaults to a fresh, empty one. FC-069 item 8 (stage 2) removed
+                the GCS persistence this used to be pointed at — it had never
+                been enabled (FC-039), so "defaults to the configured bucket"
+                always meant "in-memory", and now says so. The parameter stays
+                because the backtest injects its own instance.
             allow_bigquery_cost_basis: forwarded to CallRoller (FC-065
                 Phase 2), which resolves its strike floor through the shared
                 resolver. A backtest passes False so it cannot query production
@@ -80,11 +82,7 @@ class WheelEngine:
         self.config = config
         self.alpaca = alpaca_client if alpaca_client is not None else AlpacaClient(config)
         self.market_data = MarketDataManager(self.alpaca, config)
-        if wheel_state is not None:
-            self.wheel_state = wheel_state
-        else:
-            state_bucket = getattr(config, 'state_storage_bucket', None) or os.getenv('STATE_STORAGE_BUCKET')
-            self.wheel_state = WheelStateManager(storage_bucket=state_bucket)
+        self.wheel_state = wheel_state if wheel_state is not None else WheelStateManager()
         # Retained for the rolling cycle, which builds its own CallRoller (and
         # therefore its own CostBasisResolver) per invocation — FC-065 Phase 2.
         self._allow_bigquery_cost_basis = allow_bigquery_cost_basis
@@ -519,9 +517,6 @@ class WheelEngine:
                     'active_puts': actual_opts['puts'],
                     'active_calls': actual_opts['calls'],
                     'wheel_cycle_start': None,
-                    'total_premium_collected': 0.0,
-                    'put_premium_collected': 0.0,
-                    'call_premium_collected': 0.0,
                 }
                 stats['state_updates'] += 1
 
@@ -556,9 +551,9 @@ class WheelEngine:
                        event_type="reconciliation_completed",
                        **stats)
 
-            # Persist reconciled state to GCS
-            self.wheel_state._save_state()
-
+            # No persistence step: the bookkeeping is per-request by design and
+            # dies with the request (FC-069 item 8 stage 2 / FC-039). The
+            # durable record of this cycle is the events logged above.
             return stats
 
         except Exception as e:
