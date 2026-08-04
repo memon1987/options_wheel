@@ -1941,6 +1941,53 @@ class TestPutSideExistingPositionSkip:
         assert [(s['symbol'], s['reason']) for s in skips] == [
             ('F', 'option_position'), ('MSFT', 'option_position')]
 
+    def test_a_held_short_CALL_blocks_puts_on_the_same_underlying(self):
+        """Review fix 3 — pin the option-type dimension.
+
+        Every other held-option fixture here is a P contract, so the mutation
+        `underlying == symbol and option_type == 'put'` survived the whole
+        suite: a held covered CALL would silently stop blocking new puts on the
+        same underlying, and the wheel would stack a short put under a short
+        call it is already carrying. The check is deliberately type-BLIND —
+        the invariant is one option position per underlying, whichever leg it
+        is. MUTATION CHECK: adding a `'put'` type condition fails this test.
+        """
+        emitted, mock_logger = self._scan([
+            {'symbol': 'F260821C00012000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        assert emitted == ['MSFT']
+        skips = _events(mock_logger, 'put_scan_skipped_existing_position')
+        assert [(s['symbol'], s['position_symbol']) for s in skips] == [
+            ('F', 'F260821C00012000')]
+
+    def test_the_match_is_equality_not_a_prefix_relation(self):
+        """Review fix 4 — kill the `startswith` survivor.
+
+        A held F contract must not block FDX, and a held FDX contract must not
+        block F. Both directions, because `underlying.startswith(symbol)` and
+        `symbol.startswith(underlying)` are different bugs and each passes the
+        other's test. MUTATION CHECK: either startswith form fails one of these.
+        """
+        self.mock_config.stock_symbols = ['F', 'FDX']
+        self.mock_market_data.filter_suitable_stocks.return_value = [
+            {'symbol': 'F', 'current_price': 11.0},
+            {'symbol': 'FDX', 'current_price': 130.0},
+        ]
+
+        held_f, _ = self._scan([
+            {'symbol': 'F260821P00010000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+        held_fdx, _ = self._scan([
+            {'symbol': 'FDX260821P00125000', 'asset_class': 'us_option',
+             'qty': -1},
+        ])
+
+        assert held_f == ['FDX']
+        assert held_fdx == ['F']
+
     def test_an_adjusted_root_still_resolves_to_its_underlying(self):
         """The parser's leading-letters fallback is the wanted answer here, not
         a guess to fail closed on: an adjusted MSFT contract still blocks MSFT

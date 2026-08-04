@@ -15,6 +15,7 @@ import pytest
 from src.utils import clock
 
 from src.backtesting.engine.broker import LedgerEvent
+from src.backtesting.engine.rejections import HOLDS_UNDERLYING_REASON
 from src.backtesting.engine.simulator import DailyState
 from src.backtesting.metrics.cycles import build_cycles, count_rolls
 from src.backtesting.metrics.fitness import compute_fitness
@@ -527,6 +528,31 @@ class TestReport:
         assert "Stock — realized" in md and "Stock — unrealized" in md
         assert "Buy & hold" in md
         assert "Attribution" in md
+
+    def test_deployment_is_reported_apart_from_the_stand_down_table(self):
+        """FC-069 item 12, review fix 1 — the report side of the same guard.
+
+        A wheel that held a position on 40 of 45 days was *working*. Ranking
+        that bucket in "why the strategy stood down" — and naming it the
+        binding constraint — reports the strategy working as the strategy
+        blocked. It gets its own section and is excluded from the table.
+
+        MUTATION CHECK: drop the `stand_down_reasons` filter in
+        `render_markdown` and the binding-constraint assertion below fails.
+        """
+        r = self._report()
+        r.data_quality = {"blocked_days_by_reason": {
+            HOLDS_UNDERLYING_REASON: 40,
+            "no put cleared delta/DTE/premium (stage 7)": 5,
+        }}
+
+        md = render_markdown(r)
+
+        stood_down = md.split("### Why the strategy stood down")[1].split("###")[0]
+        assert HOLDS_UNDERLYING_REASON not in stood_down
+        assert "The binding constraint was **no put cleared" in md
+        assert "Capital deployment (not a stand-down)" in md
+        assert "**40**" in md
 
     def test_markdown_always_carries_the_bias_footer(self):
         """An unlisted caveat is one the reader assumes does not exist."""

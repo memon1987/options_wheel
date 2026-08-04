@@ -156,9 +156,10 @@ don't know them. Three worth knowing here: the fidelity figures (81% put-leg str
 reproduction, 55.2% / 0.676 on the call leg) are **stale pending re-measurement after
 FC-068**, which changed the selection model they were measured against; a symbol showing
 0% days in position is a **filter** result — 8 of 14 configured symbols currently cannot
-trade at all, for reasons unrelated to symbol quality; and `backtest_runs` rows carry two
+trade at all, for reasons unrelated to symbol quality; and `backtest_runs` rows carry three
 non-comparability boundaries, `engine_version = 'fc-032-phase-5'` (dead engine path) vs
-`'fc-068-prod-pipeline'`, plus the timestamp-only FC-048 put-only boundary at 2026-07-29.
+`'fc-068-prod-pipeline'` vs `'fc-069-scanner-rewire'` (scanner rewire + rejection-vocabulary
+change, 2026-08-04), plus the timestamp-only FC-048 put-only boundary at 2026-07-29.
 
 ```bash
 python main.py --command backtest --symbol NVDA --start 2025-10-01 --end 2026-07-01

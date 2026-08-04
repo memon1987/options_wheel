@@ -17,6 +17,7 @@ import json
 from dataclasses import asdict, is_dataclass
 from typing import List, Optional
 
+from ..engine.rejections import NOT_A_STAND_DOWN, stand_down_reasons
 from ..metrics.cycles import WheelCycle
 from ..metrics.fitness import FitnessReport
 
@@ -159,7 +160,16 @@ def render_markdown(report: FitnessReport) -> str:
     # Why the strategy stood down. A verdict that hides its own binding
     # constraint invites the wrong action: "this symbol is unfit" reads very
     # differently from "our gap filter excludes this symbol in high-vol regimes".
-    blocked = report.data_quality.get("blocked_days_by_reason") or {}
+    #
+    # FC-069 item 12 (review fix 1): "already holds this underlying" is counted
+    # by the tally but is NOT a stand-down — it is the wheel deployed, which on
+    # a healthy symbol is most days in the window. Leading this table with it,
+    # and calling it the binding constraint, would report the strategy working
+    # as the strategy blocked. It gets its own line below the table instead.
+    all_blocked = report.data_quality.get("blocked_days_by_reason") or {}
+    blocked = stand_down_reasons(all_blocked)
+    deployed_days = sum(count for reason, count in all_blocked.items()
+                        if reason in NOT_A_STAND_DOWN)
     if blocked:
         candidates = report.data_quality.get("days_with_a_qualifying_candidate")
         a("### Why the strategy stood down")
@@ -179,6 +189,17 @@ def render_markdown(report: FitnessReport) -> str:
               f"so this is NOT a count of days a tradeable option existed — "
               f"where the binding constraint sits upstream of stage 7, the "
               f"chain was never looked at.")
+        a("")
+
+    if deployed_days:
+        a("### Capital deployment (not a stand-down)")
+        a("")
+        a(f"On **{deployed_days}** of {report.decision_days} decision days the "
+          f"put scan skipped this symbol because a position was already open on "
+          f"it. That is the wheel working — one position per underlying is the "
+          f"design — so it is reported here rather than in the stand-down table "
+          f"above, and it is never stamped as the binding constraint. A high "
+          f"number here means high deployment, not high blockage.")
         a("")
 
     # ---- Headline: strategy vs the only benchmark that matters --------------

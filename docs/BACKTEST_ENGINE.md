@@ -146,16 +146,27 @@ failure mode: it cannot flatter a symbol into looking tradeable.
 4. **The engine refuses split-spanning windows** (`UnadjustedCorporateAction`) by design —
    raw bars are correct for point-in-time chain work but cannot span a split. Pick a
    window that avoids the split date; the error message names it.
-5. **Two non-comparability boundaries in `backtest_runs`, and only one is machine-queryable.**
+5. **Three non-comparability boundaries in `backtest_runs`, and only two are machine-queryable.**
    - Rows before **2026-07-29** describe a **put-only** engine (FC-048 — every backtest
      this project ever ran before it misrouted covered calls to the put seller). FC-048
      did not bump `engine_version`, so this boundary is **timestamp-only**.
    - Rows with `engine_version = 'fc-032-phase-5'` describe the **dead engine path**;
      `engine_version = 'fc-068-prod-pipeline'` describes the production pipeline
      (FC-068). Query the version, not the date.
+   - `engine_version = 'fc-069-scanner-rewire'` (FC-069 item 12, **2026-08-04**) changes
+     the replayed scanner *and* the rejection vocabulary. The put-side existing-position
+     check no longer substring-matches OCC symbols, so a symbol the replay used to skip
+     on a spelling coincidence (`'F' ⊂ 'PFE…'`, `'F' ⊂ 'MSFT…'`) is now scanned. And
+     `blocked_days_by_reason` gained an "already holds this underlying (scan, put)"
+     bucket which is deliberately **excluded from `binding_constraint` selection** — it
+     means the wheel was deployed, not blocked. So pre/post rows differ in
+     `blocked_days_by_reason` *and* in `binding_constraint` semantics even where the
+     verdict is unchanged: a pre-bump row's `binding_constraint` was chosen from a
+     vocabulary that did not contain this bucket, and a post-bump `NULL` can now mean
+     "the only thing that stopped it was already holding it."
 
-   Do not compare across either boundary. Old rows are never mutated — provenance is
-   `engine_version` + `timestamp` + `config_hash`.
+   Do not compare across any of the three boundaries. Old rows are never mutated —
+   provenance is `engine_version` + `timestamp` + `config_hash`.
 6. **There is no gap filter** (FC-049, FC-068, FC-069). Production never ran the stage-2
    filter; FC-068 removed the backtest's only caller with the engine path; **FC-069 item 5
    then deleted `GapDetector` and all twelve `gap_risk_controls` knobs outright** (the code

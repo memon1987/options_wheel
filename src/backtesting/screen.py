@@ -39,7 +39,16 @@ logger = structlog.get_logger(__name__)
 # comparable. (FC-048 changed the measurement just as much — every backtest
 # before it ran a put-only wheel — and did NOT bump this, so its boundary is
 # timestamp-only, 2026-07-29.)
-ENGINE_VERSION = "fc-068-prod-pipeline"
+#
+# FC-069 item 12 bumped it again. Two things moved under the replay: the
+# scanner's put-side existing-position check stopped substring-matching OCC
+# symbols (a symbol the replay used to skip on a spelling coincidence is now
+# scanned), and the rejection vocabulary gained a bucket that is deliberately
+# excluded from `binding_constraint` selection. So rows either side differ in
+# both `blocked_days_by_reason` and `binding_constraint` semantics, on top of
+# any verdict the un-over-blocking moved. Not bumping would have reproduced the
+# FC-048 timestamp-only wart this very comment criticizes.
+ENGINE_VERSION = "fc-069-scanner-rewire"
 
 # Default lookback for a screening run. Long enough for a meaningful number of
 # cycles, short enough that a symbol's *recent* behavior dominates — a demotion

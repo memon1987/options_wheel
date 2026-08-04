@@ -22,6 +22,37 @@ import structlog
 
 from ...utils import clock
 
+# FC-069 item 12, review fix 1. This bucket is NOT a stand-down: it fires on
+# every day the wheel is doing exactly what it exists to do — holding a position
+# on the underlying it already sold a put against. On a healthy deployment it is
+# the *most common* bucket by a wide margin (a golden-path fixture puts it at
+# 40 of 45 days), so ranking it with the real blockers would stamp "the strategy
+# was working" as `backtest_runs.binding_constraint` and lead the "why the
+# strategy stood down" table with it. That is the FC-057 dishonest-metric class
+# the tally exists to end, reintroduced from the other side.
+#
+# It stays counted and stays visible — deployment density is real information —
+# but it is reported as deployment, never ranked as a constraint. Consumers:
+# `reporting/bq_writer._binding` and `reporting/report.render_markdown`.
+HOLDS_UNDERLYING_REASON = "already holds this underlying (scan, put)"
+
+# Reasons that must be excluded from binding-constraint selection and from the
+# stood-down ordering. A set, not a single constant, because the next reason of
+# this species (a "capital fully deployed" bucket, say) belongs here too rather
+# than in another one-off `!=` test.
+NOT_A_STAND_DOWN = frozenset({HOLDS_UNDERLYING_REASON})
+
+
+def stand_down_reasons(blocked: Optional[Dict[str, int]]) -> Dict[str, int]:
+    """``blocked_days_by_reason`` minus the reasons that are not stand-downs.
+
+    Order-preserving (the tally emits most-common-first, and both consumers
+    take the first key as the binding constraint).
+    """
+    return {reason: count for reason, count in (blocked or {}).items()
+            if reason not in NOT_A_STAND_DOWN}
+
+
 # Live event_type -> the human-facing reason a day produced no trade. Ordered
 # roughly by how early the stage sits in the pipeline.
 #
@@ -77,8 +108,9 @@ _REASONS = {
     # live path and therefore in the replay (same scanner since FC-068). The
     # skip's fail-closed API-error sibling, `position_check_failed`, is
     # deliberately NOT mapped here: it means the positions call failed, not
-    # that a position exists, and the two must not share a bucket.
-    "put_scan_skipped_existing_position": "already holds this underlying (scan, put)",
+    # that a position exists, and the two must not share a bucket. This bucket
+    # is counted but never ranked — see HOLDS_UNDERLYING_REASON above.
+    "put_scan_skipped_existing_position": HOLDS_UNDERLYING_REASON,
     # Execution-stage failures (FC-048). Without these the tally cannot see an
     # opportunity that was found and ranked but died at the router or in the
     # wrong seller -- which is exactly how the covered-call misroute stayed
