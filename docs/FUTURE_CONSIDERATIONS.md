@@ -1244,6 +1244,8 @@ Fix **FC-056** (call-leg pricing) before goal 3 drives any production parameter 
 
 ### FC-066: the call roller has never executed a roll — quote-key bug, eligibility gap, stateless premium
 
+> **CLOSED 2026-08-04 — superseded by FC-078** (`docs/plans/fc-078.md`, PR #82, merged `c379e81`): quote keys fixed, cadence daily, premium dependency deleted (credit-only makes it irrelevant), pre-revival checklist delivered (alert wiring, structured skip events, replay-BQ gate pinned). **The roller executed its first-ever roll the same day** (GOOGL C370 8/07 → C375 8/21, +$235). Entry below preserved for history.
+
 **Status:** Consideration — **the fatal defect (1) has no other entry; FC-039 covers only cause (3)**
 **Size estimate:** M
 **Owner:** unassigned
@@ -1487,6 +1489,8 @@ Option (1) is the smallest change; option (3) is the one that stops this recurri
 ---
 
 ### FC-062: the roller has its own fail-open cost-basis floor and bypasses the execute-time guard
+
+> **CLOSED 2026-08-04 — both halves delivered**: the floor half by FC-065 Phase 2 (PR #76 — roller floor via shared `CostBasisResolver`, fail-closed); the `execute_roll` routing half by FC-078 (PR #82 — execute-time floor pinned on stored ladder candidates, commit `7326df1`, mutation-verified). Entry below preserved for history.
 
 **Status:** Consideration — **must be resolved before any roller revival ships**
 **Size estimate:** S
