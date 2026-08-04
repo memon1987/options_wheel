@@ -1014,6 +1014,26 @@ class TestQueuedCancelsOnTheBtcLeg:
         # The breadcrumb is emitted too, and it is alert-wired.
         assert 'call_roll_order_refetch_failed' in event_types(log)
 
+    def test_the_production_settle_bound_actually_allows_polling(self):
+        """The autouse fixture drives the settle bound to 0 so tests don't
+        sleep — which means no other test can see the SHIPPED value. Without
+        this assertion, setting the source constant to 0 (one read, no polling:
+        precisely the H-1 defect) passes the entire suite.
+
+        The bound must exceed the 5s poll interval, or "poll to terminal" is one
+        read wearing a loop.
+        """
+        import inspect
+        source = inspect.getsource(call_roller_module)
+        # Read the literal from source, not the module attribute — the fixture
+        # has already replaced the latter.
+        literal = re.search(r'^_CANCEL_SETTLE_TIMEOUT_SECONDS = (\d+)',
+                            source, re.M)
+        assert literal, "the settle bound constant is gone"
+        assert int(literal.group(1)) >= 5, (
+            "the shipped cancel-settle bound is below the 5s poll interval, so "
+            "it performs a single read — the H-1 defect, restored")
+
     def test_the_refetch_breadcrumb_is_emitted_once_not_per_read(
             self, roller, mock_alpaca, monkeypatch):
         monkeypatch.setattr(call_roller_module,
