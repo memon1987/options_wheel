@@ -232,42 +232,6 @@ The second option is more robust — it handles the "Cloud Run instance crashed 
 
 ---
 
-### FC-014: Wire RiskManager.validate_new_position() into sellers (or retire it)
-
-**Status:** Consideration
-**Size estimate:** M
-**Owner:** unassigned
-**Plan file:** not yet
-
-**Problem / opportunity:** `RiskManager.validate_new_position()` (risk_manager.py:23) is defined but **never invoked**. It contains portfolio-level checks — max total positions, max positions per stock, max exposure per ticker, min cash reserve, portfolio allocation — that today are partially duplicated in `wheel_engine._can_open_new_positions` and partially absent. Only `validate_roll()` is wired (from `CallRoller`). Either consolidate the put/call seller paths through `validate_new_position` (and dedupe the engine-level checks) or formally retire the method and document where each portfolio-level check actually lives.
-
-**Open questions:**
-- Consolidate (route puts/calls through `validate_new_position`) or retire (delete the method, ensure engine-level checks cover everything)?
-- If consolidating, do the engine-level early checks stay as a fast-fail before scanning, with the seller-level call as the authoritative gate?
-- Are `max_exposure_per_ticker` and `min_cash_reserve` actually checked anywhere today, or are they silently disabled?
-
-**Links:** FC-013 Phase-1 audit, `risk_manager.py:23-120`, `wheel_engine.py:220-249`.
-
----
-
-### FC-015: Centralize hold-period state in WheelStateManager (cold-start safe)
-
-**Status:** Consideration
-**Size estimate:** M
-**Owner:** unassigned
-**Plan file:** not yet
-
-**Problem / opportunity:** Both `PutSeller._entry_times` (put_seller.py:30) and `CallSeller._entry_times` (call_seller.py:32) are local in-memory dicts that do not survive Cloud Run cold starts. The `profit_taking_min_hold_hours` gate inside `should_close_*_early()` silently fails open when the dict is empty (no `entry_time` → loop falls through). This is the same class of bug as FC-009 (the `_closed_today` cold-start dedup issue). Persist `_entry_times` to GCS alongside the existing wheel state so the hold-period gate enforces correctly across cold starts and parallel cycles.
-
-**Open questions:**
-- Persist to GCS (existing `WheelStateManager` GCS layer) or query Alpaca for fill timestamps?
-- Should this share infrastructure with FC-009's `_closed_today` fix or stay independent?
-- What's the migration path for currently-held positions whose entry times are unknown?
-
-**Links:** FC-009, `put_seller.py:30,378,544`, `call_seller.py:32,300,557`.
-
----
-
 ### FC-016: Test coverage for orchestration & account-level gates
 
 **Status:** Consideration
@@ -785,10 +749,27 @@ The backtest replays `run_strategy_cycle()`, which uses the second producer. So 
 
 *(Renumbered from FC-048 at merge: FC-048 was concurrently allocated on main to the covered-call misroute found by the B2 study. Independent findings — but the same species: a control that looks active and is not.)*
 
-**Status:** Consideration
+**Status:** Consideration — **code deleted from the tree 2026-08-04 by FC-069 item 5**
 **Size estimate:** M
 **Owner:** unassigned
 **Plan file:** not yet
+
+> **⚠ The code this entry describes is no longer in the repository.** FC-069 S1
+> (operator decision, option ii) deleted `src/risk/gap_detector.py` (645 lines),
+> `tests/test_gap_detector.py`, the entire `risk.gap_risk_controls:` yaml block
+> (12 keys), every `Config` accessor for them, `/config`'s `gap_thresholds`
+> block, and the three gap keys in `bq_writer.config_hash`. **It all lives at
+> pre-S1 `main` SHA `afb6698`** — `git show afb6698:src/risk/gap_detector.py`.
+>
+> The operator's reasoning: "revive only with evidence" is better served by a
+> git SHA than by 645 orphaned lines the next inventory has to re-litigate,
+> and reviving *with* evidence means reviving code with the evidence in hand.
+> The post-sweep control matrix reads **"gap risk: absent by decision"**, which
+> ratifies FC-036's study (don't arm the execution gate) alongside this entry's
+> finding. **This FC still owns any evidence-based revival** — nothing about
+> the deletion forecloses it; it starts from git history rather than from a
+> corpse in the tree. The two study harnesses are kept and carry SHA pointers:
+> `tools/diagnostics/fc002_gap_filter_ab.py` and `fc036_gap_gate_study.py`.
 
 **Problem:** `GapDetector.filter_stocks_by_gap_risk` is called from exactly one place —
 `WheelEngine._find_new_opportunities`. The deployed Cloud Run trading path is
@@ -1636,6 +1617,18 @@ The grace only becomes a latent weakness **if** we ever consolidate strategies i
 ## Completed
 
 _Move entries here once a plan has been published, executed, and merged. Include plan file + PR/commit link._
+
+### FC-014: Wire RiskManager.validate_new_position() into sellers (or retire it)
+- Plan: `docs/plans/fc-069.md` (item 7)
+- PR: https://github.com/memon1987/options_wheel/pull/83
+- Closed: 2026-08-04 by FC-069 item 7 (operator decision: retire)
+- Notes: `validate_new_position` and its five sibling methods (six in all — `_validate_option_specific_risks`, `calculate_portfolio_risk_metrics`, `should_reduce_positions`, `get_emergency_stop_conditions`, `check_emergency_conditions`) were deleted with zero production call sites ever recorded; `validate_roll` survives as the roller's gate (FC-066's turf). All five checks this entry named are dispositioned: the global position cap by FC-069 item 1 (deleted — operator flip from revive), per-ticker exposure by item 2 (deleted; corrected structural bound documented — the real per-ticker bound is `max_position_size` × portfolio, which *floats with equity*, not an absolute dollar cap), per-stock cap by item 3 (deleted; emergent invariant documented with its open-order caveat), cash reserve by the item 7 rider (deleted with its detective check), and portfolio allocation by card 17 (knob deleted; its warn-only detective mirror deleted with it under card 16). The account-level loss-limit concepts inside the emergency-stop methods were dispositioned by item 7's sub-decision: carried into **FC-074** (filed 2026-08-01), the account-level kill-switch entry, whose thresholds are to be chosen from the account's actual drawdown history rather than inherited from the dead code's 15%/5%. The consolidate fork died with the method: enforcement on this system is distributed by design — scanner filters, selection ledgers, execute-time floor, plus the hourly `/regression` detective layer (card 16). This entry's third open question is answered on the record: **no**, `max_exposure_per_ticker` and `min_cash_reserve` were never checked anywhere — they were silently disabled from inception.
+
+### FC-015: Centralize hold-period state in WheelStateManager (cold-start safe)
+- Plan: `docs/plans/fc-069.md` (item 6)
+- PR: https://github.com/memon1987/options_wheel/pull/83
+- Closed: 2026-08-04 by FC-069 item 6 (operator decision: delete)
+- Notes: `_entry_times` never survived a request (sellers are constructed per request, not per cold start as this entry assumed), so the 4h gate has been open since inception — 2026-05-12 evidence: 4 of 35 sub-4h closes. The raised DTE-band thresholds carry the hold discipline. The knob (`risk.profit_taking.min_hold_hours`), both dicts, their population sites and the gate code are deleted. If a hold gate is ever wanted, derive entry time statelessly from Alpaca order history (`filled_at`) — do not persist process state; that answer supersedes this entry's GCS-vs-Alpaca open question, and its "share infrastructure with FC-009" question is moot for the same reason.
 
 ### FC-006: Covered call rolling engine (Friday EOW)
 - Plan: `docs/plans/fc-006.md`

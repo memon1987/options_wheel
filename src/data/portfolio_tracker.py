@@ -385,22 +385,22 @@ class PortfolioTracker:
         recommendations = []
         
         try:
-            # Cash level recommendations
+            # Cash level recommendations. FC-069 S1 dropped the
+            # `min_cash_reserve` branch with the knob — there is no cash-reserve
+            # policy to advise against.
             cash_percent = (snapshot['account']['cash'] / snapshot['account']['portfolio_value'] * 100)
-            if cash_percent < self.config.min_cash_reserve * 100:
-                recommendations.append(f"Consider increasing cash reserves (currently {cash_percent:.1f}%)")
-            elif cash_percent > 50:
+            if cash_percent > 50:
                 recommendations.append("High cash levels - consider deploying capital in wheel strategies")
-            
-            # Position count recommendations
+
+            # Position count recommendations. FC-069 S1 dropped the
+            # "approaching maximum position limit" branch with
+            # `max_total_positions` — there is no global position cap.
             wheel_metrics = snapshot.get('wheel_metrics', {})
             active_wheels = wheel_metrics.get('active_wheels', 0)
-            
+
             if active_wheels < 3:
                 recommendations.append("Consider adding more wheel positions for diversification")
-            elif active_wheels > self.config.max_total_positions * 0.8:
-                recommendations.append("Approaching maximum position limit")
-            
+
             # Performance-based recommendations
             if 'total_return_percent' in performance:
                 if performance['total_return_percent'] < -5:
@@ -437,7 +437,7 @@ class PortfolioTracker:
                 'export_timestamp': datetime.now().isoformat(),
                 'performance_history': self._performance_history,
                 'config_snapshot': {
-                    'max_positions': self.config.max_total_positions,
+                    # `max_positions` dropped by FC-069 S1 with the knob.
                     'max_position_size': self.config.max_position_size,
                     'stock_symbols': self.config.stock_symbols
                 }

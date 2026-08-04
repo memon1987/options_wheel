@@ -3,7 +3,7 @@
 `WheelEngine` and everything it builds consume a single object, `AlpacaClient`.
 This module implements that object's *consumed surface* against historical data
 and `BacktestBroker`, so the live `PutSeller`/`CallSeller`/`CallRoller`/
-`MarketDataManager`/`GapDetector` run unmodified over history.
+`MarketDataManager` run unmodified over history.
 
 Three principles, each a defense against a specific way a replay can lie:
 
@@ -47,12 +47,13 @@ class UnsupportedBacktestCall(RuntimeError):
 
 # Alpaca stamps daily stock bars at MIDNIGHT ET — 04:00 UTC under EDT, 05:00 UTC
 # under EST. The adapter reproduces the live stamp rather than inventing one.
-# A fixed 04:00 is an hour off for winter dates, which is harmless: since FC-036
-# GapDetector compares CALENDAR DATES (``idx.date()``), and both 04:00 and 05:00
-# UTC on trading day D yield date D. (Before FC-036 it compared timestamps, and
-# the stamp is what let the session's own bar pass as "previous close" — see
-# docs/plans/fc-036.md.) Kept fixed for determinism; revisit only if some caller
-# ever depends on the exact hour.
+# A fixed 04:00 is an hour off for winter dates, which was harmless for the
+# historical consumer: the FC-036 gap gate compared CALENDAR DATES
+# (``idx.date()``), and both 04:00 and 05:00 UTC on trading day D yield date D.
+# (Before FC-036 it compared timestamps, and the stamp is what let the session's
+# own bar pass as "previous close" — see docs/plans/fc-036.md. FC-069 has since
+# deleted that gate entirely.) Kept fixed for determinism; revisit only if some
+# caller ever depends on the exact hour.
 _BAR_STAMP = time(4, 0)
 
 # Ledger kinds that Alpaca reports as account activities, and their activity_type.
@@ -240,20 +241,14 @@ class BacktestAlpacaClient:
         (``datetime64[ns, UTC]``, bars stamped 04:00 UTC), so that replay and
         live derive identical trading dates from the index.
 
-        Since FC-036, GapDetector's ``_get_previous_close`` excludes the
-        decision date's own bar by CALENDAR DATE rather than by timestamp, so
-        replay and live now agree: the previous close is the prior session's.
-        In replay that makes the stage-4 gap a close-to-close measure, while
-        live compares a real-time quote against the same prior close — a
-        documented difference, not a defect (see docs/plans/fc-036.md D3).
-
         ``days`` is a CALENDAR-day lookback, not a bar count — the live client
         builds ``start = end - timedelta(days=days)``. Slicing the last ``days``
         *bars* instead hands the caller ~43% more history (50 calendar days is
         ~35 sessions), which silently changes every windowed statistic computed
-        on it. GapDetector's gap *frequency* is a ratio over exactly this
-        window: with the longer window NVDA measured 18.6% against a 15% limit
-        and was blocked for all of Nov 2025, while live traded it on 7 days.
+        on it. The illustration that established this, from the gap-frequency
+        filter FC-069 later deleted: it was a ratio over exactly this window,
+        and with the longer window NVDA measured 18.6% against a 15% limit and
+        was blocked for all of Nov 2025, while live traded it on 7 days.
         """
         cutoff = self.today - timedelta(days=days) if days else None
         bars = [

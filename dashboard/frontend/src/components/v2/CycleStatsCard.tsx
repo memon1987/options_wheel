@@ -70,7 +70,12 @@ export default function CycleStatsCard({ data }: Props) {
         />
       </div>
       {post && post.count > 0 && (
-        <div className="text-xs text-gray-500 mt-3" title={`FC-029 risk re-tune deployed ${data.fc029_deploy_date} (call delta band, hard cost-basis floor, drawdown pause).`}>
+        {/* The deploy note describes what FC-029 shipped on that date, which is
+            what splits the regimes. The drawdown pause it shipped no longer
+            exists (FC-065 OQ-3 killed the gate; FC-069 item 9 deleted the
+            knob) — said so here so the tooltip does not read as a description
+            of the current system. */}
+        <div className="text-xs text-gray-500 mt-3" title={`FC-029 risk re-tune deployed ${data.fc029_deploy_date} (call delta band, hard cost-basis floor, and a drawdown pause that has since been removed).`}>
           Since FC-029 ({data.fc029_deploy_date}): {post.count} cycles ·{' '}
           win rate {post.win_rate !== null ? fmtPercent(post.win_rate, 0) : '—'} ·{' '}
           expectancy {fmtCurrency(post.expectancy)} · vs pre:{' '}

@@ -6,8 +6,15 @@ longer wired into anything. `GapDetector` was consumed only by
 `WheelEngine._find_new_opportunities` (stages 2 and 4), which FC-068 deleted —
 production stopped calling that path in 2025, so the filter has not affected a
 live trade in over ten months, and it now affects backtests too (it used to run
-in replays only because the replay drove the dead path). The detector class,
-its knobs and its tests remain; their fate is FC-069 item 5.
+in replays only because the replay drove the dead path).
+
+⚠️ **CODE DELETED BY FC-069 item 5 (2026-08-04).** GapDetector, the
+`risk.gap_risk_controls` knobs and `tests/test_gap_detector.py` are no longer in
+the tree; **the code lives at pre-S1 main SHA `afb6698`**. This file is kept as
+the record of the study, not as a runnable harness — every mode that imports
+`src.risk.gap_detector` or reads a gap knob off `Config` will now fail at
+import or attribute access. To re-run it, check out `afb6698`. Gap risk is
+absent by decision; FC-049 owns any evidence-based revival.
 
 Consequences for this file, specifically:
   * the `verify` mode asserts *source properties* of `_find_new_opportunities`,

@@ -232,6 +232,12 @@ logger.info("STAGE 9: Max new positions per cycle limit REACHED",
 
 ## Code Locations
 
+> ⚠️ **STALE.** Stages 2–6 and 9 do not exist: FC-068 deleted
+> `WheelEngine._find_new_opportunities` (2026-08-01) and FC-069 S1 deleted
+> `src/risk/gap_detector.py` (2026-08-04). Line numbers for the surviving rows
+> have drifted. Kept as the historical record; see `docs/gates.md` for what
+> actually gates a trade today.
+
 | Stage | File | Lines | Function |
 |-------|------|-------|----------|
 | 1 | `src/api/market_data.py` | 117-119 | `filter_suitable_stocks()` |

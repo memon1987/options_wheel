@@ -113,11 +113,18 @@ def config_hash(config) -> str:
     without this, a re-run under a changed premium floor is indistinguishable
     from a genuine change in the symbol.
     """
+    # HASH DISCONTINUITY (FC-069 S1, 2026-08-04): `gap_lookback_days`,
+    # `max_gap_frequency` and `execution_gap_threshold` were dropped from this
+    # list when item 5 deleted GapDetector and the `gap_risk_controls` knobs.
+    # `config_hash` values therefore change for all `backtest_runs` rows written
+    # at or after this boundary; rows either side are not hash-comparable even
+    # when every surviving parameter is identical. This is the second
+    # non-comparability marker on the table, beside FC-068's `engine_version`
+    # boundary — one boundary, two markers.
     keys = [
         "put_target_dte", "call_target_dte", "put_delta_range", "call_delta_range",
         "min_put_premium", "min_call_premium", "max_position_size",
-        "max_stock_price", "min_stock_price", "gap_lookback_days",
-        "max_gap_frequency", "execution_gap_threshold",
+        "max_stock_price", "min_stock_price",
     ]
     payload = {k: getattr(config, k, None) for k in keys}
 

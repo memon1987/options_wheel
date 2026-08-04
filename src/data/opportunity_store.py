@@ -115,7 +115,12 @@ class OpportunityStore:
                 'strategy_id': self.strategy_id,
                 'scan_time': scan_time.isoformat(),
                 'run_id': run_id or '',
-                'expires_at': (scan_time + timedelta(minutes=20)).isoformat(),
+                # FC-069 item 11 deleted `expires_at`. It looked like a TTL and
+                # was never read: both `get_pending_opportunities` and
+                # `mark_executed` gate on `scan_time` vs
+                # `opportunity_max_age_minutes` (30). Its hardcoded 20 minutes
+                # disagreed with the operative 30 and nobody ever noticed —
+                # which is the proof it gated nothing.
                 'opportunity_count': len(opportunities),
                 'opportunities': opportunities,
                 'status': 'pending'
@@ -135,8 +140,7 @@ class OpportunityStore:
                 status="success",
                 opportunity_count=len(opportunities),
                 blob_path=blob_path,
-                run_id=run_id or '',
-                expires_at=storage_data['expires_at']
+                run_id=run_id or ''
             )
 
             logger.info("Stored opportunities to Cloud Storage",

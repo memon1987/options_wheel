@@ -620,7 +620,13 @@ log_error_event(
 
 ---
 
-### Gap Detector (`src/risk/gap_detector.py`)
+### Gap Detector (`src/risk/gap_detector.py`) — **DELETED**
+
+> ⚠️ **FC-069 item 5 deleted this module on 2026-08-04**, together with the
+> twelve `risk.gap_risk_controls` knobs. None of the events below is emitted
+> any more, in production or in backtests. Gap risk is absent by decision;
+> the code lives at pre-sweep `main` SHA `afb6698`. Kept as the historical
+> record of the event shapes.
 
 #### Stage 2: Gap Risk Analysis
 
@@ -716,8 +722,12 @@ log_system_event(
     status="success",
     opportunity_count=10,
     blob_path="opportunities/2025-10-06/16-00.json",
-    expires_at="2025-10-06T16:20:00"
+    run_id="..."
 )
+# `expires_at` was removed from this event by FC-069 item 11: it echoed a blob
+# field that nothing ever read (retrieval gates on scan_time vs
+# opportunity_max_age_minutes), and its hardcoded 20 minutes disagreed with the
+# operative 30.
 ```
 
 **Storage Failed:**
@@ -820,17 +830,15 @@ Complete logging for each stage of the risk filtering pipeline:
 - **Event Type:** `stage_1_complete`
 - **Fields:** total_analyzed, passed, rejected, passed_symbols, rejected_symbols
 
-### Stage 2: Gap Risk Analysis
-- **Component:** `GapDetector.filter_stocks_by_gap_risk()`
-- **Event Type:** `stage_2_complete`
-- **Fields:** input_symbols, passed, rejected, passed_symbols, rejected_symbols
+### Stage 2: Gap Risk Analysis — **GONE** (FC-068 deleted the caller, FC-069 the module)
+- **Component:** `GapDetector.filter_stocks_by_gap_risk()` — no longer in the tree
+- **Event Type:** `stage_2_complete` — never emitted any more
 
 ### Stage 3: [Reserved for future use]
 
-### Stage 4: Execution Gap Check
-- **Component:** `GapDetector.can_execute_trade()`
-- **Event Type:** `execution_gap_exceeded` or `gap_within_limits`
-- **Fields:** gap_percent, threshold, previous_close, current_price
+### Stage 4: Execution Gap Check — **GONE** (FC-068 deleted the caller, FC-069 the module)
+- **Component:** `GapDetector.can_execute_trade()` — no longer in the tree
+- **Event Type:** `execution_gap_exceeded` / `gap_within_limits` — never emitted any more
 
 ### Stage 5: [Reserved for future use]
 

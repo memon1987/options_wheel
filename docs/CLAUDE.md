@@ -53,8 +53,11 @@ mypy src/                        # Type checking
 > filter → rank → `select_batch` → `execute_batch`) → `PutSeller`/`CallSeller`, and has
 > since 2025-10-03. What survives on `WheelEngine` is `reconcile_positions` (pre-trade
 > housekeeping) and `run_rolling_cycle` (Friday `/roll`). Step 5 is also wrong:
-> `RiskManager.validate_new_position` is called on no live path — only `validate_roll`
-> is. **The full rewrite of this section is FC-069 item 14**; this note exists so the
+> `RiskManager` never validated anything on a live path. **FC-069 S1 (2026-08-04)
+> deleted `validate_new_position` and five sibling methods outright** — the class
+> is now `validate_roll` only, the roller's gate. Live validation is the scanner
+> filters, `select_batch`'s ledgers and the execute-time cost-basis floor.
+> **The full rewrite of this section is FC-069 item 14**; this note exists so the
 > known-false claims below do not get *more* false in the interim.
 
 **Core Strategy Flow:**

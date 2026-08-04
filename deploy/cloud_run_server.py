@@ -1288,17 +1288,19 @@ def get_config():
         config_data = {
             'paper_trading': True,  # Always true for cloud deployment
             'stock_symbols': getattr(config, 'stock_symbols', []),
-            'max_positions': getattr(config, 'max_total_positions', 10),
-            'gap_thresholds': {
-                'quality': getattr(config, 'quality_gap_threshold', 2.0),
-                'execution': getattr(config, 'execution_gap_threshold', 1.5)
-            },
-            # FC-031: the dashboard reads these so its calibration bands and
-            # drawdown-pause card track the live strategy config instead of
-            # hardcoding parallel constants.
+            # FC-069 S1 removed three fields from this response:
+            # `max_positions` (item 1 — the global cap knob is deleted; breadth
+            # is bounded by buying power and the ticker universe),
+            # `gap_thresholds` (item 5 — GapDetector and its knobs are deleted;
+            # gap risk is absent by decision), and
+            # `call_drawdown_pause_threshold` (item 9 — there is no drawdown
+            # pause; FC-065 P4 already removed the dashboard read). None had a
+            # dashboard consumer at the time of removal.
+            # FC-031: the dashboard reads the delta ranges so its calibration
+            # bands track the live strategy config instead of hardcoding
+            # parallel constants.
             'put_delta_range': getattr(config, 'put_delta_range', [0.10, 0.20]),
             'call_delta_range': getattr(config, 'call_delta_range', [0.15, 0.25]),
-            'call_drawdown_pause_threshold': getattr(config, 'call_drawdown_pause_threshold', 0.05),
         }
 
         return jsonify(config_data)

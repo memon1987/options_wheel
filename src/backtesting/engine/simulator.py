@@ -194,9 +194,10 @@ class Simulator:
         self.fill_haircut = fill_haircut
         self.fees_per_contract = fees_per_contract
         # Warm-up history, kept after FC-068 for a different reason than it was
-        # introduced with. The original rationale was GapDetector's positional
-        # ~30-bar lookback; the gap stages are gone with the engine path. What
-        # still needs history on day one is `market_data.get_stock_metrics` /
+        # introduced with. The original rationale was the gap detector's
+        # positional ~30-bar lookback; the gap stages went with the engine path
+        # and FC-069 deleted the module. What still needs history on day one is
+        # `market_data.get_stock_metrics` /
         # `filter_suitable_stocks` — the volatility and average-volume metrics
         # stage 1 filters on. Load bars *before* `start` so the first decision
         # day has the lookback live would have had. 60 calendar days
@@ -285,9 +286,10 @@ class Simulator:
           position marks at zero and cannot be closed. The lowest close bounds
           the lowest strike the run can ever be short.
 
-        Both are computed from **decision-window bars only**. Warm-up bars are
-        loaded purely to give GapDetector its lookback, and a split inside the
-        warm-up buffer is explicitly tolerated (see ``run``) — for NVDA that
+        Both are computed from **decision-window bars only**. Warm-up bars
+        exist only to give day one the metric lookback live would have had, and
+        a split inside the warm-up buffer is explicitly tolerated (see
+        ``run``) — for NVDA that
         means a pre-split close of 1224.40 sitting in the same series as a ~180
         spot. Including it would set the ceiling ~7x too high and silently turn
         the strike filter into a no-op for every run starting within the warm-up
@@ -321,21 +323,22 @@ class Simulator:
             )
         # Refuse a window containing an unmodelled corporate action. Raw bars
         # are correct for point-in-time chain work but cannot span a split: the
-        # benchmark, the equity curve and the gap filter would all read a -90%
-        # crash that never happened.
+        # benchmark and the equity curve would both read a -90% crash that
+        # never happened.
         for symbol, bars in stock_bars.items():
             split = detect_split(bars)
             if split is not None:
                 split_date, ratio = split
                 # A split inside the WARM-UP buffer is survivable: those bars
-                # only feed GapDetector's lookback, and no equity, benchmark or
-                # settlement number is computed from them. Refusing the run
-                # would reject ~2 months of otherwise-legitimate history and
-                # tell the user to avoid a date their window already avoids.
+                # only feed the day-one metric lookback, and no equity,
+                # benchmark or settlement number is computed from them.
+                # Refusing the run would reject ~2 months of otherwise-
+                # legitimate history and tell the user to avoid a date their
+                # window already avoids.
                 if split_date < self.start:
                     logger.warning(
                         "Split inside the warm-up window, not the decision "
-                        "window: gap statistics over the first sessions read a "
+                        "window: metrics over the first sessions read a "
                         "corporate action as a price move and will be "
                         "distorted. Decision-day results are unaffected.",
                         event_category="backtest",
