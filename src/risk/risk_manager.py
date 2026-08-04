@@ -1,10 +1,12 @@
 """Risk management system for options wheel strategy."""
 
+from datetime import date
 from typing import Dict, List, Any, Optional, Tuple
 import structlog
 
 from ..utils import clock
 from ..utils.config import Config
+from ..utils.option_symbols import coerce_expiry_date
 
 logger = structlog.get_logger(__name__)
 
@@ -120,17 +122,39 @@ class RiskManager:
             return False, f"Risk validation error: {str(e)}"
     
     def validate_roll(self, new_call: Dict[str, Any], current_strike: float,
-                      cost_basis_per_share: float) -> Tuple[bool, str]:
+                      cost_basis_per_share: float,
+                      max_expiry: date) -> Tuple[bool, str]:
         """Validate a call roll replacement leg.
 
         Unlike validate_new_position, this skips portfolio-level checks
         (position count, concentration, cash reserve) since a roll is a
         replacement, not a new position.
 
+        FC-078 rewrote three of the five checks (DD-3):
+
+        - The **entry delta band** is replaced by a bare upper rail. The band's
+          lower bound forces far-OTM replacements exactly when a defensive roll
+          needs near-money strikes — the documented trap that made shallow-ITM
+          rescue illegal. The rail still blocks replace-ITM-with-deep-ITM churn.
+        - The **DTE cap** is replaced by an expiry-relative date bound. Roll
+          economics extend the *existing contract's* tenor, so the horizon is
+          measured from the old expiry, not from today. The eval-relative frame
+          would have excluded GOOGL C370 8/07 -> C375 8/21 (17 DTE from the
+          evaluation, exactly old-expiry + 14).
+        - The **``min_call_premium`` floor is gone**: what a roll must clear is
+          the net credit against the contract being closed, which the roller
+          enforces on the placed limit prices. A standalone premium floor
+          answers a question nobody asked on this path.
+
         Args:
             new_call: Candidate replacement call from find_suitable_calls
             current_strike: Strike of the call being closed
             cost_basis_per_share: Stock cost basis per share
+            max_expiry: Latest expiration the replacement may carry — the
+                roller computes it as ``old expiry + rolling_max_extension_days``.
+                Required, not defaulted: a roll horizon that silently falls back
+                to "no bound" is how a defensive roll parks capital under a cap
+                for a month.
 
         Returns:
             Tuple of (is_valid, reason)
@@ -146,21 +170,27 @@ class RiskManager:
             if new_strike < cost_basis_per_share:
                 return False, f"New strike {new_strike} below cost basis {cost_basis_per_share:.2f}"
 
-            # Delta within configured range
+            # Delta upper rail (FC-078 DD-3) — no lower bound
             delta = abs(new_call.get('delta', 0))
-            delta_range = self.config.call_delta_range
-            if not (delta_range[0] <= delta <= delta_range[1]):
-                return False, f"Delta {delta:.3f} outside range {delta_range}"
+            max_delta = self.config.rolling_max_replacement_delta
+            if delta > max_delta:
+                return False, f"Delta {delta:.3f} above roll rail {max_delta}"
 
-            # Premium meets minimum
-            premium = new_call.get('mid_price', 0)
-            if premium < self.config.min_call_premium:
-                return False, f"Premium {premium} below minimum {self.config.min_call_premium}"
-
-            # DTE within target
-            dte = new_call.get('dte', 0)
-            if dte > self.config.call_target_dte:
-                return False, f"DTE {dte} exceeds maximum {self.config.call_target_dte}"
+            # Expiry within the expiry-relative roll-out horizon (FC-078 DD-3).
+            # Fail closed on an unparseable expiry: "we could not tell how far
+            # out this expires" must not resolve to "sell it".
+            expiry = coerce_expiry_date(new_call.get('expiration_date'))
+            if expiry is None:
+                return False, (
+                    f"Replacement expiry unparseable "
+                    f"({new_call.get('expiration_date')!r})")
+            horizon = coerce_expiry_date(max_expiry)
+            if horizon is None:
+                return False, f"Roll horizon unparseable ({max_expiry!r})"
+            if expiry > horizon:
+                return False, (
+                    f"Expiry {expiry.isoformat()} beyond roll horizon "
+                    f"{horizon.isoformat()}")
 
             return True, "Roll target validated"
 

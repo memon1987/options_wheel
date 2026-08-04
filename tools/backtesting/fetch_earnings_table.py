@@ -13,10 +13,16 @@ no yfinance import at runtime.
 
 Known limitation, deliberately accepted: these are dates as known *today*,
 including any subsequently-revised or -confirmed dates, so a replay can "know" an
-earnings date slightly earlier than the live bot did. The only consumer is the
-rolling blackout (``rolling_earnings_blackout_days``, currently 2), so the blast
-radius is a handful of Friday roll decisions per symbol-year. Recorded in the
-report footer rather than silently ignored.
+earnings date slightly earlier than the live bot did.
+
+The blast radius is no longer small, and the old claim here that "the only
+consumer is the rolling blackout, so it's a handful of Friday roll decisions"
+went stale twice over. FC-013 made the scanner's entry-side span gate a
+consumer, and FC-078 deleted the rolling blackout outright and replaced it with
+a **daily** span check on every roll *replacement*. Both gates are fail-closed
+and both run every trading day, so a shifted date now moves real entry and roll
+decisions across the whole window. Recorded in the report footer rather than
+silently ignored.
 
 Usage:
     python tools/backtesting/fetch_earnings_table.py

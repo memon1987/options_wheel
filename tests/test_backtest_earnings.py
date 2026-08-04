@@ -1,9 +1,13 @@
 """Point-in-time earnings calendar + rolling wiring (FC-032 Phase 3).
 
-The earnings gate is small in blast radius (it blocks Friday rolls within
-``rolling_earnings_blackout_days``) but it is a place where a replay can quietly
-become more permissive than production, so it gets the same treatment as the
-other seams: answer from the frozen clock, or refuse.
+The earnings gate is no longer small in blast radius. FC-013 made the scanner's
+entry-side span gate a consumer, and FC-078 deleted the roller's fail-open
+``rolling_earnings_blackout_days`` blackout and replaced it with a fail-CLOSED
+span check on every roll *replacement*, evaluated daily. Both gates run every
+trading day, so a replay that answers the earnings question from anything but
+the frozen clock becomes quietly more permissive than production across the
+whole window — hence the same treatment as the other seams: answer from the
+frozen clock, or refuse.
 """
 
 from __future__ import annotations

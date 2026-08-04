@@ -169,38 +169,47 @@ midnight, so neither can change value in that window.
 
 ---
 
-## The roll path (Fridays, `src/strategy/call_roller.py`)
+## The roll path (daily, `src/strategy/call_roller.py`)
+
+Rewritten by FC-078. The roller runs every trading day at 15:30 ET and is
+**credit-only**: the invariant `STO_limit − BTC_limit >= min_net_credit` is
+enforced on the limit prices actually placed, so a filled roll can never net a
+debit.
 
 | # | Gate | Config | Notes |
 |---|---|---|---|
-| 20 | Current DTE | `rolling.max_current_dte: 1` | |
-| 21 | ITM trigger ratio | `rolling.itm_trigger_ratio` | |
-| 22 | Max rolls per position | `rolling.max_rolls_per_position` | counted from wheel state, which has never persisted — always reads 0 |
-| 23 | Earnings blackout (roller) | `rolling.earnings_blackout_days` | `is_earnings_within_n_days`, **fails open** |
-| 24 | `RiskManager.validate_roll` | `rolling.*`, entry delta band, DTE cap, debit tolerance | |
+| 20 | Open-order conflict | — | a live open order on the option symbol → skip; `/monitor`'s DAY buy-to-close limits outlive its 14:55 slot and the profit-taker has precedence |
+| 21 | ITM trigger ratio | `rolling.itm_trigger_ratio: 0.98` | OTM calls are the profit-taker's territory |
+| 22 | Stock-quote quality | — | two-sided **and** `ask/bid <= 1.05`; **fails closed** (`stock_quote_unusable`) |
+| 23 | Cost-basis floor | — | shared `CostBasisResolver`, **fails closed** (FC-065 P2), alert-wired since FC-078 |
+| 24 | Earnings span on the **replacement** | `earnings.enabled` | `next_earnings_info` tri-state → `exclude_expiry_on_or_after`; `unknown` (or a missing calendar) skips the whole roll. **Fails closed** |
+| 25 | `RiskManager.validate_roll` | `rolling.max_replacement_delta: 0.60`, `rolling.max_extension_days: 14` | strike > old; strike >= basis; delta upper rail only; expiry <= **old expiry** + N |
+| 26 | Credit invariant | `rolling.min_net_credit_per_contract: 0.00` | checked at the candidate screen, pre-BTC re-check, order construction, and every ladder rung |
+| 27 | Cycle time budget | — | a position is not *started* without 600 s of remaining budget → `cycle_budget_exhausted` |
 
-**The roller keeps its own gate, unchanged — operator decision (FC-069 item 4
-sign-off).** Two knobs therefore coexist: `rolling.earnings_blackout_days`
-(roller, N-based, fail-open) and `earnings.blackout_days` (put leg, N-based,
-fail-closed) plus the call leg's knob-less span. Unifying them would reach into
-the roller's config surface while FC-069 item 13 holds all `rolling.*` keys for
-FC-066's revival decision, so unification is FC-066's pre-revival checklist
-item, not FC-013's.
+**Deleted by FC-078** (see the plan's DD-6 table for each fate):
+`rolling.max_current_dte` (the DTE ≤ 1 eligibility trap),
+`rolling.max_rolls_per_position` (counted wheel-state rolls that never
+persisted — always read 0, never bound), `rolling.earnings_blackout_days` (the
+fail-OPEN blackout, subsumed by the fail-CLOSED span predicate above),
+`rolling.max_debit_pct_of_premium` / `_of_notional` (no debit path exists to
+tolerate), `rolling.btc_limit_over_ask_pct` / `stc_limit_under_bid_pct` (pads
+that broke or wasted the credit invariant), `rolling.trigger_time_et` (never
+consumed; the scheduler owns timing).
 
-**Two inherited quirks on this path, recorded so they are not mistaken for
-FC-013's doing:**
+**The roller's earnings posture is now the scanner's.** FC-069 item 4's
+"roller keeps its own fail-open gate" sign-off is superseded: the roll path
+consumes the same tri-state `next_earnings_info` surface the scanner does and
+fails closed on `unknown`. The buyback/replacement distinction is what makes
+this correct — the gate exists to stop *opening* gap exposure, so it filters
+**candidates**; when it empties the candidate set the roller places no order at
+all rather than closing and staying uncovered.
 
-1. **The roller's earnings gate is structurally no-op'd today.** `should_roll`
-   is never reached with a live opportunity because
-   `evaluate_roll_opportunity` reads `last_price`/`ask_price` from a client
-   that returns `bid`/`ask` (FC-066 cause 1), so price resolves to 0 and it
-   returns `None` before any eligibility gate. A golden replay asserts
-   `rolls_executed == 0`.
-2. **An injected calendar bypasses the `enabled` check on the roll path.**
-   `run_rolling_cycle` consults `config.earnings_enabled` only when it
-   constructs its own service; a calendar passed in is used regardless. This is
-   the inverse of the scanner's DD-8 semantics (where config always wins) and
-   is FC-066's inheritance, deliberately untouched here.
+**One inherited quirk survives on this path:** an injected calendar bypasses the
+`enabled` check. `run_rolling_cycle` consults `config.earnings_enabled` only
+when it constructs its own service; a calendar passed in is used regardless.
+This is the inverse of the scanner's DD-8 semantics (where config always wins)
+and is FC-066's inheritance, deliberately untouched.
 
 `/monitor` closes positions and is **never gated** — a close reduces risk.
 
@@ -214,7 +223,12 @@ FC-013's doing:**
 | `earnings.blackout_days` | `2` | put leg only | — |
 | `earnings.cache_ttl_hours` | `24` | L1 + L2 entry validity | — |
 | `earnings.lookahead_days` | `90` | Finnhub query window; validated `>= call_target_dte + 7` | — |
-| `rolling.earnings_blackout_days` | `2` | roller only | — |
+| `rolling.enabled` | `true` | roller master switch | **`ROLLER_ENABLED`** — same semantics as `EARNINGS_ENABLED` (FC-078) |
+| `rolling.max_extension_days` | `14` | roll horizon, measured from the **old expiry** | — |
+| `rolling.max_replacement_delta` | `0.60` | replacement delta upper rail | — |
+| `rolling.min_net_credit_per_contract` | `0.00` | the credit invariant | — |
+| `rolling.imminence_extrinsic_threshold` | `0.20` | assignment-imminence pricing override | — |
+| — | `false` | roller evaluates but places neither leg | **`ROLLER_DRY_RUN`** — env-only, no yaml key |
 | `risk.gap_risk_controls.earnings_avoidance_days` | `5` | **nothing — dead knob**, FC-069's sweep deletes it | — |
 
 `EARNINGS_ENABLED` exists because the yaml value is baked into the image, so a

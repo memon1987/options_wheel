@@ -1,0 +1,30 @@
+{
+  "displayName": "Covered call ROLLED (or stranded) — options-wheel",
+  "documentation": {
+    "content": "The daily credit-only roller (FC-078) either executed a roll or stranded a buy-to-close. The operator must KNOW either happened without reading logs.\n\nTwo conditions:\n- call_roll_completed: both legs done. A short call was bought back and a higher strike further out was sold, at limit prices that netted a credit. This is the roller working. Informational, but it is a two-leg live order pair on the book — look at it the same day.\n- call_roll_naked_exposure: the BTC filled and every STO ladder rung failed. The shares are UNCOVERED but long-only — there is NO naked short position. The residual is not a day of lost premium: worst case is the full BTC debit paid in cash with nothing sold against it, re-covered later through the entry path at entry-band premiums, adversely selected. Near a report the FC-013 span gate can legitimately hold the shares uncovered through the event.\n\nTriage:\n1. gcloud logging read 'jsonPayload.event_type=\"call_roll_completed\" OR jsonPayload.event_type=\"call_roll_naked_exposure\"' --limit=20 --freshness=1d\n2. For a completed roll: confirm both fills in options_wheel.trades_from_activities after the next 15-min ingest, and that NO residual open order sits on either leg's symbol (cancel-then-verify worked). Assert new strike > old, new strike >= Alpaca avg_entry_price, fill credit = STO fill - BTC fill >= 0.\n3. For naked exposure: confirm the next /scan -> /run re-covered. If the span gate is holding it uncovered through earnings, that is correct by doctrine — record it, do not override.\n4. A repeated naked-exposure pattern is the thing to investigate, not any single instance.\n\nStop the roller without a deploy: gcloud run services update options-wheel-strategy --update-env-vars ROLLER_ENABLED=false (never --set-env-vars; it wipes the whole env set).\n\nNOTE: the filter deliberately does NOT constrain severity. Cloud Run captures the app's stderr as plain text with EMPTY severity, so a severity>=WARNING clause matches nothing (FC-030 fire drill, 2026-07-18). Payload shape is matched both ways.\n\nRate limit is 300s, not the 86400s used elsewhere: a second roll on the same day is a separate event the operator must see, and the default suppression window would swallow it.\n\nPlan: docs/plans/fc-078.md",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "A covered call was rolled",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"options-wheel-strategy\" AND (jsonPayload.event_type=\"call_roll_completed\" OR textPayload:\"call_roll_completed\")"
+      }
+    },
+    {
+      "displayName": "Roll stranded a buy-to-close — shares uncovered",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"options-wheel-strategy\" AND (jsonPayload.error_type=\"call_roll_naked_exposure\" OR jsonPayload.event_type=\"call_roll_naked_exposure\" OR textPayload:\"call_roll_naked_exposure\")"
+      }
+    }
+  ],
+  "alertStrategy": {
+    "notificationRateLimit": {"period": "300s"},
+    "autoClose": "1800s"
+  },
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/gen-lang-client-0607444019/notificationChannels/10474915111056992031"
+  ]
+}

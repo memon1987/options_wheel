@@ -144,9 +144,134 @@ class TestConfig:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
             f.write("invalid: yaml: content: [")
             config_path = f.name
-        
+
         try:
             with pytest.raises(yaml.YAMLError):
                 Config(config_path)
         finally:
             os.unlink(config_path)
+
+
+# =========================================================================== #
+# FC-078 — the rolling knob set (T-13)
+#
+# Plan: docs/plans/fc-078.md DD-6 / DD-7. Four knobs added, eight deleted, one
+# env override added mirroring EARNINGS_ENABLED.
+# =========================================================================== #
+
+from pathlib import Path  # noqa: E402
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _settings(tmp_path, **rolling_overrides):
+    with open(REPO / 'config' / 'settings.yaml') as fh:
+        data = yaml.safe_load(fh)
+    data.setdefault('rolling', {}).update(rolling_overrides)
+    path = tmp_path / 'settings.yaml'
+    path.write_text(yaml.safe_dump(data))
+    return str(path)
+
+
+class TestTheRollingKnobs:
+
+    def test_the_shipped_config_parses_the_four_new_knobs(self):
+        config = Config(str(REPO / 'config' / 'settings.yaml'))
+        assert config.rolling_max_extension_days == 14
+        assert config.rolling_max_replacement_delta == 0.60
+        assert config.rolling_min_net_credit_per_contract == 0.00
+        assert config.rolling_imminence_extrinsic_threshold == 0.20
+        # Kept knobs.
+        assert config.rolling_itm_trigger_ratio == 0.98
+        assert config.rolling_btc_fill_timeout_seconds == 120
+        assert config.rolling_fallback_strike_attempts == 2
+
+    def test_the_deleted_properties_are_gone(self):
+        """*Catches:* a half-deletion that leaves a knob readable but unread —
+        the state the max-rolls gate lived in for a year."""
+        config = Config(str(REPO / 'config' / 'settings.yaml'))
+        for gone in ('rolling_trigger_time_et', 'rolling_max_current_dte',
+                     'rolling_max_debit_pct_of_premium',
+                     'rolling_max_debit_pct_of_notional',
+                     'rolling_max_rolls_per_position',
+                     'rolling_earnings_blackout_days',
+                     'rolling_btc_limit_over_ask_pct',
+                     'rolling_stc_limit_under_bid_pct'):
+            assert not hasattr(config, gone), f"{gone} survived the deletion"
+
+    def test_the_deleted_keys_are_gone_from_the_shipped_yaml(self):
+        with open(REPO / 'config' / 'settings.yaml') as fh:
+            rolling = yaml.safe_load(fh)['rolling']
+        for gone in ('trigger_time_et', 'max_current_dte',
+                     'max_debit_pct_of_premium', 'max_debit_pct_of_notional',
+                     'max_rolls_per_position', 'earnings_blackout_days',
+                     'btc_limit_over_ask_pct', 'stc_limit_under_bid_pct'):
+            assert gone not in rolling, f"rolling.{gone} survived the deletion"
+
+    @pytest.mark.parametrize("overrides,fragment", [
+        ({'max_extension_days': 0}, 'max_extension_days'),
+        ({'max_extension_days': 2.5}, 'max_extension_days'),
+        ({'max_replacement_delta': 0}, 'max_replacement_delta'),
+        ({'max_replacement_delta': 1.5}, 'max_replacement_delta'),
+        ({'min_net_credit_per_contract': -1}, 'min_net_credit_per_contract'),
+        ({'imminence_extrinsic_threshold': -0.01},
+         'imminence_extrinsic_threshold'),
+    ])
+    def test_out_of_bounds_knobs_are_refused_at_load(self, tmp_path, overrides,
+                                                     fragment):
+        with pytest.raises(ValueError, match=fragment):
+            Config(_settings(tmp_path, **overrides))
+
+    def test_bounds_are_inclusive_where_they_should_be(self, tmp_path):
+        config = Config(_settings(tmp_path, max_extension_days=1,
+                                  max_replacement_delta=1.0,
+                                  min_net_credit_per_contract=0,
+                                  imminence_extrinsic_threshold=0))
+        assert config.rolling_max_extension_days == 1
+        assert config.rolling_max_replacement_delta == 1.0
+
+
+class TestTheRollerEnvOverrides:
+    """DD-7. The yaml value is baked into the image, so "turn the roller off"
+    would otherwise mean commit -> Cloud Build -> deploy — the pipeline that
+    once sat silently red for 11 days (FC-031). This roller places live two-leg
+    orders; its stop lever must not need a build."""
+
+    def test_roller_enabled_beats_the_baked_yaml_value(self, monkeypatch,
+                                                       tmp_path):
+        path = _settings(tmp_path)
+        monkeypatch.delenv("ROLLER_ENABLED", raising=False)
+        assert Config(path).rolling_enabled is True
+
+        monkeypatch.setenv("ROLLER_ENABLED", "false")
+        assert Config(path).rolling_enabled is False
+
+        monkeypatch.setenv("ROLLER_ENABLED", "TRUE")
+        assert Config(path).rolling_enabled is True
+
+    def test_an_unparseable_value_falls_back_to_yaml(self, monkeypatch,
+                                                     tmp_path):
+        """A typo must neither disable the roller nor enable it — yaml wins."""
+        path = _settings(tmp_path)
+        monkeypatch.setenv("ROLLER_ENABLED", "maybe")
+        assert Config(path).rolling_enabled is True
+
+        path_off = _settings(tmp_path, enabled=False)
+        assert Config(path_off).rolling_enabled is False
+
+    def test_dry_run_is_env_only_and_defaults_off(self, monkeypatch, tmp_path):
+        path = _settings(tmp_path)
+        monkeypatch.delenv("ROLLER_DRY_RUN", raising=False)
+        assert Config(path).roller_dry_run is False
+
+        monkeypatch.setenv("ROLLER_DRY_RUN", "true")
+        assert Config(path).roller_dry_run is True
+
+    def test_an_unparseable_dry_run_is_treated_as_false(self, monkeypatch,
+                                                        tmp_path):
+        """Unlike ROLLER_ENABLED there is no yaml key to fall back to, so the
+        fallback is the default: off. A typo here costs the operator a debug
+        session, never an order."""
+        path = _settings(tmp_path)
+        monkeypatch.setenv("ROLLER_DRY_RUN", "sometimes")
+        assert Config(path).roller_dry_run is False

@@ -13,7 +13,7 @@ Example: AAPL250117C00185000
 - 00185000: Strike price $185.00 * 1000 with padding
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
 import calendar
 import re
@@ -22,6 +22,32 @@ import structlog
 from . import clock
 
 logger = structlog.get_logger(__name__)
+
+
+def coerce_expiry_date(value) -> Optional[date]:
+    """Normalize an expiration to a plain ``date``, or None if unusable.
+
+    Contracts arrive with ``expiration_date`` as an ISO string from both the
+    live client (``parse_option_symbol``) and the backtest adapter
+    (``quote.expiration.isoformat()``), but ``get_option_chain_with_analysis``
+    also tolerates ``datetime``, and test fixtures pass ``date``. One coercion
+    so an expiry comparison cannot silently compare a str to a date.
+
+    Lives here (FC-078) rather than in ``market_data`` because the roll-horizon
+    bound in ``RiskManager.validate_roll`` needs the same coercion, and a
+    second copy of a date parser is how two gates end up disagreeing about
+    what a contract expires on.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.fromisoformat(str(value)[:10].replace('Z', '')).date()
+    except (TypeError, ValueError):
+        return None
 
 
 class OptionSymbolGenerator:

@@ -66,23 +66,39 @@ class TestAlpacaClientInjection:
 
 
 class TestWheelStateInjection:
-    def test_injected_state_is_used_and_shared_with_the_roller(self):
-        """Pre-FC-068 the shared consumer asserted here was the engine's
-        CallSeller. That seller is deleted; the roller is now the component the
-        state must reach, and it is the one that runs inside a replay."""
+    def test_the_state_is_deliberately_NOT_handed_to_the_roller(self):
+        """FC-078 DD-6 — T-12's engine half.
+
+        This assertion is inverted from what it was. Pre-FC-068 the shared
+        consumer was the engine's CallSeller; FC-068 deleted that seller and
+        left the roller as the component the state reached. FC-078 deleted the
+        roller's dependency outright: the only consumer was the debit
+        tolerance's ``original_premium``, credit-only has no debit to tolerate,
+        and ``STATE_STORAGE_BUCKET`` has been unset since project start so the
+        state was never persisted to read back in the first place.
+
+        Half-maintaining the fiction is worse than none, so the engine must not
+        pass it — and this test fails if anyone re-wires it.
+        """
         state = WheelStateManager()
         alpaca = Mock()
         alpaca.get_positions.return_value = []
+        alpaca.get_orders.return_value = []
         config = Mock()
         config.rolling_enabled = True
         config.earnings_enabled = False
         engine = WheelEngine(config, alpaca_client=alpaca, wheel_state=state)
+        # The engine still keeps it — reconcile_positions is a real consumer.
         assert engine.wheel_state is state
 
         with patch("src.strategy.wheel_engine.CallRoller") as roller:
             engine.run_rolling_cycle()
 
-        assert roller.call_args.args[3] is state
+        assert state not in roller.call_args.args
+        assert state not in roller.call_args.kwargs.values()
+        # Positional contract: (alpaca, market_data, config, risk_manager,
+        # earnings_calendar). The state used to sit at index 3.
+        assert roller.call_args.args[3].__class__.__name__ == 'RiskManager'
 
     def test_injected_state_never_touches_cloud_storage(self):
         """A bucket-less manager must not construct a GCS client."""

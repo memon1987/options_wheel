@@ -206,17 +206,23 @@ monitoring:
   enable_performance_metrics: true
   
 # Call Rolling (Friday EOW) — FC-006
+# FC-078 — daily credit-only defensive rolls.
+#
+# Evaluated every trading day at 15:30 ET; a roll executes only when the placed
+# LIMIT prices net a credit, so a filled roll can never net a debit. The debit
+# tolerance, the DTE-<=1 eligibility trap, the max-rolls counter (which read a
+# state file that has never persisted) and both aggression pads are gone — see
+# docs/plans/fc-078.md DD-6 for the fate of every removed knob.
+#
+# Kill switch without a deploy: ROLLER_ENABLED=false (env wins over this key).
+# Debug without placing orders: ROLLER_DRY_RUN=true (env-only).
 rolling:
   enabled: true
-  trigger_time_et: "15:00"
-  max_current_dte: 1
-  itm_trigger_ratio: 0.98
-  max_debit_pct_of_premium: 0.25        # 25% of original premium collected
-  max_debit_pct_of_notional: 0.005      # 0.5% of notional exposure
-  max_rolls_per_position: 2
-  earnings_blackout_days: 2
-  btc_limit_over_ask_pct: 0.05
-  stc_limit_under_bid_pct: 0.05         # symmetric with BTC aggression
+  itm_trigger_ratio: 0.98               # stock/strike >= this is roll-eligible
+  max_extension_days: 14                # replacement expiry <= OLD expiry + N
+  max_replacement_delta: 0.60           # upper rail only; no lower bound
+  min_net_credit_per_contract: 0.00     # $/contract on the placed limits
+  imminence_extrinsic_threshold: 0.20   # $/share extrinsic -> mid-based pricing
   btc_fill_timeout_seconds: 120
   fallback_strike_attempts: 2
 

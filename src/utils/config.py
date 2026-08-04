@@ -302,6 +302,41 @@ class Config:
             if not symbols:
                 errors.append("No stock symbols configured in stocks.symbols")
 
+        # Rolling validation (FC-078 DD-6). Bounds on the four knobs the roller
+        # prices and gates live orders with. Absent keys validate against their
+        # property defaults, which are in range by construction — a config with
+        # no rolling block is valid, a config with a nonsense one is not.
+        rolling = self._config.get('rolling', {})
+
+        extension_days = rolling.get('max_extension_days', 14)
+        if not isinstance(extension_days, int) or isinstance(extension_days, bool) \
+                or extension_days < 1:
+            errors.append(
+                f"rolling.max_extension_days must be an integer >= 1 "
+                f"(got {extension_days!r})")
+
+        max_delta = rolling.get('max_replacement_delta', 0.60)
+        if not isinstance(max_delta, (int, float)) or isinstance(max_delta, bool) \
+                or not (0 < max_delta <= 1):
+            errors.append(
+                f"rolling.max_replacement_delta must satisfy 0 < x <= 1 "
+                f"(got {max_delta!r})")
+
+        min_credit = rolling.get('min_net_credit_per_contract', 0.00)
+        if not isinstance(min_credit, (int, float)) or isinstance(min_credit, bool) \
+                or min_credit < 0:
+            errors.append(
+                f"rolling.min_net_credit_per_contract must be >= 0 "
+                f"(got {min_credit!r}) — a negative minimum is a debit "
+                f"allowance, which FC-078 makes structurally impossible")
+
+        imminence = rolling.get('imminence_extrinsic_threshold', 0.20)
+        if not isinstance(imminence, (int, float)) or isinstance(imminence, bool) \
+                or imminence < 0:
+            errors.append(
+                f"rolling.imminence_extrinsic_threshold must be >= 0 "
+                f"(got {imminence!r})")
+
         # Monitoring validation
         monitoring = self._config.get('monitoring', {})
         check_interval = monitoring.get('check_interval_minutes', 0)
@@ -637,21 +672,63 @@ class Config:
         """Threshold for counting significant gaps (legacy name)."""
         return self.quality_gap_threshold
 
-    # Call Rolling (FC-006)
+    # Call Rolling (FC-006; knob set rewritten by FC-078 DD-6)
     @property
     def rolling_enabled(self) -> bool:
-        """Whether call rolling engine is enabled."""
+        """Whether the call rolling engine is enabled.
+
+        **``ROLLER_ENABLED`` wins over the yaml key when it is set** (FC-078
+        DD-7), mirroring ``EARNINGS_ENABLED`` exactly. The yaml value is baked
+        into the image, so "turn the roller off" would otherwise mean commit ->
+        Cloud Build -> deploy — and the roller places live two-leg orders, so
+        the stop lever must not need a build:
+
+            gcloud run services update options-wheel-strategy \\
+                --update-env-vars ROLLER_ENABLED=false
+
+        ``--update-env-vars``, never ``--set-env-vars`` — the latter wipes the
+        whole env set.
+
+        An unparseable value is ignored (yaml wins) rather than silently read as
+        one or the other: a typo must neither disable the roller nor enable it.
+        """
+        override = os.getenv("ROLLER_ENABLED")
+        if override is not None:
+            parsed = _parse_bool(override)
+            if parsed is not None:
+                return parsed
+            logger.warning(
+                "ROLLER_ENABLED is set but unparseable; falling back to settings.yaml",
+                event_category="system",
+                event_type="config_env_override_ignored",
+                variable="ROLLER_ENABLED",
+                value=override,
+            )
         return self._config.get("rolling", {}).get("enabled", False)
 
     @property
-    def rolling_trigger_time_et(self) -> str:
-        """Earliest ET time to trigger rolling."""
-        return self._config.get("rolling", {}).get("trigger_time_et", "15:00")
+    def roller_dry_run(self) -> bool:
+        """Whether the roller evaluates but places NEITHER leg (FC-078 DD-7).
 
-    @property
-    def rolling_max_current_dte(self) -> int:
-        """Max DTE on existing call to be eligible for roll."""
-        return self._config.get("rolling", {}).get("max_current_dte", 1)
+        Env-only, default false. An operational debugging flag — deliberately
+        not a yaml key and not a launch gate (operator decision, FC-078). An
+        unparseable value falls back to false: dry-run is the *safe* posture, so
+        a typo that lands here costs a cycle, never an order.
+        """
+        override = os.getenv("ROLLER_DRY_RUN")
+        if override is None:
+            return False
+        parsed = _parse_bool(override)
+        if parsed is not None:
+            return parsed
+        logger.warning(
+            "ROLLER_DRY_RUN is set but unparseable; treating as false",
+            event_category="system",
+            event_type="config_env_override_ignored",
+            variable="ROLLER_DRY_RUN",
+            value=override,
+        )
+        return False
 
     @property
     def rolling_itm_trigger_ratio(self) -> float:
@@ -659,34 +736,36 @@ class Config:
         return self._config.get("rolling", {}).get("itm_trigger_ratio", 0.98)
 
     @property
-    def rolling_max_debit_pct_of_premium(self) -> float:
-        """Max net debit as % of original premium collected."""
-        return self._config.get("rolling", {}).get("max_debit_pct_of_premium", 0.25)
+    def rolling_max_extension_days(self) -> int:
+        """Calendar days past the OLD expiry a replacement may expire (FC-078 DD-3).
+
+        Expiry-relative, not evaluation-relative: roll economics extend the
+        existing contract's tenor. An eval-relative frame would have excluded
+        the flagship GOOGL C370 8/07 -> C375 8/21 roll, which is 17 DTE from the
+        evaluation date but exactly old-expiry + 14.
+        """
+        return self._config.get("rolling", {}).get("max_extension_days", 14)
 
     @property
-    def rolling_max_debit_pct_of_notional(self) -> float:
-        """Max net debit as % of notional exposure (backstop)."""
-        return self._config.get("rolling", {}).get("max_debit_pct_of_notional", 0.005)
+    def rolling_max_replacement_delta(self) -> float:
+        """Upper delta rail on a replacement call (FC-078 DD-3). No lower bound."""
+        return self._config.get("rolling", {}).get("max_replacement_delta", 0.60)
 
     @property
-    def rolling_max_rolls_per_position(self) -> int:
-        """Max consecutive rolls per symbol."""
-        return self._config.get("rolling", {}).get("max_rolls_per_position", 2)
+    def rolling_min_net_credit_per_contract(self) -> float:
+        """Minimum net credit per contract, in dollars, on the placed limits.
+
+        Default 0.00: any non-negative roll at conservative prices executes the
+        day it appears. The knob exists so a churn guard can be added without a
+        code change (FC-078 DD-1).
+        """
+        return self._config.get("rolling", {}).get("min_net_credit_per_contract", 0.00)
 
     @property
-    def rolling_earnings_blackout_days(self) -> int:
-        """Days before earnings to block rolling."""
-        return self._config.get("rolling", {}).get("earnings_blackout_days", 2)
-
-    @property
-    def rolling_btc_limit_over_ask_pct(self) -> float:
-        """BTC limit price premium over ask (aggression)."""
-        return self._config.get("rolling", {}).get("btc_limit_over_ask_pct", 0.05)
-
-    @property
-    def rolling_stc_limit_under_bid_pct(self) -> float:
-        """STC limit price discount under bid (aggression)."""
-        return self._config.get("rolling", {}).get("stc_limit_under_bid_pct", 0.05)
+    def rolling_imminence_extrinsic_threshold(self) -> float:
+        """Per-share extrinsic at or below which assignment is treated as
+        imminent and the roller switches to mid-based pricing (FC-078 DD-2)."""
+        return self._config.get("rolling", {}).get("imminence_extrinsic_threshold", 0.20)
 
     @property
     def rolling_btc_fill_timeout_seconds(self) -> int:

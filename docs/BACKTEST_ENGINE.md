@@ -95,6 +95,13 @@ python main.py --command screen --no-persist       # analysis only, writes nothi
 > has been re-run yet**. The *strike-reproduction* figures are the ones directly at risk;
 > the premium ratios and the 100% delta-band result depend on the chain model rather than
 > the selection rule and should move little. Do not quote 81% / 55.2% / 0.676 as current.
+>
+> **FC-078 (2026-08-04) folds into the same re-baseline:** the replay now runs
+> `run_rolling_cycle()` *every* trading day instead of Fridays only, mirroring the revived
+> daily roller, and that roller can now actually execute — so replays after FC-078 can
+> close and re-sell short calls mid-window where every earlier replay could not. Roll
+> frequency and credit capture are new inputs to the fidelity numbers, not just the
+> selection rule.
 
 | | decisions | strike reproduction | premium on **identical** contracts | delta band |
 |---|---:|---:|---:|---:|

@@ -1169,11 +1169,18 @@ def monitor_positions():
 @require_api_key
 @require_account_match
 def trigger_roll():
-    """Friday EOW call rolling cycle (FC-006).
+    """Daily credit-only call rolling cycle (FC-006, revived by FC-078).
 
-    Evaluates short call positions for rolling when the underlying has
-    rallied through the strike. Executes BTC -> STO with percentage-based
-    debit tolerance. Only runs on Fridays.
+    Evaluates short call positions for rolling when the underlying has rallied
+    through the strike. Executes BTC -> STO as two sequential limit orders whose
+    placed prices must net a credit, so a filled roll can never net a debit.
+
+    Runs every trading day: the Friday-only weekday guard was deleted in FC-078
+    (DD-2/DD-4 — a churned book's calls are 5-7 DTE on any given day, and 52% of
+    call expiries are mid-week, which a Friday-only job can never see). The
+    market-open guard and ``strategy_lock`` stay; the lock is what serializes
+    ``/roll`` against ``/monitor`` and ``/run`` so two managers of the same
+    positions cannot interleave.
     """
     with strategy_lock:
         start_time = datetime.now()
@@ -1184,16 +1191,6 @@ def trigger_roll():
                        event_type="roll_skipped_market_closed")
             return jsonify({
                 'message': 'Market closed - skipping roll',
-                'timestamp': datetime.now().isoformat()
-            })
-
-        # Friday-only guard
-        from zoneinfo import ZoneInfo
-        now_et = datetime.now(ZoneInfo("America/New_York"))
-        if now_et.weekday() != 4:
-            return jsonify({
-                'skipped': 'not_friday',
-                'day': now_et.strftime('%A'),
                 'timestamp': datetime.now().isoformat()
             })
 
