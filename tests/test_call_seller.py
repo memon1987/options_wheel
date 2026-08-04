@@ -550,3 +550,50 @@ class TestCallSaleExecutedTelemetryFC065P4:
                                       cost_basis_per_share=368.34,
                                       premium=2.50))
         assert event['total_return_if_called'] == pytest.approx(250.0)
+
+
+class TestSellerStateOrphanDeletedFC069:
+    """FC-069 item 8, stage 1 — the orphaned seller state plumbing is gone.
+
+    A census in the shape of ``test_cost_basis.py``'s resolver-instance
+    census: these assertions fail the moment someone reintroduces the
+    ``wheel_state`` half on a seller. The layer they pinned never ran in
+    production — ``/run`` and ``/monitor`` (and the replay) construct both
+    sellers with three positional arguments — so the regression to guard
+    against is re-adding an optional state channel that would once again fire
+    nowhere while implying it does.
+    """
+
+    def _call_seller(self):
+        return CallSeller(Mock(), Mock(), Mock(spec=Config))
+
+    def test_call_seller_has_no_wheel_state_attribute(self):
+        assert not hasattr(self._call_seller(), 'wheel_state')
+
+    def test_call_seller_takes_no_wheel_state_manager_keyword(self):
+        with pytest.raises(TypeError):
+            CallSeller(Mock(), Mock(), Mock(spec=Config), wheel_state_manager=Mock())
+
+    def test_call_seller_no_longer_handles_assignments(self):
+        # `handle_call_assignment` had zero callers; the live assignment
+        # bookkeeping is `WheelStateManager.handle_call_assignment`, driven
+        # from `wheel_engine.reconcile_positions` (stage 2's territory).
+        assert not hasattr(self._call_seller(), 'handle_call_assignment')
+
+    def test_neither_seller_carries_a_private_option_symbol_parser(self):
+        # The canonical parser is `src.utils.option_symbols.parse_option_symbol`;
+        # the private per-seller twins were dead (zero callers).
+        from src.strategy.put_seller import PutSeller
+        assert not hasattr(self._call_seller(), '_parse_option_symbol')
+        assert not hasattr(PutSeller(Mock(), Mock(), Mock(spec=Config)),
+                           '_parse_option_symbol')
+
+    def test_the_dte_parser_both_sellers_actually_use_survives(self):
+        # Mutation guard for the delete above: the monitor path's
+        # `_parse_dte_from_option_symbol` is live on both sellers and must not
+        # be swept up with its dead namesake.
+        from src.strategy.put_seller import PutSeller
+        assert self._call_seller()._parse_dte_from_option_symbol(
+            'AAPL250117C00185000') >= 0
+        assert PutSeller(Mock(), Mock(), Mock(spec=Config))._parse_dte_from_option_symbol(
+            'AAPL250117P00185000') >= 0

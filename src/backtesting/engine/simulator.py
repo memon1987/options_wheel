@@ -399,9 +399,11 @@ class Simulator:
         exec_engine = ExecutionEngine(
             client, self.config, logger, trade_journal=NoOpTradeJournal()
         )
-        # Constructed exactly as /run builds them (cloud_run_server.py) — in
-        # particular CallSeller gets NO wheel_state, so the replay mirrors
-        # production's orphaned state layer rather than a richer fiction.
+        # Constructed exactly as /run builds them (cloud_run_server.py).
+        # FC-069 item 8 (stage 1) deleted CallSeller's wheel_state parameter
+        # outright — it was orphaned on every construction site, this one
+        # included — so there is no longer a state layer for the replay to
+        # diverge from.
         put_seller = PutSeller(client, market_data, self.config)
         call_seller = CallSeller(client, market_data, self.config)
 

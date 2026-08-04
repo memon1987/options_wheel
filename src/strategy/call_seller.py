@@ -8,7 +8,7 @@ from ..utils import clock
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
-from ..utils.logging_events import log_trade_event, log_error_event, log_position_update
+from ..utils.logging_events import log_trade_event, log_error_event
 from ..utils.option_symbols import parse_option_symbol
 from .cost_basis import (
     opportunity_floor_per_share,
@@ -32,7 +32,7 @@ class CallSeller:
     """
 
     def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager,
-                 config: Config, wheel_state_manager=None):
+                 config: Config):
         """Initialize call seller.
 
         FC-068 removed the ``allow_bigquery_cost_basis`` keyword with the
@@ -42,20 +42,20 @@ class CallSeller:
         replay gate now lives on ``OptionsScanner``, the sole remaining
         producer.
 
+        FC-069 item 8 (stage 1) removed the ``wheel_state_manager`` keyword
+        and the ``set_active_call_details`` call it fed. Both were orphaned:
+        ``/run`` and ``/monitor`` construct this class with three positional
+        arguments and the replay mirrors them, so the state write fired
+        nowhere. Stage 2 shrinks ``WheelStateManager`` itself.
+
         Args:
             alpaca_client: Alpaca API client
             market_data: Market data manager
             config: Configuration instance
-            wheel_state_manager: Optional WheelStateManager for tracking active
-                call details. Orphaned in practice as of FC-068 — ``/run``
-                constructs this class without it and the repointed replay
-                mirrors that, so ``set_active_call_details`` fires nowhere.
-                FC-069 item 8 owns the WheelStateManager shrink.
         """
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
-        self.wheel_state = wheel_state_manager
         # FC-069 item 6 deleted `_entry_times` and the min-hold gate it fed.
         # CallSeller is constructed per request, so the dict populated during
         # `/run` was already gone by `/monitor` — the gate has been open since
@@ -221,19 +221,6 @@ class CallSeller:
                     dte=opportunity.get('dte', 0)
                 )
 
-                # Track active call details for rolling engine (FC-006)
-                if self.wheel_state:
-                    underlying = opportunity.get('symbol', '')
-                    if underlying:
-                        self.wheel_state.set_active_call_details(
-                            symbol=underlying,
-                            option_symbol=option_symbol,
-                            premium=premium,
-                            strike=opportunity.get('strike_price', 0),
-                            contracts=contracts,
-                            sell_date=clock.now().strftime('%Y-%m-%d'),
-                        )
-
                 return result
             else:
                 # Order failed - return structured error
@@ -332,91 +319,6 @@ class CallSeller:
                         symbol=option_symbol,
                         error=str(e))
             return 7  # Default fallback
-
-    def _parse_option_symbol(self, option_symbol: str) -> tuple:
-        """
-        Parse option symbol to extract underlying, strike, and DTE.
-
-        Option symbol format: AMD251031C00350000
-        - Underlying: AMD (1-6 letters before date)
-        - Date: 251031 (YYMMDD)
-        - Type: P (Put) or C (Call)
-        - Strike: 00350000 (last 8 digits / 1000 = $350.00)
-
-        Args:
-            option_symbol: Full option symbol
-
-        Returns:
-            Tuple of (underlying_symbol, strike_price, dte)
-        """
-        import re
-        from datetime import datetime, timezone
-
-        try:
-            # Use fully anchored regex pattern to parse entire symbol at once
-            # OCC standard: 1-6 letter underlying + 6-digit date + P/C + 8-digit strike
-            pattern = r'^([A-Z]{1,6})(\d{6})([PC])(\d{8})$'
-            match = re.match(pattern, option_symbol.strip().upper())
-
-            if match:
-                underlying = match.group(1)
-                date_str = match.group(2)
-                # option_type = match.group(3)  # P or C - not used currently
-                strike_str = match.group(4)
-
-                # Parse date
-                year = 2000 + int(date_str[0:2])
-                month = int(date_str[2:4])
-                day = int(date_str[4:6])
-                exp_date = datetime(year, month, day, tzinfo=timezone.utc)
-                now = clock.now_utc()
-                dte = max(0, (exp_date.date() - now.date()).days)
-
-                # Parse strike price
-                strike_price = float(strike_str) / 1000.0
-
-                return underlying, strike_price, dte
-
-            # Fallback to legacy parsing for non-standard formats
-            logger.debug("Option symbol did not match standard OCC format, using fallback parsing",
-                        event_category="data",
-                        event_type="option_symbol_fallback_parse",
-                        symbol=option_symbol)
-
-            # Extract underlying symbol (letters at start)
-            underlying_match = re.match(r'^([A-Z]+)', option_symbol.upper())
-            underlying = underlying_match.group(1) if underlying_match else option_symbol[:3]
-
-            # Extract date portion (6 digits immediately before P/C)
-            date_match = re.search(r'(\d{6})[PC]', option_symbol.upper())
-            if date_match:
-                date_str = date_match.group(1)
-                year = 2000 + int(date_str[0:2])
-                month = int(date_str[2:4])
-                day = int(date_str[4:6])
-                exp_date = datetime(year, month, day, tzinfo=timezone.utc)
-                now = clock.now_utc()
-                dte = max(0, (exp_date.date() - now.date()).days)
-            else:
-                dte = 7  # Default fallback
-
-            # Extract strike price (last 8 digits / 1000)
-            strike_match = re.search(r'[PC](\d{8})$', option_symbol.upper())
-            if strike_match:
-                strike_price = float(strike_match.group(1)) / 1000.0
-            else:
-                strike_price = 0
-
-            return underlying, strike_price, dte
-
-        except Exception as e:
-            logger.debug("Failed to parse option symbol",
-                        event_category="data",
-                        event_type="option_symbol_parse_debug",
-                        symbol=option_symbol,
-                        error=str(e))
-            # Return safe defaults
-            return option_symbol[:3] if len(option_symbol) >= 3 else option_symbol, 0, 7
 
     def _get_profit_target_for_dte(self, dte: int) -> float:
         """
@@ -568,95 +470,3 @@ class CallSeller:
                         event_type="call_stop_loss_check_error",
                         error=str(e))
             return False
-
-    def handle_call_assignment(self, assignment_info: Dict[str, Any], wheel_state_manager=None) -> Dict[str, Any]:
-        """Handle when a short call gets assigned (shares called away).
-
-        Args:
-            assignment_info: Assignment details
-            wheel_state_manager: Optional wheel state manager for proper state transitions
-
-        Returns:
-            Assignment handling result with wheel state updates
-        """
-        try:
-            symbol = assignment_info['symbol']
-            shares_assigned = assignment_info.get('shares', 0)
-            strike_price = assignment_info.get('strike_price', 0)
-            assignment_date = assignment_info.get('date', clock.now())
-
-            logger.info("Handling call assignment",
-                       event_category="trade",
-                       event_type="call_assignment_handling",
-                       symbol=symbol,
-                       shares=shares_assigned,
-                       strike=strike_price)
-
-            # Update wheel state if manager provided
-            wheel_result = None
-            if wheel_state_manager:
-                wheel_result = wheel_state_manager.handle_call_assignment(
-                    symbol, shares_assigned, strike_price, assignment_date, assignment_info
-                )
-
-            # Calculate realized profit/loss
-            # This would include the premium received plus capital gain/loss
-            realized_pnl = 0.0
-            if wheel_result and 'capital_gain' in wheel_result:
-                realized_pnl = wheel_result['capital_gain']
-
-            result = {
-                'action_type': 'assignment_handled',
-                'strategy': 'call_assignment',
-                'symbol': symbol,
-                'shares_assigned': shares_assigned,
-                'assignment_price': strike_price,
-                'realized_pnl': realized_pnl,
-                'timestamp': assignment_date.isoformat(),
-                'wheel_cycle_completed': wheel_result.get('wheel_cycle_completed', False) if wheel_result else False,
-                'next_action': 'look_for_new_put_opportunity' if wheel_result and wheel_result.get('wheel_cycle_completed') else 'continue_wheel_strategy'
-            }
-
-            # Include wheel state information if available
-            if wheel_result:
-                result['wheel_state_transition'] = {
-                    'phase_before': wheel_result.get('phase_before', {}).value if hasattr(wheel_result.get('phase_before', {}), 'value') else None,
-                    'phase_after': wheel_result.get('phase_after', {}).value if hasattr(wheel_result.get('phase_after', {}), 'value') else None,
-                    'remaining_shares': wheel_result.get('remaining_shares', 0)
-                }
-
-                if wheel_result.get('completed_cycle'):
-                    result['completed_wheel_cycle'] = wheel_result['completed_cycle']
-
-            logger.info("Call assignment handled with wheel state management",
-                       event_category="trade",
-                       event_type="call_assignment_complete",
-                       symbol=symbol,
-                       shares_assigned=shares_assigned,
-                       wheel_cycle_completed=result['wheel_cycle_completed'],
-                       next_phase=result.get('wheel_state_transition', {}).get('phase_after'))
-
-            # Enhanced position update logging
-            log_position_update(
-                logger,
-                event_type="call_assignment",
-                symbol=symbol,
-                position_status="assigned",
-                position_type="call",
-                action="assignment",
-                shares=shares_assigned,
-                assignment_price=strike_price,
-                realized_pnl=realized_pnl,
-                wheel_cycle_completed=result['wheel_cycle_completed'],
-                phase_before=result.get('wheel_state_transition', {}).get('phase_before'),
-                phase_after=result.get('wheel_state_transition', {}).get('phase_after')
-            )
-
-            return result
-
-        except Exception as e:
-            logger.error("Failed to handle call assignment",
-                        event_category="error",
-                        event_type="call_assignment_error",
-                        error=str(e))
-            return {'error': str(e)}
