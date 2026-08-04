@@ -63,8 +63,11 @@ class _Resp:
         return self._payload
 
 
-def run_checks(monkeypatch, positions, portfolio_value=100_000.0):
-    """Drive check_risk_parameters against synthetic data, keyed by check name."""
+def _raw_results(monkeypatch, positions, portfolio_value=100_000.0):
+    """Drive check_risk_parameters and return the raw CheckResult list.
+
+    Use this when the *number* of findings matters (deduplication).
+    """
     monitor = RegressionMonitor(service_url="http://test", api_key="k")
 
     def fake_get(path, timeout=30):
@@ -84,9 +87,13 @@ def run_checks(monkeypatch, positions, portfolio_value=100_000.0):
     # touch the network or ambient credentials.
     monkeypatch.setitem(__import__("sys").modules, "google.cloud.bigquery", None)
 
-    results = monitor.check_risk_parameters()
+    return monitor.check_risk_parameters()
+
+
+def run_checks(monkeypatch, positions, portfolio_value=100_000.0):
+    """Drive check_risk_parameters against synthetic data, keyed by check name."""
     out = {}
-    for r in results:
+    for r in _raw_results(monkeypatch, positions, portfolio_value):
         # A check that fires more than once keeps its first (failing) result.
         out.setdefault(r.name, r)
     return out
@@ -169,6 +176,40 @@ class TestMaxPositionSize:
         assert r.status == "fail"
         assert r.details["limit"] == pytest.approx(0.10)
 
+    def test_config_is_resolved_via_STRATEGY_CONFIG(self, monkeypatch):
+        """The monitor must read the SAME profile as the process it watches.
+
+        `deploy/cloud_run_server.py`'s `strategy_config()` resolves
+        STRATEGY_CONFIG; a bare `Config()` here would validate the wheel's
+        policy against a covered-call service's positions.
+        """
+        monkeypatch.setenv("STRATEGY_CONFIG", "config/covered_call.yaml")
+        res = run_checks(monkeypatch, [_stock("AAPL", 100, 300.0, 30_000.0)])
+        r = res["risk_max_position_size"]
+        # covered_call.yaml also carries 0.35, so assert the resolution
+        # happened rather than the number: a bare Config() would have read
+        # settings.yaml and never touched this file.
+        assert r.status == "pass"
+        assert r.details["limit"] == pytest.approx(0.35)
+
+    def test_strategy_config_profile_drives_the_limit(self, monkeypatch, tmp_path):
+        """Point STRATEGY_CONFIG at a profile with a distinct limit."""
+        import shutil
+        import yaml
+
+        src = "config/covered_call.yaml"
+        data = yaml.safe_load(open(src))
+        data["risk"]["max_position_size"] = 0.10
+        profile = tmp_path / "tight_profile.yaml"
+        profile.write_text(yaml.dump(data))
+
+        monkeypatch.setenv("STRATEGY_CONFIG", str(profile))
+        # 30% violates this profile's 10%; under settings.yaml's 0.35 it passes.
+        res = run_checks(monkeypatch, [_stock("AAPL", 100, 300.0, 30_000.0)])
+        r = res["risk_max_position_size"]
+        assert r.status == "fail"
+        assert r.details["limit"] == pytest.approx(0.10)
+
     def test_fails_loudly_when_config_cannot_load(self, monkeypatch):
         """Never silently fall back to a stale number and report pass."""
         def boom(*a, **kw):
@@ -219,10 +260,15 @@ class TestNakedCall:
 
     def test_malformed_symbol_is_not_classified_as_a_call(self, monkeypatch):
         """`strict_option_type` returns None for a non-OCC symbol, so the
-        check skips rather than inheriting `parse_option_symbol`'s last-resort
-        `'C' if 'C' in symbol` heuristic."""
+        check does not inherit `parse_option_symbol`'s last-resort
+        `'C' if 'C' in symbol` heuristic.
+
+        Polarity note (S1 review): non-classification is correct, but it must
+        not be SILENT — the position also has to surface as a warn finding.
+        """
         res = run_checks(monkeypatch, [_option("NOT_AN_OCC", -1)])
         assert statuses(res, "risk_naked_call") == "pass"
+        assert statuses(res, "risk_unclassifiable_option") == "warn"
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +333,102 @@ class TestCostBasisProtection:
         res = run_checks(monkeypatch, [_option("AAPL260821C00250000", -1)])
         assert statuses(res, "risk_cost_basis_protection") == "pass"
         assert statuses(res, "risk_naked_call") == "fail"
+
+
+# ---------------------------------------------------------------------------
+# Unclassifiable option positions must surface, not vanish (S1 review fix 1)
+# ---------------------------------------------------------------------------
+
+class TestUnclassifiableOption:
+
+    # An adjusted contract: the root carries a digit suffix after a split or
+    # special dividend, so it fails OCC_STRICT_RE. Its deliverable is NOT 100
+    # shares, which is exactly why checks 7/8 must not do share arithmetic on
+    # it — and exactly why a human needs to see it.
+    ADJUSTED = "AAPL1260821C00250000"
+
+    def test_passes_when_every_option_parses(self, monkeypatch):
+        res = run_checks(monkeypatch, [
+            _stock("AAPL", 100, 200.0, 25_000.0),
+            _option("AAPL260821C00250000", -1),
+        ])
+        assert statuses(res, "risk_unclassifiable_option") == "pass"
+
+    def test_adjusted_contract_produces_a_warn_finding(self, monkeypatch):
+        res = run_checks(monkeypatch, [_option(self.ADJUSTED, -1)])
+        r = res["risk_unclassifiable_option"]
+        assert r.status == "warn"
+        assert self.ADJUSTED in r.message
+        # Details must carry enough for triage without re-fetching.
+        assert r.details["option_symbol"] == self.ADJUSTED
+        assert r.details["qty"] == "-1"
+        assert r.details["side"] == "short"
+
+    def test_adjusted_contract_is_excluded_from_naked_call_and_cost_basis(self, monkeypatch):
+        """It surfaces as a warn, and does NOT get share/strike arithmetic.
+
+        Note the position is uncovered and its nominal strike sits below the
+        stock's basis — under substring matching it would have produced two
+        confident, wrong findings.
+        """
+        res = run_checks(monkeypatch, [
+            _stock("AAPL", 100, 300.0, 25_000.0),
+            _option(self.ADJUSTED, -1),
+        ])
+        assert statuses(res, "risk_unclassifiable_option") == "warn"
+        assert statuses(res, "risk_naked_call") == "pass"
+        assert statuses(res, "risk_cost_basis_protection") == "pass"
+
+    def test_one_finding_per_position_not_one_per_loop(self, monkeypatch):
+        """Checks 7 and 8 both skip these; the finding is emitted once."""
+        monitor_results = _raw_results(monkeypatch, [_option(self.ADJUSTED, -1)])
+        hits = [r for r in monitor_results if r.name == "risk_unclassifiable_option"]
+        assert len(hits) == 1
+
+    def test_each_unparseable_position_gets_its_own_finding(self, monkeypatch):
+        monitor_results = _raw_results(monkeypatch, [
+            _option(self.ADJUSTED, -1),
+            _option("NOT_AN_OCC", -1),
+        ])
+        hits = [r for r in monitor_results if r.name == "risk_unclassifiable_option"]
+        assert len(hits) == 2
+        assert {h.details["option_symbol"] for h in hits} == {self.ADJUSTED, "NOT_AN_OCC"}
+
+
+# ---------------------------------------------------------------------------
+# Endpoint response shapes (S1 review fix 4)
+# ---------------------------------------------------------------------------
+
+def test_dict_shaped_positions_response_is_unwrapped(monkeypatch):
+    """Production `/positions` returns {"positions": [...]}, not a bare list.
+
+    Pins the isinstance(dict) unwrap branch: if it regressed, `positions`
+    would be a list of dict KEYS and every check would silently see zero
+    positions and report `pass`.
+    """
+    monitor = RegressionMonitor(service_url="http://test", api_key="k")
+
+    def fake_get(path, timeout=30):
+        if path == "/account":
+            return _Resp({"portfolio_value": "100000", "cash": "50000",
+                          "buying_power": "50000"})
+        if path == "/positions":
+            return _Resp({"positions": [
+                _stock("AAPL", 100, 300.0, 25_000.0),
+                _option("AAPL260821C00250000", -1),   # strike below basis
+            ]})
+        raise AssertionError(f"unexpected path {path}")
+
+    monkeypatch.setattr(monitor, "_get", fake_get)
+    monkeypatch.setitem(__import__("sys").modules, "google.cloud.bigquery", None)
+
+    res = {}
+    for r in monitor.check_risk_parameters():
+        res.setdefault(r.name, r)
+
+    # The positions were really seen: this fires only if check 8 got the data.
+    assert res["risk_cost_basis_protection"].status == "fail"
+    assert res["risk_account_data"].status == "pass"
 
 
 # ---------------------------------------------------------------------------

@@ -820,6 +820,14 @@ class RegressionMonitor:
           silently, leaving the detective floor check **blind on exactly the
           assigned lots it exists for**. ``avg_entry_price`` is the decided
           floor source (FC-065 Phase 1).
+
+        Plus one new check from the S1 review: **``risk_unclassifiable_option``**
+        (warn) surfaces any option position whose symbol is not a strict OCC
+        contract — adjusted roots after a split or special dividend, most
+        importantly. Checks 7 and 8 exclude those positions (their share
+        arithmetic assumes a 100-share deliverable, which an adjusted contract
+        does not have), and excluding them *silently* would have inverted
+        check 8's own principle.
         """
         checks: List[CheckResult] = []
 
@@ -829,11 +837,17 @@ class RegressionMonitor:
         # finding: this monitor must never silently fall back to a stale
         # number and report "pass" against a policy it invented. So we fail the
         # check loudly instead of guessing.
+        # STRATEGY_CONFIG resolution mirrors the server's `strategy_config()`
+        # exactly. A bare `Config()` would validate the wheel's policy against
+        # a covered-call service's positions — the alarm layer must read the
+        # same profile the process it is watching runs.
+        cfg = None
         max_position_size: Optional[float] = None
         config_load_error: Optional[str] = None
         try:
             from src.utils.config import Config
-            max_position_size = float(Config().max_position_size)
+            cfg = Config(os.environ.get("STRATEGY_CONFIG", "config/settings.yaml"))
+            max_position_size = float(cfg.max_position_size)
         except Exception as exc:  # pragma: no cover - defensive
             config_load_error = str(exc)
 
@@ -918,6 +932,45 @@ class RegressionMonitor:
                     {"limit": max_position_size},
                 ))
 
+        # --- Classification pre-pass for checks 7 and 8 ---
+        # `strict_option_type` returns None for anything that is not an exact
+        # OCC contract, which correctly refuses the `"C" in symbol` family. But
+        # refusing to classify must not mean going quiet: an **adjusted
+        # contract** (digit-suffixed root after a split or special dividend,
+        # e.g. `AAPL1260821C00250000`) fails the strict regex, and a silent
+        # `continue` would make it vanish from both the naked-call and
+        # cost-basis detectives — the position most likely to need a human.
+        # That would invert check 8's own principle, so an unclassifiable
+        # option is a `warn` finding instead. One finding per position,
+        # emitted here rather than in both loops.
+        #
+        # `warn`, not `fail`: it does not 500 the endpoint (this is "look at
+        # this", not "a control was violated"), and the share arithmetic below
+        # is genuinely unsafe on an adjusted contract, whose deliverable is not
+        # 100 shares. Surfacing it for triage is the correct answer; guessing
+        # is not.
+        classified: List[Tuple[Dict[str, Any], str, Dict[str, Any]]] = []
+        for pos in option_positions:
+            symbol = pos.get("symbol", "")
+            opt_type = strict_option_type(symbol)
+            if opt_type is None:
+                checks.append(CheckResult(
+                    "risk_unclassifiable_option", "warn",
+                    f"cannot classify option position {symbol}",
+                    {"option_symbol": symbol, "qty": pos.get("qty"),
+                     "side": pos.get("side"),
+                     "note": "not a strict OCC contract symbol (adjusted root?); "
+                             "excluded from naked-call and cost-basis checks"},
+                ))
+                continue
+            classified.append((pos, opt_type, parse_option_symbol(symbol)))
+
+        if not any(r.name == "risk_unclassifiable_option" for r in checks):
+            checks.append(CheckResult(
+                "risk_unclassifiable_option", "pass",
+                "All option positions parse as OCC contracts",
+            ))
+
         # --- 7. Naked call detection (short calls must have underlying shares) ---
         stock_qty: Dict[str, int] = {}
         for p in stock_positions:
@@ -925,21 +978,17 @@ class RegressionMonitor:
             if sym:
                 stock_qty[sym] = int(float(p.get("qty", 0)))
 
-        for pos in option_positions:
+        for pos, opt_type, parsed in classified:
             symbol = pos.get("symbol", "")
             raw_qty = float(pos.get("qty", 0))
             qty = abs(int(raw_qty))
 
-            # Canonical parse. `strict_option_type` returns None for anything
-            # that is not an exact OCC contract, so a malformed symbol is never
-            # silently classified as a call (the `"C" in symbol` family, which
-            # also read the 'C' in e.g. a ticker).
-            if strict_option_type(symbol) != "call":
+            if opt_type != "call":
                 continue
             if not (raw_qty < 0 or pos.get("side") == "short"):
                 continue  # long calls commit no shares
 
-            underlying = parse_option_symbol(symbol).get("underlying", "")
+            underlying = parsed.get("underlying", "")
             owned_shares = stock_qty.get(underlying, 0)
             required_shares = qty * 100
 
@@ -961,14 +1010,13 @@ class RegressionMonitor:
         # the assigned lots this check exists to protect.
         stock_by_symbol = {p.get("symbol"): p for p in stock_positions if p.get("symbol")}
 
-        for pos in option_positions:
+        for pos, opt_type, parsed in classified:
             symbol = pos.get("symbol", "")
-            if strict_option_type(symbol) != "call":
+            if opt_type != "call":
                 continue
             if not (float(pos.get("qty", 0)) < 0 or pos.get("side") == "short"):
                 continue  # only short calls can be written below basis
 
-            parsed = parse_option_symbol(symbol)
             underlying = parsed.get("underlying", "")
             strike = float(parsed.get("strike_price", 0) or 0)
             if strike <= 0:
@@ -1006,6 +1054,20 @@ class RegressionMonitor:
             checks.append(CheckResult("risk_cost_basis_protection", "pass", "All call strikes above cost basis"))
 
         # --- 9. Recent trade validation (BigQuery) ---
+        # Premium floors re-sourced from the same Config instance as check 4,
+        # ending the last hardcoded-mirror in this file. Warn-only semantics
+        # unchanged. If Config failed to load, check 4 has already reported it
+        # loudly; these fall back to the historical constants rather than
+        # suppressing the trade scan entirely.
+        min_put_premium = 0.50
+        min_call_premium = 0.30
+        if cfg is not None:
+            try:
+                min_put_premium = float(cfg.min_put_premium)
+                min_call_premium = float(cfg.min_call_premium)
+            except Exception:  # pragma: no cover - defensive
+                pass
+
         try:
             from google.cloud import bigquery
             bq = bigquery.Client(project=GCP_PROJECT)
@@ -1022,15 +1084,17 @@ class RegressionMonitor:
                 # Premium thresholds
                 premium = float(row.get("premium") or 0)
                 opt_type = row.get("option_type", "")
-                if opt_type == "put" and 0 < premium < 0.50:
+                if opt_type == "put" and 0 < premium < min_put_premium:
                     checks.append(CheckResult(
                         "risk_min_premium", "warn",
-                        f"Put trade {row.get('symbol')} premium ${premium:.2f} below min ($0.50)",
+                        f"Put trade {row.get('symbol')} premium ${premium:.2f} "
+                        f"below min (${min_put_premium:.2f})",
                     ))
-                elif opt_type == "call" and 0 < premium < 0.30:
+                elif opt_type == "call" and 0 < premium < min_call_premium:
                     checks.append(CheckResult(
                         "risk_min_premium", "warn",
-                        f"Call trade {row.get('symbol')} premium ${premium:.2f} below min ($0.30)",
+                        f"Call trade {row.get('symbol')} premium ${premium:.2f} "
+                        f"below min (${min_call_premium:.2f})",
                     ))
 
                 # client_order_id must be present
