@@ -249,3 +249,209 @@ class TestExpiryCoercion(_SpanFixture):
         results = self.market_data.find_suitable_calls('NVDA', min_strike_price=100.0)
 
         assert len(results) == 1
+
+
+# =========================================================================== #
+# FC-078 — the 'roll' criteria profile and the roll-out horizon (T-8, T-7)
+#
+# Plan: docs/plans/fc-078.md §3. One filter site, two profiles. The entry
+# profile must be byte-identical; a second filter implementation would be the
+# FC-063 dict-boundary disease in new clothes.
+# =========================================================================== #
+
+class _RollProfileFixture:
+    def setup_method(self):
+        self.config = Mock(spec=Config)
+        self.config.call_target_dte = 7
+        self.config.call_delta_range = [0.15, 0.25]
+        self.config.min_call_premium = 0.30
+        self.config.rolling_max_replacement_delta = 0.60
+        self.market_data = MarketDataManager(Mock(), self.config)
+
+    def _chain(self, calls):
+        self.market_data.get_option_chain_with_analysis = Mock(
+            return_value={'puts': [], 'calls': calls})
+
+    def _stats(self, symbol='NVDA'):
+        return self.market_data.last_call_rejection_stats[symbol]
+
+
+class TestTheEntryProfileIsInert(_RollProfileFixture):
+    """T-8. *Catches:* the roll profile leaking into the scanner path.
+
+    The scanner is the production entry path; anything that changes its results
+    changes what the bot opens, silently.
+    """
+
+    def _mixed_chain(self):
+        return [
+            _call('NVDA260810C00200000', TODAY + timedelta(days=7),
+                  strike=200.0, delta=0.17, mid=1.50, dte=7),
+            _call('NVDA260810C00210000', TODAY + timedelta(days=7),
+                  strike=210.0, delta=0.45, mid=0.20, dte=7),     # delta + premium
+            _call('NVDA260901C00220000', TODAY + timedelta(days=29),
+                  strike=220.0, delta=0.20, mid=2.00, dte=29),    # DTE
+            _call('NVDA260810C00230000', TODAY + timedelta(days=7),
+                  strike=230.0, delta=0.22, mid=0.10, dte=7),     # premium
+        ]
+
+    def test_the_default_call_is_byte_identical_to_passing_entry_explicitly(self):
+        self._chain(self._mixed_chain())
+        implicit = self.market_data.find_suitable_calls('NVDA', min_strike_price=100.0)
+
+        self._chain(self._mixed_chain())
+        explicit = self.market_data.find_suitable_calls(
+            'NVDA', min_strike_price=100.0, criteria_profile='entry')
+
+        assert implicit == explicit
+
+    def test_the_entry_profile_still_applies_every_entry_criterion(self):
+        """The fixture is built so each rejected contract is rejected for a
+        DIFFERENT reason. If any one of them starts passing, an entry criterion
+        has been dropped."""
+        self._chain(self._mixed_chain())
+
+        results = self.market_data.find_suitable_calls('NVDA', min_strike_price=100.0)
+
+        assert [c['strike_price'] for c in results] == [200.0]
+        stats = self._stats()
+        assert stats['dte_too_high'] == 1
+        assert stats['premium_too_low'] == 2      # the 0.20 and the 0.10
+        assert stats['delta_out_of_range'] == 0   # premium is checked first
+
+    def test_the_horizon_parameter_is_inert_by_default(self):
+        self._chain(self._mixed_chain())
+        results = self.market_data.find_suitable_calls('NVDA', min_strike_price=100.0)
+
+        assert self._stats()['expiry_beyond_horizon'] == 0
+        assert len(results) == 1
+
+    def test_the_entry_profile_still_returns_at_most_five(self):
+        """The top-5 slice is entry behaviour and must survive: only the roll
+        profile returns the full legal set."""
+        self._chain([
+            _call(f'NVDA260810C{int(s * 1000):08d}', TODAY + timedelta(days=7),
+                  strike=s, delta=0.20, mid=1.50, dte=7)
+            for s in (200.0, 205.0, 210.0, 215.0, 220.0, 225.0, 230.0)
+        ])
+
+        results = self.market_data.find_suitable_calls('NVDA', min_strike_price=100.0)
+
+        assert len(results) == 5
+
+
+class TestTheRollProfile(_RollProfileFixture):
+
+    def _roll_chain(self):
+        return [
+            # Past the entry DTE cap: legal on a roll, the whole point.
+            _call('NVDA260901C00210000', TODAY + timedelta(days=29),
+                  strike=210.0, delta=0.45, mid=5.00, dte=29),
+            # Below the entry delta band's LOWER bound is fine; above the rail
+            # is not.
+            _call('NVDA260901C00205000', TODAY + timedelta(days=29),
+                  strike=205.0, delta=0.70, mid=8.00, dte=29),
+            # Sub-min_call_premium: legal on a roll.
+            _call('NVDA260901C00240000', TODAY + timedelta(days=29),
+                  strike=240.0, delta=0.05, mid=0.10, dte=29),
+        ]
+
+    def test_the_roll_profile_drops_dte_and_premium_and_keeps_a_delta_rail(self):
+        self._chain(self._roll_chain())
+
+        results = self.market_data.find_suitable_calls(
+            'NVDA', min_strike_price=100.0, criteria_profile='roll')
+
+        strikes = sorted(c['strike_price'] for c in results)
+        assert strikes == [210.0, 240.0], "delta rail or a dropped gate is wrong"
+        assert self._stats()['delta_out_of_range'] == 1   # the 0.70
+        assert self._stats()['dte_too_high'] == 0
+        assert self._stats()['premium_too_low'] == 0
+
+    def test_the_roll_profile_keeps_the_liquidity_check(self):
+        illiquid = _call('NVDA260901C00210000', TODAY + timedelta(days=29),
+                         strike=210.0, delta=0.45, mid=5.00, dte=29)
+        illiquid['volume'] = 0
+        illiquid['open_interest'] = 3
+        self._chain([illiquid])
+
+        results = self.market_data.find_suitable_calls(
+            'NVDA', min_strike_price=100.0, criteria_profile='roll')
+
+        assert results == []
+        assert self._stats()['no_liquidity'] == 1
+
+    def test_the_horizon_ceiling_rejects_expiries_past_the_bound(self):
+        horizon = TODAY + timedelta(days=14)
+        self._chain([
+            _call('NVDA260817C00210000', horizon, strike=210.0, delta=0.45,
+                  mid=5.00, dte=14),
+            _call('NVDA260818C00215000', horizon + timedelta(days=1),
+                  strike=215.0, delta=0.45, mid=5.00, dte=15),
+        ])
+
+        results = self.market_data.find_suitable_calls(
+            'NVDA', min_strike_price=100.0, criteria_profile='roll',
+            include_expiry_on_or_before=horizon)
+
+        assert [c['strike_price'] for c in results] == [210.0]
+        assert self._stats()['expiry_beyond_horizon'] == 1
+
+    def test_an_unparseable_expiry_fails_closed_against_the_horizon(self):
+        candidate = _call('NVDA260817C00210000', TODAY + timedelta(days=14),
+                          strike=210.0, delta=0.45, mid=5.00, dte=14)
+        candidate['expiration_date'] = 'not-a-date'
+        self._chain([candidate])
+
+        results = self.market_data.find_suitable_calls(
+            'NVDA', min_strike_price=100.0, criteria_profile='roll',
+            include_expiry_on_or_before=TODAY + timedelta(days=14))
+
+        assert results == []
+        assert self._stats()['expiry_beyond_horizon'] == 1
+
+    def test_the_span_floor_and_the_horizon_ceiling_compose(self):
+        """The roll path is the only caller that passes both. Neither may
+        cancel the other."""
+        horizon = TODAY + timedelta(days=14)
+        earnings = TODAY + timedelta(days=10)
+        self._chain([
+            _call('NVDA260810C00210000', TODAY + timedelta(days=7),
+                  strike=210.0, delta=0.45, mid=5.00, dte=7),    # in, before
+            _call('NVDA260814C00215000', TODAY + timedelta(days=11),
+                  strike=215.0, delta=0.45, mid=5.00, dte=11),   # in, spans
+            _call('NVDA260901C00220000', TODAY + timedelta(days=29),
+                  strike=220.0, delta=0.45, mid=5.00, dte=29),   # out
+        ])
+
+        results = self.market_data.find_suitable_calls(
+            'NVDA', min_strike_price=100.0, criteria_profile='roll',
+            exclude_expiry_on_or_after=earnings,
+            include_expiry_on_or_before=horizon)
+
+        assert [c['strike_price'] for c in results] == [210.0]
+        assert self._stats()['expires_into_earnings'] == 1
+        assert self._stats()['expiry_beyond_horizon'] == 1
+
+    def test_the_roll_profile_returns_the_full_legal_set_not_a_top_five_slice(self):
+        """FC-078 DD-3 ranks by NET CREDIT, and ``return_score`` (annualised
+        yield x OTM preference) is entry-shaped. Truncating by it would drop
+        near-money, high-credit replacements before the roller ever ranked them
+        — the same failure mode DD-3 rejected first-past-the-post ordering for.
+        """
+        self._chain([
+            _call(f'NVDA260901C{int(s * 1000):08d}', TODAY + timedelta(days=29),
+                  strike=s, delta=0.45, mid=5.00, dte=29)
+            for s in (205.0, 210.0, 215.0, 220.0, 225.0, 230.0, 235.0)
+        ])
+
+        results = self.market_data.find_suitable_calls(
+            'NVDA', min_strike_price=100.0, criteria_profile='roll')
+
+        assert len(results) == 7
+
+    def test_an_unknown_profile_is_refused_loudly(self):
+        self._chain([])
+        with pytest.raises(ValueError, match='criteria_profile'):
+            self.market_data.find_suitable_calls(
+                'NVDA', min_strike_price=100.0, criteria_profile='rol')

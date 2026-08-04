@@ -502,6 +502,7 @@ class TestNoProductionSideEffects:
         config.earnings_enabled = False
         alpaca = Mock()
         alpaca.get_positions.return_value = []
+        alpaca.get_orders.return_value = []
 
         engine = WheelEngine(config, alpaca_client=alpaca,
                              wheel_state=WheelStateManager(),
@@ -526,6 +527,8 @@ class TestNoProductionSideEffects:
 
         from src.strategy.call_roller import CallRoller
 
+        # (alpaca, market_data, config, risk_manager, earnings_calendar) —
+        # FC-078 dropped the wheel_state parameter that used to sit at index 3.
         roller = CallRoller(Mock(), Mock(), Mock(), Mock(), Mock(),
                             allow_bigquery_cost_basis=False)
 
@@ -1065,33 +1068,50 @@ class TestTheCallLegActuallyRuns:
         assert (kinds.index("sell_put_open") < kinds.index("put_assignment")
                 < kinds.index("sell_call_open") < kinds.index("call_assignment"))
 
-    def test_the_friday_roll_seat_is_occupied_and_still_a_no_op(self, dip_then_recovering):
-        """FC-068 tripwire on the kept ``run_rolling_cycle()`` call.
+    def test_the_roll_seat_is_occupied_daily_and_every_roll_nets_a_credit(
+            self, dip_then_recovering):
+        """T-15 — the FC-068 tripwire, FIRED.
 
-        The Friday call is retained because the production ``/roll`` scheduler
-        invokes that exact code, so the replay reproduces the production week.
-        What it reproduces today is a guaranteed no-op:
-        ``evaluate_roll_opportunity`` reads ``last_price``/``ask_price`` from a
-        client that returns ``bid``/``ask``, so price resolves to 0 and it
-        returns ``None`` at call_roller.py:128-129 — *before* the eligibility
-        gates, the FC-065 P2 floor or its replay-BigQuery gate are reached.
+        This test used to assert ``rolls_executed == 0``. That was the whole
+        point of it: the seat was retained because the production ``/roll``
+        scheduler invokes this exact code, and the assertion made the seat
+        load-bearing instead of silent, so that reviving the roller would flip a
+        test rather than quietly change every backtest number.
 
-        Asserting it makes the seat load-bearing instead of silent: when
-        FC-066 revives the roller, this test flips rather than every backtest
-        number quietly changing. ``rolls_evaluated >= 0`` is deliberate — the
-        fixture need not hold a short call on a Friday for the point to stand;
-        ``rolls_executed == 0`` is the claim.
+        FC-078 is that revival, and the flip is intentional. Two things changed
+        together: the replay's cadence is now **daily**, mirroring production
+        (a Friday-only replay of a daily roller would misstate roll frequency
+        and credit capture in every future measurement), and the roller can
+        actually execute (the quote-key mismatch that made it a guaranteed
+        no-op is fixed).
+
+        So the assertion moves from "it never fires" to what actually protects
+        money now: **every executed roll in a replay satisfied the credit
+        invariant and increased the strike.** A replay that rolls at a debit, or
+        rolls down, is the regression worth catching — not a replay that rolls.
+
+        *Mutation:* restore the Friday-only guard in the simulator → the daily
+        cadence assertion fails.
         """
         days, closes, exps = dip_then_recovering
         result = _simulator("XYZ", closes, exps, days).run()
 
-        assert result.rolls_evaluated >= 0
-        assert result.rolls_executed == 0, (
-            "the roller executed a roll in a replay. If FC-066 landed, this "
-            "test is the intended tripwire: every post-FC-066 backtest measures "
-            "a different strategy than every pre-FC-066 one, and the "
-            "engine_version stamp must be bumped again."
-        )
+        assert result.rolls_evaluated > 0, (
+            "the roll seat is empty: run_rolling_cycle() is not being called, "
+            "or it is still gated to one weekday")
+        # Daily cadence: with a Friday-only guard the evaluation count cannot
+        # exceed the number of Fridays in the window.
+        fridays = sum(1 for d in days if d.weekday() == 4)
+        assert result.rolls_evaluated > fridays, (
+            f"only {result.rolls_evaluated} evaluations over {len(days)} "
+            f"sessions ({fridays} Fridays) — the replay is still Friday-only")
+
+        for record in result.roll_records:
+            assert record['new_strike'] > record['old_strike'], (
+                f"a replay roll went sideways or down: {record}")
+            assert record['net_credit'] >= 0, (
+                f"a replay roll netted a DEBIT — the credit invariant is not "
+                f"holding end to end: {record}")
 
     def test_no_dead_path_events_in_replay(self, dip_then_recovering):
         """A half-deletion would leave the engine path partly alive.

@@ -1,41 +1,94 @@
-"""Covered call rolling engine for Friday EOW rolls.
+"""Covered call rolling engine — daily, credit-only defensive rolls.
 
-Plan: docs/plans/fc-006.md
+Plan: docs/plans/fc-078.md (revives FC-006, which never executed a roll in
+production; FC-066 diagnosed the four stacked causes).
 
-Buys-to-close expiring ITM short calls and sells-to-open new calls at higher
-strikes for next week. Uses percentage-based debit tolerance, 2-roll max per
-position, and reuses the existing find_suitable_calls framework.
+Buys-to-close an ITM short call and sells-to-open a higher strike further out,
+as two sequential single-leg limit orders, **BTC first**. The whole design turns
+on one invariant:
+
+    STO_limit - BTC_limit >= rolling.min_net_credit_per_contract / 100
+
+checked on the *limit prices actually placed*, at four sites: the candidate
+screen, immediately before BTC placement, order construction, and every ladder
+rung. Because both legs are limit orders, fills can only improve on it (BTC
+fills at <= limit, STO at >= limit), so **a filled roll can never net a debit**.
+There is no debit path to tolerate, so there is no debit tolerance — and no
+dependency on a wheel-state ``original_premium`` that has never persisted.
+
+Terminal-event contract (FC-078 DD-5): every short call evaluated in a cycle
+emits **exactly one** terminal event, one of:
+
+    call_roll_skipped{skip_reason}   no order was ever placed
+    call_roll_btc_rejected           the BTC was refused; nothing live
+    call_roll_btc_timeout_canceled   canceled with VERIFIED zero fill
+    call_roll_naked_exposure         some BTC qty filled, STO ladder exhausted
+    call_roll_completed              both legs done
+    call_roll_dry_run                ROLLER_DRY_RUN=true; nothing placed
+
+Events must tell the truth about what filled. A cancel that fails *because the
+order filled* is a fill, not an error — which is why every cancel on this path
+is followed by a re-fetch before anything is reported.
 """
 
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from datetime import date, timedelta
+from typing import Dict, Any, Iterator, List, Optional, Set, Tuple
 
 import structlog
 
-from ..utils import clock
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
-from ..api.earnings_calendar import EarningsCalendarService
+from ..api.earnings_calendar import (
+    EarningsCalendarService, EARNINGS_KNOWN, EARNINGS_UNKNOWN)
 from ..risk.risk_manager import RiskManager
 from ..utils.config import Config
-from ..utils.option_symbols import parse_option_symbol
+from ..utils.option_symbols import parse_option_symbol, coerce_expiry_date
 from ..utils.logging_events import log_trade_event, log_error_event, log_position_update
 from .cost_basis import CostBasisResolver, SOURCE_DIVERGENT
-from .wheel_state_manager import WheelStateManager
 
 logger = structlog.get_logger(__name__)
 
+# Float slack on the credit comparison. Limits are rounded to cents before the
+# invariant is tested, so this only absorbs binary-representation noise on an
+# exactly-at-the-floor roll (the default floor is $0.00, which is exactly the
+# case that must not be rejected by 1e-17).
+_CREDIT_EPSILON = 1e-9
+
+# Half-spread crossed in imminence mode, per share. Symmetric on both legs so
+# the invariant is tested against a like-for-like pair.
+_IMMINENCE_PAD = 0.05
+
+# Stock-quote spread sanity bound. A live IEX example that motivated it: AAPL
+# bid 287.82 / ask 318.75 — a 10.7% spread that makes the ITM ratio 0.92 or 1.02
+# depending on which side you trust. A quote that wide must not gate a money
+# decision.
+_MAX_STOCK_SPREAD_RATIO = 1.05
+
+# Statuses at which an order is done moving on its own. ``partially_filled`` is
+# deliberately absent: it is NOT terminal, and returning on it (as the as-built
+# code did) leaves the remainder working while the next leg is placed.
+#
+# ``pending_cancel`` is absent for a sharper reason (FC-078 review, execution
+# H-1): Alpaca cancels are QUEUED, not synchronous. An order sitting in
+# ``pending_cancel`` is still working and can still fill. Treating that read as
+# a disposition is how a roller reports "canceled, zero fill" about contracts it
+# is in the middle of buying.
+_TERMINAL_ORDER_STATUSES = ('filled', 'expired', 'canceled', 'rejected')
+
+# How long to keep re-reading an order after cancelling it, waiting for the
+# broker to settle it into a terminal status. Short: a cancel that has not
+# resolved in this window is not going to tell us anything by waiting longer,
+# and the safe action does not depend on the answer — we stop touching the
+# position either way.
+_CANCEL_SETTLE_TIMEOUT_SECONDS = 15
+
 
 class CallRoller:
-    """Friday EOW call rolling engine.
-
-    Evaluates short call positions for rolling when the underlying has
-    rallied through the strike. Executes sequential BTC -> STO with
-    percentage-based debit tolerance.
-    """
+    """Daily credit-only covered-call rolling engine."""
 
     def __init__(self, alpaca_client: AlpacaClient, market_data: MarketDataManager,
-                 config: Config, wheel_state: WheelStateManager,
+                 config: Config,
                  risk_manager: RiskManager,
                  earnings_calendar: Optional[EarningsCalendarService] = None,
                  allow_bigquery_cost_basis: bool = True):
@@ -45,19 +98,26 @@ class CallRoller:
             alpaca_client: Alpaca API client.
             market_data: Market data manager.
             config: Configuration instance.
-            wheel_state: State manager for roll counts and active call details.
             risk_manager: Validates the replacement leg.
-            earnings_calendar: Optional earnings service for the blackout gate.
+            earnings_calendar: Earnings service for the FC-013 span gate on the
+                replacement. Required whenever ``earnings.enabled`` — a missing
+                service fails the roll CLOSED (``earnings_unknown``), never open.
             allow_bigquery_cost_basis: whether the cost-basis divergence
                 cross-check may query BigQuery. A backtest passes False: the
                 cross-check would otherwise read *production* trade history —
                 against CURRENT_TIMESTAMP() — mixing real assignments into a
                 simulated run. Mirrors ``CallSeller`` (FC-065).
+
+        There is no state-manager parameter. FC-078 DD-6 deleted the roller's
+        persistence dependency rather than repairing it: the only consumer was
+        the debit tolerance's ``original_premium``, credit-only has no debit to
+        tolerate, and ``STATE_STORAGE_BUCKET`` has been unset since project
+        start so nothing was ever persisted to read back. Alpaca positions are
+        the truth; ``reconcile_positions`` already rebuilds from them.
         """
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
-        self.wheel_state = wheel_state
         self.risk_manager = risk_manager
         self.earnings_calendar = earnings_calendar
         # FC-065 Phase 2: the roll's strike floor is resolved through the same
@@ -69,108 +129,173 @@ class CallRoller:
             alpaca_client, config, allow_bigquery=allow_bigquery_cost_basis
         )
 
+    # ------------------------------------------------------------------ #
+    # Terminal events
+    # ------------------------------------------------------------------ #
+    def log_terminal_skip(self, option_symbol: str, underlying: str,
+                          skip_reason: str, **fields: Any) -> None:
+        """Emit the ``call_roll_skipped`` terminal event.
+
+        Public because the cycle owns two skip reasons the roller cannot see
+        from inside a single position's evaluation — ``cycle_budget_exhausted``
+        and ``open_orders_unavailable`` — and the terminal-event contract is
+        only worth anything if every path spells the event the same way.
+        """
+        log_trade_event(
+            logger, event_type="call_roll_skipped",
+            symbol=option_symbol, underlying=underlying,
+            strategy="roll_call", success=False,
+            skip_reason=skip_reason, gate_failed=skip_reason,
+            **fields,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Eligibility
+    # ------------------------------------------------------------------ #
     def should_roll(self, short_call_position: Dict[str, Any],
                     stock_position: Dict[str, Any],
-                    current_stock_price: float) -> Tuple[bool, str]:
-        """Check all trigger gates for rolling a short call.
+                    current_stock_price: float,
+                    open_order_symbols: Optional[Set[str]] = None
+                    ) -> Tuple[bool, str]:
+        """Check the pre-order eligibility gates for rolling a short call.
+
+        FC-078 DD-2 deleted three gates and added one:
+
+        - **DTE <= 1 is gone.** It existed to bound *debit* escalation near
+          expiry; credit-only removes the hazard, and it is precisely what
+          blinded the roller — a churned book's calls are 5-7 DTE on any given
+          day (FC-066 cause 2). Self-timing is the credit sign, not the calendar.
+        - **Max-rolls-per-position is gone.** It counted wheel-state rolls that
+          were never persisted, so it always read 0 and never bound. The process
+          terminates structurally instead: ``validate_roll`` requires strictly
+          increasing strikes and every roll nets >= $0, so re-rolls are monotone
+          and profitable.
+        - **The fail-OPEN earnings blackout is gone**, subsumed by the fail-CLOSED
+          span predicate applied to the *replacement* in evaluate_roll_opportunity.
+        - **The open-order guard is new** (DD-4): ``/monitor`` places
+          fire-and-forget DAY buy-to-close limits that outlive its 14:55 slot, so
+          at 15:30 the roller can see a short call with a live BTC working
+          against it. Rolling it could fill both buys — an unintended LONG call
+          plus a sold replacement. We skip rather than cancel: the working order
+          belongs to the profit-taker, which has precedence by design, and a
+          cancel can lose the race to a fill anyway. Cost is one cycle.
 
         Returns:
-            (should_roll, reason_code) — reason_code explains the decision.
+            (should_roll, reason_code) — a bare reason code from the DD-5
+            taxonomy, with the numbers carried as event fields rather than
+            interpolated into the string.
         """
         option_symbol = short_call_position.get('symbol', '')
         parsed = parse_option_symbol(option_symbol)
-        underlying = parsed.get('underlying', '')
         current_strike = parsed.get('strike_price', 0)
-        dte = parsed.get('dte', 999)
 
-        # Gate: DTE must be <= max_current_dte
-        if dte > self.config.rolling_max_current_dte:
-            return False, f"dte_too_high ({dte} > {self.config.rolling_max_current_dte})"
-
-        # Gate: Stock price / strike >= ITM trigger ratio
         if current_strike <= 0:
             return False, "invalid_strike"
+
+        if open_order_symbols and option_symbol in open_order_symbols:
+            return False, "open_order_conflict"
+
         ratio = current_stock_price / current_strike
         if ratio < self.config.rolling_itm_trigger_ratio:
-            return False, f"not_itm_enough (ratio={ratio:.4f} < {self.config.rolling_itm_trigger_ratio})"
-
-        # Gate: Max rolls per position
-        roll_count = self.wheel_state.get_roll_count(underlying)
-        if roll_count >= self.config.rolling_max_rolls_per_position:
-            return False, f"max_rolls_reached ({roll_count} >= {self.config.rolling_max_rolls_per_position})"
-
-        # Gate: Earnings blackout
-        if self.earnings_calendar:
-            if self.earnings_calendar.is_earnings_within_n_days(
-                    underlying, self.config.rolling_earnings_blackout_days):
-                return False, "earnings_blackout"
+            return False, "not_itm_enough"
 
         return True, "eligible"
 
+    # ------------------------------------------------------------------ #
+    # Evaluation
+    # ------------------------------------------------------------------ #
     def evaluate_roll_opportunity(self, short_call_position: Dict[str, Any],
-                                  stock_position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Evaluate whether a short call should be rolled and find a target.
+                                  stock_position: Dict[str, Any],
+                                  open_order_symbols: Optional[Set[str]] = None
+                                  ) -> Optional[Dict[str, Any]]:
+        """Evaluate a short call and select the replacement to execute.
+
+        Emits a terminal ``call_roll_skipped`` event on every failure path —
+        including the three that used to ``return None`` silently (falsy or
+        raising stock quote, zero stock price, zero BTC ask), which is FC-066
+        checklist item 2 and the reason five Fridays of production told us
+        nothing.
 
         Returns:
-            Roll opportunity dict with both legs described, or None if no roll.
+            Roll opportunity dict, or None if no roll (a terminal event fired).
         """
         option_symbol = short_call_position.get('symbol', '')
         parsed = parse_option_symbol(option_symbol)
         underlying = parsed.get('underlying', '')
         current_strike = parsed.get('strike_price', 0)
+        old_expiry = coerce_expiry_date(parsed.get('expiration_date'))
         contracts = abs(int(float(short_call_position.get('qty', 0))))
 
-        # Get current stock price
-        quote = self.alpaca.get_stock_quote(underlying)
+        # --- Stock quote: two-sided, spread-sane, or no decision (DD-1/M-5) ---
+        # get_stock_quote RAISES on failure — the as-built `if not quote` branch
+        # was unreachable, which is why a data outage looked like "no roll today".
+        try:
+            quote = self.alpaca.get_stock_quote(underlying)
+        except Exception as exc:
+            self.log_terminal_skip(
+                option_symbol, underlying, "stock_quote_unavailable",
+                current_strike=current_strike, error=str(exc))
+            return None
         if not quote:
-            return None
-        current_stock_price = float(quote.get('last_price', 0) or quote.get('ask_price', 0))
-        if current_stock_price <= 0:
+            self.log_terminal_skip(
+                option_symbol, underlying, "stock_quote_unavailable",
+                current_strike=current_strike, error="empty quote")
             return None
 
-        # Get earnings proximity for log enrichment
-        earnings_info = {}
-        if self.earnings_calendar:
-            earnings_info = self.earnings_calendar.get_earnings_proximity(underlying)
+        stock_bid = _as_float(quote.get('bid'))
+        stock_ask = _as_float(quote.get('ask'))
+        if stock_bid <= 0 or stock_ask <= 0 or stock_ask / stock_bid > _MAX_STOCK_SPREAD_RATIO:
+            # Fail closed, both ways. The deleted "whichever side is positive"
+            # fallback would answer a money question from half a quote.
+            self.log_terminal_skip(
+                option_symbol, underlying, "stock_quote_unusable",
+                current_strike=current_strike,
+                stock_bid=stock_bid, stock_ask=stock_ask,
+                max_spread_ratio=_MAX_STOCK_SPREAD_RATIO)
+            return None
+        current_stock_price = (stock_bid + stock_ask) / 2
 
-        # Check trigger gates
-        should, reason = self.should_roll(short_call_position, stock_position,
-                                          current_stock_price)
+        # Earnings proximity, for log enrichment only. The gate itself is the
+        # span predicate below.
+        earnings_info: Dict[str, Any] = {}
+        if self.earnings_calendar is not None:
+            try:
+                earnings_info = self.earnings_calendar.get_earnings_proximity(underlying) or {}
+            except Exception:
+                earnings_info = {}
+
+        # --- Eligibility gates ---
+        should, reason = self.should_roll(
+            short_call_position, stock_position, current_stock_price,
+            open_order_symbols)
         if not should:
-            log_trade_event(
-                logger, event_type="call_roll_skipped",
-                symbol=option_symbol, underlying=underlying,
-                strategy="roll_call", success=False,
-                skip_reason=reason, gate_failed=reason,
+            self.log_terminal_skip(
+                option_symbol, underlying, reason,
                 current_strike=current_strike,
                 stock_price=current_stock_price,
+                itm_ratio=(round(current_stock_price / current_strike, 4)
+                           if current_strike > 0 else None),
+                itm_trigger_ratio=self.config.rolling_itm_trigger_ratio,
                 **earnings_info,
             )
             return None
 
-        # Get cost basis for strike selection floor.
-        # FC-065 Phase 2: resolved through the shared CostBasisResolver rather
-        # than derived here from cost_basis/qty. Rolling is the one path that
-        # places orders without passing execute_call_sale, so this floor is the
-        # only thing between a BTC/STO pair and a strike below what the shares
-        # cost — and the old derivation silently produced 0 whenever Alpaca
-        # reported no cost basis, which left min_strike = current_strike + 0.01,
-        # i.e. no basis protection at all.
+        # --- Cost-basis floor, fail closed (FC-065 Phase 2) ---
+        # Rolling is the one path that places orders without passing
+        # execute_call_sale, so this floor is the only thing between a BTC/STO
+        # pair and a strike below what the shares cost.
         shares = int(float(stock_position.get('qty', 0)))
         resolution = self.cost_basis_resolver.resolve_detailed(
             underlying, stock_position, shares)
         cost_basis_per_share = resolution['basis']
 
-        # FAIL CLOSED. resolve_detailed returns a zero basis for both verdicts
-        # that mean "no usable floor", and they are split into two events
-        # mirroring the scanner's pair, because they are different failures:
-        #   - unresolved: absent/zero avg_entry_price, nothing to floor against.
-        #   - divergent:  the broker gave a number and the assignment history
-        #     contradicts it — resolved and *vetoed*. Labelling that
-        #     "unresolved" is actively wrong, and it hides the symbol from any
-        #     *_divergent taxonomy, which is the one that means "the broker's
-        #     number may be wrong" rather than "the broker said nothing".
         if cost_basis_per_share <= 0:
+            # resolve_detailed returns a zero basis for both verdicts that mean
+            # "no usable floor", split into two events because they are
+            # different failures: unresolved (nothing to floor against) vs
+            # divergent (the broker gave a number and the assignment history
+            # contradicts it — resolved and *vetoed*). Both are alert-wired
+            # since FC-078 (FC-066 checklist item 1).
             cross_check = resolution.get('cross_check') or {}
             divergent = resolution.get('source') == SOURCE_DIVERGENT
             log_trade_event(
@@ -195,106 +320,238 @@ class CallRoller:
             )
             return None
 
-        # Find replacement calls — min strike is max(cost_basis, current_strike + 0.01)
-        min_strike = max(cost_basis_per_share, current_strike + 0.01)
-        suitable_calls = self.market_data.find_suitable_calls(underlying,
-                                                               min_strike_price=min_strike)
-        if not suitable_calls:
-            log_trade_event(
-                logger, event_type="call_roll_skipped",
-                symbol=option_symbol, underlying=underlying,
-                strategy="roll_call", success=False,
-                skip_reason="no_suitable_replacement",
-                current_strike=current_strike,
-                **earnings_info,
-            )
-            return None
-
-        # Get original premium for debit tolerance
-        active_details = self.wheel_state.get_active_call_details(underlying)
-        original_premium = active_details['premium_per_contract'] if active_details else 0
-
-        # Get current ask for BTC pricing
-        btc_quote = self.alpaca.get_option_quote(option_symbol)
-        btc_ask = float(btc_quote.get('ask_price', 0)) if btc_quote else 0
+        # --- BTC quote and the pricing mode (DD-1/DD-2) ---
+        btc_quote = self.alpaca.get_option_quote(option_symbol) or {}
+        btc_ask = _as_float(btc_quote.get('ask'))
+        btc_bid = _as_float(btc_quote.get('bid'))
         if btc_ask <= 0:
+            self.log_terminal_skip(
+                option_symbol, underlying, "btc_quote_unavailable",
+                current_strike=current_strike,
+                stock_price=current_stock_price, **earnings_info)
             return None
 
-        # Try candidates in order (sorted by return_score)
-        max_attempts = self.config.rolling_fallback_strike_attempts + 1
-        for candidate in suitable_calls[:max_attempts]:
-            new_strike = candidate.get('strike_price', 0)
-            new_bid = candidate.get('bid', 0)
+        extrinsic_per_share: Optional[float] = None
+        imminent = False
+        if btc_bid > 0 and btc_ask > 0:
+            # A mid needs two sides. Without them there is no extrinsic estimate
+            # worth acting on, so base pricing applies and the override does not
+            # fire — no aggression on junk data.
+            option_mid = (btc_bid + btc_ask) / 2
+            intrinsic = max(0.0, current_stock_price - current_strike)
+            extrinsic_per_share = max(0.0, option_mid - intrinsic)
+            imminent = extrinsic_per_share <= self.config.rolling_imminence_extrinsic_threshold
+        else:
+            option_mid = None
 
-            # Validate via risk manager
-            valid, val_reason = self.risk_manager.validate_roll(
-                candidate, current_strike, cost_basis_per_share)
+        pricing_mode = 'imminence' if imminent else 'base'
+        # Imminence mode crosses half the spread on both legs: when assignment is
+        # imminent, bid/ask pricing double-counts the spread and the escape is
+        # worth the fill risk. It relaxes NOTHING else — not the invariant, not
+        # the floor, not the span gate.
+        btc_limit = (round(option_mid + _IMMINENCE_PAD, 2) if imminent
+                     else round(btc_ask, 2))
+
+        # --- FC-013 span gate on the replacement, fail closed (DD-3) ---
+        span_floor: Optional[date] = None
+        if self.config.earnings_enabled:
+            if self.earnings_calendar is None:
+                # Never fail open on a missing service.
+                self.log_terminal_skip(
+                    option_symbol, underlying, "earnings_unknown",
+                    current_strike=current_strike,
+                    stock_price=current_stock_price,
+                    earnings_status="no_calendar_service")
+                return None
+            status, earnings_date = self.earnings_calendar.next_earnings_info(underlying)
+            if status == EARNINGS_UNKNOWN:
+                # A span test with no date cannot clear any candidate.
+                self.log_terminal_skip(
+                    option_symbol, underlying, "earnings_unknown",
+                    current_strike=current_strike,
+                    stock_price=current_stock_price,
+                    earnings_status=status, **earnings_info)
+                return None
+            if status == EARNINGS_KNOWN:
+                span_floor = earnings_date
+
+        # --- Candidate search ---
+        if old_expiry is None:
+            # Without the old expiry there is no horizon to bound the
+            # replacement by. Fail closed rather than roll unbounded.
+            self.log_terminal_skip(
+                option_symbol, underlying, "invalid_expiry",
+                current_strike=current_strike,
+                stock_price=current_stock_price, **earnings_info)
+            return None
+        max_expiry = old_expiry + timedelta(days=self.config.rolling_max_extension_days)
+
+        min_strike = max(cost_basis_per_share, current_strike + 0.01)
+        candidates = self.market_data.find_suitable_calls(
+            underlying,
+            min_strike_price=min_strike,
+            exclude_expiry_on_or_after=span_floor,
+            include_expiry_on_or_before=max_expiry,
+            criteria_profile='roll',
+        )
+        if not candidates:
+            self.log_terminal_skip(
+                option_symbol, underlying, "no_suitable_replacement",
+                current_strike=current_strike,
+                stock_price=current_stock_price,
+                min_strike=min_strike,
+                max_expiry=max_expiry.isoformat(),
+                # Named span_floor_date, not next_earnings_date: the latter is
+                # already a get_earnings_proximity key and would collide.
+                span_floor_date=(span_floor.isoformat() if span_floor else None),
+                **earnings_info)
+            return None
+
+        # --- Credit screen over the LEGAL set; execute maximum net credit ---
+        min_credit_per_share = self.config.rolling_min_net_credit_per_contract / 100.0
+        legal = self._legal_candidates(
+            candidates, current_strike, cost_basis_per_share, max_expiry,
+            btc_limit, min_credit_per_share, imminent)
+
+        if not legal:
+            self.log_terminal_skip(
+                option_symbol, underlying, "no_credit_candidate",
+                current_strike=current_strike,
+                stock_price=current_stock_price,
+                btc_limit=btc_limit,
+                pricing_mode=pricing_mode,
+                candidates_screened=len(candidates),
+                min_net_credit_per_contract=self.config.rolling_min_net_credit_per_contract,
+                **earnings_info)
+            return None
+
+        primary = legal[0]
+
+        opportunity = {
+            'underlying': underlying,
+            'old_option_symbol': option_symbol,
+            'new_option_symbol': primary['new_option_symbol'],
+            'old_strike': current_strike,
+            'new_strike': primary['new_strike'],
+            'old_expiry': old_expiry,
+            'max_expiry': max_expiry,
+            'contracts': contracts,
+            'btc_limit': btc_limit,
+            'stc_limit': primary['stc_limit'],
+            'net_credit_per_contract': primary['net_credit_per_contract'],
+            'pricing_mode': pricing_mode,
+            'imminent': imminent,
+            'extrinsic_per_share': extrinsic_per_share,
+            'stock_price': current_stock_price,
+            'cost_basis_per_share': cost_basis_per_share,
+            'min_credit_per_share': min_credit_per_share,
+            'earnings_info': earnings_info,
+            'candidate': primary['candidate'],
+            # The ladder reuses THIS list and never re-queries the chain
+            # (DD-1/M-8): a fresh find_suitable_calls at execute time could
+            # admit candidates filtered under a different earnings-cache state
+            # or drifted deltas, and an unfiltered order is a money bug. Price
+            # freshness is obtained per-rung from the candidate's own quote.
+            'fallback_candidates': legal,
+        }
+
+        log_trade_event(
+            logger, event_type="call_roll_evaluated",
+            symbol=option_symbol, underlying=underlying,
+            strategy="roll_call", success=True,
+            current_strike=current_strike,
+            target_strike=primary['new_strike'],
+            target_symbol=primary['new_option_symbol'],
+            btc_limit=btc_limit, stc_limit=primary['stc_limit'],
+            net_credit=primary['net_credit_per_contract'],
+            net_credit_total=round(primary['net_credit_per_contract'] * contracts, 2),
+            pricing_mode=pricing_mode,
+            imminence=imminent,
+            extrinsic_per_share=extrinsic_per_share,
+            legal_candidates=len(legal),
+            max_expiry=max_expiry.isoformat(),
+            contracts=contracts,
+            **earnings_info,
+        )
+        return opportunity
+
+    def _legal_candidates(self, candidates: List[Dict[str, Any]],
+                          current_strike: float, cost_basis_per_share: float,
+                          max_expiry: date, btc_limit: float,
+                          min_credit_per_share: float,
+                          imminent: bool) -> List[Dict[str, Any]]:
+        """Screen every candidate, credit-ordered, most credit first.
+
+        FC-078 DD-3: selection is **maximum net credit among legal candidates**,
+        ties broken toward the higher strike — not first-past-the-post on
+        ``return_score``. That score is annualised yield x OTM preference, an
+        entry-shaped ordering; letting it pick the executed contract is how a
+        book takes +$13 over +$248 on the same position. Every legal candidate
+        already improves the strike strictly (``validate_roll``), so strike
+        improvement is guaranteed and credit is the honest maximand. Paying
+        certain credit for contingent strike value is a delta bet — the
+        roll-up chasing this FC excludes.
+        """
+        legal: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            valid, _reason = self.risk_manager.validate_roll(
+                candidate, current_strike, cost_basis_per_share, max_expiry)
             if not valid:
                 continue
 
-            # Compute economics
-            economics = self._compute_net_roll_economics(
-                original_premium, btc_ask, new_bid, contracts)
-
-            # Check debit tolerance
-            notional = current_strike * 100 * contracts
-            if not self._check_debit_tolerance(
-                    economics['net_debit'], original_premium, notional):
-                log_trade_event(
-                    logger, event_type="call_roll_blocked_debit",
-                    symbol=option_symbol, underlying=underlying,
-                    strategy="roll_call", success=False,
-                    net_debit=economics['net_debit'],
-                    max_allowed_premium_pct=self.config.rolling_max_debit_pct_of_premium,
-                    pct_of_premium=economics['debit_pct_of_premium'],
-                    **earnings_info,
-                )
+            stc_limit = self._stc_limit_from_quote(
+                _as_float(candidate.get('bid')), _as_float(candidate.get('ask')),
+                imminent)
+            if stc_limit is None:
                 continue
 
-            # Found a viable opportunity
-            opportunity = {
-                'underlying': underlying,
-                'old_option_symbol': option_symbol,
-                'new_option_symbol': candidate['symbol'],
-                'old_strike': current_strike,
-                'new_strike': new_strike,
-                'contracts': contracts,
-                'btc_ask': btc_ask,
-                'new_bid': new_bid,
-                'original_premium': original_premium,
-                'stock_price': current_stock_price,
-                'cost_basis_per_share': cost_basis_per_share,
-                'economics': economics,
-                'earnings_info': earnings_info,
+            net = stc_limit - btc_limit
+            if net + _CREDIT_EPSILON < min_credit_per_share:
+                continue
+
+            legal.append({
                 'candidate': candidate,
-            }
+                'new_option_symbol': candidate['symbol'],
+                'new_strike': candidate.get('strike_price', 0),
+                'stc_limit': stc_limit,
+                'net_credit_per_share': net,
+                'net_credit_per_contract': round(net * 100, 2),
+            })
 
-            log_trade_event(
-                logger, event_type="call_roll_evaluated",
-                symbol=option_symbol, underlying=underlying,
-                strategy="roll_call", success=True,
-                current_strike=current_strike,
-                target_strike=new_strike,
-                btc_ask=btc_ask, stc_bid=new_bid,
-                net_debit=economics['net_debit'],
-                net_debit_pct=economics['debit_pct_of_premium'],
-                contracts=contracts,
-                **earnings_info,
-            )
-            return opportunity
+        legal.sort(key=lambda entry: (-entry['net_credit_per_share'],
+                                      -entry['new_strike']))
+        return legal
 
-        log_trade_event(
-            logger, event_type="call_roll_skipped",
-            symbol=option_symbol, underlying=underlying,
-            strategy="roll_call", success=False,
-            skip_reason="no_candidate_passed_economics",
-            current_strike=current_strike,
-            **earnings_info,
-        )
-        return None
+    @staticmethod
+    def _stc_limit_from_quote(bid: float, ask: float,
+                              imminent: bool) -> Optional[float]:
+        """The sell-to-open limit for a pricing mode, or None if unquotable.
 
+        Base mode sells at the bid — the conservative side, so the screened
+        credit is the worst case rather than a hope. Imminence mode sells at
+        mid - $0.05, which requires a two-sided quote; without one there is no
+        mid, and the candidate is dropped rather than silently priced by another
+        mode's rule.
+        """
+        if imminent:
+            if bid <= 0 or ask <= 0:
+                return None
+            limit = round((bid + ask) / 2 - _IMMINENCE_PAD, 2)
+        else:
+            if bid <= 0:
+                return None
+            limit = round(bid, 2)
+        return limit if limit > 0 else None
+
+    # ------------------------------------------------------------------ #
+    # Execution
+    # ------------------------------------------------------------------ #
     def execute_roll(self, opportunity: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a two-leg roll: buy-to-close then sell-to-open.
+        """Execute a two-leg roll: buy-to-close, then sell-to-open.
+
+        BTC is always first. STO-first would momentarily hold two short calls
+        against 100 shares — a naked call Alpaca would either reject or margin.
+        There is no acceptable STO-first sequence.
 
         Returns:
             Result dict with success status, order IDs, and fill details.
@@ -303,19 +560,60 @@ class CallRoller:
         old_symbol = opportunity['old_option_symbol']
         new_symbol = opportunity['new_option_symbol']
         contracts = opportunity['contracts']
-        btc_ask = opportunity['btc_ask']
-        new_bid = opportunity['new_bid']
+        btc_limit = opportunity['btc_limit']
         earnings_info = opportunity.get('earnings_info', {})
+        min_credit = opportunity['min_credit_per_share']
+
+        if self.config.roller_dry_run:
+            log_trade_event(
+                logger, event_type="call_roll_dry_run",
+                symbol=old_symbol, underlying=underlying,
+                strategy="roll_call", success=True,
+                would_be_btc_symbol=old_symbol,
+                would_be_btc_limit=btc_limit,
+                would_be_stc_symbol=new_symbol,
+                would_be_stc_limit=opportunity['stc_limit'],
+                net_credit=opportunity['net_credit_per_contract'],
+                pricing_mode=opportunity['pricing_mode'],
+                contracts=contracts,
+                **earnings_info,
+            )
+            return {'success': False, 'reason': 'dry_run',
+                    'underlying': underlying}
+
+        # --- Pre-BTC invariant re-check (DD-1) ---
+        # Evaluation quotes are minutes old by order time. Re-pricing the STO
+        # leg here shrinks the staleness window to the BTC poll itself, and
+        # losing the race HERE costs nothing: no order exists yet.
+        fresh = self.alpaca.get_option_quote(new_symbol) or {}
+        fresh_stc_limit = self._stc_limit_from_quote(
+            _as_float(fresh.get('bid')), _as_float(fresh.get('ask')),
+            opportunity['imminent'])
+        if fresh_stc_limit is None or \
+                (fresh_stc_limit - btc_limit) + _CREDIT_EPSILON < min_credit:
+            self.log_terminal_skip(
+                old_symbol, underlying, "credit_gone_at_execution",
+                current_strike=opportunity['old_strike'],
+                target_strike=opportunity['new_strike'],
+                btc_limit=btc_limit,
+                evaluated_stc_limit=opportunity['stc_limit'],
+                recheck_stc_limit=fresh_stc_limit,
+                pricing_mode=opportunity['pricing_mode'],
+                **earnings_info)
+            return {'success': False, 'reason': 'credit_gone_at_execution',
+                    'underlying': underlying}
+        opportunity['stc_limit'] = fresh_stc_limit
+        if opportunity['fallback_candidates']:
+            opportunity['fallback_candidates'][0]['stc_limit'] = fresh_stc_limit
 
         # === LEG 1: Buy-to-close ===
-        btc_limit = round(btc_ask * (1 + self.config.rolling_btc_limit_over_ask_pct), 2)
-
         log_trade_event(
             logger, event_type="call_roll_btc_placed",
             symbol=old_symbol, underlying=underlying,
             strategy="roll_call", success=True,
             current_strike=opportunity['old_strike'],
             contracts=contracts, limit_price=btc_limit,
+            pricing_mode=opportunity['pricing_mode'],
         )
 
         btc_result = self.alpaca.place_option_order(
@@ -323,30 +621,70 @@ class CallRoller:
             side='buy', order_type='limit', limit_price=btc_limit)
 
         if not btc_result or not btc_result.get('success', False):
-            error_msg = btc_result.get('error_message', 'BTC order rejected') if btc_result else 'No result'
+            error_msg = (btc_result.get('error_message', 'BTC order rejected')
+                         if btc_result else 'No result')
             log_error_event(
-                logger, error_type="call_roll_btc_unfilled",
+                logger, error_type="call_roll_btc_rejected",
                 error_message=error_msg, component="call_roller",
                 recoverable=True, symbol=old_symbol, underlying=underlying,
+                limit_price=btc_limit, contracts=contracts,
             )
-            return {'success': False, 'reason': 'btc_rejected', 'error': error_msg}
+            return {'success': False, 'reason': 'btc_rejected',
+                    'error': error_msg, 'underlying': underlying}
 
         btc_order_id = btc_result.get('order_id', '')
 
-        # Poll for BTC fill
-        btc_fill = self._poll_order_fill(btc_order_id)
-        if not btc_fill or btc_fill.get('status') not in ('filled', 'partially_filled'):
-            log_error_event(
-                logger, error_type="call_roll_btc_unfilled",
-                error_message=f"BTC order {btc_order_id} did not fill within timeout",
-                component="call_roller", recoverable=True,
-                symbol=old_symbol, underlying=underlying,
-                order_id=btc_order_id,
-            )
-            return {'success': False, 'reason': 'btc_unfilled', 'order_id': btc_order_id}
+        # --- Poll, then cancel-and-VERIFY on timeout ---
+        # "Cancel failed because it filled" is a fill, not an error. The
+        # as-built code returned on timeout with the DAY order still live and
+        # reported `btc_unfilled` without ever looking again — a fiction that
+        # would have been logged while contracts were being bought.
+        btc_order = self._poll_order_fill(btc_order_id)
+        timed_out = btc_order is None
+        if timed_out:
+            btc_order = self._cancel_and_settle(btc_order_id)
+            if btc_order is None:
+                # The cancel never settled. We do NOT know whether contracts
+                # were bought, so we must not sell a call against a short
+                # position whose size is unknown. Stop, and page.
+                return self._unknown_disposition(
+                    leg='btc', order_id=btc_order_id, symbol=old_symbol,
+                    underlying=underlying, earnings_info=earnings_info,
+                    detail=("BTC cancel did not settle to a terminal status "
+                            "within the bound; the order may still be working"))
 
-        btc_filled_price = btc_fill.get('filled_avg_price', btc_limit)
-        btc_filled_qty = btc_fill.get('filled_qty', contracts)
+        btc_filled_qty = int(_as_float(btc_order.get('filled_qty')))
+        if btc_filled_qty <= 0:
+            btc_status = btc_order.get('status')
+            if btc_status == 'rejected':
+                # L-2: a broker rejection after placement is a REJECTION, not a
+                # timeout-cancel. The event name has to say which happened —
+                # "canceled at timeout" and "the broker refused it" call for
+                # different investigations.
+                log_error_event(
+                    logger, error_type="call_roll_btc_rejected",
+                    error_message=f"BTC order {btc_order_id} rejected after placement",
+                    component="call_roller", recoverable=True,
+                    symbol=old_symbol, underlying=underlying,
+                    order_id=btc_order_id, limit_price=btc_limit,
+                    contracts=contracts, rejected_after_placement=True,
+                )
+                return {'success': False, 'reason': 'btc_rejected',
+                        'order_id': btc_order_id, 'underlying': underlying}
+            log_trade_event(
+                logger, event_type="call_roll_btc_timeout_canceled",
+                symbol=old_symbol, underlying=underlying,
+                strategy="roll_call", success=False,
+                order_id=btc_order_id,
+                order_status=btc_status,
+                disposition=('timeout_canceled' if timed_out else 'terminal_no_fill'),
+                limit_price=btc_limit, contracts=contracts,
+                **earnings_info,
+            )
+            return {'success': False, 'reason': 'btc_timeout_canceled',
+                    'order_id': btc_order_id, 'underlying': underlying}
+
+        btc_filled_price = _as_float(btc_order.get('filled_avg_price')) or btc_limit
 
         log_trade_event(
             logger, event_type="call_roll_btc_filled",
@@ -355,58 +693,126 @@ class CallRoller:
             order_id=btc_order_id,
             filled_qty=btc_filled_qty,
             filled_price=btc_filled_price,
+            requested_qty=contracts,
         )
 
-        # === LEG 2: Sell-to-open ===
-        stc_fill_result = self._attempt_stc(
-            new_symbol, underlying, contracts, new_bid, opportunity, earnings_info)
+        if btc_filled_qty < contracts:
+            # Partial-fill truth (DD-1). The remainder is dead — either our
+            # cancel above killed it or the order reached a terminal status —
+            # and the position keeps `contracts - filled` of the OLD call, still
+            # covered, still evaluated tomorrow. The STO leg must be sized to
+            # what actually closed; the as-built code passed the REQUESTED qty,
+            # which would sell a call against shares still pledged to the
+            # unclosed remainder.
+            #
+            # No cancel is needed here: either the timeout path above already
+            # canceled, or the poll returned a TERMINAL status, which means
+            # nothing of this order is still working.
+            log_trade_event(
+                logger, event_type="call_roll_partial_fill",
+                symbol=old_symbol, underlying=underlying,
+                strategy="roll_call", success=True,
+                leg="btc",
+                requested_qty=contracts,
+                filled_qty=btc_filled_qty,
+                unfilled_qty=contracts - btc_filled_qty,
+            )
 
-        if stc_fill_result and stc_fill_result.get('success'):
-            stc_order_id = stc_fill_result['order_id']
-            stc_filled_qty = stc_fill_result['filled_qty']
-            stc_filled_price = stc_fill_result['filled_price']
+        # === LEG 2: Sell-to-open, sized to what actually closed ===
+        stc_result = self._attempt_stc(opportunity, btc_filled_qty, btc_filled_price)
 
-            # Calculate actual net premium
-            btc_total = btc_filled_price * btc_filled_qty * 100
-            stc_total = stc_filled_price * stc_filled_qty * 100
-            net_premium = stc_total - btc_total
+        if stc_result and stc_result.get('unknown_disposition'):
+            return self._unknown_disposition(
+                leg='stc', order_id=stc_result.get('order_id', ''),
+                symbol=stc_result.get('symbol', new_symbol),
+                underlying=underlying, earnings_info=earnings_info,
+                detail=("STO cancel did not settle to a terminal status within "
+                        "the bound; the order may still be working, so no "
+                        "further sell was placed"),
+                btc_order_id=btc_order_id, btc_filled_qty=btc_filled_qty)
 
-            # Handle partial fill
-            if stc_filled_qty < contracts:
+        if stc_result and stc_result.get('success'):
+            stc_filled_qty = stc_result['filled_qty']
+            stc_filled_price = stc_result['filled_price']
+
+            # Per-replaced-quantity accounting (FC-078 review, execution H-2 =
+            # trader M-1). The shipped version computed
+            # ``stc_price*stc_qty - btc_price*btc_qty`` across MIXED quantities,
+            # so a 2-contract BTC against a 1-contract STO reported
+            # ``call_roll_completed`` with net_credit = -$590 — a blended DEBIT
+            # labelled a credit — while 100 shares sat uncovered with no
+            # naked-exposure-class event. The credit invariant is a per-contract
+            # guarantee; only a per-contract number may be called a credit.
+            replaced = min(stc_filled_qty, btc_filled_qty)
+            uncovered = btc_filled_qty - replaced
+            net_credit = (stc_filled_price - btc_filled_price) * replaced * 100
+            btc_cash_paid = btc_filled_price * btc_filled_qty * 100
+            stc_cash_received = stc_filled_price * stc_filled_qty * 100
+
+            if uncovered > 0:
                 log_trade_event(
                     logger, event_type="call_roll_partial_fill",
-                    symbol=new_symbol, underlying=underlying,
+                    symbol=stc_result['symbol'], underlying=underlying,
                     strategy="roll_call", success=True,
-                    requested_qty=contracts,
+                    leg="stc",
+                    requested_qty=btc_filled_qty,
                     filled_qty=stc_filled_qty,
-                    unfilled_qty=contracts - stc_filled_qty,
+                    unfilled_qty=uncovered,
                 )
-
-            # Update state
-            self.wheel_state.remove_position(underlying, 'call', btc_filled_qty, 'rolled')
-            self.wheel_state.add_call_position(
-                underlying, stc_filled_qty, stc_filled_price, clock.now())
-            self.wheel_state.set_active_call_details(
-                underlying, new_symbol, stc_filled_price,
-                opportunity['new_strike'], stc_filled_qty,
-                clock.now().strftime('%Y-%m-%d'))
-            self.wheel_state.record_call_roll(
-                underlying, old_symbol, new_symbol, stc_filled_qty,
-                net_premium, btc_total, stc_total,
-                opportunity['old_strike'], opportunity['new_strike'],
-                clock.now().strftime('%Y-%m-%d'))
+                # The remainder is exactly the naked-exposure case, at a smaller
+                # quantity — plan §1 already said so ("the uncovered remainder
+                # falls through to the naked-exposure terminal if no later rung
+                # covers it"); the code did not. One terminal, alert-wired,
+                # reporting both legs explicitly rather than a blended figure.
+                log_error_event(
+                    logger, error_type="call_roll_partial_naked_exposure",
+                    error_message=(
+                        f"Rolled {replaced} of {btc_filled_qty} contracts — "
+                        f"{uncovered} contract(s) worth of shares "
+                        f"({uncovered * 100}) are UNCOVERED (no naked position); "
+                        f"next /scan -> /run re-covers through the entry path "
+                        f"with all entry gates applied"),
+                    component="call_roller", recoverable=False,
+                    symbol=stc_result['symbol'], underlying=underlying,
+                    old_option_symbol=old_symbol,
+                    contracts_replaced=replaced,
+                    contracts_uncovered=uncovered,
+                    btc_filled_qty=btc_filled_qty,
+                    btc_filled_price=btc_filled_price,
+                    btc_cash_paid=round(btc_cash_paid, 2),
+                    stc_filled_qty=stc_filled_qty,
+                    stc_filled_price=stc_filled_price,
+                    stc_cash_received=round(stc_cash_received, 2),
+                    net_credit_on_replaced=round(net_credit, 2),
+                    btc_order_id=btc_order_id,
+                    stc_order_id=stc_result['order_id'],
+                )
+                return {
+                    'success': False,
+                    'reason': 'partial_naked_exposure',
+                    'underlying': underlying,
+                    'contracts_replaced': replaced,
+                    'contracts_uncovered': uncovered,
+                    'net_credit_on_replaced': round(net_credit, 2),
+                    'btc_order_id': btc_order_id,
+                    'stc_order_id': stc_result['order_id'],
+                }
 
             log_position_update(
                 logger, event_type="call_roll_completed",
                 symbol=underlying,
                 position_status="rolled",
                 old_strike=opportunity['old_strike'],
-                new_strike=opportunity['new_strike'],
-                net_premium=round(net_premium, 2),
+                new_strike=stc_result.get('new_strike', opportunity['new_strike']),
+                old_option_symbol=old_symbol,
+                new_option_symbol=stc_result['symbol'],
+                net_credit=round(net_credit, 2),
                 contracts=stc_filled_qty,
-                roll_count=self.wheel_state.get_roll_count(underlying),
+                pricing_mode=opportunity['pricing_mode'],
+                btc_filled_price=btc_filled_price,
+                stc_filled_price=stc_filled_price,
                 btc_order_id=btc_order_id,
-                stc_order_id=stc_order_id,
+                stc_order_id=stc_result['order_id'],
                 **earnings_info,
             )
 
@@ -414,65 +820,220 @@ class CallRoller:
                 'success': True,
                 'underlying': underlying,
                 'old_strike': opportunity['old_strike'],
-                'new_strike': opportunity['new_strike'],
+                'new_strike': stc_result.get('new_strike', opportunity['new_strike']),
                 'contracts': stc_filled_qty,
-                'net_premium': round(net_premium, 2),
+                'net_credit': round(net_credit, 2),
                 'btc_order_id': btc_order_id,
-                'stc_order_id': stc_order_id,
-            }
-        else:
-            # STO failed after BTC succeeded — naked exposure
-            log_error_event(
-                logger, error_type="call_roll_naked_exposure",
-                error_message="STO failed after BTC succeeded — shares uncovered",
-                component="call_roller", recoverable=False,
-                symbol=new_symbol, underlying=underlying,
-                btc_order_id=btc_order_id,
-            )
-            # Still update state for the BTC side
-            self.wheel_state.remove_position(underlying, 'call', btc_filled_qty, 'rolled_btc_only')
-            return {
-                'success': False,
-                'reason': 'stc_failed_naked_exposure',
-                'btc_order_id': btc_order_id,
-                'underlying': underlying,
+                'stc_order_id': stc_result['order_id'],
             }
 
-    def _attempt_stc(self, new_symbol: str, underlying: str, contracts: int,
-                     new_bid: float, opportunity: Dict, earnings_info: Dict) -> Optional[Dict]:
-        """Attempt STO with retry at flat bid then fallback strikes."""
-        # First attempt: aggressive pricing
-        stc_limit = round(new_bid * (1 - self.config.rolling_stc_limit_under_bid_pct), 2)
-        result = self._place_and_poll_stc(new_symbol, underlying, contracts, stc_limit)
-        if result and result.get('success'):
-            return result
+        # STO ladder exhausted after a BTC fill. The shares are uncovered but
+        # LONG-ONLY — there is no naked position — and the residual is not "a
+        # day's premium leak": worst case is the full BTC debit paid in cash
+        # with nothing sold against it, re-covered later through the entry path
+        # at entry-band premiums, adversely selected. Near a report the FC-013
+        # span gate can legitimately leave the shares uncovered through the
+        # event. That is correct by doctrine and a real terminal outcome, which
+        # is why this event is alert-wired rather than absorbed.
+        log_error_event(
+            logger, error_type="call_roll_naked_exposure",
+            error_message=("STO ladder exhausted after BTC filled — shares "
+                           "uncovered (no naked position); next /scan -> /run "
+                           "re-covers through the entry path with all entry "
+                           "gates applied"),
+            component="call_roller", recoverable=False,
+            symbol=new_symbol, underlying=underlying,
+            btc_order_id=btc_order_id,
+            btc_filled_qty=btc_filled_qty,
+            btc_filled_price=btc_filled_price,
+        )
+        return {
+            'success': False,
+            'reason': 'stc_failed_naked_exposure',
+            'btc_order_id': btc_order_id,
+            'btc_filled_qty': btc_filled_qty,
+            'underlying': underlying,
+        }
 
-        # Retry at flat bid
-        result = self._place_and_poll_stc(new_symbol, underlying, contracts, round(new_bid, 2))
-        if result and result.get('success'):
-            return result
+    def _unknown_disposition(self, *, leg: str, order_id: str, symbol: str,
+                             underlying: str, earnings_info: Dict[str, Any],
+                             detail: str, **fields: Any) -> Dict[str, Any]:
+        """The fail-safe terminal: an order whose fate we could not establish.
 
-        # Try fallback strikes from the candidate list
-        min_strike = max(opportunity['cost_basis_per_share'],
-                         opportunity['old_strike'] + 0.01)
-        fallback_calls = self.market_data.find_suitable_calls(
-            underlying, min_strike_price=min_strike)
+        This exists because the honest answer to "did that cancel work?" is
+        sometimes "we don't know", and every other answer the code could give is
+        a guess about live contracts. It is alert-wired precisely because it
+        needs a human to look at the account — the bot deliberately stops
+        touching the position rather than acting on a guess.
+        """
+        log_error_event(
+            logger, error_type="call_roll_unknown_disposition",
+            error_message=(
+                f"{leg.upper()} order {order_id} disposition UNKNOWN — {detail}. "
+                f"No further orders placed for this position this cycle; "
+                f"check the account before the next cycle."),
+            component="call_roller", recoverable=False,
+            symbol=symbol, underlying=underlying, leg=leg, order_id=order_id,
+            **fields,
+        )
+        return {'success': False, 'reason': f'{leg}_disposition_unknown',
+                'order_id': order_id, 'underlying': underlying}
 
-        for fallback in fallback_calls[1:self.config.rolling_fallback_strike_attempts + 1]:
-            fb_symbol = fallback['symbol']
-            fb_bid = fallback.get('bid', 0)
-            if fb_bid <= 0:
+    # ------------------------------------------------------------------ #
+    # The STO ladder
+    # ------------------------------------------------------------------ #
+    def _attempt_stc(self, opportunity: Dict[str, Any], qty: int,
+                     btc_filled_price: float) -> Optional[Dict[str, Any]]:
+        """Sell-to-open with a bounded retry ladder.
+
+        **At most one STO order is live at any instant** — an invariant, not an
+        aspiration. As-built, a rung that timed out left its DAY limit working
+        and the ladder placed the next sell on top of it: two live sells against
+        one covered lot, and a late fill on rung 1 while rung 2 works is a
+        genuine **naked short call**. Every rung transition here is
+        cancel-then-SETTLE, and a cancel that fails because the order filled is
+        reported as that rung *succeeding*.
+
+        The invariant needs the settle, not just the cancel (review H-1): an
+        Alpaca cancel is queued, so a rung sitting in ``pending_cancel`` is
+        still working. If a rung will not settle, the ladder **stops** — placing
+        the next sell against an unresolved one is exactly the naked-call window
+        this method exists to close.
+        """
+        underlying = opportunity['underlying']
+        # (order_id, symbol, strike, limit)
+        live: Optional[Tuple[str, str, float, float]] = None
+
+        for symbol, limit, new_strike in self._rungs(opportunity, btc_filled_price):
+            if live is not None:
+                pending = live
+                live = None
+                resolved, settled = self._settle_live_rung(pending, underlying)
+                if resolved:
+                    return resolved
+                if not settled:
+                    return {'success': False, 'unknown_disposition': True,
+                            'order_id': pending[0], 'symbol': pending[1]}
+
+            order_id = self._place_stc(symbol, underlying, qty, limit)
+            if order_id is None:
                 continue
-            fb_limit = round(fb_bid * (1 - self.config.rolling_stc_limit_under_bid_pct), 2)
-            result = self._place_and_poll_stc(fb_symbol, underlying, contracts, fb_limit)
-            if result and result.get('success'):
-                return result
+
+            order = self._poll_order_fill(order_id)
+            if order is None:
+                # Timed out with the order still working — carry it forward so
+                # the NEXT rung cancels-and-verifies before placing anything.
+                live = (order_id, symbol, new_strike, limit)
+                continue
+
+            filled_qty = int(_as_float(order.get('filled_qty')))
+            if filled_qty > 0:
+                return self._stc_success(order_id, symbol, underlying, new_strike,
+                                         filled_qty, order, limit)
+            # Terminal with zero fill (rejected / expired / canceled): nothing
+            # is live, so the next rung may be placed directly.
+            log_error_event(
+                logger, error_type="call_roll_stc_unfilled",
+                error_message=f"STO order {order_id} status={order.get('status')}",
+                component="call_roller", recoverable=True,
+                symbol=symbol, underlying=underlying, order_id=order_id,
+            )
+
+        if live is not None:
+            resolved, settled = self._settle_live_rung(live, underlying)
+            if resolved:
+                return resolved
+            if not settled:
+                return {'success': False, 'unknown_disposition': True,
+                        'order_id': live[0], 'symbol': live[1]}
 
         return None
 
-    def _place_and_poll_stc(self, symbol: str, underlying: str,
-                            contracts: int, limit_price: float) -> Optional[Dict]:
-        """Place STO order and poll for fill."""
+    def _rungs(self, opportunity: Dict[str, Any],
+               btc_filled_price: float) -> Iterator[Tuple[str, float, float]]:
+        """Yield ``(symbol, limit, strike)`` per ladder rung, priced when reached.
+
+        Rung 1 — the primary candidate at the pre-BTC re-checked limit.
+        Rung 2 — the primary at the invariant *minimum* price
+                 (``btc_filled_price + min_credit``), used only when that is
+                 BELOW rung 1's price, i.e. only when the BTC filled better than
+                 its limit. Never below the minimum: that is the invariant.
+        Rungs 3+ — up to ``fallback_strike_attempts`` further candidates from the
+                 stored legal list, each re-quoted, re-validated through
+                 ``validate_roll``, and re-tested against the invariant computed
+                 from the **actual BTC fill price**. Candidates are never
+                 re-queried from the chain (M-8): the stored list is the one that
+                 passed the span gate, the profile and the floor.
+        """
+        min_credit = opportunity['min_credit_per_share']
+        floor_price = round(btc_filled_price + min_credit, 2)
+        primary_symbol = opportunity['new_option_symbol']
+        primary_limit = opportunity['stc_limit']
+
+        yield (primary_symbol, primary_limit, opportunity['new_strike'])
+
+        if 0 < floor_price < primary_limit:
+            yield (primary_symbol, floor_price, opportunity['new_strike'])
+
+        attempts = self.config.rolling_fallback_strike_attempts
+        for entry in opportunity['fallback_candidates'][1:1 + attempts]:
+            symbol = entry['new_option_symbol']
+            quote = self.alpaca.get_option_quote(symbol) or {}
+            limit = self._stc_limit_from_quote(
+                _as_float(quote.get('bid')), _as_float(quote.get('ask')),
+                opportunity['imminent'])
+            if limit is None:
+                continue
+
+            valid, _reason = self.risk_manager.validate_roll(
+                entry['candidate'], opportunity['old_strike'],
+                opportunity['cost_basis_per_share'], opportunity['max_expiry'])
+            if not valid:
+                continue
+
+            # The invariant against what the BTC ACTUALLY cost, not its limit.
+            if (limit - btc_filled_price) + _CREDIT_EPSILON < min_credit:
+                continue
+
+            yield (symbol, limit, entry['new_strike'])
+
+    def _settle_live_rung(self, live: Tuple[str, str, float, float],
+                          underlying: str
+                          ) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """Cancel a working STO rung and wait for the broker to settle it.
+
+        Returns ``(result, settled)``:
+
+        - ``(success_dict, True)`` — the cancel lost the race to a fill, so that
+          rung SUCCEEDED. A partial fill counts as that rung's result; the
+          uncovered remainder is reported by the caller.
+        - ``(None, True)`` — settled terminal with nothing filled. Safe to place
+          the next rung.
+        - ``(None, False)`` — **did not settle.** The order may still be
+          working, so the ladder must stop: placing another sell here is the
+          two-live-sells window in its purest form.
+        """
+        order_id, symbol, new_strike, limit_price = live
+        order = self._cancel_and_settle(order_id)
+        if order is None:
+            log_error_event(
+                logger, error_type="call_roll_stc_disposition_unknown",
+                error_message=(
+                    f"STO order {order_id} did not settle after cancel; "
+                    f"ladder stopped rather than placing another sell"),
+                component="call_roller", recoverable=False,
+                symbol=symbol, underlying=underlying, order_id=order_id,
+            )
+            return None, False
+        filled_qty = int(_as_float(order.get('filled_qty')))
+        if filled_qty > 0:
+            return self._stc_success(order_id, symbol, underlying, new_strike,
+                                     filled_qty, order, limit_price), True
+        return None, True
+
+    def _place_stc(self, symbol: str, underlying: str, contracts: int,
+                   limit_price: float) -> Optional[str]:
+        """Place one STO rung. Returns the order id, or None if it was refused."""
         log_trade_event(
             logger, event_type="call_roll_stc_placed",
             symbol=symbol, underlying=underlying,
@@ -485,98 +1046,121 @@ class CallRoller:
             side='sell', order_type='limit', limit_price=limit_price)
 
         if not result or not result.get('success', False):
-            return None
-
-        order_id = result.get('order_id', '')
-        fill = self._poll_order_fill(order_id)
-
-        if not fill:
-            return None
-
-        status = fill.get('status', '')
-        filled_qty = fill.get('filled_qty', 0)
-
-        if filled_qty > 0:
-            log_trade_event(
-                logger, event_type="call_roll_stc_filled",
-                symbol=symbol, underlying=underlying,
-                strategy="roll_call", success=True,
-                order_id=order_id,
-                filled_qty=filled_qty,
-                filled_price=fill.get('filled_avg_price', limit_price),
+            log_error_event(
+                logger, error_type="call_roll_stc_rejected",
+                error_message=(result.get('error_message', 'STO order rejected')
+                               if result else 'No result'),
+                component="call_roller", recoverable=True,
+                symbol=symbol, underlying=underlying, limit_price=limit_price,
             )
-            return {
-                'success': True,
-                'order_id': order_id,
-                'filled_qty': filled_qty,
-                'filled_price': fill.get('filled_avg_price', limit_price),
-                'symbol': symbol,
-            }
+            return None
+        return result.get('order_id', '')
 
-        log_error_event(
-            logger, error_type="call_roll_stc_unfilled",
-            error_message=f"STO order {order_id} status={status}",
-            component="call_roller", recoverable=True,
+    def _stc_success(self, order_id: str, symbol: str, underlying: str,
+                     new_strike: float, filled_qty: int, order: Dict[str, Any],
+                     limit_price: Optional[float]) -> Dict[str, Any]:
+        filled_price = _as_float(order.get('filled_avg_price'))
+        if filled_price <= 0 and limit_price is not None:
+            filled_price = limit_price
+        log_trade_event(
+            logger, event_type="call_roll_stc_filled",
             symbol=symbol, underlying=underlying,
+            strategy="roll_call", success=True,
             order_id=order_id,
+            filled_qty=filled_qty,
+            filled_price=filled_price,
         )
-        return None
+        return {
+            'success': True,
+            'order_id': order_id,
+            'filled_qty': filled_qty,
+            'filled_price': filled_price,
+            'symbol': symbol,
+            'new_strike': new_strike,
+        }
 
-    def _poll_order_fill(self, order_id: str) -> Optional[Dict]:
-        """Poll order status until terminal state or timeout."""
-        timeout = self.config.rolling_btc_fill_timeout_seconds
+    # ------------------------------------------------------------------ #
+    # Order plumbing
+    # ------------------------------------------------------------------ #
+    def _poll_order_fill(self, order_id: str,
+                         timeout: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Poll until the order reaches a terminal status, or the timeout.
+
+        ``partially_filled`` is NOT terminal: returning on it (as-built) hands
+        the caller a half-fill while the remainder is still working, which is
+        how the STO leg came to be sized off the requested quantity. Neither is
+        ``pending_cancel``. Returns None when no terminal status was observed
+        inside the bound — which means **we do not know what this order did**,
+        and every caller must treat it that way.
+
+        An unreadable order (API error, empty response) is NOT a disposition
+        either: it simply fails to advance the poll, and if it never advances
+        the caller gets None. The alternative — reading a blip as "verified zero
+        fill" — is how a filled contract gets reported as canceled.
+        """
+        if timeout is None:
+            timeout = self.config.rolling_btc_fill_timeout_seconds
         poll_interval = 5
         elapsed = 0
+        reported_refetch_failure = False
 
-        while elapsed < timeout:
+        while True:
             try:
                 order = self.alpaca.get_order_by_id(order_id)
-                status = order.get('status', '')
-                if status in ('filled', 'partially_filled', 'expired', 'canceled'):
+                if order and order.get('status', '') in _TERMINAL_ORDER_STATUSES:
                     return order
-            except Exception:
-                pass
+            except Exception as exc:
+                # Once per poll, not once per read: a persistent outage should
+                # leave one breadcrumb, not twenty-four.
+                if not reported_refetch_failure:
+                    reported_refetch_failure = True
+                    log_error_event(
+                        logger, error_type="call_roll_order_refetch_failed",
+                        error_message=str(exc), component="call_roller",
+                        recoverable=True, order_id=order_id,
+                    )
+            if elapsed >= timeout:
+                return None
             time.sleep(poll_interval)
             elapsed += poll_interval
 
-        return None
+    def _cancel_and_settle(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Cancel an order, then poll until the broker SETTLES it.
 
-    def _compute_net_roll_economics(self, original_premium: float,
-                                     btc_ask: float, new_bid: float,
-                                     contracts: int) -> Dict[str, Any]:
-        """Compute net credit/debit for the roll using conservative pricing."""
-        btc_cost_per = btc_ask  # paying ask to close
-        stc_credit_per = new_bid  # receiving bid to open
-        net_per_contract = stc_credit_per - btc_cost_per  # positive = credit
-        net_debit = -net_per_contract if net_per_contract < 0 else 0
-        net_credit = net_per_contract if net_per_contract > 0 else 0
+        FC-078 review, execution H-1. Alpaca cancels are queued: the order goes
+        to ``pending_cancel`` and can still fill from there. A single re-read
+        after the cancel therefore establishes nothing — the shipped version
+        dispatched on ``filled_qty`` while ignoring a non-terminal status, which
+        produced two documented fictions in the reviewer's probe: an STO ladder
+        that placed three sells which all filled while reporting
+        ``naked_exposure`` ("no naked position") against two genuinely naked
+        calls, and a BTC reporting ``btc_timeout_canceled`` with
+        ``order_status=pending_cancel`` while the DAY order kept working.
 
-        debit_pct_of_premium = (net_debit / original_premium * 100) if original_premium > 0 else 999
+        Returns the terminal order dict, or **None when the disposition could
+        not be established**. None is not "nothing filled": it is "we do not
+        know", and callers fail safe on it — never placing another sell, always
+        emitting the alert-wired unknown-disposition terminal.
+        """
+        self._safe_cancel(order_id)
+        return self._poll_order_fill(
+            order_id, timeout=_CANCEL_SETTLE_TIMEOUT_SECONDS)
 
-        return {
-            'btc_cost_per': btc_cost_per,
-            'stc_credit_per': stc_credit_per,
-            'net_per_contract': net_per_contract,
-            'net_debit': net_debit,
-            'net_credit': net_credit,
-            'total_net': net_per_contract * contracts * 100,
-            'debit_pct_of_premium': round(debit_pct_of_premium, 2),
-        }
-
-    def _check_debit_tolerance(self, net_debit: float, original_premium: float,
-                                notional_value: float) -> bool:
-        """Check if net debit is within tolerance bounds."""
-        if net_debit <= 0:
-            return True  # credit roll — always ok
-
-        # Primary gate: debit as % of original premium
-        max_debit_premium = original_premium * self.config.rolling_max_debit_pct_of_premium
-        if net_debit > max_debit_premium:
+    def _safe_cancel(self, order_id: str) -> bool:
+        """Cancel, swallowing failure. A failed cancel is never conclusive — the
+        caller settles the order afterwards, which is what decides the
+        disposition."""
+        try:
+            return bool(self.alpaca.cancel_order(order_id))
+        except Exception:
             return False
 
-        # Backstop: debit as % of notional
-        max_debit_notional = notional_value * self.config.rolling_max_debit_pct_of_notional
-        if net_debit > max_debit_notional:
-            return False
 
-        return True
+def _as_float(value: Any) -> float:
+    """Coerce a quote/order field to a float, treating junk as 0.0."""
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0

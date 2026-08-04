@@ -6,7 +6,7 @@ Each simulated trading day:
                       ->  OptionsScanner.scan_for_put_opportunities()
                           + scan_for_call_opportunities()      (find candidates)
                       ->  ExecutionEngine: filter -> rank -> select -> execute
-                      ->  Friday only: wheel_engine.run_rolling_cycle()
+                      ->  wheel_engine.run_rolling_cycle()   (daily, FC-078)
                       ->  settle expirations against today's close
                       ->  record equity
 
@@ -50,7 +50,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import structlog
 
@@ -134,13 +134,14 @@ class SimulationResult:
     # from, so the early-assignment test could not be applied. The residual of
     # C2, reported rather than assumed away.
     unpriced_ex_div_calls: int = 0
-    # FC-068 roller tripwire. The Friday `run_rolling_cycle()` call is kept so
-    # the replay reproduces the production week, and today it is a guaranteed
-    # no-op (the roller's quote-key mismatch returns None before any gate). A
-    # golden replay asserts `rolls_executed == 0`, so FC-066's fix flips a test
-    # rather than silently changing every measurement.
+    # Roller activity. FC-078 revived the roller and made the replay's cadence
+    # daily to match production, which flipped the FC-068 tripwire by design.
+    # `roll_records` carries the executed rolls so the golden replay can assert
+    # what actually matters now — every executed roll netted a credit and
+    # increased the strike — instead of "the roller never fires".
     rolls_evaluated: int = 0
     rolls_executed: int = 0
+    roll_records: List[Dict[str, Any]] = field(default_factory=list)
     # FC-013 earnings-table coverage, both reported rather than assumed away.
     # `without_data`: the symbol is absent from the table entirely.
     # `past_horizon`: the symbol IS in the table but every date it carries is
@@ -181,7 +182,6 @@ class Simulator:
         warmup_calendar_days: int = 60,
         earnings_calendar: Optional[object] = None,
         dividend_schedule: Optional[DividendSchedule] = None,
-        roll_weekday: int = 4,
     ) -> None:
         self.config = restrict_symbols(config, symbols)
         self.provider = provider
@@ -218,8 +218,6 @@ class Simulator:
         if dividend_schedule is None:
             dividend_schedule = load_default_schedule()
         self.dividends = dividend_schedule
-        # Production runs the roll cycle on Fridays (weekday 4).
-        self.roll_weekday = roll_weekday
 
     # ------------------------------------------------------------------ #
     # Data loading
@@ -416,6 +414,7 @@ class Simulator:
         self._unpriced_ex_div_calls = 0
         self._rolls_evaluated = 0
         self._rolls_executed = 0
+        self._roll_records: List[Dict[str, Any]] = []
 
         # Swap the analytics singleton for a recorder: strategy code fetches it
         # from module scope, so there is no injection point. Restored on exit.
@@ -471,23 +470,26 @@ class Simulator:
                     self._execute_opportunities(
                         exec_engine, put_seller, call_seller, opportunities, client
                     )
-                    # Production runs the roll cycle Friday afternoon, after the
-                    # normal cycle. CallRoller executes its own BTC/STO legs, so
-                    # unlike the scan it needs no separate execution phase.
+                    # Production runs the roll cycle every trading day at 15:30
+                    # ET, after the normal cycle. CallRoller executes its own
+                    # BTC/STO legs, so unlike the scan it needs no separate
+                    # execution phase.
                     #
-                    # Kept deliberately (FC-068): the Friday /roll scheduler
-                    # invokes this exact code, and the replay reproduces its
-                    # exact no-op — `evaluate_roll_opportunity` reads
-                    # `last_price`/`ask_price` from a client that returns
-                    # `bid`/`ask`, so price resolves to 0 and it returns None
-                    # before any eligibility gate. A golden replay asserts
-                    # `rolls_executed == 0`, so when FC-066 fixes the roller it
-                    # flips a test instead of silently changing every
-                    # measurement.
-                    if day.weekday() == self.roll_weekday:
-                        rolls = engine.run_rolling_cycle() or {}
-                        self._rolls_evaluated += int(rolls.get('rolls_evaluated', 0) or 0)
-                        self._rolls_executed += int(rolls.get('rolls_executed', 0) or 0)
+                    # FC-078 §9: the replay mirrors production, so this is daily,
+                    # not Friday-only. A Friday-only replay of a DAILY production
+                    # roller would misstate roll frequency and credit capture in
+                    # every future measurement — the simulator's whole job is
+                    # replaying the production week as it is actually run.
+                    #
+                    # This is the FC-068 tripwire firing as designed: the golden
+                    # replay's `rolls_executed == 0` assertion flips here rather
+                    # than every backtest number changing silently.
+                    rolls = engine.run_rolling_cycle() or {}
+                    self._rolls_evaluated += int(rolls.get('rolls_evaluated', 0) or 0)
+                    self._rolls_executed += int(rolls.get('rolls_executed', 0) or 0)
+                    self._roll_records.extend(
+                        r for r in (rolls.get('roll_details') or [])
+                        if r.get('success'))
                 except Exception:
                     logger.exception(
                         "Strategy cycle raised during replay",
@@ -547,6 +549,7 @@ class Simulator:
             unpriced_ex_div_calls=self._unpriced_ex_div_calls,
             rolls_evaluated=self._rolls_evaluated,
             rolls_executed=self._rolls_executed,
+            roll_records=list(self._roll_records),
             earnings_symbols_without_data=sorted(
                 getattr(self.earnings_calendar, 'symbols_without_data', set()) or []),
             earnings_symbols_past_horizon=sorted(

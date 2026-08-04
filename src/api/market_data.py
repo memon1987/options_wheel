@@ -9,6 +9,7 @@ import structlog
 from .alpaca_client import AlpacaClient
 from ..utils import clock
 from ..utils.config import Config
+from ..utils.option_symbols import coerce_expiry_date
 
 logger = structlog.get_logger(__name__)
 
@@ -23,25 +24,11 @@ logger = structlog.get_logger(__name__)
 _DEFAULT_CACHE_TTL = timedelta(seconds=300)
 
 
-def _coerce_date(value) -> Optional[date]:
-    """Normalize an expiration to a plain ``date``, or None if unusable.
-
-    Contracts arrive with ``expiration_date`` as an ISO string from both the
-    live client (``parse_option_symbol``) and the backtest adapter
-    (``quote.expiration.isoformat()``), but ``get_option_chain_with_analysis``
-    also tolerates ``datetime``, and test fixtures pass ``date``. One coercion
-    so the FC-013 span comparison cannot silently compare a str to a date.
-    """
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    try:
-        return datetime.fromisoformat(str(value)[:10].replace('Z', '')).date()
-    except (TypeError, ValueError):
-        return None
+# FC-078 moved the body to ``src/utils/option_symbols.coerce_expiry_date`` so
+# ``RiskManager.validate_roll``'s roll-horizon bound can share the exact same
+# coercion. The name is kept as a module-local alias: every existing call site
+# and test reference resolves unchanged.
+_coerce_date = coerce_expiry_date
 
 
 class MarketDataManager:
@@ -403,7 +390,9 @@ class MarketDataManager:
         return suitable_puts[:5]  # Return top 5
     
     def find_suitable_calls(self, symbol: str, min_strike_price: float = 0.0,
-                            exclude_expiry_on_or_after: Optional[date] = None
+                            exclude_expiry_on_or_after: Optional[date] = None,
+                            include_expiry_on_or_before: Optional[date] = None,
+                            criteria_profile: str = 'entry'
                             ) -> List[Dict[str, Any]]:
         """Find call options suitable for selling in wheel strategy.
 
@@ -428,10 +417,46 @@ class MarketDataManager:
                 ``None`` (the default) is today's behaviour, byte-identical —
                 the parameter is inert for every caller that does not pass it.
 
+            include_expiry_on_or_before: FC-078 DD-3 — the roll-out **horizon**
+                ceiling, symmetric with (and applied alongside) the span floor
+                above. A candidate whose ``expiration_date`` falls strictly
+                after this date is rejected.
+
+                The bound is per-position (old expiry + ``max_extension_days``,
+                an expiry-relative frame), which is why it arrives as a date
+                rather than being read from config here: the shared filter
+                cannot know which contract is being rolled. ``None`` (the
+                default) is inert.
+
+            criteria_profile: which criteria set ``_check_call_criteria_detailed``
+                applies. ``'entry'`` (the default) is today's behaviour,
+                byte-identical — DTE cap, ``min_call_premium`` floor, the entry
+                delta band, liquidity. ``'roll'`` (FC-078 DD-3) drops the DTE
+                cap (the expiry bound arrives as ``include_expiry_on_or_before``
+                instead), drops the premium floor (the roll's economics are the
+                *net* credit, not the standalone premium), and replaces the
+                entry delta band with a bare upper rail
+                ``rolling_max_replacement_delta`` — the band's *lower* bound is
+                the trap that made shallow-ITM rescue illegal. Liquidity is kept.
+
+                The ``'roll'`` profile additionally returns the **full** legal
+                candidate list rather than the entry path's top-5-by-return_score
+                slice. FC-078 DD-3 selects the executed contract by maximum net
+                credit, and ``return_score`` (annualised yield x OTM preference)
+                is entry-shaped: truncating by it would drop near-money,
+                high-credit replacements before the roller ever ranked them —
+                the same failure mode DD-3 rejected first-past-the-post
+                ordering for. See the FC-078 PR body, "plan gap 1".
+
         Returns:
             List of suitable call options, sorted by attractiveness
         """
         span_floor = _coerce_date(exclude_expiry_on_or_after)
+        horizon_ceiling = _coerce_date(include_expiry_on_or_before)
+        if criteria_profile not in ('entry', 'roll'):
+            raise ValueError(
+                f"Unknown criteria_profile {criteria_profile!r} (expected "
+                "'entry' or 'roll')")
         options_data = self.get_option_chain_with_analysis(symbol)
         calls = options_data['calls']
 
@@ -444,8 +469,11 @@ class MarketDataManager:
                    min_premium=self.config.min_call_premium,
                    delta_range=self.config.call_delta_range,
                    min_strike_price=min_strike_price,
+                   criteria_profile=criteria_profile,
                    exclude_expiry_on_or_after=(
-                       span_floor.isoformat() if span_floor else None))
+                       span_floor.isoformat() if span_floor else None),
+                   include_expiry_on_or_before=(
+                       horizon_ceiling.isoformat() if horizon_ceiling else None))
 
         # Warn if cost basis protection is not being used. Pre-FC-029 this
         # warning fired for legitimate put-only scans too (no shares held);
@@ -476,6 +504,10 @@ class MarketDataManager:
             # this counter > 0 is a span-emptied symbol (a decision row),
             # while an empty result with it at 0 is ordinary `no_candidates`.
             'expires_into_earnings': 0,
+            # FC-078: expiry beyond the roll-out horizon (old expiry + N). Only
+            # ever non-zero on the 'roll' profile, where the DTE cap is off and
+            # this date bound replaces it.
+            'expiry_beyond_horizon': 0,
             'total_rejected': 0
         }
 
@@ -510,7 +542,8 @@ class MarketDataManager:
                 continue
 
             # Filter by strategy criteria with detailed rejection tracking
-            rejection_reason = self._check_call_criteria_detailed(call)
+            rejection_reason = self._check_call_criteria_detailed(
+                call, profile=criteria_profile)
 
             if rejection_reason:
                 rejection_stats['total_rejected'] += 1
@@ -522,6 +555,25 @@ class MarketDataManager:
                 rejected_calls_data['dtes'].append(call['dte'])
                 rejected_calls_data['strikes'].append(call['strike_price'])
                 continue
+
+            # FC-078 DD-3: the roll-out horizon ceiling. Applied before the span
+            # predicate so the FC-013 counter keeps its meaning ("how many
+            # in-horizon strikes did the event take") rather than being inflated
+            # by contracts that were out of reach anyway. Inert on the entry
+            # profile, which never passes the bound.
+            if horizon_ceiling is not None:
+                expiry = _coerce_date(call.get('expiration_date'))
+                # Same fail-closed posture as the span floor: an expiry we
+                # cannot parse is rejected. "We could not tell how far out this
+                # expires" must not resolve to "sell it".
+                if expiry is None or expiry > horizon_ceiling:
+                    rejection_stats['total_rejected'] += 1
+                    rejection_stats['expiry_beyond_horizon'] += 1
+                    rejected_calls_data['premiums'].append(call['mid_price'])
+                    rejected_calls_data['deltas'].append(abs(call.get('delta', 0)))
+                    rejected_calls_data['dtes'].append(call['dte'])
+                    rejected_calls_data['strikes'].append(call['strike_price'])
+                    continue
 
             # FC-013 DD-3: the earnings SPAN predicate, applied last so the
             # counter answers "how many QUALIFYING strikes did the event take".
@@ -587,7 +639,9 @@ class MarketDataManager:
                        rejected_premium_too_low=rejection_stats['premium_too_low'],
                        rejected_delta_out_of_range=rejection_stats['delta_out_of_range'],
                        rejected_no_liquidity=rejection_stats['no_liquidity'],
-                       rejected_expires_into_earnings=rejection_stats['expires_into_earnings'])
+                       rejected_expires_into_earnings=rejection_stats['expires_into_earnings'],
+                       rejected_expiry_beyond_horizon=rejection_stats['expiry_beyond_horizon'],
+                       criteria_profile=criteria_profile)
         else:
             # Calculate stats for rejected calls
             avg_premium = sum(rejected_calls_data['premiums']) / len(rejected_calls_data['premiums']) if rejected_calls_data['premiums'] else 0
@@ -610,12 +664,20 @@ class MarketDataManager:
                        rejected_delta_out_of_range=rejection_stats['delta_out_of_range'],
                        rejected_no_liquidity=rejection_stats['no_liquidity'],
                        rejected_expires_into_earnings=rejection_stats['expires_into_earnings'],
+                       rejected_expiry_beyond_horizon=rejection_stats['expiry_beyond_horizon'],
+                       criteria_profile=criteria_profile,
                        # Stats on rejected calls
                        rejected_avg_premium=round(avg_premium, 2),
                        rejected_avg_delta=round(avg_delta, 4),
                        rejected_max_premium=round(max_premium, 2),
                        rejected_dte_range=f"{min_dte}-{max_dte}")
 
+        # The entry path keeps its top-5 slice, byte-identical. The roll path
+        # gets the full legal set: FC-078 DD-3 ranks by net credit, and slicing
+        # by the entry-shaped ``return_score`` first would hide exactly the
+        # near-money, high-credit replacements a defensive roll wants.
+        if criteria_profile == 'roll':
+            return suitable_calls
         return suitable_calls[:5]  # Return top 5
 
     def _validate_option_data(self, option: Dict[str, Any]) -> tuple:
@@ -702,15 +764,43 @@ class MarketDataManager:
         # Use detailed checker
         return self._check_put_criteria_detailed(put_option) is None
 
-    def _check_call_criteria_detailed(self, call_option: Dict[str, Any]) -> Optional[str]:
+    def _check_call_criteria_detailed(self, call_option: Dict[str, Any],
+                                      profile: str = 'entry') -> Optional[str]:
         """Check if call option meets criteria and return specific rejection reason.
 
         Args:
             call_option: Call option data
+            profile: ``'entry'`` (default, byte-identical to pre-FC-078
+                behaviour) or ``'roll'`` (FC-078 DD-3 — no DTE cap, no premium
+                floor, delta upper rail only, liquidity kept).
 
         Returns:
             Rejection reason key if rejected, None if passes all criteria
         """
+        if profile == 'roll':
+            # No DTE check: the roll horizon is expiry-relative and per-position,
+            # so it is applied in find_suitable_calls as a date bound, not here.
+            #
+            # No premium floor: what a roll must clear is the NET credit against
+            # the contract being closed, not a standalone premium. min_call_premium
+            # is inert on ITM replacements (they carry large premiums) where it
+            # isn't simply the wrong question.
+            #
+            # Delta: upper rail only. The entry band's lower bound forces far-OTM
+            # replacements exactly when a defensive roll needs near-money strikes —
+            # the documented trap (FC-066 / FC-078 DD-3). The rail blocks
+            # replace-ITM-with-deep-ITM churn, which pins shares under a
+            # near-certain-assignment cap for another two weeks for pennies.
+            delta = abs(call_option.get('delta', 0))
+            if delta > self.config.rolling_max_replacement_delta:
+                return 'delta_out_of_range'
+
+            # Liquidity criteria: kept, identically.
+            if call_option['volume'] == 0 and call_option['open_interest'] < 10:
+                return 'no_liquidity'
+
+            return None
+
         # DTE criteria - check first as it's most common
         max_dte = self.config.call_target_dte
         if call_option['dte'] > max_dte:

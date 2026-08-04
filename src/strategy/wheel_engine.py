@@ -9,7 +9,7 @@ from ..utils import clock
 from ..api.alpaca_client import AlpacaClient
 from ..api.market_data import MarketDataManager
 from ..utils.config import Config
-from ..utils.logging_events import log_system_event, log_trade_event
+from ..utils.logging_events import log_system_event, log_trade_event, log_error_event
 from ..utils.positions import get_stock_positions
 from ..utils.option_symbols import parse_option_symbol
 from ..data.analytics_writer import get_analytics_writer
@@ -20,9 +20,20 @@ from ..api.earnings_calendar import EarningsCalendarService
 
 logger = structlog.get_logger(__name__)
 
+# FC-078 §4 — roll-cycle time budget, in seconds.
+#
+# The daily scheduler job is created with --attempt-deadline 1800s. The budget
+# is that minus headroom, and no position is *started* unless the full
+# per-position worst case remains: BTC 120 s poll + cancel/verify + up to four
+# STO rungs x 120 s. Realistic load is 0-1 executable roll per day; this guard
+# exists for the pathological day, where the alternative is a request killed
+# between a filled BTC and an unplaced STO.
+_CYCLE_BUDGET_SECONDS = 1500
+_PER_POSITION_BUDGET_SECONDS = 600
+
 
 class WheelEngine:
-    """Position housekeeping and the Friday roll cycle.
+    """Position housekeeping and the daily roll cycle.
 
     FC-068 deleted the orchestration half of this class. ``run_strategy_cycle``
     and everything beneath it (``_find_new_opportunities``,
@@ -592,11 +603,42 @@ class WheelEngine:
                         error=str(e))
             return {'error': str(e)}
 
-    def run_rolling_cycle(self) -> Dict[str, Any]:
-        """Run Friday EOW call rolling cycle (FC-006).
+    def _open_order_symbols(self):
+        """Symbols with a live open order, and whether we could tell.
 
-        Evaluates all short call positions for rolling eligibility,
-        then executes qualifying rolls via CallRoller.
+        Returns ``(symbols, ok)``. ``ok=False`` means the fetch failed and the
+        caller must fail CLOSED — an unknown open-order picture cannot protect
+        against the double buy-to-close the guard exists for.
+
+        **FC-043 gotcha, load-bearing:** ``status`` is not a value filter over
+        Alpaca's default page. ``'open'`` is a *query token*, never an
+        ``OrderStatus`` value, and Alpaca's REST default is open/limit-50.
+        ``AlpacaClient.get_orders`` routes the token to ``QueryOrderStatus.OPEN``
+        and raises the page size — passing ``'open'`` here is correct only
+        because of that routing. Filtering on ``status.value == 'open'``, which
+        is what FC-043 found in production, matched nothing at all.
+        """
+        try:
+            orders = self.alpaca.get_orders(status='open') or []
+            # Inside the try on purpose: a malformed response is the same
+            # failure as a raised one — we cannot see the open-order picture —
+            # and it must fail closed rather than take down the whole cycle.
+            return {o.get('symbol', '') for o in orders if o.get('symbol')}, True
+        except Exception as exc:
+            logger.error("Could not fetch open orders for the roll guard",
+                         event_category="error",
+                         event_type="roll_open_orders_fetch_failed",
+                         error=str(exc))
+            return set(), False
+
+    def run_rolling_cycle(self) -> Dict[str, Any]:
+        """Run the daily credit-only call rolling cycle (FC-006, revived by FC-078).
+
+        Evaluates every short call position for rolling eligibility, then
+        executes qualifying rolls via CallRoller. Runs every trading day at
+        15:30 ET — after the last ``/monitor`` (profit-taking churn settled) and
+        after the last ``/run`` execute (a freshly sold call is OTM by
+        construction and simply skips ``not_itm_enough``).
 
         Returns:
             Summary dict with rolls_evaluated, rolls_executed, rolls_skipped.
@@ -616,7 +658,7 @@ class WheelEngine:
 
         roller = CallRoller(
             self.alpaca, self.market_data, self.config,
-            self.wheel_state, risk_manager, earnings_calendar,
+            risk_manager, earnings_calendar,
             allow_bigquery_cost_basis=self._allow_bigquery_cost_basis)
 
         # Get all positions
@@ -633,6 +675,7 @@ class WheelEngine:
 
         # Filter to short call positions
         short_calls = []
+        uncovered_calls = []
         for op in option_positions:
             qty = float(op.get('qty', 0))
             if qty >= 0:
@@ -643,6 +686,14 @@ class WheelEngine:
             underlying = parsed.get('underlying', '')
             if underlying in stock_by_symbol:
                 short_calls.append((op, stock_by_symbol[underlying]))
+            else:
+                # A short call with NO covering shares. The roller cannot roll
+                # it (there is no cost-basis floor to resolve), but silently
+                # dropping it means the one position shape nobody wants — a
+                # genuinely naked short call — is the one the roll cycle never
+                # mentions. Emit a terminal so it shows up in the same place
+                # every other roll decision does (FC-078 review, trader L-1).
+                uncovered_calls.append((op, underlying))
 
         results = {
             'rolls_evaluated': 0,
@@ -651,15 +702,89 @@ class WheelEngine:
             'roll_details': [],
         }
 
+        # FC-078 DD-4: the open-order guard. /monitor places fire-and-forget DAY
+        # buy-to-close limits with no cancel, so at 15:30 the roller can see a
+        # short call with a live BTC still working against it — rolling it could
+        # fill both buys, leaving an unintended LONG call plus a sold
+        # replacement. One API call per cycle, not per position.
+        open_order_symbols, open_orders_ok = self._open_order_symbols()
+
+        for call_pos, underlying in uncovered_calls:
+            results['rolls_evaluated'] += 1
+            results['rolls_skipped'] += 1
+            roller.log_terminal_skip(
+                call_pos.get('symbol', ''), underlying, "no_covering_shares",
+                contracts=abs(int(float(call_pos.get('qty', 0)))))
+
         for call_pos, stock_pos in short_calls:
             results['rolls_evaluated'] += 1
+            option_symbol = call_pos.get('symbol', '')
+            underlying = self._extract_underlying_from_option_symbol(option_symbol) or ''
 
-            opportunity = roller.evaluate_roll_opportunity(call_pos, stock_pos)
+            if not open_orders_ok:
+                # Fail closed: without the open-order picture the guard cannot
+                # protect, and the hazard it guards is a double buy-to-close.
+                roller.log_terminal_skip(
+                    option_symbol, underlying, "open_orders_unavailable")
+                results['rolls_skipped'] += 1
+                continue
+
+            # FC-078 §4: cycle time budget. Worst case per position is ~600 s
+            # (BTC 120 s poll + cancel/verify + up to 4 STO rungs x 120 s), and
+            # a kill BETWEEN the BTC fill and the STO placement is the worst
+            # seam there is — shares uncovered, no event, no alert. So a
+            # position is never *started* without the full worst case left.
+            elapsed = (clock.now() - start_time).total_seconds()
+            if _CYCLE_BUDGET_SECONDS - elapsed < _PER_POSITION_BUDGET_SECONDS:
+                roller.log_terminal_skip(
+                    option_symbol, underlying, "cycle_budget_exhausted",
+                    elapsed_seconds=round(elapsed, 1),
+                    cycle_budget_seconds=_CYCLE_BUDGET_SECONDS,
+                    per_position_budget_seconds=_PER_POSITION_BUDGET_SECONDS)
+                results['rolls_skipped'] += 1
+                continue
+
+            # Per-position isolation: one bad symbol must not kill the cycle.
+            # The except still emits a terminal event, because "exactly one
+            # terminal event per evaluated position" has to hold on the paths
+            # nobody planned for too.
+            try:
+                opportunity = roller.evaluate_roll_opportunity(
+                    call_pos, stock_pos, open_order_symbols)
+            except Exception as exc:
+                logger.error("Roll evaluation raised",
+                             event_category="error",
+                             event_type="roll_position_error",
+                             symbol=option_symbol, error=str(exc), exc_info=True)
+                roller.log_terminal_skip(
+                    option_symbol, underlying, "evaluation_error", error=str(exc))
+                results['rolls_skipped'] += 1
+                continue
+
             if not opportunity:
                 results['rolls_skipped'] += 1
                 continue
 
-            roll_result = roller.execute_roll(opportunity)
+            try:
+                roll_result = roller.execute_roll(opportunity)
+            except Exception as exc:
+                # Deliberately NOT a skip event. An exception raised out of
+                # execute_roll may have left a filled BTC behind, so this is an
+                # error-severity terminal with the same "look at this" weight as
+                # call_roll_naked_exposure, not a benign "no roll today".
+                logger.error("Roll execution raised",
+                             event_category="error",
+                             event_type="roll_position_error",
+                             symbol=option_symbol, error=str(exc), exc_info=True)
+                log_error_event(
+                    logger, error_type="call_roll_execution_error",
+                    error_message=str(exc), component="wheel_engine",
+                    recoverable=False, symbol=option_symbol,
+                    underlying=underlying,
+                )
+                results['rolls_skipped'] += 1
+                continue
+
             results['roll_details'].append(roll_result)
 
             if roll_result.get('success'):
