@@ -32,7 +32,6 @@ def main():
     print(f"✓ Config loaded")
     print(f"  - Paper trading: {config.paper_trading}")
     print(f"  - Stock symbols: {config.stock_symbols}")
-    print(f"  - Max positions: {config.max_total_positions}")
 
     alpaca_client = AlpacaClient(config)
     print(f"✓ Alpaca client initialized")

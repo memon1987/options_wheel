@@ -28,8 +28,11 @@ class PutSeller:
         self.alpaca = alpaca_client
         self.market_data = market_data
         self.config = config
-        self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
-        
+        # FC-069 item 6 deleted `_entry_times` and the min-hold gate it fed.
+        # PutSeller is constructed per request, so the dict populated during
+        # `/run` was already gone by `/monitor` — the gate has been open since
+        # inception. Hold discipline lives in the DTE profit bands.
+
     def _calculate_position_size(self, put_option: Dict[str, Any], override_buying_power: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Calculate appropriate position size for put selling.
 
@@ -289,9 +292,6 @@ class PutSeller:
                     dte=opportunity.get('dte', 0)
                 )
 
-                # Track entry time for hold period (min_hold_hours)
-                self._entry_times[option_symbol] = clock.now()
-
                 return result
 
             else:
@@ -455,13 +455,6 @@ class PutSeller:
 
             # Profit target: Dynamic based on DTE (theta-optimized)
             if unrealized_pl > 0 and position_value > 0:
-                # Hold period check: skip profit-target if position too new
-                entry_time = self._entry_times.get(option_symbol)
-                if entry_time:
-                    hours_held = (clock.now() - entry_time).total_seconds() / 3600
-                    if hours_held < self.config.profit_taking_min_hold_hours:
-                        return False
-
                 profit_percentage = unrealized_pl / position_value
 
                 # Get dynamic profit target based on DTE

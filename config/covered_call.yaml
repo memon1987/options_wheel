@@ -51,10 +51,11 @@ strategy:
   # explicit so the mode is auditable, not to invite alternatives. Reuses the
   # shared CostBasisResolver (FC-050). Consumed in Phase 2.
   floor_mode: avg_entry_price
-  # Position limits.
-  max_positions_per_stock: 1
-  max_total_positions: 20
-  max_exposure_per_ticker: 200000  # larger book than the wheel; $200k/ticker cap
+  # FC-069 S1 deleted the breadth/exposure knobs that were mirrored here from
+  # the wheel (`max_positions_per_stock`, `max_total_positions`,
+  # `max_exposure_per_ticker`) along with their Config properties and
+  # validation. They had no consumer on either profile's live path. Phase 2
+  # sizing is bounded by `max_position_size` and the 4x-margin discipline below.
 
 # Holdings-derived universe (requirement: no configured stock list). The engine
 # writes calls against whatever equity it finds in the account. These controls
@@ -71,9 +72,9 @@ universe:
   earnings_exclusion_days: 5    # no new calls within N days of earnings
 
 risk:
-  max_portfolio_allocation: 0.80
+  # `max_portfolio_allocation` and `min_cash_reserve` deleted by FC-069 S1
+  # (no consumer on either profile).
   max_position_size: 0.35
-  min_cash_reserve: 0.20
   # 4x-margin discipline (Phase 0 found this account is 4x vs the wheel's 2x):
   # size against equity, never buying_power, and alert if long exposure exceeds
   # equity. Consumed in Phase 2.
@@ -96,10 +97,6 @@ risk:
     default_long_dte_target: 0.50
     dte_bands: []
 
-monitoring:
-  check_interval_minutes: 15
-  assignment_alert: true
-  profit_target_alert: true
-  loss_threshold_alert: true
-  enable_cloud_logging: true
-  max_execution_time_minutes: 5
+# The `monitoring:` block was deleted by FC-069 S1 (card 17) on both profiles:
+# zero consumers, and `check_interval_minutes` misrepresented Cloud Scheduler's
+# cadence as config.

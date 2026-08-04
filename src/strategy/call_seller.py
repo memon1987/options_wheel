@@ -56,7 +56,10 @@ class CallSeller:
         self.market_data = market_data
         self.config = config
         self.wheel_state = wheel_state_manager
-        self._entry_times: Dict[str, datetime] = {}  # symbol → entry time for hold period
+        # FC-069 item 6 deleted `_entry_times` and the min-hold gate it fed.
+        # CallSeller is constructed per request, so the dict populated during
+        # `/run` was already gone by `/monitor` — the gate has been open since
+        # inception. Hold discipline lives in the DTE profit bands.
 
     def execute_call_sale(self, opportunity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Execute a covered call trade.
@@ -230,9 +233,6 @@ class CallSeller:
                             contracts=contracts,
                             sell_date=clock.now().strftime('%Y-%m-%d'),
                         )
-
-                # Track entry time for hold period (min_hold_hours)
-                self._entry_times[option_symbol] = clock.now()
 
                 return result
             else:
@@ -488,13 +488,6 @@ class CallSeller:
 
             # Profit target: Dynamic based on DTE (theta-optimized)
             if unrealized_pl > 0 and position_value > 0:
-                # Hold period check: skip profit-target if position too new
-                entry_time = self._entry_times.get(option_symbol)
-                if entry_time:
-                    hours_held = (clock.now() - entry_time).total_seconds() / 3600
-                    if hours_held < self.config.profit_taking_min_hold_hours:
-                        return False
-
                 profit_percentage = unrealized_pl / position_value
 
                 # Get dynamic profit target based on DTE

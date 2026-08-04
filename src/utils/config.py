@@ -152,7 +152,10 @@ class Config:
         # Required sections. ``stocks`` is a configured trading universe, which
         # only the wheel has — the covered-call universe is derived from account
         # holdings, so that profile has no ``stocks`` section.
-        required_sections = ['alpaca', 'strategy', 'risk', 'monitoring']
+        # ``monitoring`` was dropped from this list by FC-069 S1 (card 17):
+        # the block it required had no consumer, so requiring it only forced
+        # every config to carry a corpse.
+        required_sections = ['alpaca', 'strategy', 'risk']
         if strategy_id == 'wheel':
             required_sections.append('stocks')
         for section in required_sections:
@@ -246,34 +249,17 @@ class Config:
             if min_price >= max_price:
                 errors.append(f"min_stock_price ({min_price}) must be less than max_stock_price ({max_price})")
 
-        # Position limits (both profiles)
-        max_positions = strategy.get('max_total_positions', 0)
-        if max_positions <= 0:
-            errors.append(f"max_total_positions must be positive (got {max_positions})")
-
-        max_per_stock = strategy.get('max_positions_per_stock', 0)
-        if max_per_stock <= 0:
-            errors.append(f"max_positions_per_stock must be positive (got {max_per_stock})")
-
-        max_exposure = strategy.get('max_exposure_per_ticker', 0)
-        if max_exposure <= 0:
-            errors.append(f"max_exposure_per_ticker must be positive (got {max_exposure})")
+        # FC-069 S1 removed the validation of `max_total_positions`,
+        # `max_positions_per_stock`, `max_exposure_per_ticker`,
+        # `max_portfolio_allocation` and `min_cash_reserve`. Validating a knob
+        # nothing enforces only guarantees the corpse stays well-formed.
 
         # Risk management validation
         risk = self._config.get('risk', {})
 
-        # Percentages should be in valid ranges
-        max_alloc = risk.get('max_portfolio_allocation', 0)
-        if not (0 < max_alloc <= 1):
-            errors.append(f"max_portfolio_allocation must be between 0 and 1 (got {max_alloc})")
-
         max_pos_size = risk.get('max_position_size', 0)
         if not (0 < max_pos_size <= 1):
             errors.append(f"max_position_size must be between 0 and 1 (got {max_pos_size})")
-
-        min_cash = risk.get('min_cash_reserve', -1)
-        if not (0 <= min_cash < 1):
-            errors.append(f"min_cash_reserve must be between 0 and 1 (got {min_cash})")
 
         # Stop loss percentages
         if risk.get('use_put_stop_loss'):
@@ -337,11 +323,9 @@ class Config:
                 f"rolling.imminence_extrinsic_threshold must be >= 0 "
                 f"(got {imminence!r})")
 
-        # Monitoring validation
-        monitoring = self._config.get('monitoring', {})
-        check_interval = monitoring.get('check_interval_minutes', 0)
-        if check_interval <= 0:
-            errors.append(f"check_interval_minutes must be positive (got {check_interval})")
+        # FC-069 S1 (card 17) deleted the `monitoring:` block and its
+        # `check_interval_minutes` validation — the real cadence is Cloud
+        # Scheduler, and no code ever read the key.
 
         # Report errors
         if errors:
@@ -444,19 +428,11 @@ class Config:
         """Delta range for call options."""
         return self._config["strategy"]["call_delta_range"]
 
-    @property
-    def call_drawdown_pause_threshold(self) -> float:
-        """FC-029 (R3): drawdown pause threshold for covered call writes.
+    # FC-069 S1 (item 9) deleted `call_drawdown_pause_threshold`. The pause is
+    # dead by operator decision (FC-065 OQ-3), FC-068 deleted its last
+    # consumer, and FC-065 P4 removed the dashboard read. There is no drawdown
+    # pause in this system.
 
-        **Orphaned as of FC-068.** Its only consumer was
-        ``CallSeller.evaluate_covered_call_opportunity``, on the engine path
-        this project deleted; the operator decided (FC-065 OQ-3) the pause is
-        not ported to the live path. The knob, its ``/config`` field and its
-        dashboard exposure are FC-069 item 9's to remove — deliberately left
-        here so the removal happens in one place with the UI.
-        """
-        return self._config["strategy"].get("call_drawdown_pause_threshold", 0.05)
-    
     @property
     def min_put_premium(self) -> float:
         """Minimum premium for put options."""
@@ -482,20 +458,15 @@ class Config:
         """Minimum average volume for stock selection."""
         return self._config["strategy"]["min_avg_volume"]
     
-    @property
-    def max_positions_per_stock(self) -> int:
-        """Maximum positions per stock."""
-        return self._config["strategy"]["max_positions_per_stock"]
-    
-    @property
-    def max_total_positions(self) -> int:
-        """Maximum total positions."""
-        return self._config["strategy"]["max_total_positions"]
-    
-    @property
-    def max_exposure_per_ticker(self) -> float:
-        """Maximum exposure per ticker (dollar amount assuming assignment)."""
-        return self._config["strategy"]["max_exposure_per_ticker"]
+    # FC-069 S1 deleted `max_positions_per_stock` (item 3),
+    # `max_total_positions` (item 1) and `max_exposure_per_ticker` (item 2).
+    # None had a preventive consumer: their only reader was the never-called
+    # `RiskManager.validate_new_position`, deleted by item 7. The breadth
+    # invariant that actually holds — one option position per underlying —
+    # is emergent from the scanner skip, `select_batch`'s duplicate_underlying
+    # drop and the calls share ledger, and is blind to resting unfilled orders.
+    # Per-ticker exposure is bounded by `max_position_size` x portfolio, which
+    # floats with equity, not by an absolute dollar cap.
 
     # FC-068 deleted `max_stocks_evaluated_per_cycle` and
     # `max_new_positions_per_cycle`. Their only consumers were stage 3 and
@@ -506,21 +477,16 @@ class Config:
     # would mint exactly the unowned corpses this FC family exists to end.
 
     # Risk Management
-    @property
-    def max_portfolio_allocation(self) -> float:
-        """Maximum portfolio allocation."""
-        return self._config["risk"]["max_portfolio_allocation"]
-    
+    # FC-069 S1 (card 17 / item 7 rider) deleted `max_portfolio_allocation`
+    # and `min_cash_reserve`. Neither had an enforcing consumer; cash
+    # discipline on this system is buying-power-bounded batching in
+    # `ExecutionEngine.select_batch`.
+
     @property
     def max_position_size(self) -> float:
         """Maximum position size as percentage of portfolio."""
         return self._config["risk"]["max_position_size"]
-    
-    @property
-    def min_cash_reserve(self) -> float:
-        """Minimum cash reserve percentage."""
-        return self._config["risk"]["min_cash_reserve"]
-    
+
     @property
     def use_put_stop_loss(self) -> bool:
         """Whether to use stop loss for put positions."""
@@ -546,10 +512,9 @@ class Config:
         """Stop loss multiplier for short-term options (accounts for time decay)."""
         return self._config["risk"]["stop_loss_multiplier"]
     
-    @property
-    def profit_target_percent(self) -> float:
-        """Profit target percentage for early closure (legacy - use profit_taking config instead)."""
-        return self._config["risk"]["profit_target_percent"]
+    # FC-069 S1 (card 17) deleted `profit_target_percent` — self-labeled legacy
+    # in both the yaml and the property, superseded by the `profit_taking.*`
+    # DTE bands, zero consumers.
 
     # Profit Taking Configuration (Dynamic DTE-based)
     @property
@@ -577,10 +542,13 @@ class Config:
         """Maximum profit target (safety bound)."""
         return self._config["risk"]["profit_taking"]["max_profit_target"]
 
-    @property
-    def profit_taking_min_hold_hours(self) -> int:
-        """Minimum hours to hold before profit-target evaluation."""
-        return self._config.get("risk", {}).get("profit_taking", {}).get("min_hold_hours", 4)
+    # FC-069 S1 (item 6, absorbing FC-015) deleted
+    # `profit_taking_min_hold_hours`. The gate it fed read `_entry_times`, an
+    # in-process dict on sellers that are constructed per request — so it has
+    # been open since inception (4 of 35 sub-4h closes observed 2026-05-12).
+    # The raised DTE bands above carry the hold discipline. If a hold gate is
+    # ever wanted, derive entry time statelessly from Alpaca order history
+    # (`filled_at`); do not resurrect process state.
 
     @property
     def profit_taking_default_long_dte(self) -> float:
@@ -593,84 +561,16 @@ class Config:
         """List of stock symbols to trade."""
         return self._config["stocks"]["symbols"]
     
-    # Monitoring
-    @property
-    def check_interval_minutes(self) -> int:
-        """Position check interval in minutes."""
-        return self._config["monitoring"]["check_interval_minutes"]
-
-    # Gap Risk Controls
-    @property
-    def enable_gap_detection(self) -> bool:
-        """Enable overnight gap monitoring."""
-        return self._config["risk"]["gap_risk_controls"]["enable_gap_detection"]
-
-    @property
-    def max_overnight_gap_percent(self) -> float:
-        """Maximum overnight gap percentage before position closure."""
-        return self._config["risk"]["gap_risk_controls"]["max_overnight_gap_percent"]
-
-    @property
-    def gap_lookback_days(self) -> int:
-        """Days to analyze historical gap frequency."""
-        return self._config["risk"]["gap_risk_controls"]["gap_lookback_days"]
-
-    @property
-    def max_gap_frequency(self) -> float:
-        """Maximum allowed gap frequency for stock selection."""
-        return self._config["risk"]["gap_risk_controls"]["max_gap_frequency"]
-
-    @property
-    def earnings_avoidance_days(self) -> int:
-        """Days to avoid new positions before earnings."""
-        return self._config["risk"]["gap_risk_controls"]["earnings_avoidance_days"]
-
-    @property
-    def premarket_gap_threshold(self) -> float:
-        """Pre-market gap threshold that triggers review."""
-        return self._config["risk"]["gap_risk_controls"]["premarket_gap_threshold"]
-
-    @property
-    def market_open_delay_minutes(self) -> int:
-        """Minutes to wait after market open if gap detected."""
-        return self._config["risk"]["gap_risk_controls"]["market_open_delay_minutes"]
-
-    @property
-    def max_historical_vol(self) -> float:
-        """Maximum historical volatility for stock selection."""
-        return self._config["risk"]["gap_risk_controls"]["max_historical_vol"]
-
-    @property
-    def vol_lookback_days(self) -> int:
-        """Days for historical volatility calculation."""
-        return self._config["risk"]["gap_risk_controls"]["vol_lookback_days"]
-
-    @property
-    def quality_gap_threshold(self) -> float:
-        """Threshold for counting significant gaps in stock quality filtering."""
-        return self._config["risk"]["gap_risk_controls"]["quality_gap_threshold"]
-
-    @property
-    def execution_gap_threshold(self) -> float:
-        """Hard threshold for blocking trade execution due to gaps."""
-        return self._config["risk"]["gap_risk_controls"]["execution_gap_threshold"]
-
-    @property
-    def execution_gap_lookback_hours(self) -> int:
-        """Hours to look back for execution gap calculation."""
-        return self._config["risk"]["gap_risk_controls"]["execution_gap_lookback_hours"]
-
-    # Legacy property for backward compatibility
-    @property
-    def max_execution_gap_percent(self) -> float:
-        """Maximum gap allowed for trade execution (legacy name)."""
-        return self.execution_gap_threshold
-
-    # Legacy property for backward compatibility
-    @property
-    def significant_gap_threshold(self) -> float:
-        """Threshold for counting significant gaps (legacy name)."""
-        return self.quality_gap_threshold
+    # FC-069 S1 deleted the `monitoring:` accessor (card 17) and the whole
+    # gap-risk accessor block (item 5) together with
+    # `src/risk/gap_detector.py`, `risk.gap_risk_controls.*` and the dead
+    # `earnings_avoidance_days` sibling (item 4). Gap risk is absent by
+    # decision: FC-036's study rejected arming the execution gate and
+    # FC-049 found the stage-2 filter would have refused 123 of 327 real
+    # entries. The module and its knobs live at pre-S1 main SHA afb6698;
+    # FC-049 owns any evidence-based revival.
+    # NOTE: `earnings.blackout_days` is a different key and is LIVE via
+    # FC-013 (`earnings_blackout_days` below) — it is not part of this.
 
     # Call Rolling (FC-006; knob set rewritten by FC-078 DD-6)
     @property

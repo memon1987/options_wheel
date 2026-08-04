@@ -116,42 +116,27 @@ data:
       min_stock_price: 20.00
       max_stock_price: 500.00
       min_avg_volume: 1000000
-      max_positions_per_stock: 1
-      max_total_positions: 10
-      max_exposure_per_ticker: 50000
 
     # Risk Management
     risk:
-      max_portfolio_allocation: 0.80
       max_position_size: 0.10
-      min_cash_reserve: 0.20
       use_put_stop_loss: false
       use_call_stop_loss: true
       put_stop_loss_percent: 0.50
       call_stop_loss_percent: 0.50
       stop_loss_multiplier: 1.5
-      profit_target_percent: 0.50
-      max_iv_rank: 80
-      min_iv_rank: 20
 
-      # Gap risk management
-      gap_risk_controls:
-        enable_gap_detection: true
-        max_overnight_gap_percent: 5.0
-        gap_lookback_days: 30
-        max_gap_frequency: 0.15
-        earnings_avoidance_days: 7
-        quality_gap_threshold: 2.0
-        # FC-036 Phase A: keep in step with config/settings.yaml (999 = shadow,
-        # gate fixed but not armed). This embedded copy is stale/unused — Cloud
-        # Run is the live deploy path — but leaving 1.5 here would silently ARM
-        # the corrected gate for anyone deploying from this manifest.
-        execution_gap_threshold: 999
-        execution_gap_lookback_hours: 16
-        premarket_gap_threshold: 2.0
-        market_open_delay_minutes: 15
-        max_historical_vol: 0.40
-        vol_lookback_days: 252
+    # FC-069 S1 deleted this manifest's copies of the swept knobs:
+    # max_positions_per_stock, max_total_positions, max_exposure_per_ticker
+    # (which had already drifted to 50000 against settings.yaml's 40000 — itself
+    # evidence nothing enforced it), max_portfolio_allocation, min_cash_reserve,
+    # profit_target_percent, max_iv_rank / min_iv_rank, the whole
+    # gap_risk_controls block, and the monitoring / logging blocks. Their
+    # properties and validation no longer exist on Config.
+    #
+    # This manifest is NOT the deploy path — Cloud Run is — and it has drifted
+    # from config/settings.yaml in several other places (universe, deltas,
+    # stop-loss switches). Treat it as an archived example, not as config.
 
     # Stock Universe
     stocks:
@@ -166,21 +151,6 @@ data:
         - "QQQ"
         - "SPY"
         - "IWM"
-
-    # Monitoring and Alerts
-    monitoring:
-      check_interval_minutes: 15
-      assignment_alert: true
-      profit_target_alert: true
-      loss_threshold_alert: true
-
-    # Logging Configuration
-    logging:
-      level: "INFO"
-      log_to_file: true
-      log_file: "logs/options_wheel.log"
-      max_log_size: "10MB"
-      backup_count: 5
 
 ---
 apiVersion: v1
