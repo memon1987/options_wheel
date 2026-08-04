@@ -6,6 +6,11 @@ wheel cycles (put assigned → call assigned on same underlying), and logs
 wheel_cycle_complete events via structlog so they flow to BigQuery.
 
 Run once: python scripts/backfill_wheel_cycles.py
+
+Historical (already run). This script never wrote the raw ``wheel_cycles``
+BigQuery table — it only emits ``wheel_cycle_complete`` log events — so the
+FC-069 item-10 retirement of that table does not affect it. Completed cycles
+are read from the ``wheel_cycles_from_activities`` view.
 """
 
 import sys

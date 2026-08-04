@@ -12,7 +12,6 @@ from ..utils.config import Config
 from ..utils.logging_events import log_system_event, log_trade_event, log_error_event
 from ..utils.positions import get_stock_positions
 from ..utils.option_symbols import parse_option_symbol
-from ..data.analytics_writer import get_analytics_writer
 from .call_roller import CallRoller
 from .wheel_state_manager import WheelStateManager
 from ..risk.risk_manager import RiskManager
@@ -236,23 +235,6 @@ class WheelEngine:
                                     strike_price=strike_price,
                                     activity_id=activity_id,
                                 )
-
-                                # Analytics: record wheel cycle completion
-                                try:
-                                    analytics = get_analytics_writer()
-                                    cost_basis = state_summary.get('stock_cost_basis', 0) if (state_summary := self.wheel_state.symbol_states.get(underlying, {})) else 0
-                                    capital_gain = (strike_price - cost_basis) * assigned_shares if strike_price and cost_basis else 0
-                                    analytics.write_wheel_cycle(
-                                        symbol=underlying,
-                                        call_strike=strike_price,
-                                        assignment_date=act_date.strftime('%Y-%m-%d'),
-                                        capital_gain=capital_gain,
-                                        shares=assigned_shares,
-                                    )
-                                except Exception:
-                                    logger.debug("Analytics write_wheel_cycle failed (activity)",
-                                                symbol=underlying, exc_info=True)
-
                             except Exception as e:
                                 logger.warning("Failed to process call assignment activity",
                                               event_category="error",
@@ -444,23 +426,6 @@ class WheelEngine:
                             strike_price=strike_price,
                             assignment_date=clock.now(),
                         )
-
-                        # Analytics: record wheel cycle completion
-                        try:
-                            analytics = get_analytics_writer()
-                            cost_basis = state_summary.get('stock_cost_basis', 0) if hasattr(state_summary, 'get') else 0
-                            capital_gain = (strike_price - cost_basis) * shares_called if strike_price and cost_basis else 0
-                            analytics.write_wheel_cycle(
-                                symbol=symbol,
-                                call_strike=strike_price,
-                                assignment_date=clock.now().strftime('%Y-%m-%d'),
-                                capital_gain=capital_gain,
-                                shares=shares_called,
-                            )
-                        except Exception:
-                            logger.debug("Analytics write_wheel_cycle failed (position diff)",
-                                        symbol=symbol, exc_info=True)
-
                     except Exception as e:
                         logger.warning("Failed to update wheel state for call assignment",
                                       event_category="error",
