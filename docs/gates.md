@@ -31,7 +31,7 @@ and stated.
 /scan   OptionsScanner  ──►  GCS opportunity blob  ──►  /run  ExecutionEngine  ──►  PutSeller / CallSeller
         (stage gates)                                    (selection gates)          (execution gates)
 
-/roll   WheelEngine.run_rolling_cycle ──► CallRoller ──► RiskManager.validate_roll   (Fridays)
+/roll   WheelEngine.run_rolling_cycle ──► CallRoller ──► RiskManager.validate_roll   (daily 15:30 ET)
 /monitor  closes only — never gated (a close reduces risk)
 ```
 
@@ -244,12 +244,12 @@ persistent-failure scenarios).
 read in two places, not one: the scanner's gate construction (rows 2/4/9 above)
 **and** `WheelEngine.run_rolling_cycle`, which consults it before constructing
 its own `EarningsCalendarService`. So `EARNINGS_ENABLED=false` also takes the
-**roller's** earnings blackout dark. That is moot today — the roller is
-structurally no-op'd by the quote-key bug (FC-066 cause 1), so it evaluates
-nothing to gate — but it must be stated: whoever revives the roller inherits a
-kill switch that silently disarms their gate too. (Note the roll path's inverse
-quirk below: an *injected* calendar bypasses the `enabled` check entirely, so
-the switch only bites on the self-constructed path.)
+**roller's** earnings span gate dark (`call_roller.py:357` gates the span check
+on `config.earnings_enabled` directly). This is **not** moot: FC-078 revived the
+roller and it executes real rolls daily, so throwing the earnings kill switch
+disarms two gates, not one. (The pre-FC-078 note that an *injected* calendar
+bypassed the `enabled` check is obsolete — see "The injected-calendar quirk is
+gone" below.)
 
 ---
 

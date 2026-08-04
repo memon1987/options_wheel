@@ -2,13 +2,28 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Every claim in this file was re-verified against the tree by grep/read on
+2026-08-04** (FC-069 item 14, after S1–S6 landed). The previous version
+described an orchestration path that had not run since 2025-10-03 and a risk
+class that never validated anything. False architecture claims in this file are
+not harmless: FC-069 item 14's own argument is that the fictional wheel-state
+layer drew ten months of remediation work partly because these docs called it
+real. **Do not add a claim here you
+have not verified against the current tree.**
+
 ## Project Overview
 
-This is an algorithmic trading solution that executes an options wheel strategy. The options wheel is a systematic approach to generating income from stocks through selling cash-secured puts and covered calls. All trade execution is handled through the Alpaca.py APIs.
+An algorithmic trading system that runs an options wheel strategy: sell
+cash-secured puts, take assignment, sell covered calls on the assigned shares,
+get called away, repeat. All execution goes through the Alpaca API. Production
+is a **stateless** Flask service on Cloud Run (`deploy/cloud_run_server.py`)
+driven entirely by Cloud Scheduler; there is no long-lived process and no
+durable strategy state (see §Accepted amnesia).
 
 ## Plan-First Development
 
-Plan-First Development rules are defined in the parent `CLAUDE.md` and apply to this project. Project-specific plan files live in `docs/plans/`.
+Plan-First Development rules are defined in the parent `CLAUDE.md` and apply to
+this project. Project-specific plan files live in `docs/plans/`.
 
 ## Development Setup
 
@@ -25,16 +40,22 @@ cp .env.example .env
 
 ## Commands
 
-**Analysis Commands:**
+**CLI** (`main.py` — `--command` accepts exactly `scan`, `status`, `report`,
+`backtest`, `screen`):
 ```bash
-python main.py --command scan    # Scan for opportunities
-python main.py --command status  # Portfolio status  
-python main.py --command report  # Performance report
+python main.py --command scan    # Scan for opportunities (same OptionsScanner as production)
+python main.py --command status  # Portfolio status  (PortfolioTracker — CLI only)
+python main.py --command report  # Performance report (PortfolioTracker — CLI only)
 ```
+
+`--command run` **no longer exists** (deleted by FC-068). It drove a separate
+engine decision path that placed real orders against the live account and had
+diverged from what production does. There is no CLI trade-execution entry point
+by design — trading happens through the Cloud Run endpoints below.
 
 **Testing:**
 ```bash
-pytest tests/ -v                 # Run all tests
+pytest tests/ -v                 # Run all tests (1262 collected as of 2026-08-04)
 pytest tests/test_config.py -v   # Run specific test file
 ```
 
@@ -43,101 +64,387 @@ pytest tests/test_config.py -v   # Run specific test file
 black src/ tests/                # Format code
 flake8 src/ tests/               # Check style
 mypy src/                        # Type checking
+cd dashboard/frontend && npx tsc --noEmit   # REQUIRED if you touched the frontend
 ```
 
-## Architecture
+The `tsc` line is not optional: an FC-069 S1 dashboard change passed pytest and
+two reviews, then broke the Cloud Build image because nobody type-checked the
+frontend.
 
-> ⚠️ **Interim note (FC-068, 2026-08-01): the engine orchestration path described in
-> step 1 was deleted.** `WheelEngine` no longer orchestrates anything — production runs
-> `/scan` (`OptionsScanner`) → GCS opportunity blob → `/run` (`ExecutionEngine`:
-> filter → rank → `select_batch` → `execute_batch`) → `PutSeller`/`CallSeller`, and has
-> since 2025-10-03. What survives on `WheelEngine` is `reconcile_positions` (pre-trade
-> housekeeping) and `run_rolling_cycle` (Friday `/roll`). Step 5 is also wrong:
-> `RiskManager` never validated anything on a live path. **FC-069 S1 (2026-08-04)
-> deleted `validate_new_position` and five sibling methods outright** — the class
-> is now `validate_roll` only, the roller's gate. Live validation is the scanner
-> filters, `select_batch`'s ledgers and the execute-time cost-basis floor.
-> **The full rewrite of this section is FC-069 item 14**; this note exists so the
-> known-false claims below do not get *more* false in the interim.
+## Architecture — the system that actually runs
 
-**Core Strategy Flow:**
-1. `WheelEngine` orchestrates the complete strategy
-2. `MarketDataManager` analyzes stocks and options chains  
-3. `OptionsScanner` identifies and ranks opportunities
-4. `PutSeller`/`CallSeller` execute strategy-specific trades
-5. `RiskManager` validates all positions against limits
-6. `PortfolioTracker` monitors performance and generates reports
+**Core strategy flow** — this is what production has run since 2025-10-03 (the
+date FC-068 established for the engine path's last live use):
 
-**Key Integration Points:**
-- All market data flows through `AlpacaClient` wrapper
-- Configuration centralized in `Config` class with YAML + env vars
-- Risk validation required before any trade execution
-- Structured logging throughout for debugging and audit trails
+```
+/scan    OptionsScanner  ──►  GCS opportunity blob  ──►  /run   ExecutionEngine  ──►  PutSeller / CallSeller
+         (stage gates)         (run_id + strategy_id)         filter → rank →
+                               30-min freshness                select_batch → execute_batch
+
+/monitor  PutSeller / CallSeller.should_close_*_early — DTE-banded profit-taking (closes only)
+/roll     WheelEngine.run_rolling_cycle ──► CallRoller ──► RiskManager.validate_roll  (daily 15:30 ET)
+```
+
+1. **`/scan`** (`OptionsScanner`, `src/data/options_scanner.py`) finds and ranks
+   opportunities for both legs and writes them to a Cloud Storage blob via
+   `OpportunityStore`. The blob carries `strategy_id` (FC-075 Seam 1 — a
+   consumer refuses a blob written by another strategy profile) and `run_id`
+   (FC-065 P4 — stamped onto the envelope *and* onto every opportunity, because
+   the two halves of a cycle are separate stateless HTTP requests).
+2. **`/run`** (`ExecutionEngine`, `src/strategy/execution_engine.py`) reads the
+   most recent blob that is younger than `strategy.opportunity_max_age_minutes`
+   (30), then: `filter_duplicate_opportunities` / `filter_failed_opportunities`
+   → `rank_opportunities` (type-aware sizing) → `select_batch` (**two pools**,
+   FC-038) → `execute_batch` → `PutSeller.execute_put_sale` /
+   `CallSeller.execute_call_sale`.
+3. **`reconcile_positions`** (`WheelEngine`) runs first inside `/run` as
+   pre-trade housekeeping. It diffs Alpaca against a per-request scratch pad and
+   emits assignment/expiration telemetry. Its failures are caught and do **not**
+   block execution.
+4. **`/monitor`** closes positions that hit their DTE-banded profit target. It
+   is never gated — a close reduces risk.
+5. **`/roll`** evaluates short calls whose underlying rallied through the strike
+   and rolls them up-and-out, **credit-only** (FC-078).
+
+`WheelEngine` is **not an orchestrator**. Post-FC-068 its entire surface is
+`reconcile_positions` and `run_rolling_cycle`.
+
+**Scheduler cadence** (Cloud Scheduler, `America/New_York`, Mon–Fri —
+live-verified 2026-08-04 with `gcloud scheduler jobs list`):
+
+| Job family | Cadence | Endpoint |
+|---|---|---|
+| `scan-10am` … `scan-3pm` | `:00`, 10:00–15:00 ET | `/scan` |
+| `execute-10-15am` … `execute-3-15pm` | `:15`, 10:15–15:15 ET | `/run` |
+| `monitor-9-55am` … `monitor-2-55pm` | `:55`, 09:55–14:55 ET | `/monitor` |
+| `options-wheel-roll-daily` | 15:30 ET | `/roll` |
+| `regression-hourly` | `:45`, 10:45–15:45 ET | `/regression` |
+| `activities-ingest-market-hours` / `-off-hours` | every 15 min 09–16 ET / hourly otherwise | `/ingest-activities` |
+| `portfolio-history-ingest-daily` / `stock-history-ingest-daily` | 16:30 / 17:00 ET | ingest endpoints |
+
+`options-wheel-roll-friday` still exists but is **PAUSED** — FC-078 replaced it
+with the daily job. The scheduler owns all timing; no cadence knob in
+`config/settings.yaml` controls it (a `monitoring.check_interval_minutes` key
+used to read as if it did, and was deleted in FC-069 S1 for exactly that
+reason).
+
+**Key integration points:**
+- All market data and trading flow through the `AlpacaClient` wrapper.
+- Configuration is centralized in `Config` (`src/utils/config.py`) — YAML plus
+  env-var substitution. One process runs **one** strategy profile, selected by
+  `STRATEGY_CONFIG` (`config/settings.yaml` = wheel, `config/covered_call.yaml`
+  = the covered-call profile, FC-075).
+- Every trading endpoint (`/scan`, `/run`, `/monitor`, `/roll`, the ingest
+  routes) is wrapped in `@require_account_match`: the service refuses to act
+  when the live Alpaca account number does not equal
+  `alpaca.expected_account_number` (503). This pins right-code to
+  right-credentials.
+- Structured logging throughout (structlog) — the events are the audit trail
+  and the dashboard's raw material.
 
 ## Trading APIs
 
-- **Alpaca API**: Primary API for all trade execution via custom AlpacaClient wrapper
-- **Paper Trading**: Enabled by default at https://paper-api.alpaca.markets/v2
-- **Options Trading**: Full support for cash-secured puts and covered calls
-- **Real-time Data**: Stock quotes, options chains, and portfolio positions
+- **Alpaca API**: primary API for all trade execution, via `AlpacaClient`.
+- **Paper Trading**: enabled by default (`alpaca.paper_trading: true`);
+  activities are read from `https://paper-api.alpaca.markets/v2`.
+- **Options Trading**: cash-secured puts and covered calls.
+- **Finnhub**: earnings dates for the FC-013 gate (`EarningsCalendarService`).
 
 ## Key Components (Implemented)
 
-- **WheelEngine** (`src/strategy/wheel_engine.py`): Core orchestrator for wheel strategy
-- **PutSeller** (`src/strategy/put_seller.py`): Cash-secured put selling logic
-- **CallSeller** (`src/strategy/call_seller.py`): Covered call selling logic  
-- **AlpacaClient** (`src/api/alpaca_client.py`): API wrapper for trading operations
-- **MarketDataManager** (`src/api/market_data.py`): Options chain analysis and filtering
-- **RiskManager** (`src/risk/risk_manager.py`): Position validation and risk controls
-- **PortfolioTracker** (`src/data/portfolio_tracker.py`): Performance monitoring
-- **OptionsScanner** (`src/data/options_scanner.py`): Opportunity identification
-- **Config** (`src/utils/config.py`): Centralized configuration management
+- **OptionsScanner** (`src/data/options_scanner.py`): the opportunity finder —
+  both legs, all scan-stage gates, decision records.
+- **ExecutionEngine** (`src/strategy/execution_engine.py`): filter, rank,
+  `select_batch` (two-pool), `execute_batch`, naked-call block.
+- **OpportunityStore** (`src/data/opportunity_store.py`): the GCS blob that
+  carries a cycle from `/scan` to `/run`.
+- **PutSeller** / **CallSeller** (`src/strategy/put_seller.py`,
+  `call_seller.py`): order construction and submission, plus the
+  `should_close_*_early` profit-taking logic used by `/monitor`.
+- **CallRoller** (`src/strategy/call_roller.py`): the daily credit-only
+  defensive roller (FC-078).
+- **CostBasisResolver** (`src/strategy/cost_basis.py`): resolves the per-share
+  cost-basis floor from Alpaca `avg_entry_price`, with a BigQuery
+  assignment-history cross-check; fails closed.
+- **EarningsCalendarService** (`src/api/earnings_calendar.py`): tri-state
+  (`known` / `unknown` / disabled) earnings dates with a two-layer cache.
+- **MarketDataManager** (`src/api/market_data.py`): stock filtering and options
+  chain analysis (`find_suitable_puts` / `find_suitable_calls`).
+- **AlpacaClient** (`src/api/alpaca_client.py`): API wrapper.
+- **RiskManager** (`src/risk/risk_manager.py`): **`validate_roll` only** — the
+  roller's gate. It has exactly one public method. See §What actually bounds
+  risk for why.
+- **WheelEngine** (`src/strategy/wheel_engine.py`): `reconcile_positions` +
+  `run_rolling_cycle`. Nothing else.
+- **WheelStateManager** (`src/strategy/wheel_state_manager.py`): per-request,
+  in-memory bookkeeping that `reconcile_positions` diffs against Alpaca. Built
+  empty every request, thrown away at the end. Shrunk from 747 to 331 lines by
+  FC-069 S6; its GCS persistence never worked (FC-039) and is gone.
+- **PortfolioTracker** (`src/data/portfolio_tracker.py`): **CLI-only**
+  (`main.py status` / `report`). Not on the deployed path — nothing in
+  `deploy/` or `src/` imports it.
+- **Config** (`src/utils/config.py`): centralized configuration.
+- **ActivitiesIngestor** (`src/data/activities_ingestor.py`): pulls Alpaca
+  account activities into BigQuery — the authoritative record of what happened.
+
+## What actually bounds risk
+
+**There is no central validator.** `RiskManager.validate_new_position` and its
+five siblings were deleted by FC-069 S1 with **zero production call sites ever
+recorded** — the old claim that "risk validation is required before any trade
+execution" was false since inception. Enforcement is distributed by design, and
+this is the inventory:
+
+**Scan stage** (`OptionsScanner`, `MarketDataManager`)
+- Price/volume band: `filter_suitable_stocks` — `$10 ≤ price ≤ $400`,
+  ≥ 2M average daily volume.
+- Contract admission: delta bands, DTE targets, premium floors
+  (`_check_put_criteria_detailed` / `_check_call_criteria_detailed`).
+- **Earnings gate (FC-013, live since 2026-08-03)** — the legs diverge
+  deliberately: **puts** block a symbol when the next earnings date is 0–2
+  calendar days out (`earnings.blackout_days: 2`, symbol-level); **calls** use a
+  true **span** test per candidate — reject when
+  `expiration_date >= next_earnings_date`, with no numeric knob, because span is
+  the risk predicate itself and is DTE-invariant. Both legs **fail closed** on
+  `unknown`.
+- Existing-position skip: the put leg skips any symbol already holding a stock
+  or option position (parse-exact since FC-069 S3 — it used to be an OCC
+  substring test that suppressed every F put because `PFE…` contains `F`).
+- Cost-basis floor, scan side: a call opportunity is not created when the
+  resolved basis is unresolved or diverges from the cross-check.
+
+**Selection stage** (`ExecutionEngine.select_batch`, two independent ledgers)
+- Calls draw down a per-underlying **available-shares** ledger; puts draw down
+  **buying power**. Charging calls phantom cash collateral was the covered-call
+  starvation bug (FC-038).
+- `duplicate_underlying` drop — one position per underlying across both pools.
+- Calls are selected first (they cost no cash, so they cannot displace a put).
+
+**Execution stage** (sellers, `execute_batch`)
+- Wrong-seller routing rejection (a call routed to `PutSeller` is refused).
+- **Execute-time cost-basis floor** (FC-050 / FC-065): a call strike below the
+  share cost basis is refused before order submit, reading the floor off the
+  opportunity so scan and execute enforce the same number. The basis source is
+  Alpaca `avg_entry_price`; it **fails closed**. This is the strongest control
+  in the system.
+- Naked-call block (`naked_call_blocked`).
+
+**The full gate-by-gate inventory — every gate, its config, its event, and its
+fail posture — lives in `docs/gates.md`. Read it before adding or changing a
+gate.**
+
+### The real per-ticker bound
+
+There is **no absolute dollar cap per ticker**. `max_exposure_per_ticker:
+40000` was deleted in FC-069 S1: it had no preventive consumer, and the
+rationale that once justified it ("one put × `max_stock_price` 400 × 100 = $40k")
+is arithmetically wrong — `max_stock_price` bounds one *contract*, not a ticker.
+What actually bounds per-ticker exposure:
+
+1. `risk.max_position_size: 0.35` × portfolio value, per position — a
+   *proportional* bound that **floats with equity** — ≈$36k at the ~$103k
+   portfolio of FC-069's sign-off, ≈$70k at $200k — where the deleted knob was
+   absolute.
+2. One option position per underlying at a time (the invariant below).
+3. `strategy.max_stock_price: 400`, capping per-contract collateral.
+
+The operator's decision (FC-069, 2026-08-01, binding) is that breadth is bounded
+by **capital and the ticker universe** — both proportional — and that a fixed
+count or a fixed dollar cap must not bind future growth. `max_total_positions`
+was deleted for the same reason. Accepted residual, on the record: buying power
+is the only preventive breadth limit on puts, and the burst scenario stays
+count-ungated.
+
+### The one-position-per-underlying invariant, and its caveat
+
+The invariant is emergent, not a knob (`max_positions_per_stock` was deleted in
+FC-069 S1). It comes from three legs, carried verbatim from FC-069 item 3:
+
+> **One option position per underlying** emerges from (i) the scanner's
+> put-side skip of any symbol with existing positions, (ii) `select_batch`'s
+> `duplicate_underlying` drop (one per batch, both pools), (iii) the calls share
+> ledger (no double-covering). The invariant is per-*position*, not
+> per-*contract*.
+>
+> **All three enforcing legs are positions-based and blind to resting unfilled
+> orders** — a submitted-but-unfilled put is invisible to the scanner skip, the
+> batch dedup (across cycles), and the share ledger alike; the invariant is
+> "one *position* per underlying, modulo the open-order window" (FC-009's
+> standing territory).
 
 ## Strategy Configuration
 
-**Short-Term Focus**: 7-day maximum expiration for rapid theta decay
-**Conservative Deltas**: 0.10-0.20 range for ~10-20% assignment probability
-**Assignment Strategy**: Take assignment on puts (no stop losses), protect calls
-**Position Sizing**: Maximum 1 contract per new position, 10% portfolio allocation
+Read `config/settings.yaml` for the live values; these are the ones that matter,
+verified 2026-08-04:
 
-## Wheel Strategy Symmetry Principle
-
-**CRITICAL DEVELOPMENT RULE**: The options wheel has two phases that must be treated symmetrically:
-
-1. **Put Selling Phase** - Initial entry via `find_suitable_puts()` and `put_seller.py`
-2. **Call Selling Phase** - Position management via `find_suitable_calls()` and `call_seller.py`
-
-**When making changes to one side (puts OR calls), ALWAYS apply equivalent changes to the other side:**
-- Logging enhancements → Apply to both puts and calls
-- Filtering improvements → Apply to both puts and calls
-- Error handling → Apply to both puts and calls
-- Performance metrics → Apply to both puts and calls
-
-**Why**: The wheel is a complete lifecycle (sell put → assignment → sell call → called away → repeat). Both phases need equal observability, consistent logging, and symmetric filtering for effective debugging and analysis.
-
-**Key Files**:
-- Filtering: `src/api/market_data.py` (find_suitable_puts/calls, _check_put/call_criteria_detailed)
-- Execution: `src/strategy/put_seller.py` and `src/strategy/call_seller.py`
+- **DTE**: `put_target_dte: 7`, `call_target_dte: 7` — short-dated, for rapid
+  theta decay.
+- **Deltas**: puts `put_delta_range: [0.10, 0.20]`; calls `call_delta_range:
+  [0.15, 0.25]`. **The two are not the same range** — FC-029 R1 tightened calls
+  from `[0.30, 0.70]` after three cycles gave up ~$9k of share upside to
+  aggressive call deltas.
+- **Premium floors**: `min_put_premium: 0.50`, `min_call_premium: 0.30`. The put
+  floor is a real universe constraint, not a formality — several configured
+  symbols cannot clear it at all.
+- **Universe**: 14 symbols in `stocks.symbols`. The **effective** universe is
+  smaller: the `$400` price ceiling and the premium floors exclude several
+  symbols entirely, so a symbol that never trades is a *filter* result, not a
+  verdict on the symbol. `docs/BACKTEST_ENGINE.md` carries the current counts —
+  do not memorize them, they move with config.
+- **Position sizing — read this carefully, it is not what it looks like:**
+  - **Puts execute at exactly 1 contract.**
+    `PutSeller._calculate_position_size` computes `min(max_position_size ×
+    portfolio ÷ collateral, buying_power ÷ collateral, 10)` and then returns
+    `contracts = 1`. The computed maximum is a **feasibility gate** (0 → the
+    opportunity is dropped as `sizing_failed`), never the executed size; the
+    10-contract ceiling therefore cannot bind today.
+  - **Calls are sized by shares**: `available_shares // 100` in
+    `rank_opportunities`, then re-checked against the per-underlying share
+    ledger in `select_batch` (FC-038 two-pool). A call consumes no buying power.
+- **Cost-basis protection**: enforced in code at scan and execute time, sourced
+  from Alpaca `avg_entry_price`. There is no knob to relax it.
 
 ## Risk Management Philosophy
 
-**Puts**: No stop losses - designed to take assignment on quality stocks
-- Assignment probability ≈ |Delta| (10-20% for our range)
-- Keep full premium on 80-90% of positions
-- Take assignment on remaining 10-20% at favorable prices
+**Puts**: no stop losses — the strategy is designed to take assignment on
+quality stocks (`use_put_stop_loss: false`).
+- Assignment probability ≈ |delta| (10–20% for the put range)
+- Keep the full premium on most positions; take assignment on the rest at
+  strikes chosen to be acceptable entry prices
 
-**Calls**: Protected with stop losses adjusted for time decay
-- 75% loss threshold (50% base × 1.5 multiplier) accounts for theta
-- Delta > 0.5 triggers immediate exit (likely ITM)
-- Prevents unlimited upside risk on covered positions
+**Calls**: **no stop losses either, since FC-010** (`use_call_stop_loss:
+false`). The stop-loss machinery (`_check_call_stop_loss`,
+`call_stop_loss_percent`, `stop_loss_multiplier`) is still in the tree but is
+**live-dormant behind the off switch**, kept deliberately rather than deleted.
+Disabling it was worth an estimated $1,000–$2,500 in avoided future losses
+across 5 historical episodes (`docs/investigations/strategy-review-2026-05-07.md`).
+Do not describe those knobs as active controls.
+
+Live covered-call management is, in full:
+1. **DTE-banded profit-taking** on `/monitor` — targets ramp 0.35 → 0.80 as DTE
+   falls 7 → 0 (`risk.profit_taking.dte_bands`), bounded by
+   `min_profit_target` / `max_profit_target`.
+2. **The cost-basis floor** — never write a call below the share basis.
+3. **Hold-uncovered-until-recovery** — when every strike above basis fails the
+   chain criteria, the position simply stays uncovered rather than writing a
+   guaranteed loss. `uncovered_days` (FC-065 P4) makes that visible instead of
+   silent.
+4. **The earnings span gate** — no call may expire on or after the next earnings
+   date.
+5. **The daily credit-only roller** — when the underlying rallies through the
+   strike (`rolling.itm_trigger_ratio: 0.98`), roll up and out for a net credit
+   on the placed limit prices, within `max_extension_days: 14` of the *old*
+   expiry and under a `max_replacement_delta: 0.60` rail.
+
+## Accepted amnesia (process-local state)
+
+Three pieces of live state are per-instance and reset on every cold start. They
+are **live controls with a known, accepted weakness — not fiction** — and the
+honest posture is to document them, not to pretend they are durable:
+
+- `_closed_today` (`deploy/cloud_run_server.py`) — `/monitor`'s duplicate-close
+  dedup. A cold start between two monitor cycles can allow a duplicate close
+  order. **FC-009 owns the fix** (check Alpaca for open buy-to-close orders —
+  the cold-start-proof option); it is still open.
+- `_failed_symbols` (`src/strategy/execution_engine.py`, module-global) —
+  suppression of non-retryable failures within a day; clears on cold start.
+- `strategy_status` (`deploy/cloud_run_server.py`, served by `/status`) —
+  last-run bookkeeping; resets silently.
+
+**Standing rule for anyone adding durable state here** (inherited from FC-039 /
+FC-069 item 8): a configured-but-unresolvable persistence target must **fail
+loudly at startup**, never silently no-op. A silent `storage_bucket=None` no-op
+is exactly how the wheel-state layer stayed fictional for a year while the docs
+called it canonical.
+
+## The detective layer — `/regression`
+
+`tools/testing/regression_monitor.py` is **not a dev tool**. It is served at
+`POST /regression` and invoked hourly at `:45` during market hours by Cloud
+Scheduler; **any check with status `fail` makes the endpoint return HTTP 500**.
+Check groups: `endpoint_health`, `trade_execution`, `log_analysis`,
+`position_reconciliation`, `performance_baseline`, `risk_parameters`.
+
+`check_risk_parameters` was synced to the real policy set by FC-069 S1 — four
+checks that mirrored deleted knobs (global position count, cash reserve,
+portfolio allocation, $40k per-ticker exposure) were removed, because an alarm
+layer that mirrors a policy nothing enforces cries wolf and gets muted. What
+survives:
+
+| Check | What it verifies |
+|---|---|
+| `risk_duplicate_underlying` | the one-position-per-underlying invariant (fail → 500); inherits the open-order blindness |
+| `risk_max_position_size` | positions ≤ `max_position_size`, **re-sourced from `Config`** and `STRATEGY_CONFIG`-aware, so it cannot drift from policy or validate the wrong profile |
+| `risk_naked_call` | no short call without covering shares (fail → 500) |
+| `risk_cost_basis_protection` | no call strike below basis, re-specced onto `avg_entry_price` — it used to derive basis from `cost_basis / qty`, which returns 0 for assigned positions, leaving it blind on exactly the lots it exists for |
+| `risk_unclassifiable_option` | **warn** — an option symbol that is not a strict OCC contract (adjusted roots after a split). The two checks above exclude such positions; excluding them silently would have inverted the point |
+
+If you change a policy, change its mirror here in the same PR.
+
+## Config discipline
+
+**A settings key with no live consumer is a defect.** This repo's recurring
+failure mode is a knob that reads as live and gates nothing — FC-069 deleted
+roughly 35 of them in one sweep, across two strata, plus whole blocks
+(`monitoring.*`, `logging.*`, `gap_risk_controls.*`) that configured nothing at
+all.
+
+The authoritative key-by-key census (every leaf key in `config/settings.yaml`
+against its verified consumer) is the **appendix of `docs/plans/fc-069.md`**.
+Two things to know before you use it:
+
+- **Any new key must land with its consumer named** — in the code review, and
+  in the census if you are touching it. A key without a consumer is born a
+  corpse.
+- **The census predates `config/covered_call.yaml`** (FC-075 Phase 1, merged
+  2026-08-03). Two profiles now exist, and the census's "78 leaf keys" headline
+  covers only `settings.yaml`. A knob deleted from one profile must be deleted
+  from both — S1 found six swept keys mirrored in the covered-call profile.
+
+## Wheel Strategy Symmetry Principle
+
+**CRITICAL DEVELOPMENT RULE**: the wheel has two phases that must be treated
+symmetrically:
+
+1. **Put selling phase** — entry via `find_suitable_puts()` and `put_seller.py`
+2. **Call selling phase** — position management via `find_suitable_calls()` and
+   `call_seller.py`
+
+**When making changes to one side (puts OR calls), ALWAYS consider the
+equivalent change on the other:**
+- Logging enhancements → both legs
+- Filtering improvements → both legs
+- Error handling → both legs
+- Performance metrics → both legs
+
+**Why**: the wheel is a complete lifecycle (sell put → assignment → sell call →
+called away → repeat). Both phases need equal observability and consistent
+logging for effective debugging.
+
+**Symmetry is a prompt, not a law.** Where the two legs genuinely differ, the
+difference must be *stated and justified*, not quietly introduced — the earnings
+gate is the model: puts use a symbol-level N=2 window, calls use a per-candidate
+span test, and `docs/gates.md` records exactly why. Call deltas differ from put
+deltas for the same kind of reason.
+
+**Key files**:
+- Filtering: `src/api/market_data.py` (`find_suitable_puts` /
+  `find_suitable_calls`, `_check_put_criteria_detailed` /
+  `_check_call_criteria_detailed`)
+- Scanning: `src/data/options_scanner.py`
+  (`scan_for_put_opportunities` / `scan_for_call_opportunities`)
+- Execution: `src/strategy/put_seller.py` and `src/strategy/call_seller.py`
 
 ## Data Analysis Policy
 
 **IMPORTANT: Cloud-First Data Analysis**
-- For ALL analysis of *what the bot actually did*, use data on Google Cloud Platform — not local files or caches.
+- For ALL analysis of *what the bot actually did*, use data on Google Cloud
+  Platform — not local files or caches.
 - Primary sources:
-  - BigQuery `options_wheel.trades_from_activities` — real fills, the source of truth for realized behavior
-  - BigQuery `options_wheel.backtest_runs` — screening results (see `docs/bigquery/backtest_runs.md`)
+  - BigQuery `options_wheel.trades_from_activities` — real fills, the source of
+    truth for realized behavior
+  - BigQuery `options_wheel.backtest_runs` — screening results (see
+    `docs/bigquery/backtest_runs.md`)
   - Google Cloud Storage: `gs://gen-lang-client-0607444019-options-data/`
   - Cloud Run dashboard endpoints
 - This ensures analysis reflects production-ready, persistent, centralized data.
@@ -150,30 +457,40 @@ trade and one component emitted fabricated numbers. Do not reference them.
 The rebuilt engine (FC-032) runs **locally by design**: it replays live strategy
 code over historical Alpaca data and needs no cloud round-trip.
 
-**Read `docs/BACKTEST_ENGINE.md` before quoting any backtest number.** It states what
-the engine measures well, what it does not, and the ten things that mislead readers who
-don't know them. Three worth knowing here: the fidelity figures (81% put-leg strike
-reproduction, 55.2% / 0.676 on the call leg) are **stale pending re-measurement after
-FC-068**, which changed the selection model they were measured against; a symbol showing
-0% days in position is a **filter** result — 8 of 14 configured symbols currently cannot
-trade at all, for reasons unrelated to symbol quality; and `backtest_runs` rows carry three
-non-comparability boundaries, `engine_version = 'fc-032-phase-5'` (dead engine path) vs
-`'fc-068-prod-pipeline'` vs `'fc-069-scanner-rewire'` (scanner rewire + rejection-vocabulary
-change, 2026-08-04), plus the timestamp-only FC-048 put-only boundary at 2026-07-29.
-
 ```bash
 python main.py --command backtest --symbol NVDA --start 2025-10-01 --end 2026-07-01
 python main.py --command screen            # whole universe -> options_wheel.backtest_runs
 ```
 
-Screening results *are* persisted to BigQuery and are cloud-first like everything
-else. A local `--command backtest` run is a simulation, never evidence of what
-the bot did — for that, always go to `trades_from_activities`.
+**`docs/BACKTEST_ENGINE.md` is the single home of every measured backtest
+figure. Read it before quoting any backtest number, and quote numbers from
+there, not from here** — fidelity percentages, per-symbol tradability counts and
+coverage figures all drift with re-measurement and config changes, and a number
+copied into a second document is a number that will be stale in a month.
+
+Three things this file *does* pin, because they are boundaries rather than
+measurements — a `backtest_runs` row is not comparable across any of them:
+
+- `engine_version = 'fc-032-phase-5'` — the dead engine path.
+- `engine_version = 'fc-068-prod-pipeline'` — the production pipeline replay.
+- `engine_version = 'fc-069-scanner-rewire'` — the scanner rewire plus a
+  rejection-vocabulary change (2026-08-04).
+- Plus a **timestamp-only** boundary: rows before **2026-07-29** describe a
+  **put-only** engine (FC-048 — every backtest before that misrouted covered
+  calls to the put seller).
+
+Screening results *are* persisted to BigQuery and are cloud-first like
+everything else. A local `--command backtest` run is a simulation, never
+evidence of what the bot did — for that, always go to
+`trades_from_activities`.
 
 **Read backtest output with its stated biases.** Every report carries a
-known-bias footer. Two of them favour the wheel over its own benchmark
-(dividends and early assignment are unmodeled), so `excess_return` is optimistic
-on dividend payers. Never quote a backtest number without them.
+known-bias footer; read it, do not assume its contents. In particular, dividends
+and ex-dividend early assignment **are modeled** (FC-042 Track C) — an older
+version of this file said they were not, which understated the engine. The
+footer states the real remaining caveats, including that dividend coverage
+depends on the committed table covering the run window and that early assignment
+for non-dividend reasons is still unmodeled.
 
 ## Dashboard & Backend Cascading Impact Analysis
 
@@ -246,17 +563,31 @@ a final state. Nothing read its output, and it would have been a second,
 non-idempotent writer of facts the activities feed already carries. See
 `docs/plans/fc-035.md`.
 
+**Do not write "completed cycle" rows from the bot either.** The
+`options_wheel.wheel_cycles` writer was deleted and the table dropped in FC-069
+S2: every row it ever wrote had `capital_gain = 0` (it read a state field that
+never resolved) and most were cold-start duplicates. The dashboard reads the
+`wheel_cycles_from_activities` view, which derives cycles from the activities
+feed. Note the separate `options_wheel_logs.wheel_cycles` **view** still has
+NULL `strike_price` / `premium` from every feeder — pre-existing rot, not a
+regression; do not treat those columns as data.
+
 ### Verification Steps
 
 After any change:
 1. Check that existing features still work (premium tracking, trade history, etc.)
-2. Verify TypeScript compiles without errors
+2. Verify TypeScript compiles without errors (`npx tsc --noEmit` — a required
+   step, not a nicety)
 3. Test the full data flow from bot to dashboard display
 4. Confirm metrics and aggregations are unaffected by display-only changes
 
 ## Development Notes
 
-**Alpaca Setup**: Requires options trading approval and paper trading endpoint
-**Testing**: Comprehensive test suite in `/tests` directory
-**Logging**: Structured logging with structlog for trade audit trails
-**Configuration**: YAML-based settings with environment variable substitution
+**Alpaca Setup**: requires options trading approval and the paper trading endpoint
+**Testing**: comprehensive suite in `/tests` (1262 tests as of 2026-08-04)
+**Logging**: structured logging with structlog for trade audit trails
+**Configuration**: YAML settings with environment-variable substitution;
+`STRATEGY_CONFIG` selects the profile
+**Env levers that bypass a deploy**: `EARNINGS_ENABLED`, `ROLLER_ENABLED`,
+`ROLLER_DRY_RUN`. Use `gcloud run services update --update-env-vars`, **never**
+`--set-env-vars` — the latter wipes the entire env set.

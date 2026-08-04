@@ -1,16 +1,28 @@
-# Options Wheel Strategy - Cloud Deployment Complete! 
+# Documentation index
 
-This repository contains a fully automated options wheel trading strategy deployed to Google Cloud Run with continuous integration.
+An automated options wheel trading strategy deployed to Google Cloud Run with
+continuous integration.
 
-## Quick Start
-- Strategy runs automatically at 9 AM, 12 PM, and 3 PM ET
-- Paper trading enabled by default for safety
-- Comprehensive gap risk management
-- Real-time monitoring and health checks
+## Start here
+- [`CLAUDE.md`](CLAUDE.md) — the architecture that actually runs, the control
+  layer, and the conventions this repo enforces. Read this first.
+- [`gates.md`](gates.md) — every gate on the live sell path: where it lives,
+  what config drives it, what it emits, whether it fails open or closed.
+- [`BACKTEST_ENGINE.md`](BACKTEST_ENGINE.md) — the single home of every measured
+  backtest figure, and what not to trust.
 
-## Documentation
-- See DEPLOYMENT_SUMMARY.md for complete setup details
-- GITHUB_DEPLOYMENT_SETUP.md for CI/CD pipeline info
-- MAINTENANCE.md for ongoing operations
+## Operating facts
+- Cloud Scheduler drives everything: `/scan` at :00 (10:00–15:00 ET), `/run` at
+  :15, `/monitor` at :55, `/roll` daily at 15:30 ET, `/regression` at :45.
+- Paper trading is the default, and every trading endpoint refuses to act unless
+  the live Alpaca account matches `alpaca.expected_account_number`.
+- Gap-risk management was removed in FC-069 — gap risk is absent by decision.
 
-🚀 Ready for automated options trading!
+## Also here
+- [`deployment/DEPLOYMENT_SUMMARY.md`](deployment/DEPLOYMENT_SUMMARY.md) — setup details
+- [`deployment/GITHUB_DEPLOYMENT_SETUP.md`](deployment/GITHUB_DEPLOYMENT_SETUP.md) — CI/CD pipeline
+- [`operations/MAINTENANCE.md`](operations/MAINTENANCE.md) — ongoing operations
+- [`plans/`](plans/) — published execution plans (`fc-NNN.md`)
+- [`FUTURE_CONSIDERATIONS.md`](FUTURE_CONSIDERATIONS.md) — pre-plan ideas
+- [`releases/`](releases/) — release notes
+- [`investigations/`](investigations/) — committed investigation write-ups
