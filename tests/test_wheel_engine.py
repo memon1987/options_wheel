@@ -291,6 +291,45 @@ class TestTheOpenOrderFetch(_CycleFixture):
         assert reasons == {'open_orders_unavailable'}
 
 
+class TestUncoveredShortCalls(_CycleFixture):
+    """Trader L-1. A short call with no matching stock position was dropped
+    before the loop, silently — so the one position shape nobody wants, a
+    genuinely naked short call, was the one the roll cycle never mentioned."""
+
+    def _naked_book(self):
+        return [
+            {'symbol': _occ('AAA', self.EXPIRY, 100.0), 'qty': '-1',
+             'asset_class': 'us_option'},
+            # no AAA shares
+        ]
+
+    def test_a_short_call_with_no_covering_shares_emits_a_terminal(self):
+        engine, alpaca = self._engine([])
+        alpaca.get_positions.return_value = self._naked_book()
+
+        with patch('src.strategy.wheel_engine.CallRoller') as roller_cls:
+            roller = roller_cls.return_value
+            results = engine.run_rolling_cycle()
+
+        assert results['rolls_evaluated'] == 1
+        assert results['rolls_skipped'] == 1
+        roller.evaluate_roll_opportunity.assert_not_called()
+        assert roller.log_terminal_skip.call_count == 1
+        assert roller.log_terminal_skip.call_args.args[2] == 'no_covering_shares'
+
+    def test_covered_calls_are_unaffected(self):
+        engine, _ = self._engine(['AAA'])
+
+        with patch('src.strategy.wheel_engine.CallRoller') as roller_cls:
+            roller = roller_cls.return_value
+            roller.evaluate_roll_opportunity.return_value = None
+            results = engine.run_rolling_cycle()
+
+        assert results['rolls_evaluated'] == 1
+        roller.evaluate_roll_opportunity.assert_called_once()
+        roller.log_terminal_skip.assert_not_called()
+
+
 class TestTheCycleBudgetGuard(_CycleFixture):
     """T-20. A position is never STARTED without the full per-position worst
     case remaining, because a kill between a filled BTC and an unplaced STO is

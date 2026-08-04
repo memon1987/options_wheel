@@ -205,8 +205,7 @@ monitoring:
   max_execution_time_minutes: 5  # Cloud Run timeout consideration
   enable_performance_metrics: true
   
-# Call Rolling (Friday EOW) — FC-006
-# FC-078 — daily credit-only defensive rolls.
+# Call Rolling — FC-006, revived by FC-078 as daily credit-only defensive rolls.
 #
 # Evaluated every trading day at 15:30 ET; a roll executes only when the placed
 # LIMIT prices net a credit, so a filled roll can never net a debit. The debit

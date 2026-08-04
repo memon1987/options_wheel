@@ -20,8 +20,22 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.strategy import call_roller as call_roller_module
 from src.strategy.call_roller import CallRoller
 from src.risk.risk_manager import RiskManager
+
+
+@pytest.fixture(autouse=True)
+def _no_settle_sleep(monkeypatch):
+    """Cancel-settle polling must not sleep in tests.
+
+    The settle bound is a module constant rather than a config knob (it is not
+    an operator decision), so tests drive it here. Default 0 = one read, which
+    is the *old* single-re-read shape — every test that needs the polling
+    behaviour raises it explicitly and stubs sleep.
+    """
+    monkeypatch.setattr(call_roller_module, '_CANCEL_SETTLE_TIMEOUT_SECONDS', 0)
+    monkeypatch.setattr(call_roller_module.time, 'sleep', lambda _s: None)
 
 
 # --------------------------------------------------------------------------- #
@@ -161,6 +175,12 @@ TERMINAL_EVENTS = {
     'call_roll_btc_rejected',
     'call_roll_btc_timeout_canceled',
     'call_roll_naked_exposure',
+    # The STO covered fewer contracts than the BTC closed. Same class as
+    # naked_exposure at a smaller quantity, and alert-wired alongside it.
+    'call_roll_partial_naked_exposure',
+    # A cancel that never settled: we do not know what the order did, so the
+    # bot stopped touching the position. Alert-wired.
+    'call_roll_unknown_disposition',
     'call_roll_completed',
     'call_roll_dry_run',
     'call_roll_execution_error',
@@ -877,6 +897,302 @@ class TestBtcTimeoutDisposition:
 
 
 # --------------------------------------------------------------------------- #
+# T-10c / T-18b — the QUEUED-CANCEL broker model (review H-1)
+# --------------------------------------------------------------------------- #
+
+def queued_cancel_broker(order_id, *, pending_reads, then_status,
+                         filled_qty=0, filled_price=None, qty=1):
+    """A broker whose cancels are QUEUED, like Alpaca's really are.
+
+    ``cancel_order`` returns success, but the order sits in ``pending_cancel``
+    for ``pending_reads`` reads before resolving to ``then_status``. That window
+    is the whole defect: an order in ``pending_cancel`` is still working and can
+    still fill, so a single post-cancel read establishes nothing.
+    """
+    state = {'reads': 0}
+
+    def by_id(oid):
+        if oid != order_id:
+            return order(oid, 'canceled', 0)
+        state['reads'] += 1
+        if state['reads'] <= pending_reads:
+            return order(oid, 'pending_cancel', 0, qty=qty)
+        return order(oid, then_status, filled_qty, filled_price, qty=qty)
+
+    return by_id, state
+
+
+class TestQueuedCancelsOnTheBtcLeg:
+    """Alpaca cancels are queued. The shipped code did ONE re-read after the
+    cancel and dispatched on ``filled_qty`` while ignoring a non-terminal
+    status, so a BTC sitting in ``pending_cancel`` — still working, still able
+    to fill — was reported as ``btc_timeout_canceled``.
+
+    *Mutation:* replace the settle poll with a single re-read → these fail.
+    """
+
+    def _armed(self, roller, mock_alpaca, by_id):
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.side_effect = [
+            accepted('btc-1'), accepted('sto-1')]
+        polls = {'n': 0}
+        inner = by_id
+
+        def wrapped(oid):
+            if oid != 'btc-1':
+                # The STO leg is not under test here; let it fill cleanly so the
+                # BTC disposition is the only variable.
+                return order(oid, 'filled', 1, 10.90)
+            polls['n'] += 1
+            if polls['n'] == 1:
+                return order('btc-1', 'new', 0)   # the fill poll times out
+            return inner(oid)
+
+        mock_alpaca.get_order_by_id.side_effect = wrapped
+        return opp
+
+    def test_a_pending_cancel_that_never_settles_is_reported_as_UNKNOWN(
+            self, roller, mock_alpaca, monkeypatch):
+        """The honest answer. Not "canceled, zero fill" — the order may still be
+        working, and we must not sell a call against a short position whose size
+        we cannot establish."""
+        by_id, _ = queued_cancel_broker('btc-1', pending_reads=99,
+                                        then_status='canceled')
+        opp = self._armed(roller, mock_alpaca, by_id)
+
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+
+        assert result['reason'] == 'btc_disposition_unknown'
+        assert terminals(log) == ['call_roll_unknown_disposition']
+        assert 'call_roll_btc_timeout_canceled' not in event_types(log)
+        # And crucially: no sell was ever placed.
+        sells = [c for c in mock_alpaca.place_option_order.call_args_list
+                 if c.kwargs['side'] == 'sell']
+        assert sells == []
+
+    def test_a_fill_landing_after_the_cancel_is_seen_by_the_settle_poll(
+            self, roller, mock_alpaca, monkeypatch):
+        """The reviewer's probe shape: cancel pending at the verify read, fill
+        lands a moment later. Polling to terminal sees it; one re-read does not."""
+        monkeypatch.setattr(call_roller_module,
+                            '_CANCEL_SETTLE_TIMEOUT_SECONDS', 15)
+        by_id, state = queued_cancel_broker(
+            'btc-1', pending_reads=2, then_status='filled',
+            filled_qty=1, filled_price=8.40)
+        opp = self._armed(roller, mock_alpaca, by_id)
+
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+
+        assert state['reads'] > 1, "the settle poll re-read only once"
+        assert result['success'] is True
+        assert terminals(log) == ['call_roll_completed']
+        assert 'call_roll_btc_timeout_canceled' not in event_types(log)
+
+    def test_an_unreadable_order_is_not_a_verified_zero_fill(self, roller,
+                                                             mock_alpaca):
+        """An API blip used to mint a 'verified zero fill' that was never
+        verified: _safe_get_order returned {} and the code read filled_qty 0."""
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.side_effect = [accepted('btc-1')]
+        polls = {'n': 0}
+
+        def by_id(oid):
+            polls['n'] += 1
+            if polls['n'] == 1:
+                return order('btc-1', 'new', 0)
+            raise RuntimeError("alpaca 503")
+
+        mock_alpaca.get_order_by_id.side_effect = by_id
+
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+
+        assert result['reason'] == 'btc_disposition_unknown'
+        assert terminals(log) == ['call_roll_unknown_disposition']
+        # The breadcrumb is emitted too, and it is alert-wired.
+        assert 'call_roll_order_refetch_failed' in event_types(log)
+
+    def test_the_refetch_breadcrumb_is_emitted_once_not_per_read(
+            self, roller, mock_alpaca, monkeypatch):
+        monkeypatch.setattr(call_roller_module,
+                            '_CANCEL_SETTLE_TIMEOUT_SECONDS', 20)
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.side_effect = [accepted('btc-1')]
+        polls = {'n': 0}
+
+        def by_id(oid):
+            polls['n'] += 1
+            if polls['n'] == 1:
+                return order('btc-1', 'new', 0)
+            raise RuntimeError("alpaca 503")
+
+        mock_alpaca.get_order_by_id.side_effect = by_id
+
+        with patch('src.strategy.call_roller.logger') as log:
+            roller.execute_roll(opp)
+
+        breadcrumbs = [e for e in event_types(log)
+                       if e == 'call_roll_order_refetch_failed']
+        assert len(breadcrumbs) == 1, (
+            f"a persistent outage left {len(breadcrumbs)} breadcrumbs; "
+            f"one per poll is the contract")
+
+
+class TestQueuedCancelsOnTheStoLadder:
+    """The reviewer's probe produced the worst outcome in the whole review here:
+    an STO ladder that placed THREE sells which all filled, while the roller
+    reported ``naked_exposure`` — "shares uncovered (no naked position)" —
+    against two genuinely naked short calls.
+
+    *Mutation:* replace the settle poll with a single re-read → these fail.
+    """
+
+    def _armed(self, roller, mock_alpaca, sto_by_id):
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.side_effect = [
+            accepted('btc-1'), accepted('sto-1'), accepted('sto-2'),
+            accepted('sto-3'), accepted('sto-4')]
+        mock_alpaca.get_order_by_id.side_effect = lambda oid: (
+            order('btc-1', 'filled', 1, 8.40) if oid == 'btc-1'
+            else sto_by_id(oid))
+        return opp
+
+    def test_a_rung_stuck_in_pending_cancel_STOPS_the_ladder(self, roller,
+                                                             mock_alpaca):
+        """This is the two-live-sells window. If rung 1 will not settle, rung 2
+        must not be placed — the shipped code placed it."""
+        polls = {}
+
+        def sto_by_id(oid):
+            polls[oid] = polls.get(oid, 0) + 1
+            if polls[oid] == 1:
+                return order(oid, 'new', 0)        # fill poll times out
+            return order(oid, 'pending_cancel', 0)  # cancel never settles
+
+        opp = self._armed(roller, mock_alpaca, sto_by_id)
+
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+
+        sells = [c for c in mock_alpaca.place_option_order.call_args_list
+                 if c.kwargs['side'] == 'sell']
+        assert len(sells) == 1, (
+            f"{len(sells)} sells placed while rung 1 was still working — "
+            f"that is {len(sells) - 1} potentially naked short call(s)")
+        assert result['reason'] == 'stc_disposition_unknown'
+        assert terminals(log) == ['call_roll_unknown_disposition']
+        # And it must NOT claim there is no naked position.
+        assert 'call_roll_naked_exposure' not in event_types(log)
+
+    def test_a_rung_that_fills_after_its_cancel_is_that_rungs_success(
+            self, roller, mock_alpaca, monkeypatch):
+        monkeypatch.setattr(call_roller_module,
+                            '_CANCEL_SETTLE_TIMEOUT_SECONDS', 15)
+        polls = {}
+
+        def sto_by_id(oid):
+            polls[oid] = polls.get(oid, 0) + 1
+            if polls[oid] == 1:
+                return order(oid, 'new', 0)
+            if polls[oid] == 2:
+                return order(oid, 'pending_cancel', 0)
+            return order(oid, 'filled', 1, 10.90)
+
+        opp = self._armed(roller, mock_alpaca, sto_by_id)
+
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+
+        assert result['success'] is True
+        assert result['stc_order_id'] == 'sto-1'
+        assert terminals(log) == ['call_roll_completed']
+        sells = [c for c in mock_alpaca.place_option_order.call_args_list
+                 if c.kwargs['side'] == 'sell']
+        assert len(sells) == 1
+
+
+# --------------------------------------------------------------------------- #
+# T-19b — the STO partial remainder (review H-2 = trader M-1)
+# --------------------------------------------------------------------------- #
+
+class TestTheStoPartialRemainder:
+    """BTC closes 2, STO covers 1 → 100 shares uncovered.
+
+    The shipped code reported ``call_roll_completed`` with
+    ``net_credit = 1xSTO - 2xBTC = -$590`` — a blended DEBIT labelled a credit —
+    and emitted no naked-exposure-class event at all, contradicting the plan's
+    own text. Latent on today's 1-lot book; a money-path contract violation
+    regardless.
+
+    *Mutation:* restore the mixed-quantity net_credit → these fail.
+    """
+
+    def _partial(self, roller, mock_alpaca):
+        opp = roller.evaluate_roll_opportunity(
+            call_position(qty='-2'), stock_position(qty='200'))
+        mock_alpaca.place_option_order.side_effect = [
+            accepted('btc-1'), accepted('sto-1')]
+        mock_alpaca.get_order_by_id.side_effect = lambda oid: (
+            order('btc-1', 'filled', 2, 8.40, qty=2) if oid == 'btc-1'
+            else order('sto-1', 'canceled', 1, 10.90, qty=2))
+        return opp
+
+    def test_the_uncovered_remainder_gets_a_naked_exposure_class_terminal(
+            self, roller, mock_alpaca):
+        opp = self._partial(roller, mock_alpaca)
+
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+
+        assert terminals(log) == ['call_roll_partial_naked_exposure']
+        assert 'call_roll_completed' not in event_types(log)
+        assert result['success'] is False
+        assert result['contracts_replaced'] == 1
+        assert result['contracts_uncovered'] == 1
+
+    def test_no_blended_negative_is_ever_labelled_a_credit(self, roller,
+                                                           mock_alpaca):
+        """The credit invariant is a PER-CONTRACT guarantee, so only a
+        per-contract number may be called a credit. 1x(10.90-8.40)x100 = +$250,
+        not 1x10.90x100 - 2x8.40x100 = -$590."""
+        opp = self._partial(roller, mock_alpaca)
+
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+
+        event = [k for e, k in events(log)
+                 if e == 'call_roll_partial_naked_exposure'][0]
+        assert event['net_credit_on_replaced'] == pytest.approx(250.0)
+        assert result['net_credit_on_replaced'] == pytest.approx(250.0)
+        # Both legs reported explicitly, so the cash picture is not inferred
+        # from a single blended figure.
+        assert event['btc_cash_paid'] == pytest.approx(1680.0)   # 2 x 8.40 x 100
+        assert event['stc_cash_received'] == pytest.approx(1090.0)  # 1 x 10.90 x 100
+        assert event['contracts_uncovered'] == 1
+
+    def test_a_fully_matched_roll_still_reports_completed(self, roller,
+                                                          mock_alpaca):
+        """The fix must not turn clean rolls into error terminals."""
+        opp = roller.evaluate_roll_opportunity(
+            call_position(qty='-2'), stock_position(qty='200'))
+        mock_alpaca.place_option_order.side_effect = [
+            accepted('btc-1'), accepted('sto-1')]
+        mock_alpaca.get_order_by_id.side_effect = lambda oid: (
+            order('btc-1', 'filled', 2, 8.40, qty=2) if oid == 'btc-1'
+            else order('sto-1', 'filled', 2, 10.90, qty=2))
+
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+
+        assert terminals(log) == ['call_roll_completed']
+        assert result['success'] is True
+        assert result['contracts'] == 2
+        assert result['net_credit'] == pytest.approx(500.0)  # 2 x 2.50 x 100
+
+
+# --------------------------------------------------------------------------- #
 # T-19 — partial-fill truth
 # --------------------------------------------------------------------------- #
 
@@ -1024,6 +1340,50 @@ class TestStoLadder:
         assert sells[0] == pytest.approx(10.90)   # rung 1: the re-checked bid
         assert sells[1] == pytest.approx(8.00)    # rung 2: the invariant floor
         assert all(p >= 8.00 for p in sells), "a rung priced below the invariant"
+
+    def test_fallback_rungs_anchor_the_invariant_on_the_ACTUAL_BTC_FILL(
+            self, roller, mock_alpaca):
+        """Trader L-3. A mutation anchoring rungs 3+ on ``btc_limit`` instead of
+        ``btc_filled_price`` survived the original suite, because every test
+        filled the BTC exactly at its limit — where the two numbers coincide.
+        They only diverge when the BTC fills BETTER than its limit, which is the
+        common case and the one that unlocks candidates.
+
+        Here BTC fills at 7.00 against an 8.40 limit, and C380 is quoted at
+        8.00: legal against the actual fill (+$1.00 credit), rejected against
+        the stale limit. Anchoring on the limit silently forfeits a real credit
+        roll — conservative, but wrong, and invisible without this test.
+        """
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.side_effect = [
+            accepted('btc-1'), accepted('sto-1'), accepted('sto-2'),
+            accepted('sto-3'), accepted('sto-4')]
+        mock_alpaca.get_option_quote.side_effect = _quote_book({
+            C375['symbol']: {'bid': 10.90, 'ask': 11.10},
+            C380['symbol']: {'bid': 8.00, 'ask': 8.20},
+        })
+        filled = {'sto-3': True}
+
+        def by_id(oid):
+            if oid == 'btc-1':
+                return order('btc-1', 'filled', 1, 7.00)   # beat the 8.40 limit
+            if oid in filled:
+                return order(oid, 'filled', 1, 8.00)
+            return order(oid, 'canceled', 0)
+
+        mock_alpaca.get_order_by_id.side_effect = by_id
+
+        result = roller.execute_roll(opp)
+
+        sold = [c.kwargs['symbol']
+                for c in mock_alpaca.place_option_order.call_args_list
+                if c.kwargs['side'] == 'sell']
+        assert C380['symbol'] in sold, (
+            "the C380 rung was never reached — the invariant is anchored on "
+            "btc_limit (8.40) instead of the actual fill (7.00), forfeiting a "
+            "legal +$1.00 credit roll")
+        assert result['success'] is True
+        assert result['net_credit'] == pytest.approx(100.0)  # (8.00-7.00)x1x100
 
     def test_fallback_rungs_re_validate_and_re_test_the_invariant(
             self, roller, mock_alpaca):
@@ -1334,6 +1694,10 @@ class TestTheTerminalTaxonomyIsExhaustive:
             'call_roll_stc_placed', 'call_roll_stc_filled',
             'call_roll_partial_fill', 'call_roll_stc_unfilled',
             'call_roll_stc_rejected', 'call_roll_order_refetch_failed',
+            # Breadcrumb emitted inside the ladder when a rung will not settle;
+            # the TERMINAL for that position is call_roll_unknown_disposition,
+            # raised by execute_roll once the ladder returns.
+            'call_roll_stc_disposition_unknown',
         }
         unclassified = emitted - TERMINAL_EVENTS - non_terminal
         assert not unclassified, (
@@ -1395,6 +1759,26 @@ class TestTheFlagshipRoll:
         assert completed['pricing_mode'] == 'base'
         assert completed['contracts'] == 1
         assert 'roll_count' not in completed
+
+    def test_a_btc_rejected_AFTER_placement_says_rejected_not_canceled(
+            self, roller, mock_alpaca):
+        """Trader L-2. A broker rejection reaching a terminal ``rejected``
+        status was reported as ``call_roll_btc_timeout_canceled`` with
+        ``disposition=terminal_no_fill``. Both mean "no fill", but they call for
+        different investigations — a rejection is an account or contract
+        problem that will recur every cycle until someone looks."""
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.side_effect = [accepted('btc-1')]
+        mock_alpaca.get_order_by_id.side_effect = lambda oid: order(
+            'btc-1', 'rejected', 0)
+
+        with patch('src.strategy.call_roller.logger') as log:
+            result = roller.execute_roll(opp)
+
+        assert result['reason'] == 'btc_rejected'
+        assert terminals(log) == ['call_roll_btc_rejected']
+        rejected = [k for e, k in events(log) if e == 'call_roll_btc_rejected'][0]
+        assert rejected['rejected_after_placement'] is True
 
     def test_a_rejected_btc_terminates_without_touching_the_position(
             self, roller, mock_alpaca):

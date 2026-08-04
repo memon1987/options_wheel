@@ -205,11 +205,14 @@ this correct — the gate exists to stop *opening* gap exposure, so it filters
 **candidates**; when it empties the candidate set the roller places no order at
 all rather than closing and staying uncovered.
 
-**One inherited quirk survives on this path:** an injected calendar bypasses the
-`enabled` check. `run_rolling_cycle` consults `config.earnings_enabled` only
-when it constructs its own service; a calendar passed in is used regardless.
-This is the inverse of the scanner's DD-8 semantics (where config always wins)
-and is FC-066's inheritance, deliberately untouched.
+**The injected-calendar quirk is gone.** It used to be that an injected calendar
+bypassed the `enabled` check, because `run_rolling_cycle` consulted
+`config.earnings_enabled` only when constructing its own service. FC-078's
+roller gates the span check on `config.earnings_enabled` directly, so config
+wins either way — the same posture as the scanner. A calendar that is injected
+while earnings are disabled is used for log enrichment only, never as a gate;
+and a *missing* calendar while earnings are enabled fails the roll closed
+(`earnings_unknown`) rather than open.
 
 `/monitor` closes positions and is **never gated** — a close reduces risk.
 

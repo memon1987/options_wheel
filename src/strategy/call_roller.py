@@ -68,7 +68,20 @@ _MAX_STOCK_SPREAD_RATIO = 1.05
 # Statuses at which an order is done moving on its own. ``partially_filled`` is
 # deliberately absent: it is NOT terminal, and returning on it (as the as-built
 # code did) leaves the remainder working while the next leg is placed.
+#
+# ``pending_cancel`` is absent for a sharper reason (FC-078 review, execution
+# H-1): Alpaca cancels are QUEUED, not synchronous. An order sitting in
+# ``pending_cancel`` is still working and can still fill. Treating that read as
+# a disposition is how a roller reports "canceled, zero fill" about contracts it
+# is in the middle of buying.
 _TERMINAL_ORDER_STATUSES = ('filled', 'expired', 'canceled', 'rejected')
+
+# How long to keep re-reading an order after cancelling it, waiting for the
+# broker to settle it into a terminal status. Short: a cancel that has not
+# resolved in this window is not going to tell us anything by waiting longer,
+# and the safe action does not depend on the answer — we stop touching the
+# position either way.
+_CANCEL_SETTLE_TIMEOUT_SECONDS = 15
 
 
 class CallRoller:
@@ -629,17 +642,41 @@ class CallRoller:
         btc_order = self._poll_order_fill(btc_order_id)
         timed_out = btc_order is None
         if timed_out:
-            self._safe_cancel(btc_order_id)
-            btc_order = self._safe_get_order(btc_order_id)
+            btc_order = self._cancel_and_settle(btc_order_id)
+            if btc_order is None:
+                # The cancel never settled. We do NOT know whether contracts
+                # were bought, so we must not sell a call against a short
+                # position whose size is unknown. Stop, and page.
+                return self._unknown_disposition(
+                    leg='btc', order_id=btc_order_id, symbol=old_symbol,
+                    underlying=underlying, earnings_info=earnings_info,
+                    detail=("BTC cancel did not settle to a terminal status "
+                            "within the bound; the order may still be working"))
 
         btc_filled_qty = int(_as_float(btc_order.get('filled_qty')))
         if btc_filled_qty <= 0:
+            btc_status = btc_order.get('status')
+            if btc_status == 'rejected':
+                # L-2: a broker rejection after placement is a REJECTION, not a
+                # timeout-cancel. The event name has to say which happened —
+                # "canceled at timeout" and "the broker refused it" call for
+                # different investigations.
+                log_error_event(
+                    logger, error_type="call_roll_btc_rejected",
+                    error_message=f"BTC order {btc_order_id} rejected after placement",
+                    component="call_roller", recoverable=True,
+                    symbol=old_symbol, underlying=underlying,
+                    order_id=btc_order_id, limit_price=btc_limit,
+                    contracts=contracts, rejected_after_placement=True,
+                )
+                return {'success': False, 'reason': 'btc_rejected',
+                        'order_id': btc_order_id, 'underlying': underlying}
             log_trade_event(
                 logger, event_type="call_roll_btc_timeout_canceled",
                 symbol=old_symbol, underlying=underlying,
                 strategy="roll_call", success=False,
                 order_id=btc_order_id,
-                order_status=btc_order.get('status'),
+                order_status=btc_status,
                 disposition=('timeout_canceled' if timed_out else 'terminal_no_fill'),
                 limit_price=btc_limit, contracts=contracts,
                 **earnings_info,
@@ -684,15 +721,35 @@ class CallRoller:
         # === LEG 2: Sell-to-open, sized to what actually closed ===
         stc_result = self._attempt_stc(opportunity, btc_filled_qty, btc_filled_price)
 
+        if stc_result and stc_result.get('unknown_disposition'):
+            return self._unknown_disposition(
+                leg='stc', order_id=stc_result.get('order_id', ''),
+                symbol=stc_result.get('symbol', new_symbol),
+                underlying=underlying, earnings_info=earnings_info,
+                detail=("STO cancel did not settle to a terminal status within "
+                        "the bound; the order may still be working, so no "
+                        "further sell was placed"),
+                btc_order_id=btc_order_id, btc_filled_qty=btc_filled_qty)
+
         if stc_result and stc_result.get('success'):
             stc_filled_qty = stc_result['filled_qty']
             stc_filled_price = stc_result['filled_price']
 
-            btc_total = btc_filled_price * btc_filled_qty * 100
-            stc_total = stc_filled_price * stc_filled_qty * 100
-            net_credit = stc_total - btc_total
+            # Per-replaced-quantity accounting (FC-078 review, execution H-2 =
+            # trader M-1). The shipped version computed
+            # ``stc_price*stc_qty - btc_price*btc_qty`` across MIXED quantities,
+            # so a 2-contract BTC against a 1-contract STO reported
+            # ``call_roll_completed`` with net_credit = -$590 — a blended DEBIT
+            # labelled a credit — while 100 shares sat uncovered with no
+            # naked-exposure-class event. The credit invariant is a per-contract
+            # guarantee; only a per-contract number may be called a credit.
+            replaced = min(stc_filled_qty, btc_filled_qty)
+            uncovered = btc_filled_qty - replaced
+            net_credit = (stc_filled_price - btc_filled_price) * replaced * 100
+            btc_cash_paid = btc_filled_price * btc_filled_qty * 100
+            stc_cash_received = stc_filled_price * stc_filled_qty * 100
 
-            if stc_filled_qty < btc_filled_qty:
+            if uncovered > 0:
                 log_trade_event(
                     logger, event_type="call_roll_partial_fill",
                     symbol=stc_result['symbol'], underlying=underlying,
@@ -700,8 +757,46 @@ class CallRoller:
                     leg="stc",
                     requested_qty=btc_filled_qty,
                     filled_qty=stc_filled_qty,
-                    unfilled_qty=btc_filled_qty - stc_filled_qty,
+                    unfilled_qty=uncovered,
                 )
+                # The remainder is exactly the naked-exposure case, at a smaller
+                # quantity — plan §1 already said so ("the uncovered remainder
+                # falls through to the naked-exposure terminal if no later rung
+                # covers it"); the code did not. One terminal, alert-wired,
+                # reporting both legs explicitly rather than a blended figure.
+                log_error_event(
+                    logger, error_type="call_roll_partial_naked_exposure",
+                    error_message=(
+                        f"Rolled {replaced} of {btc_filled_qty} contracts — "
+                        f"{uncovered} contract(s) worth of shares "
+                        f"({uncovered * 100}) are UNCOVERED (no naked position); "
+                        f"next /scan -> /run re-covers through the entry path "
+                        f"with all entry gates applied"),
+                    component="call_roller", recoverable=False,
+                    symbol=stc_result['symbol'], underlying=underlying,
+                    old_option_symbol=old_symbol,
+                    contracts_replaced=replaced,
+                    contracts_uncovered=uncovered,
+                    btc_filled_qty=btc_filled_qty,
+                    btc_filled_price=btc_filled_price,
+                    btc_cash_paid=round(btc_cash_paid, 2),
+                    stc_filled_qty=stc_filled_qty,
+                    stc_filled_price=stc_filled_price,
+                    stc_cash_received=round(stc_cash_received, 2),
+                    net_credit_on_replaced=round(net_credit, 2),
+                    btc_order_id=btc_order_id,
+                    stc_order_id=stc_result['order_id'],
+                )
+                return {
+                    'success': False,
+                    'reason': 'partial_naked_exposure',
+                    'underlying': underlying,
+                    'contracts_replaced': replaced,
+                    'contracts_uncovered': uncovered,
+                    'net_credit_on_replaced': round(net_credit, 2),
+                    'btc_order_id': btc_order_id,
+                    'stc_order_id': stc_result['order_id'],
+                }
 
             log_position_update(
                 logger, event_type="call_roll_completed",
@@ -760,6 +855,30 @@ class CallRoller:
             'underlying': underlying,
         }
 
+    def _unknown_disposition(self, *, leg: str, order_id: str, symbol: str,
+                             underlying: str, earnings_info: Dict[str, Any],
+                             detail: str, **fields: Any) -> Dict[str, Any]:
+        """The fail-safe terminal: an order whose fate we could not establish.
+
+        This exists because the honest answer to "did that cancel work?" is
+        sometimes "we don't know", and every other answer the code could give is
+        a guess about live contracts. It is alert-wired precisely because it
+        needs a human to look at the account — the bot deliberately stops
+        touching the position rather than acting on a guess.
+        """
+        log_error_event(
+            logger, error_type="call_roll_unknown_disposition",
+            error_message=(
+                f"{leg.upper()} order {order_id} disposition UNKNOWN — {detail}. "
+                f"No further orders placed for this position this cycle; "
+                f"check the account before the next cycle."),
+            component="call_roller", recoverable=False,
+            symbol=symbol, underlying=underlying, leg=leg, order_id=order_id,
+            **fields,
+        )
+        return {'success': False, 'reason': f'{leg}_disposition_unknown',
+                'order_id': order_id, 'underlying': underlying}
+
     # ------------------------------------------------------------------ #
     # The STO ladder
     # ------------------------------------------------------------------ #
@@ -772,8 +891,14 @@ class CallRoller:
         and the ladder placed the next sell on top of it: two live sells against
         one covered lot, and a late fill on rung 1 while rung 2 works is a
         genuine **naked short call**. Every rung transition here is
-        cancel-then-verify, and a cancel that fails because the order filled is
+        cancel-then-SETTLE, and a cancel that fails because the order filled is
         reported as that rung *succeeding*.
+
+        The invariant needs the settle, not just the cancel (review H-1): an
+        Alpaca cancel is queued, so a rung sitting in ``pending_cancel`` is
+        still working. If a rung will not settle, the ladder **stops** — placing
+        the next sell against an unresolved one is exactly the naked-call window
+        this method exists to close.
         """
         underlying = opportunity['underlying']
         # (order_id, symbol, strike, limit)
@@ -781,10 +906,14 @@ class CallRoller:
 
         for symbol, limit, new_strike in self._rungs(opportunity, btc_filled_price):
             if live is not None:
-                resolved = self._cancel_and_verify(live, underlying)
+                pending = live
                 live = None
+                resolved, settled = self._settle_live_rung(pending, underlying)
                 if resolved:
                     return resolved
+                if not settled:
+                    return {'success': False, 'unknown_disposition': True,
+                            'order_id': pending[0], 'symbol': pending[1]}
 
             order_id = self._place_stc(symbol, underlying, qty, limit)
             if order_id is None:
@@ -811,9 +940,12 @@ class CallRoller:
             )
 
         if live is not None:
-            resolved = self._cancel_and_verify(live, underlying)
+            resolved, settled = self._settle_live_rung(live, underlying)
             if resolved:
                 return resolved
+            if not settled:
+                return {'success': False, 'unknown_disposition': True,
+                        'order_id': live[0], 'symbol': live[1]}
 
         return None
 
@@ -865,24 +997,39 @@ class CallRoller:
 
             yield (symbol, limit, entry['new_strike'])
 
-    def _cancel_and_verify(self, live: Tuple[str, str, float, float],
-                           underlying: str) -> Optional[Dict[str, Any]]:
-        """Cancel a working STO order and re-read it before believing anything.
+    def _settle_live_rung(self, live: Tuple[str, str, float, float],
+                          underlying: str
+                          ) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """Cancel a working STO rung and wait for the broker to settle it.
 
-        Returns the success dict when the cancel lost the race to a fill — that
-        rung SUCCEEDED — and None when the order is confirmed dead with nothing
-        filled. A partial fill counts as that rung's result; the uncovered
-        remainder falls through to the naked-exposure terminal if no later rung
-        covers it.
+        Returns ``(result, settled)``:
+
+        - ``(success_dict, True)`` — the cancel lost the race to a fill, so that
+          rung SUCCEEDED. A partial fill counts as that rung's result; the
+          uncovered remainder is reported by the caller.
+        - ``(None, True)`` — settled terminal with nothing filled. Safe to place
+          the next rung.
+        - ``(None, False)`` — **did not settle.** The order may still be
+          working, so the ladder must stop: placing another sell here is the
+          two-live-sells window in its purest form.
         """
         order_id, symbol, new_strike, limit_price = live
-        self._safe_cancel(order_id)
-        order = self._safe_get_order(order_id)
+        order = self._cancel_and_settle(order_id)
+        if order is None:
+            log_error_event(
+                logger, error_type="call_roll_stc_disposition_unknown",
+                error_message=(
+                    f"STO order {order_id} did not settle after cancel; "
+                    f"ladder stopped rather than placing another sell"),
+                component="call_roller", recoverable=False,
+                symbol=symbol, underlying=underlying, order_id=order_id,
+            )
+            return None, False
         filled_qty = int(_as_float(order.get('filled_qty')))
         if filled_qty > 0:
             return self._stc_success(order_id, symbol, underlying, new_strike,
-                                     filled_qty, order, limit_price)
-        return None
+                                     filled_qty, order, limit_price), True
+        return None, True
 
     def _place_stc(self, symbol: str, underlying: str, contracts: int,
                    limit_price: float) -> Optional[str]:
@@ -935,52 +1082,78 @@ class CallRoller:
     # ------------------------------------------------------------------ #
     # Order plumbing
     # ------------------------------------------------------------------ #
-    def _poll_order_fill(self, order_id: str) -> Optional[Dict[str, Any]]:
+    def _poll_order_fill(self, order_id: str,
+                         timeout: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Poll until the order reaches a terminal status, or the timeout.
 
         ``partially_filled`` is NOT terminal: returning on it (as-built) hands
         the caller a half-fill while the remainder is still working, which is
-        how the STO leg came to be sized off the requested quantity. Returns
-        None on timeout — the caller then cancels and re-reads, which is the
-        only way to learn what actually happened.
+        how the STO leg came to be sized off the requested quantity. Neither is
+        ``pending_cancel``. Returns None when no terminal status was observed
+        inside the bound — which means **we do not know what this order did**,
+        and every caller must treat it that way.
+
+        An unreadable order (API error, empty response) is NOT a disposition
+        either: it simply fails to advance the poll, and if it never advances
+        the caller gets None. The alternative — reading a blip as "verified zero
+        fill" — is how a filled contract gets reported as canceled.
         """
-        timeout = self.config.rolling_btc_fill_timeout_seconds
+        if timeout is None:
+            timeout = self.config.rolling_btc_fill_timeout_seconds
         poll_interval = 5
         elapsed = 0
+        reported_refetch_failure = False
 
         while True:
             try:
                 order = self.alpaca.get_order_by_id(order_id)
                 if order and order.get('status', '') in _TERMINAL_ORDER_STATUSES:
                     return order
-            except Exception:
-                pass
+            except Exception as exc:
+                # Once per poll, not once per read: a persistent outage should
+                # leave one breadcrumb, not twenty-four.
+                if not reported_refetch_failure:
+                    reported_refetch_failure = True
+                    log_error_event(
+                        logger, error_type="call_roll_order_refetch_failed",
+                        error_message=str(exc), component="call_roller",
+                        recoverable=True, order_id=order_id,
+                    )
             if elapsed >= timeout:
                 return None
             time.sleep(poll_interval)
             elapsed += poll_interval
 
+    def _cancel_and_settle(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Cancel an order, then poll until the broker SETTLES it.
+
+        FC-078 review, execution H-1. Alpaca cancels are queued: the order goes
+        to ``pending_cancel`` and can still fill from there. A single re-read
+        after the cancel therefore establishes nothing — the shipped version
+        dispatched on ``filled_qty`` while ignoring a non-terminal status, which
+        produced two documented fictions in the reviewer's probe: an STO ladder
+        that placed three sells which all filled while reporting
+        ``naked_exposure`` ("no naked position") against two genuinely naked
+        calls, and a BTC reporting ``btc_timeout_canceled`` with
+        ``order_status=pending_cancel`` while the DAY order kept working.
+
+        Returns the terminal order dict, or **None when the disposition could
+        not be established**. None is not "nothing filled": it is "we do not
+        know", and callers fail safe on it — never placing another sell, always
+        emitting the alert-wired unknown-disposition terminal.
+        """
+        self._safe_cancel(order_id)
+        return self._poll_order_fill(
+            order_id, timeout=_CANCEL_SETTLE_TIMEOUT_SECONDS)
+
     def _safe_cancel(self, order_id: str) -> bool:
         """Cancel, swallowing failure. A failed cancel is never conclusive — the
-        caller re-reads the order, which is what decides the disposition."""
+        caller settles the order afterwards, which is what decides the
+        disposition."""
         try:
             return bool(self.alpaca.cancel_order(order_id))
         except Exception:
             return False
-
-    def _safe_get_order(self, order_id: str) -> Dict[str, Any]:
-        """Re-read an order after a cancel. An unreadable order is reported as
-        zero-filled: the alternative is inventing a fill, and the position and
-        the next cycle both survive an under-report."""
-        try:
-            return self.alpaca.get_order_by_id(order_id) or {}
-        except Exception as exc:
-            log_error_event(
-                logger, error_type="call_roll_order_refetch_failed",
-                error_message=str(exc), component="call_roller",
-                recoverable=True, order_id=order_id,
-            )
-            return {}
 
 
 def _as_float(value: Any) -> float:

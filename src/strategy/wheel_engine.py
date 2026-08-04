@@ -675,6 +675,7 @@ class WheelEngine:
 
         # Filter to short call positions
         short_calls = []
+        uncovered_calls = []
         for op in option_positions:
             qty = float(op.get('qty', 0))
             if qty >= 0:
@@ -685,6 +686,14 @@ class WheelEngine:
             underlying = parsed.get('underlying', '')
             if underlying in stock_by_symbol:
                 short_calls.append((op, stock_by_symbol[underlying]))
+            else:
+                # A short call with NO covering shares. The roller cannot roll
+                # it (there is no cost-basis floor to resolve), but silently
+                # dropping it means the one position shape nobody wants — a
+                # genuinely naked short call — is the one the roll cycle never
+                # mentions. Emit a terminal so it shows up in the same place
+                # every other roll decision does (FC-078 review, trader L-1).
+                uncovered_calls.append((op, underlying))
 
         results = {
             'rolls_evaluated': 0,
@@ -699,6 +708,13 @@ class WheelEngine:
         # fill both buys, leaving an unintended LONG call plus a sold
         # replacement. One API call per cycle, not per position.
         open_order_symbols, open_orders_ok = self._open_order_symbols()
+
+        for call_pos, underlying in uncovered_calls:
+            results['rolls_evaluated'] += 1
+            results['rolls_skipped'] += 1
+            roller.log_terminal_skip(
+                call_pos.get('symbol', ''), underlying, "no_covering_shares",
+                contracts=abs(int(float(call_pos.get('qty', 0)))))
 
         for call_pos, stock_pos in short_calls:
             results['rolls_evaluated'] += 1
