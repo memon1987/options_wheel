@@ -109,7 +109,7 @@ def _deterministic_alpaca_credentials(monkeypatch):
     `Config()` validates that ALPACA_API_KEY_ID / ALPACA_SECRET_KEY are set
     and raises otherwise. Tests that build a real Config (test_clock_seam,
     test_backtest_simulator — which want the real settings.yaml values, e.g.
-    profit_taking_min_hold_hours) therefore passed on a developer machine
+    the profit_taking DTE bands) therefore passed on a developer machine
     with a .env file and failed in Cloud Build with 18 errors, because the
     result depended on ambient environment.
 
@@ -218,21 +218,15 @@ def test_config_data() -> Dict[str, Any]:
             'min_stock_price': 20.0,
             'max_stock_price': 500.0,
             'min_avg_volume': 1000000,
-            'max_positions_per_stock': 1,
-            'max_total_positions': 10,
-            'max_exposure_per_ticker': 50000.0,
             'opportunity_max_age_minutes': 30
         },
         'risk': {
-            'max_portfolio_allocation': 0.80,
             'max_position_size': 0.10,
-            'min_cash_reserve': 0.20,
             'use_put_stop_loss': False,
             'use_call_stop_loss': True,
             'put_stop_loss_percent': 0.50,
             'call_stop_loss_percent': 0.50,
             'stop_loss_multiplier': 1.5,
-            'profit_target_percent': 0.50,
             'profit_taking': {
                 'use_dynamic_profit_target': True,
                 'static_profit_target': 0.50,
@@ -240,28 +234,14 @@ def test_config_data() -> Dict[str, Any]:
                 'max_profit_target': 0.80,
                 'default_long_dte_target': 0.50,
                 'dte_bands': []
-            },
-            'gap_risk_controls': {
-                'enable_gap_detection': True,
-                'max_overnight_gap_percent': 0.05,
-                'gap_lookback_days': 30,
-                'max_gap_frequency': 0.10,
-                'earnings_avoidance_days': 5,
-                'premarket_gap_threshold': 2.0,
-                'market_open_delay_minutes': 15,
-                'max_historical_vol': 0.50,
-                'vol_lookback_days': 20,
-                'quality_gap_threshold': 0.05,
-                'execution_gap_threshold': 1.5,
-                'execution_gap_lookback_hours': 24
             }
+            # FC-069 S1 deleted the gap_risk_controls block with GapDetector.
         },
         'stocks': {
             'symbols': ['AAPL', 'MSFT', 'GOOGL']
-        },
-        'monitoring': {
-            'check_interval_minutes': 5
         }
+        # FC-069 S1 deleted the monitoring block and dropped it from
+        # Config's required_sections.
     }
 
 
@@ -294,22 +274,16 @@ def mock_config():
     config.min_stock_price = 20.0
     config.max_stock_price = 500.0
     config.min_avg_volume = 1000000
-    config.max_positions_per_stock = 1
-    config.max_total_positions = 10
-    config.max_exposure_per_ticker = 50000.0
     config.stock_symbols = ['AAPL', 'MSFT', 'GOOGL']
     config.opportunity_max_age_minutes = 30
 
     # Risk settings
-    config.max_portfolio_allocation = 0.80
     config.max_position_size = 0.10
-    config.min_cash_reserve = 0.20
     config.use_put_stop_loss = False
     config.use_call_stop_loss = True
     config.put_stop_loss_percent = 0.50
     config.call_stop_loss_percent = 0.50
     config.stop_loss_multiplier = 1.5
-    config.profit_target_percent = 0.50
 
     # Profit taking settings
     config.use_dynamic_profit_target = True
@@ -319,22 +293,8 @@ def mock_config():
     config.profit_taking_default_long_dte = 0.50
     config.profit_taking_dte_bands = []
 
-    # Gap risk settings
-    config.enable_gap_detection = True
-    config.max_overnight_gap_percent = 0.05
-    config.gap_lookback_days = 30
-    config.max_gap_frequency = 0.10
-    config.earnings_avoidance_days = 5
-    config.premarket_gap_threshold = 2.0
-    config.market_open_delay_minutes = 15
-    config.max_historical_vol = 0.50
-    config.vol_lookback_days = 20
-    config.quality_gap_threshold = 0.05
-    config.execution_gap_threshold = 1.5
-    config.execution_gap_lookback_hours = 24
-
-    # Monitoring settings
-    config.check_interval_minutes = 5
+    # FC-069 S1 deleted the gap-risk and monitoring knobs along with
+    # GapDetector; nothing under test reads them any more.
 
     return config
 

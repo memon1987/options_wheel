@@ -238,9 +238,12 @@ class HealthChecker:
         """Check configuration validity."""
         try:
             # Verify all required config parameters
+            # `execution_gap_threshold` dropped by FC-069 S1 — the gap knobs
+            # and GapDetector are deleted, so requiring the attribute here
+            # would fail this check against every valid config.
             required_attrs = [
                 'alpaca_api_key', 'alpaca_secret_key',
-                'stock_symbols', 'execution_gap_threshold'
+                'stock_symbols', 'max_position_size'
             ]
 
             for attr in required_attrs:

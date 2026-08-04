@@ -119,17 +119,19 @@ def falling_then_flat():
     """Price slides enough to put an assigned strike ITM, then stabilizes.
 
     Includes ~45 sessions of warm-up history before the first decision day.
-    That was originally GapDetector's positional ~30-bar lookback; post-FC-068
-    the gap stages are gone and what needs the history is stage 1's volatility
-    and average-volume metrics (`market_data.filter_suitable_stocks`).
+    That was originally the gap detector's positional ~30-bar lookback;
+    post-FC-068 the gap stages are gone (and FC-069 deleted the module), so
+    what needs the history is stage 1's volatility and average-volume metrics
+    (`market_data.filter_suitable_stocks`).
     """
     warmup = _weekdays(date(2024, 3, 25), 45)
     days = _weekdays(date(2024, 6, 3), 30)
     closes = {d: 100.0 for d in warmup}
     # -3/day for 10 sessions (100 -> 70), then flat. The strategy sells puts
     # ~8% OTM, so a gentler slide would never overtake the strike before expiry
-    # and the assignment path would go untested. -3 stays under GapDetector's
-    # 5% overnight-gap block, which would otherwise halt trading outright.
+    # and the assignment path would go untested. -3 was also chosen to stay
+    # under the old 5% overnight-gap block (deleted by FC-069); the shape is
+    # kept because the fixture's assignment timing is calibrated to it.
     for i, d in enumerate(days):
         closes[d] = 100.0 - min(i, 10) * 3.0
     expirations = [d for d in days if d.weekday() == 4]  # Fridays

@@ -12,6 +12,8 @@ Checks performed:
     3. Log analysis (Cloud Logging: error rates, error patterns, correlation IDs)
     4. Position reconciliation (app positions vs Alpaca API)
     5. Performance baseline comparison (rolling 7-day metric deviations)
+    6. Risk parameter validation (duplicate underlyings, position sizing,
+       naked calls, cost-basis floor) — see `check_risk_parameters`
 """
 
 import os
@@ -30,6 +32,10 @@ import structlog
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from src.utils.logging_events import log_system_event, log_error_event, log_performance_metric
+# Canonical OCC parsing. FC-069 S1 (item 12 family) replaced this module's
+# hand-rolled leading-alpha underlying extraction and its `"C" in symbol`
+# short-call test with these — the eighth site in the OCC-substring family.
+from src.utils.option_symbols import parse_option_symbol, strict_option_type
 
 logger = structlog.get_logger(__name__)
 
@@ -775,12 +781,61 @@ class RegressionMonitor:
     # ------------------------------------------------------------------
 
     def check_risk_parameters(self) -> List[CheckResult]:
-        """Validate all risk guardrails against live positions and account.
+        """Validate the live risk invariants against positions and account.
 
-        Checks every risk rule from config/settings.yaml against the current
-        state of the account, positions, and recent trades.
+        This is a **detective** layer, not a preventive one: it runs hourly via
+        Cloud Scheduler against `/regression` and any `fail` makes the endpoint
+        return HTTP 500. It therefore must mirror policies that actually exist —
+        an alarm layer that cries wolf gets muted.
+
+        FC-069 S1 (card 16) synced it to the post-sweep policy set. Four checks
+        were deleted with the knobs they mirrored:
+
+        - ``risk_max_total_positions`` (hardcoded 10) — no global cap exists.
+        - ``risk_min_cash_reserve`` (hardcoded 20%) — no cash-reserve policy.
+        - ``risk_max_portfolio_allocation`` (hardcoded 80%) — no allocation cap.
+        - ``risk_max_exposure_per_ticker`` (hardcoded $40k) — no per-ticker cap,
+          and the check was a live incident waiting on account growth: a single
+          ``max_position_size``-sized lot crosses $40k market value at roughly a
+          $114k portfolio, at which point this returned **fail → HTTP 500 hourly
+          on a healthy account**, against a policy nothing enforced. It never
+          even mirrored faithfully — it measured market value where the dead
+          knob meant assignment notional.
+
+        The four survivors verify invariants that are genuinely live, and all
+        four were hardened:
+
+        - **2 · duplicate underlyings** — the one-option-position-per-underlying
+          invariant is real (scanner skip + `select_batch` dedup + share
+          ledger), so the check stays even though its knob is gone. Blind to
+          resting unfilled orders, like all three enforcing legs (FC-009).
+        - **4 · max position size** — re-sourced from ``Config.max_position_size``
+          instead of a hardcoded 0.35, so the alarm cannot drift from the policy.
+        - **7 · naked calls** — real protection. The ``"C" in symbol`` short-call
+          test and the hand-rolled leading-alpha underlying parser are replaced
+          by the canonical parsers.
+        - **8 · cost-basis protection** — re-specced onto ``avg_entry_price``.
+          It derived basis from ``cost_basis / qty``, which FC-029 proved
+          returns 0 for assigned positions; the ``> 0`` guard then skipped
+          silently, leaving the detective floor check **blind on exactly the
+          assigned lots it exists for**. ``avg_entry_price`` is the decided
+          floor source (FC-065 Phase 1).
         """
         checks: List[CheckResult] = []
+
+        # Re-source the sizing policy from Config rather than a hardcoded
+        # constant. Config() is importable in-process and reads the same
+        # settings.yaml baked into the image. Failing to load it is itself a
+        # finding: this monitor must never silently fall back to a stale
+        # number and report "pass" against a policy it invented. So we fail the
+        # check loudly instead of guessing.
+        max_position_size: Optional[float] = None
+        config_load_error: Optional[str] = None
+        try:
+            from src.utils.config import Config
+            max_position_size = float(Config().max_position_size)
+        except Exception as exc:  # pragma: no cover - defensive
+            config_load_error = str(exc)
 
         # --- Fetch live data ---
         try:
@@ -798,8 +853,6 @@ class RegressionMonitor:
             positions = []
 
         portfolio_value = float(account.get("portfolio_value", 0))
-        cash = float(account.get("cash", 0))
-        buying_power = float(account.get("buying_power", 0))
 
         if portfolio_value <= 0:
             checks.append(CheckResult(
@@ -814,174 +867,140 @@ class RegressionMonitor:
         stock_positions = [p for p in positions if p.get("asset_class") == "us_equity"]
         option_positions = [p for p in positions if p.get("asset_class") == "us_option"]
 
-        # --- 1. Max total positions (10) ---
-        total_positions = len(option_positions)
-        if total_positions > 10:
-            checks.append(CheckResult(
-                "risk_max_total_positions", "fail",
-                f"Total option positions ({total_positions}) exceeds max_total_positions (10)",
-                {"total_positions": total_positions},
-            ))
-        else:
-            checks.append(CheckResult(
-                "risk_max_total_positions", "pass",
-                f"Total option positions ({total_positions}) within limit (10)",
-            ))
-
-        # --- 2. Max positions per stock (1) ---
+        # --- 2. One option position per underlying ---
+        # The knob (`max_positions_per_stock`) is gone but the invariant is
+        # real and triple-enforced on the live path, so the mirror stays.
         underlying_counts: Dict[str, int] = {}
         for pos in option_positions:
             symbol = pos.get("symbol", "")
-            # Extract underlying from option symbol (letters before first digit)
-            underlying = ""
-            for ch in symbol:
-                if ch.isdigit():
-                    break
-                underlying += ch
+            underlying = parse_option_symbol(symbol).get("underlying", "")
+            if not underlying:
+                continue
             underlying_counts[underlying] = underlying_counts.get(underlying, 0) + 1
 
         duplicates = {k: v for k, v in underlying_counts.items() if v > 1}
         if duplicates:
             checks.append(CheckResult(
-                "risk_max_positions_per_stock", "fail",
-                f"Multiple positions for same underlying: {duplicates}",
+                "risk_duplicate_underlying", "fail",
+                f"Multiple option positions for same underlying: {duplicates}",
                 {"duplicates": duplicates},
             ))
         else:
             checks.append(CheckResult(
-                "risk_max_positions_per_stock", "pass",
-                "No duplicate underlying positions",
+                "risk_duplicate_underlying", "pass",
+                "No duplicate underlying option positions",
             ))
 
-        # --- 3. Min cash reserve (20%) ---
-        cash_pct = cash / portfolio_value if portfolio_value > 0 else 0
-        if cash_pct < 0.20:
+        # --- 4. Max single position size (Config.max_position_size) ---
+        if max_position_size is None:
             checks.append(CheckResult(
-                "risk_min_cash_reserve", "warn",
-                f"Cash reserve ({cash_pct:.1%}) below minimum (20%)",
-                {"cash": cash, "portfolio_value": portfolio_value, "cash_pct": round(cash_pct, 4)},
+                "risk_max_position_size", "fail",
+                f"Cannot validate position sizing: Config failed to load ({config_load_error})",
+                {"config_load_error": config_load_error},
             ))
         else:
-            checks.append(CheckResult(
-                "risk_min_cash_reserve", "pass",
-                f"Cash reserve ({cash_pct:.1%}) meets minimum (20%)",
-            ))
+            limit_pct = f"{max_position_size:.0%}"
+            for pos in positions:
+                market_value = abs(float(pos.get("market_value", 0)))
+                pos_pct = market_value / portfolio_value if portfolio_value > 0 else 0
+                if pos_pct > max_position_size:
+                    checks.append(CheckResult(
+                        "risk_max_position_size", "fail",
+                        f"Position {pos.get('symbol')} is {pos_pct:.1%} of portfolio (max {limit_pct})",
+                        {"symbol": pos.get("symbol"), "market_value": market_value,
+                         "pct": round(pos_pct, 4), "limit": max_position_size},
+                    ))
 
-        # --- 4. Max single position size (35%) ---
-        for pos in positions:
-            market_value = abs(float(pos.get("market_value", 0)))
-            pos_pct = market_value / portfolio_value if portfolio_value > 0 else 0
-            if pos_pct > 0.35:
+            if not any(r.name == "risk_max_position_size" for r in checks):
                 checks.append(CheckResult(
-                    "risk_max_position_size", "fail",
-                    f"Position {pos.get('symbol')} is {pos_pct:.1%} of portfolio (max 35%)",
-                    {"symbol": pos.get("symbol"), "market_value": market_value, "pct": round(pos_pct, 4)},
+                    "risk_max_position_size", "pass",
+                    f"All positions within {limit_pct} limit",
+                    {"limit": max_position_size},
                 ))
 
-        if not any(r.name == "risk_max_position_size" for r in checks):
-            checks.append(CheckResult("risk_max_position_size", "pass", "All positions within 35% limit"))
-
-        # --- 5. Max portfolio allocation (80%) ---
-        total_position_value = sum(abs(float(p.get("market_value", 0))) for p in positions)
-        allocation_pct = total_position_value / portfolio_value if portfolio_value > 0 else 0
-        if allocation_pct > 0.80:
-            checks.append(CheckResult(
-                "risk_max_portfolio_allocation", "warn",
-                f"Portfolio allocation ({allocation_pct:.1%}) exceeds 80% limit",
-                {"total_position_value": total_position_value, "allocation_pct": round(allocation_pct, 4)},
-            ))
-        else:
-            checks.append(CheckResult(
-                "risk_max_portfolio_allocation", "pass",
-                f"Portfolio allocation ({allocation_pct:.1%}) within 80% limit",
-            ))
-
-        # --- 6. Max exposure per ticker ($40,000) ---
-        ticker_exposure: Dict[str, float] = {}
-        for pos in positions:
-            symbol = pos.get("symbol", "")
-            underlying = ""
-            for ch in symbol:
-                if ch.isdigit():
-                    break
-                underlying += ch
-            exposure = abs(float(pos.get("market_value", 0)))
-            ticker_exposure[underlying] = ticker_exposure.get(underlying, 0) + exposure
-
-        over_exposed = {k: v for k, v in ticker_exposure.items() if v > 40000}
-        if over_exposed:
-            checks.append(CheckResult(
-                "risk_max_exposure_per_ticker", "fail",
-                f"Tickers exceeding $40k exposure: {over_exposed}",
-                {"over_exposed": {k: round(v, 2) for k, v in over_exposed.items()}},
-            ))
-        else:
-            checks.append(CheckResult(
-                "risk_max_exposure_per_ticker", "pass",
-                "All tickers within $40k exposure limit",
-            ))
-
-        # --- 7. Naked call detection (calls must have underlying shares) ---
-        stock_symbols = {p.get("symbol") for p in stock_positions}
-        stock_qty = {p.get("symbol"): int(float(p.get("qty", 0))) for p in stock_positions}
+        # --- 7. Naked call detection (short calls must have underlying shares) ---
+        stock_qty: Dict[str, int] = {}
+        for p in stock_positions:
+            sym = p.get("symbol")
+            if sym:
+                stock_qty[sym] = int(float(p.get("qty", 0)))
 
         for pos in option_positions:
             symbol = pos.get("symbol", "")
-            qty = abs(int(float(pos.get("qty", 0))))
-            side = pos.get("side", "")
+            raw_qty = float(pos.get("qty", 0))
+            qty = abs(int(raw_qty))
 
-            # Detect short calls (sold calls)
-            is_short_call = ("C" in symbol and side == "short") or \
-                            ("C" in symbol and float(pos.get("qty", 0)) < 0)
+            # Canonical parse. `strict_option_type` returns None for anything
+            # that is not an exact OCC contract, so a malformed symbol is never
+            # silently classified as a call (the `"C" in symbol` family, which
+            # also read the 'C' in e.g. a ticker).
+            if strict_option_type(symbol) != "call":
+                continue
+            if not (raw_qty < 0 or pos.get("side") == "short"):
+                continue  # long calls commit no shares
 
-            if is_short_call:
-                underlying = ""
-                for ch in symbol:
-                    if ch.isdigit():
-                        break
-                    underlying += ch
+            underlying = parse_option_symbol(symbol).get("underlying", "")
+            owned_shares = stock_qty.get(underlying, 0)
+            required_shares = qty * 100
 
-                owned_shares = stock_qty.get(underlying, 0)
-                required_shares = qty * 100
-
-                if owned_shares < required_shares:
-                    checks.append(CheckResult(
-                        "risk_naked_call", "fail",
-                        f"Naked call detected: {symbol} (need {required_shares} shares of {underlying}, own {owned_shares})",
-                        {"option_symbol": symbol, "underlying": underlying,
-                         "required_shares": required_shares, "owned_shares": owned_shares},
-                    ))
+            if owned_shares < required_shares:
+                checks.append(CheckResult(
+                    "risk_naked_call", "fail",
+                    f"Naked call detected: {symbol} (need {required_shares} shares of {underlying}, own {owned_shares})",
+                    {"option_symbol": symbol, "underlying": underlying,
+                     "required_shares": required_shares, "owned_shares": owned_shares},
+                ))
 
         if not any(r.name == "risk_naked_call" for r in checks):
             checks.append(CheckResult("risk_naked_call", "pass", "No naked calls detected"))
 
-        # --- 8. Cost basis protection (call strikes >= cost basis) ---
+        # --- 8. Cost basis protection (short call strikes >= avg_entry_price) ---
+        # Basis comes from the stock position's `avg_entry_price`, the decided
+        # floor source (FC-065 Phase 1). The previous derivation, cost_basis/qty,
+        # returns 0 for assigned positions, so the `> 0` guard skipped exactly
+        # the assigned lots this check exists to protect.
+        stock_by_symbol = {p.get("symbol"): p for p in stock_positions if p.get("symbol")}
+
         for pos in option_positions:
             symbol = pos.get("symbol", "")
-            if "C" not in symbol or float(pos.get("qty", 0)) >= 0:
-                continue  # Only check short calls
+            if strict_option_type(symbol) != "call":
+                continue
+            if not (float(pos.get("qty", 0)) < 0 or pos.get("side") == "short"):
+                continue  # only short calls can be written below basis
 
-            underlying = ""
-            for ch in symbol:
-                if ch.isdigit():
-                    break
-                underlying += ch
-
-            # Extract strike from OCC symbol (last 8 digits / 1000)
-            try:
-                strike = float(symbol[-8:]) / 1000.0
-            except (ValueError, IndexError):
+            parsed = parse_option_symbol(symbol)
+            underlying = parsed.get("underlying", "")
+            strike = float(parsed.get("strike_price", 0) or 0)
+            if strike <= 0:
                 continue
 
-            stock_pos = next((p for p in stock_positions if p.get("symbol") == underlying), None)
-            if stock_pos:
-                cost_basis_per_share = float(stock_pos.get("cost_basis", 0)) / max(int(float(stock_pos.get("qty", 1))), 1)
-                if cost_basis_per_share > 0 and strike < cost_basis_per_share:
-                    checks.append(CheckResult(
-                        "risk_cost_basis_protection", "fail",
-                        f"Call {symbol} strike ${strike:.2f} below cost basis ${cost_basis_per_share:.2f}",
-                        {"option_symbol": symbol, "strike": strike, "cost_basis": round(cost_basis_per_share, 2)},
-                    ))
+            stock_pos = stock_by_symbol.get(underlying)
+            if not stock_pos:
+                continue  # naked — check 7's finding, not this one's
+
+            try:
+                basis_per_share = float(stock_pos.get("avg_entry_price") or 0)
+            except (TypeError, ValueError):
+                basis_per_share = 0.0
+
+            if basis_per_share <= 0:
+                # Unresolvable basis is a finding, not a silent skip: the old
+                # version's silent skip is what made this check blind.
+                checks.append(CheckResult(
+                    "risk_cost_basis_protection", "fail",
+                    f"Cannot verify floor for {symbol}: {underlying} position has no usable avg_entry_price",
+                    {"option_symbol": symbol, "underlying": underlying,
+                     "avg_entry_price": stock_pos.get("avg_entry_price")},
+                ))
+                continue
+
+            if strike < basis_per_share:
+                checks.append(CheckResult(
+                    "risk_cost_basis_protection", "fail",
+                    f"Call {symbol} strike ${strike:.2f} below cost basis ${basis_per_share:.2f}",
+                    {"option_symbol": symbol, "strike": strike,
+                     "cost_basis": round(basis_per_share, 2)},
+                ))
 
         if not any(r.name == "risk_cost_basis_protection" for r in checks):
             checks.append(CheckResult("risk_cost_basis_protection", "pass", "All call strikes above cost basis"))

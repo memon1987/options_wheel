@@ -85,10 +85,12 @@ class TestNoLookahead:
     def test_stock_bars_index_is_tz_aware_utc_like_live(self, setup):
         """Index must match live's dtype/stamp so dates derive identically.
 
-        Live returns datetime64[ns, UTC] stamped 04:00 (midnight ET). Since
-        FC-036 GapDetector selects the previous close by calendar date
-        (``idx.date()``) rather than by timestamp, so what matters is that
-        each bar's index date equals its trading date under both stamps.
+        Live returns datetime64[ns, UTC] stamped 04:00 (midnight ET). The
+        property that matters is that each bar's index date equals its trading
+        date under both the 04:00 and 05:00 stamps — established when the
+        FC-036 gap gate selected the previous close by calendar date
+        (``idx.date()``), and still required by every date-based consumer of
+        this index after FC-069 deleted that gate.
         """
         import pandas as pd
 
@@ -97,7 +99,7 @@ class TestNoLookahead:
             df = client.get_stock_bars("XYZ", days=30)
         assert str(df.index.dtype) == "datetime64[ns, UTC]"
         assert df.index[0].hour == 4
-        # The date-based selection GapDetector performs must exclude D2 itself.
+        # Date-based selection must exclude D2 itself.
         df_dates = pd.Series([idx.date() for idx in df.index], index=df.index)
         assert list(df.loc[df_dates < D2].index.date) == [D1]
 

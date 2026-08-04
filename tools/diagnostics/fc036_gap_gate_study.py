@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """FC-036 Half 1 — what a *working* stage-4 execution-gap gate would have done.
 
+⚠️ **CODE DELETED BY FC-069 item 5 (2026-08-04).** `src/risk/gap_detector.py`
+and the `risk.gap_risk_controls` knobs this harness monkeypatches are no longer
+in the tree; **the code lives at pre-S1 main SHA `afb6698`**. Phase B was never
+armed and gap risk is now absent by decision (FC-049 owns any evidence-based
+revival), so this file is kept as the record of the study, not as a runnable
+harness — check out `afb6698` to re-run it.
+
 PURPOSE
 -------
 `GapDetector._get_previous_close` read the current session's own daily bar, so the

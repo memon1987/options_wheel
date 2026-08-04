@@ -902,8 +902,10 @@ class BigQueryService:
     # ================================================================
 
     # Deploy date of the FC-029 risk re-tune (call delta band, hard
-    # cost-basis floor, drawdown pause). Used to split cycle/put stats
-    # into before/after regimes so the parameter change is measurable.
+    # cost-basis floor, and a drawdown pause that no longer exists — the gate
+    # died with FC-065 OQ-3 and the knob with FC-069 item 9). Used to split
+    # cycle/put stats into before/after regimes so the parameter change is
+    # measurable; the date is what matters and is unchanged.
     FC029_DEPLOY_DATE = "2026-05-08"
 
     # Known, dated reconciliation gaps. Each entry documents a measured

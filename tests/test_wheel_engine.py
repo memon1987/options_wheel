@@ -80,8 +80,8 @@ class TestWheelEngineConstruction:
     def test_the_engine_no_longer_owns_sellers_or_a_gap_detector(self):
         """The engine constructed a PutSeller, a CallSeller (with its own
         CostBasisResolver) and a GapDetector purely to feed the dead path.
-        ``/run`` builds its own sellers; the gap detector is consumed by
-        nothing (FC-069 item 5). Holding them here would keep a second,
+        ``/run`` builds its own sellers; the gap detector module itself was
+        deleted by FC-069 item 5. Holding them here would keep a second,
         divergent wiring alive."""
         engine = self._engine()
         for gone in ('put_seller', 'call_seller', 'gap_detector',

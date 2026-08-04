@@ -26,7 +26,15 @@ from src.utils.option_symbols import parse_option_symbol
 
 
 class TestClockDrivesLiveDecisions:
-    """The min-hold gate in should_close_put_early() must read simulated time.
+    """`should_close_put_early()` must decide from *simulated* time.
+
+    FC-069 item 6 deleted the min-hold gate that this class originally used as
+    its vehicle (it read `_entry_times`, an in-process dict on a per-request
+    seller, so it never ran in production). The property under test is
+    unchanged and is now pinned on the control that actually carries the hold
+    discipline: the DTE-banded profit target. DTE is derived from
+    `clock.now()`, so freezing the clock moves the position into a different
+    band and flips the close decision.
 
     A real Config is used deliberately. With a Mock, _get_profit_target_for_dte
     returns a Mock, the `profit_percentage >= profit_target` comparison raises
@@ -35,19 +43,18 @@ class TestClockDrivesLiveDecisions:
     reason and could never exercise the released branch at all.
     """
 
-    # Entry, and an expiry 4 calendar days later so the DTE band is well defined.
+    # A reference instant, and an expiry 4 calendar days later.
     ENTRY = datetime(2024, 6, 3, 10, 0)
-    # 90% profit: past every DTE-band target (dte 4 -> 0.45).
+    # 50% profit. It clears the DTE-4 band target (0.45) but not the DTE-2
+    # one (0.60) — so the same position closes or holds purely on sim time.
     POSITION = {
         "symbol": "XYZ240607P00090000",
-        "unrealized_pl": 90.0,
+        "unrealized_pl": 50.0,
         "market_value": -100.0,
     }
 
     def _put_seller(self) -> PutSeller:
-        ps = PutSeller(Mock(), Mock(), Config())
-        ps._entry_times[self.POSITION["symbol"]] = self.ENTRY
-        return ps
+        return PutSeller(Mock(), Mock(), Config())
 
     def test_dte_itself_is_computed_from_simulated_time(self):
         """parse_option_symbol drives the profit target; it must honor the freeze."""
@@ -56,20 +63,18 @@ class TestClockDrivesLiveDecisions:
         with clock.frozen(self.ENTRY + timedelta(days=3)):
             assert parse_option_symbol(self.POSITION["symbol"])["dte"] == 1
 
-    def test_min_hold_gate_blocks_when_simulated_time_is_too_soon(self):
+    def test_closes_when_simulated_time_puts_it_in_a_looser_band(self):
         ps = self._put_seller()
-        assert ps.config.profit_taking_min_hold_hours == 4
-        # Two simulated hours after entry: under the 4h floor -> must not close,
-        # no matter how profitable, and no matter what the wall clock says.
-        with clock.frozen(self.ENTRY + timedelta(hours=2)):
-            assert ps.should_close_put_early(dict(self.POSITION)) is False
-
-    def test_min_hold_gate_releases_once_simulated_time_advances(self):
-        ps = self._put_seller()
-        # Ten simulated hours after entry: the hold gate no longer blocks, and a
-        # 90% gain clears the DTE-band target.
-        with clock.frozen(self.ENTRY + timedelta(hours=10)):
+        # DTE 4 -> target 0.45; a 50% gain clears it.
+        with clock.frozen(self.ENTRY):
             assert ps.should_close_put_early(dict(self.POSITION)) is True
+
+    def test_holds_when_simulated_time_puts_it_in_a_tighter_band(self):
+        ps = self._put_seller()
+        # DTE 2 -> target 0.60; the same 50% gain no longer clears it, no
+        # matter what the wall clock says.
+        with clock.frozen(self.ENTRY + timedelta(days=2)):
+            assert ps.should_close_put_early(dict(self.POSITION)) is False
 
     def test_the_two_branches_differ_only_by_the_frozen_clock(self):
         """Same seller, same position, same wall clock — only sim time differs.
@@ -77,11 +82,11 @@ class TestClockDrivesLiveDecisions:
         This is the property the whole replay rests on.
         """
         ps = self._put_seller()
-        with clock.frozen(self.ENTRY + timedelta(hours=1)):
+        with clock.frozen(self.ENTRY):
             early = ps.should_close_put_early(dict(self.POSITION))
-        with clock.frozen(self.ENTRY + timedelta(hours=9)):
+        with clock.frozen(self.ENTRY + timedelta(days=2)):
             late = ps.should_close_put_early(dict(self.POSITION))
-        assert (early, late) == (False, True)
+        assert (early, late) == (True, False)
 
 
 class TestSeamIsInvisibleInProduction:

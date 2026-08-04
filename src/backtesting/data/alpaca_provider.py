@@ -113,8 +113,8 @@ def detect_split(bars: List[StockBar]) -> Optional[tuple]:
     garbage deltas on every pre-split day.
 
     What raw bars cannot survive is a split *inside* the window: the equity
-    curve, the buy-and-hold benchmark and GapDetector's gap frequency all read a
-    -90% crash that never happened. Modelling the corporate action properly
+    curve and the buy-and-hold benchmark both read a -90% crash that never
+    happened. (The gap-frequency filter did too, until FC-069 deleted it.) Modelling the corporate action properly
     (share multiplication plus OCC contract adjustment) is real work; until then
     the honest move is to refuse the window rather than emit a confident
     fabrication.

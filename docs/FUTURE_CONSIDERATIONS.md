@@ -785,10 +785,27 @@ The backtest replays `run_strategy_cycle()`, which uses the second producer. So 
 
 *(Renumbered from FC-048 at merge: FC-048 was concurrently allocated on main to the covered-call misroute found by the B2 study. Independent findings — but the same species: a control that looks active and is not.)*
 
-**Status:** Consideration
+**Status:** Consideration — **code deleted from the tree 2026-08-04 by FC-069 item 5**
 **Size estimate:** M
 **Owner:** unassigned
 **Plan file:** not yet
+
+> **⚠ The code this entry describes is no longer in the repository.** FC-069 S1
+> (operator decision, option ii) deleted `src/risk/gap_detector.py` (645 lines),
+> `tests/test_gap_detector.py`, the entire `risk.gap_risk_controls:` yaml block
+> (12 keys), every `Config` accessor for them, `/config`'s `gap_thresholds`
+> block, and the three gap keys in `bq_writer.config_hash`. **It all lives at
+> pre-S1 `main` SHA `afb6698`** — `git show afb6698:src/risk/gap_detector.py`.
+>
+> The operator's reasoning: "revive only with evidence" is better served by a
+> git SHA than by 645 orphaned lines the next inventory has to re-litigate,
+> and reviving *with* evidence means reviving code with the evidence in hand.
+> The post-sweep control matrix reads **"gap risk: absent by decision"**, which
+> ratifies FC-036's study (don't arm the execution gate) alongside this entry's
+> finding. **This FC still owns any evidence-based revival** — nothing about
+> the deletion forecloses it; it starts from git history rather than from a
+> corpse in the tree. The two study harnesses are kept and carry SHA pointers:
+> `tools/diagnostics/fc002_gap_filter_ab.py` and `fc036_gap_gate_study.py`.
 
 **Problem:** `GapDetector.filter_stocks_by_gap_risk` is called from exactly one place —
 `WheelEngine._find_new_opportunities`. The deployed Cloud Run trading path is

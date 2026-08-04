@@ -78,12 +78,9 @@ class TestConfigProfiles:
                          "put_delta_range": [0.1, 0.2], "call_delta_range": [0.1, 0.2],
                          "min_put_premium": 0.5, "min_call_premium": 0.3,
                          "min_stock_price": 20, "max_stock_price": 500,
-                         "min_avg_volume": 1_000_000, "max_positions_per_stock": 1,
-                         "max_total_positions": 10, "max_exposure_per_ticker": 40000},
-            "risk": {"max_portfolio_allocation": 0.8, "max_position_size": 0.35,
-                     "min_cash_reserve": 0.2},
+                         "min_avg_volume": 1_000_000},
+            "risk": {"max_position_size": 0.35},
             "stocks": {"symbols": ["AAPL"]},
-            "monitoring": {"check_interval_minutes": 15},
         }
 
     def test_absent_strategy_id_rejected(self, tmp_path):
@@ -100,12 +97,8 @@ class TestConfigProfiles:
             "strategy_id": "covered_call",
             "alpaca": {"paper_trading": True, "api_key_id": "k", "secret_key": "s",
                        "expected_account_number": "PA_CC"},
-            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25],
-                         "max_positions_per_stock": 1, "max_total_positions": 20,
-                         "max_exposure_per_ticker": 200000},
-            "risk": {"max_portfolio_allocation": 0.8, "max_position_size": 0.35,
-                     "min_cash_reserve": 0.2},
-            "monitoring": {"check_interval_minutes": 15},
+            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25]},
+            "risk": {"max_position_size": 0.35},
         }
         with pytest.raises(ValueError, match="opportunity_bucket is required"):
             Config(self._write(tmp_path, base))
@@ -141,14 +134,10 @@ class TestConfigProfiles:
             "strategy_id": "covered_call",
             "alpaca": {"paper_trading": True, "api_key_id": "k", "secret_key": "s",
                        "expected_account_number": "PA_CC"},
-            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25],
-                         "max_positions_per_stock": 1, "max_total_positions": 20,
-                         "max_exposure_per_ticker": 200000},
-            "risk": {"max_portfolio_allocation": 0.8, "max_position_size": 0.35,
-                     "min_cash_reserve": 0.2},
+            "strategy": {"call_target_dte": 7, "call_delta_range": [0.15, 0.25]},
+            "risk": {"max_position_size": 0.35},
             "gcs": {"opportunity_bucket": "cc-bucket"},
             "bigquery": {"dataset": "covered_call"},
-            "monitoring": {"check_interval_minutes": 15},
         }
         c = Config(self._write(tmp_path, data))
         assert c.strategy_id == "covered_call"
