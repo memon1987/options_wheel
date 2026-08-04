@@ -1055,6 +1055,49 @@ class TestStoLadder:
         assert result['reason'] == 'stc_failed_naked_exposure'
         assert terminals(log) == ['call_roll_naked_exposure']
 
+    def test_the_ladder_re_validates_even_a_stored_candidate(self, roller,
+                                                             mock_alpaca):
+        """T-5, the other half. *Mutation:* remove ``validate_roll`` from the
+        fallback path → this fails.
+
+        Re-validating a candidate the evaluation already validated looks
+        redundant, and that is exactly why it gets deleted. It is the last gate
+        between the stored list and a live order: anything that puts a wrong
+        entry on that list — a future caller building the opportunity by hand,
+        a refactor that widens the list, a merge — reaches the order site
+        otherwise. Here the list carries a strike BELOW the cost-basis floor.
+        """
+        opp = roller.evaluate_roll_opportunity(
+            call_position(), stock_position(avg_entry_price='374.00'))
+        below_floor = candidate(372.5, bid=12.00, ask=12.20)
+        opp['fallback_candidates'].append({
+            'candidate': below_floor,
+            'new_option_symbol': below_floor['symbol'],
+            'new_strike': 372.5,
+            'stc_limit': 12.00,
+            'net_credit_per_share': 3.60,
+            'net_credit_per_contract': 360.0,
+        })
+        mock_alpaca.place_option_order.side_effect = [
+            accepted('btc-1'), accepted('sto-1'), accepted('sto-2'),
+            accepted('sto-3'), accepted('sto-4')]
+        mock_alpaca.get_option_quote.side_effect = _quote_book({
+            C375['symbol']: {'bid': 10.90, 'ask': 11.10},
+            below_floor['symbol']: {'bid': 12.00, 'ask': 12.20},
+        })
+        mock_alpaca.get_order_by_id.side_effect = lambda oid: (
+            order('btc-1', 'filled', 1, 8.40) if oid == 'btc-1'
+            else order(oid, 'canceled', 0))
+
+        roller.execute_roll(opp)
+
+        sold = [c.kwargs['symbol']
+                for c in mock_alpaca.place_option_order.call_args_list
+                if c.kwargs['side'] == 'sell']
+        assert below_floor['symbol'] not in sold, (
+            "the ladder sold a strike below the cost-basis floor — the "
+            "execute-time half of the floor (FC-062) is not binding")
+
     def test_an_exhausted_ladder_terminates_with_naked_exposure(self, roller,
                                                                 mock_alpaca):
         opp = self._arm_ladder(roller, mock_alpaca,
