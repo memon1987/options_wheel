@@ -364,27 +364,6 @@ class PutSeller:
             return 7
         return dte
 
-    def _parse_option_symbol(self, option_symbol: str) -> tuple:
-        """
-        Parse option symbol to extract underlying, strike, and DTE.
-
-        Delegates to the shared parse_option_symbol() utility.
-
-        Args:
-            option_symbol: Full option symbol
-
-        Returns:
-            Tuple of (underlying_symbol, strike_price, dte)
-        """
-        parsed = parse_option_symbol(option_symbol)
-        underlying = parsed['underlying']
-        strike_price = parsed['strike_price']
-        dte = parsed['dte']
-        # Use fallback DTE of 7 if parsing failed
-        if parsed.get('expiration_date') is None:
-            dte = 7
-        return underlying, strike_price, dte
-
     def _get_profit_target_for_dte(self, dte: int) -> float:
         """
         Get profit target based on DTE using configured bands.
