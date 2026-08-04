@@ -1562,6 +1562,25 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-078: minimal roller revival — credit-only defensive rolls, daily evaluation
+
+**Status:** Filed 2026-08-04 by operator decision — **EXPEDITED: plan + build launching immediately** (target: live before the 8/07 expiries, hoping to capture GOOGL-class rolls on current holdings)
+**Size estimate:** S-M (money path: plan + two-reviewer gate)
+**Owner:** zeshan + Claude
+**Plan file:** docs/plans/fc-078.md (drafting)
+
+**Problem:** the roller has never executed a roll (FC-066: quote-key bug, Friday-only cadence, dead-state credit-only-by-accident). The earnings-pop investigation (docs/investigations/earnings-pop-callaway-2026-08-03.md) proved two things: (1) no roller can rescue a deep-ITM earnings pop (AMZN: every strike-improving roll is a $1.2-1.7k debit — the earnings gate, FC-013, is the fix for that class); (2) the as-built roller leaves free money on the table — GOOGL had a ZERO-COST credit roll (+$10 strike, up to +$1,001 upside preserved) that its own entry-delta band and DTE cap made illegal.
+
+**Scope (deliberately minimal):** fix the quote keys (bid/ask, FC-066 cause 1); **daily evaluation** (not Friday-only, not expiry-day-only); **credit-only execution** (structurally cannot pay debits to chase runaways — cannot repeat the AMZN class); defensive-roll exemption from the entry delta band; replacement DTE up to ~14; **assignment-imminence override** (extrinsic below threshold -> take the best credit roll now). Includes FC-066's pre-revival checklist: alert-wire both roll-path cost-basis skip events, structured events for the silent pre-guard skips, the replay-BQ gate forwarding (already pinned by test).
+
+**Timing design decision (operator question answered 2026-08-04):** daily evaluation + credit-only threshold is self-timing — marginal rolls defer automatically (credit improves toward expiry when the stock is still), transient zero-cost windows get caught the day they appear, and the imminence override prevents waiting into early assignment. Expiry-day-only was rejected: it forfeits mark-dependent windows and walks into early-assignment risk on deep-ITM positions; the theta gain from waiting is a bet on the stock standing still, not a free harvest.
+
+**Explicitly out of scope:** debit rolls of any kind; roll-up chasing; changes to the earnings gate (a roll that would newly span an earnings date must be blocked by the same span predicate — the replacement is a new short call); FC-066's full revival question (this supersedes its mechanism list; FC-066 closes into this on completion); the rolling.* knob sweep (FC-069 item 13's HOLD resolves here: knobs consumed by this design are kept, dead ones die with this FC's plan).
+
+**Links:** FC-066 (supersedes-on-completion, with lineage), FC-013 (the complement: gate prevents the unrescuable, roller monetizes the rescuable; span predicate applies to replacements), FC-062 (execute_roll must route through the shared floor gate — absorbed here), docs/investigations/earnings-pop-callaway-2026-08-03.md, FC-069 item 13.
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration
