@@ -11,7 +11,12 @@ Manual test scripts for verifying system functionality:
 - **`test_trading_workflow.py`** - Complete workflow simulation (scan → execute → monitor)
 - **`test_trade_execution.py`** - Detailed trade execution test with risk validation
 - **`test_live_engine.py`** - Live engine testing
-- **`test_issue_audit.py`** - Comprehensive system audit for pre-launch checks
+
+`test_issue_audit.py` was **deleted by FC-069 S1**. It audited the account
+against `max_exposure_per_ticker`, `min_cash_reserve`, `max_portfolio_allocation`
+and `max_total_positions` — a policy layer that never gated a trade and that
+FC-069 removed, so its premise is gone. Its useful residue (account-vs-config
+arithmetic) is superseded by the hourly `/regression` checks.
 
 ### Usage
 
@@ -25,9 +30,6 @@ python scripts/testing/test_trading_workflow.py
 
 # Simulate trade execution
 python scripts/testing/test_trade_execution.py
-
-# Run system audit
-python scripts/testing/test_issue_audit.py
 ```
 
 ### Requirements

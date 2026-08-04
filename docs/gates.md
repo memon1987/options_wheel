@@ -232,7 +232,7 @@ and a *missing* calendar while earnings are enabled fails the roll closed
 | `rolling.min_net_credit_per_contract` | `0.00` | the credit invariant | — |
 | `rolling.imminence_extrinsic_threshold` | `0.20` | assignment-imminence pricing override | — |
 | — | `false` | roller evaluates but places neither leg | **`ROLLER_DRY_RUN`** — env-only, no yaml key |
-| `risk.gap_risk_controls.earnings_avoidance_days` | `5` | **nothing — dead knob**, FC-069's sweep deletes it | — |
+| ~~`risk.gap_risk_controls.earnings_avoidance_days`~~ | — | **deleted 2026-08-04 by FC-069 S1**, with the whole `gap_risk_controls` block and `GapDetector`. It never gated anything and is unrelated to `earnings.blackout_days`, which is this gate's live knob. | — |
 
 `EARNINGS_ENABLED` exists because the yaml value is baked into the image, so a
 config rollback rides Cloud Build — the same pipeline that once sat silently
@@ -255,8 +255,9 @@ the switch only bites on the self-constructed path.)
 
 ## The emergent one-position invariant
 
-Carried verbatim from FC-069 item 3, because `max_positions_per_stock: 1` is a
-dead knob and this is what actually enforces the behaviour:
+Carried verbatim from FC-069 item 3. `max_positions_per_stock` was a dead knob
+and FC-069 S1 deleted it (2026-08-04); this is what actually enforces the
+behaviour:
 
 > **One option position per underlying** emerges from (i) the scanner's
 > put-side skip of any symbol with existing positions, (ii) `select_batch`'s

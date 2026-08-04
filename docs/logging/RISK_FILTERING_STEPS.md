@@ -8,9 +8,10 @@
 > **FC-068 (2026-08-01) deleted that path.**
 >
 > **Gone, with the code that emitted them:**
-> - **Stage 2** — gap-risk analysis (`GapDetector.filter_stocks_by_gap_risk`). The
->   detector class survives but is now consumed by *nothing*, in production or in
->   backtests (FC-049, FC-069 item 5).
+> - **Stage 2** — gap-risk analysis (`GapDetector.filter_stocks_by_gap_risk`).
+>   **FC-069 item 5 deleted the detector class and all twelve `gap_risk_controls`
+>   knobs on 2026-08-04** (code at pre-sweep `main` SHA `afb6698`). Gap risk is
+>   absent by decision; FC-049 owns any evidence-based revival.
 > - **Stage 3** — `max_stocks_evaluated_per_cycle`. **Knob deleted** by FC-068 (it was
 >   `null`, so it never limited anything).
 > - **Stage 4** — execution gap check (`GapDetector.can_execute_trade`).
@@ -23,8 +24,8 @@
 >   nothing on the live path, before or after — that is FC-009's standing territory.
 > - **Stage 9** — `max_new_positions_per_cycle`. **Knob deleted** by FC-068 (also `null`).
 > - The **covered-call drawdown pause** (`covered_call_drawdown_pause`), deleted per
->   FC-065 OQ-3. `call_drawdown_pause_threshold` survives as an orphaned knob until
->   FC-069 item 9 removes it and its `/config` field.
+>   FC-065 OQ-3. `call_drawdown_pause_threshold` and its `/config` field were
+>   **removed by FC-069 item 9** (2026-08-04). There is no drawdown pause anywhere.
 >
 > **What actually gates a trade today:** stage 1 (price/volume band) → the options-chain
 > filters (`find_suitable_puts` / `find_suitable_calls`, including the cost-basis floor on
@@ -378,6 +379,17 @@ STAGE 9: New Positions Per Cycle Limit (CONFIGURABLE)
 ---
 
 ## Configuration Reference
+
+> ⚠️ **STALE — do not use as a config reference.** Every "Config Line" number
+> below has drifted, `max_exposure_per_ticker` never was `$25,000` by the time
+> this table was written, and **eight of these keys no longer exist**:
+> `max_stocks_evaluated_per_cycle` and `max_new_positions_per_cycle` (deleted by
+> FC-068); `max_gap_frequency`, `max_historical_vol`, `max_overnight_gap_percent`,
+> `execution_gap_threshold`, `quality_gap_threshold`, `max_exposure_per_ticker`
+> and `max_portfolio_allocation` (deleted by FC-069 S1, 2026-08-04). The
+> authoritative list of live keys with their verified consumers is the knob
+> census in `docs/plans/fc-069.md`; the live gate inventory is `docs/gates.md`.
+> Kept as the historical record of what this document once claimed.
 
 All thresholds are configurable in [config/settings.yaml](../config/settings.yaml)
 

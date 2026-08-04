@@ -38,7 +38,6 @@ class TestWheelEngineConstruction:
 
     def _engine(self):
         self.mock_config = Mock(spec=Config)
-        self.mock_config.max_total_positions = 10
         self.mock_config.stock_symbols = ['AAPL', 'MSFT', 'GOOGL']
 
         with patch('src.strategy.wheel_engine.AlpacaClient') as mock_alpaca_cls, \

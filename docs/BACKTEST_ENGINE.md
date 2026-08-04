@@ -156,10 +156,15 @@ failure mode: it cannot flatter a symbol into looking tradeable.
 
    Do not compare across either boundary. Old rows are never mutated — provenance is
    `engine_version` + `timestamp` + `config_hash`.
-6. **The stage-2 gap filter is wired into nothing at all** (FC-049, FC-068). Production
-   never ran it; since FC-068 neither does the backtest, because the only caller was the
-   deleted engine path. `GapDetector` and its knobs still exist as unconsumed code
-   (FC-069 item 5). There is no stage-2 or stage-4 block rate any more.
+6. **There is no gap filter** (FC-049, FC-068, FC-069). Production never ran the stage-2
+   filter; FC-068 removed the backtest's only caller with the engine path; **FC-069 item 5
+   then deleted `GapDetector` and all twelve `gap_risk_controls` knobs outright** (the code
+   lives at pre-sweep `main` SHA `afb6698`). Gap risk is absent by decision. There is no
+   stage-2 or stage-4 block rate any more. Note that FC-069 also dropped
+   `gap_lookback_days` / `max_gap_frequency` / `execution_gap_threshold` from
+   `config_hash`, which is a **second non-comparability boundary** on `backtest_runs`
+   alongside the `engine_version` one above: hashes computed before and after 2026-08-04
+   differ even when every surviving parameter is identical.
 7. **The put-side "already have a position on this symbol" skip is silent.** The scanner
    returns early with no log line (`options_scanner.py:_has_existing_position`), so the
    rejection tally cannot count it — production emits nothing there either, and inventing
