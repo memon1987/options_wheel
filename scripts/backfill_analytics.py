@@ -118,43 +118,18 @@ def main():
     print(f"  Executions backfilled: done")
 
     # ------------------------------------------------------------------ #
-    # 4. Backfill wheel cycles (from Alpaca Activities API)
+    # 4. Backfill wheel cycles — REMOVED in FC-069 (item 10).
+    #    The wheel_cycles table it inserted into is being retired;
+    #    snapshot + drop are operator-executed post-merge (FC-069
+    #    §Rollback). The six hand-identified cycles it wrote are
+    #    recoverable from git history and from trades_from_activities,
+    #    which is the authoritative source the
+    #    wheel_cycles_from_activities view reads.
     # ------------------------------------------------------------------ #
-    print("Backfilling wheel cycles...")
-    # These are manually identified from Alpaca Activities API
-    cycles = [
-        ("AMD", "2025-11-21", 230.0, "2025-11-28", 192.50, -3750.0, 7),
-        ("AMZN", "2025-11-07", 247.50, "2025-11-28", 212.50, -3500.0, 21),
-        ("NVDA", "2025-11-28", 182.50, "2026-01-02", 185.0, 250.0, 35),
-        ("UNH", "2025-11-07", 332.50, "2025-11-14", 315.0, -1750.0, 7),
-        ("UNH", "2026-02-06", 282.50, "2026-02-20", 282.50, 0.0, 14),
-        ("UNH", "2026-03-27", 267.50, "2026-04-02", 267.50, 0.0, 6),
-    ]
-
-    rows = []
-    for symbol, put_date, put_strike, call_date, call_strike, capital_gain, duration in cycles:
-        rows.append({
-            "timestamp": f"{call_date}T00:00:00Z",
-            "symbol": symbol,
-            "put_date": put_date,
-            "put_strike": put_strike,
-            "assignment_date": put_date,  # approximate
-            "call_date": call_date,
-            "call_strike": call_strike,
-            "capital_gain": capital_gain,
-            "duration_days": duration,
-            "shares": 100,
-        })
-
-    table_ref = f"{PROJECT_ID}.{ANALYTICS_DATASET}.wheel_cycles"
-    errors = client.insert_rows_json(table_ref, rows)
-    if errors:
-        print(f"  Wheel cycle insert errors: {errors}")
-    else:
-        print(f"  Wheel cycles backfilled: {len(rows)} cycles")
 
     print("\nBackfill complete.")
-    print("Note: order_statuses removed in FC-035; position_snapshots and scans removed in FC-012.")
+    print("Note: wheel_cycles removed in FC-069; order_statuses removed in FC-035; "
+          "position_snapshots and scans removed in FC-012.")
 
 
 if __name__ == "__main__":

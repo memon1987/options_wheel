@@ -7,11 +7,9 @@ code-defined schema — no auto-detection, no wildcard query conflicts.
 Manages these tables in the ``options_wheel`` dataset:
   - errors          (error events)
   - executions      (endpoint run summaries)
-  - wheel_cycles    (completed wheel cycles — dashboard now reads from
-                     wheel_cycles_from_activities view; this remains as
-                     a secondary audit)
   - decision_events (FC-065 Phase 4 — one covered-call decision per held
                      symbol per cycle, keyed (run_id, symbol, stage))
+
 Post-FC-012 (2026-04-24) removals:
   - write_scan_result / write_scan_results_batch (never called)
   - write_position_snapshot / write_position_snapshots_batch (migrated
@@ -23,6 +21,20 @@ Post-FC-035 (2026-07-29) removals:
     never fired (0 events, 0 rows, in ~490 production invocations).
     Fills/expirations come from the activities ingestor ->
     trades_from_activities, which is authoritative and idempotent.
+
+Post-FC-069 (2026-08-04) removals:
+  - write_wheel_cycle + the wheel_cycles table. Its two callers in
+    ``reconcile_positions`` wrote unkeyed rows whose ``capital_gain``
+    always resolved to 0 — it was derived from wheel-state cost basis,
+    and that state does not survive a cold start (``_save_state`` is a
+    no-op, FC-039) — and the same assignments were re-detected from a
+    rolling 7-day activity window on every cold start, so the rows also
+    duplicated: 78 rows when the writer was stopped, 72 of them
+    zero-gain writer artifacts (74 total zero-gain, of which two are
+    hand-backfilled breakeven cycles that are legitimately $0). Completed cycles come from the
+    ``wheel_cycles_from_activities`` VIEW (FC-012 / FC-018), derived
+    from ``trades_from_activities`` and untouched by this removal; the
+    raw table had no readers at all.
 
 Design principles:
   - Graceful no-op if BigQuery is unavailable
@@ -83,22 +95,13 @@ if _HAS_BIGQUERY:
         ],
         # scans table: populated by the Cloud Logging sink (filtering events).
         # AnalyticsWriter never wrote it — dead schema + methods removed in FC-012.
-        "wheel_cycles": [
-            bigquery.SchemaField("timestamp", "TIMESTAMP"),
-            bigquery.SchemaField("symbol", "STRING"),
-            bigquery.SchemaField("put_date", "DATE"),
-            bigquery.SchemaField("put_strike", "FLOAT"),
-            bigquery.SchemaField("put_premium", "FLOAT"),
-            bigquery.SchemaField("assignment_date", "DATE"),
-            bigquery.SchemaField("call_date", "DATE"),
-            bigquery.SchemaField("call_strike", "FLOAT"),
-            bigquery.SchemaField("call_premium", "FLOAT"),
-            bigquery.SchemaField("capital_gain", "FLOAT"),
-            bigquery.SchemaField("total_premium", "FLOAT"),
-            bigquery.SchemaField("total_return", "FLOAT"),
-            bigquery.SchemaField("duration_days", "INTEGER"),
-            bigquery.SchemaField("shares", "INTEGER"),
-        ],
+        #
+        # wheel_cycles: removed in FC-069 (item 10). The schema entry is
+        # deliberately absent — _ensure_all_tables() auto-creates a table for
+        # every key here, so re-adding it would resurrect the dropped table on
+        # the next cold start. Completed cycles come from the
+        # wheel_cycles_from_activities VIEW.
+        #
         # position_snapshots: removed in FC-012. PORTFOLIO rows migrated to
         # equity_history_from_alpaca; non-PORTFOLIO rows dropped entirely
         # (frontend never consumed /metrics/stock-snapshots).
@@ -316,29 +319,6 @@ class AnalyticsWriter:
             "request_id": request_id,
         })
 
-    def write_wheel_cycle(self, *, symbol: str, put_date: str = "",
-                          put_strike: float = 0, put_premium: float = 0,
-                          assignment_date: str = "", call_date: str = "",
-                          call_strike: float = 0, call_premium: float = 0,
-                          capital_gain: float = 0, total_premium: float = 0,
-                          total_return: float = 0, duration_days: int = 0,
-                          shares: int = 100, **extra) -> None:
-        self._write("wheel_cycles", {
-            "symbol": symbol,
-            "put_date": put_date or None,
-            "put_strike": put_strike,
-            "put_premium": put_premium,
-            "assignment_date": assignment_date or None,
-            "call_date": call_date or None,
-            "call_strike": call_strike,
-            "call_premium": call_premium,
-            "capital_gain": capital_gain,
-            "total_premium": total_premium,
-            "total_return": total_return,
-            "duration_days": duration_days,
-            "shares": shares,
-        })
-
     def write_decision_events(self, rows: List[dict]) -> None:
         """Write FC-065 Phase 4 decision records, keyed for idempotency.
 
@@ -346,8 +326,10 @@ class AnalyticsWriter:
         handed to BigQuery as the streaming ``insertId``.  Rows arriving
         without one are refused rather than written unkeyed — an unkeyed
         fire-and-forget writer is exactly what produced 36 duplicate
-        ``wheel_cycles`` rows per assignment, and a decision table that
-        double-counts is worse than no decision table.
+        ``wheel_cycles`` rows per assignment (that writer and its table were
+        retired in FC-069; the duplication lesson is why this one is keyed),
+        and a decision table that double-counts is worse than no decision
+        table.
 
         Readers must still dedup on ``dedup_key`` (insertId dedup is
         best-effort over a short window; a scheduler retry minutes later

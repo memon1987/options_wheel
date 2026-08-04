@@ -383,3 +383,148 @@ class TestTheCycleBudgetGuard(_CycleFixture):
 def _dt(day, seconds):
     from datetime import datetime, time
     return datetime.combine(day, time(15, 30)) + timedelta(seconds=seconds)
+
+
+# =========================================================================== #
+# FC-069 S2 (item 10) — reconcile_positions after the wheel_cycles writes.
+#
+# Both call-assignment branches wrapped an `analytics.write_wheel_cycle` call
+# in a swallow-all `try/except`, so the write was never observable to the
+# caller — which is exactly what makes its deletion inert. What *is* observable
+# in those branches is the wheel-state transition and the trade event; these
+# tests pin that, so a regression while removing the write (or a partial
+# revert) fails loudly instead of silently dropping an assignment.
+#
+# Plan: docs/plans/fc-069.md item 10.
+# =========================================================================== #
+
+from datetime import datetime  # noqa: E402
+
+
+class TestReconcileCallAssignmentAfterWheelCyclesRemoval:
+
+    ASSIGNED_CALL = 'MSFT260116C00190000'   # MSFT, call, strike 190.0
+
+    def _engine(self, *, activities, positions, state):
+        config = Mock(spec=Config)
+        config.state_storage_bucket = None
+
+        alpaca = Mock()
+        alpaca.get_account_activities.return_value = activities
+        alpaca.get_positions.return_value = positions
+
+        wheel_state = Mock()
+        wheel_state.symbol_states = state
+        wheel_state.get_position_summary.side_effect = lambda sym: {
+            'symbol': sym,
+            'stock_shares': state.get(sym, {}).get('stock_shares', 0),
+            'stock_cost_basis': state.get(sym, {}).get('stock_cost_basis', 0),
+            'active_puts': state.get(sym, {}).get('active_puts', 0),
+            'active_calls': state.get(sym, {}).get('active_calls', 0),
+        }
+
+        with patch('src.strategy.wheel_engine.MarketDataManager'):
+            engine = WheelEngine(config, alpaca_client=alpaca,
+                                 wheel_state=wheel_state)
+        return engine, wheel_state
+
+    def _reconcile(self, engine):
+        events = []
+        with patch('src.strategy.wheel_engine.log_trade_event',
+                   side_effect=lambda logger, **kw: events.append(kw)):
+            stats = engine.reconcile_positions()
+        assert 'error' not in stats, stats
+        return stats, events
+
+    # -- activity-driven branch (the OPASN path) ---------------------------- #
+
+    def _activity_engine(self):
+        activity = {
+            'id': 'act-1',
+            'activity_type': 'OPASN',
+            'symbol': self.ASSIGNED_CALL,
+            'qty': '1',
+            'date': '2026-08-03',
+            'net_amount': '19000',
+        }
+        return self._engine(activities=[activity], positions=[], state={})
+
+    def test_activity_branch_still_transitions_wheel_state(self):
+        engine, wheel_state = self._activity_engine()
+        self._reconcile(engine)
+
+        wheel_state.handle_call_assignment.assert_called_once()
+        kwargs = wheel_state.handle_call_assignment.call_args.kwargs
+        assert kwargs['symbol'] == 'MSFT'
+        assert kwargs['shares'] == 100          # 1 contract -> 100 shares
+        assert kwargs['strike_price'] == 190.0
+        assert kwargs['assignment_date'] == datetime(2026, 8, 3)
+
+    def test_activity_branch_still_logs_the_assignment_event(self):
+        engine, _ = self._activity_engine()
+        stats, events = self._reconcile(engine)
+
+        assigned = [e for e in events
+                    if e.get('event_type') == 'call_assignment_from_activity']
+        assert len(assigned) == 1
+        assert assigned[0]['underlying'] == 'MSFT'
+        assert assigned[0]['shares'] == 100
+        assert assigned[0]['strike_price'] == 190.0
+        assert assigned[0]['activity_id'] == 'act-1'
+        assert stats['activities_assignments_detected'] == 1
+
+    # -- position-diff branch (the fallback path) --------------------------- #
+
+    def _diff_engine(self):
+        # Alpaca: 100 shares and 1 short call left. State: 200 shares, 2 calls.
+        # -> calls decreased AND shares decreased => call assignment.
+        positions = [
+            {'symbol': 'MSFT', 'qty': '100', 'asset_class': 'us_equity'},
+            {'symbol': self.ASSIGNED_CALL, 'qty': '-1',
+             'asset_class': 'us_option'},
+        ]
+        state = {'MSFT': {'stock_shares': 200, 'stock_cost_basis': 180.0,
+                          'active_puts': 0, 'active_calls': 2}}
+        return self._engine(activities=[], positions=positions, state=state)
+
+    def test_position_diff_branch_still_transitions_wheel_state(self):
+        engine, wheel_state = self._diff_engine()
+        self._reconcile(engine)
+
+        wheel_state.handle_call_assignment.assert_called_once()
+        kwargs = wheel_state.handle_call_assignment.call_args.kwargs
+        assert kwargs['symbol'] == 'MSFT'
+        assert kwargs['shares'] == 100          # 200 tracked - 100 actual
+        assert kwargs['strike_price'] == 190.0  # read off the surviving leg
+        assert isinstance(kwargs['assignment_date'], datetime)
+
+    def test_position_diff_branch_still_logs_and_syncs_state(self):
+        engine, wheel_state = self._diff_engine()
+        stats, events = self._reconcile(engine)
+
+        detected = [e for e in events
+                    if e.get('event_type') == 'call_assignment_detected']
+        assert len(detected) == 1
+        assert detected[0]['contracts'] == 1
+        assert detected[0]['shares_called'] == 100
+        assert stats['call_assignments_detected'] == 1
+        # State sync to Alpaca is the other observable half of the branch.
+        assert wheel_state.symbol_states['MSFT']['stock_shares'] == 100
+        assert wheel_state.symbol_states['MSFT']['active_calls'] == 1
+
+    # -- the removal itself ------------------------------------------------- #
+
+    def test_reconcile_never_reaches_the_analytics_writer(self):
+        """The wheel_cycles table was dropped in FC-069; a resurrected write
+        would target a table that no longer exists (and would re-duplicate on
+        every cold start, which is why it was dropped)."""
+        assert not hasattr(wheel_engine_module, 'get_analytics_writer'), (
+            "wheel_engine re-imported the analytics writer; the wheel_cycles "
+            "writes it fed were removed in FC-069 item 10")
+
+        for factory in (self._activity_engine, self._diff_engine):
+            engine, _ = factory()
+            with patch('src.data.analytics_writer.get_analytics_writer') as gw:
+                self._reconcile(engine)
+            assert gw.call_count == 0, (
+                "reconcile_positions built an analytics writer")

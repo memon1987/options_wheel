@@ -1566,6 +1566,21 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-079: OCC-substring bugs survive on reconcile paths — call assignments structurally undetectable for P-containing underlyings
+
+**Status:** Filed 2026-08-04 (from FC-069 S2 review; flagged in PR #84)
+**Size estimate:** S (canonical-parser rewire + tests; behavior change on live reconcile → own PR, two-reviewer gate)
+**Owner:** unassigned
+**Plan file:** not yet
+
+**Problem:** `src/strategy/wheel_engine.py` `reconcile_positions`'s position-diff fallback classifies option legs with `if 'P' in option_symbol … elif 'C' in option_symbol` over the **full OCC symbol** (currently `:306-309`). Every leg on an underlying whose ticker contains a `P` — AAPL, PFE, SPY, PG — classifies as a put, so the position-diff path can never detect a **call** assignment for those symbols. The activity-driven path (OPASN) is unaffected, which is why this has not visibly misfired — but the position-diff branch exists precisely as the fallback when the activities path misses, and it is silently disabled for roughly a third of the universe. Discovered during FC-069 S2 when a new test using AAPL failed with a wrong classification; the S2 tests deliberately use MSFT (no `P`) — a future symbol swap to AAPL in those tests will fail until this FC lands.
+
+**Second site, same family:** `tools/testing/regression_monitor.py` `reconcile_positions`/`reconcile_orphaned` (~`:628`) still uses `"C" in symbol` plus a hand-rolled leading-alpha parser (noted by the S1 confirmation pass; warn-only surface). FC-069 S1 rewired `check_risk_parameters` to the canonical parsers but scoped out this sibling.
+
+**Fix direction:** `strict_option_type` / `parse_option_symbol` (`src/utils/option_symbols.py`) at both sites, with tests pinning AAPL call-assignment detection on the position-diff path (must FAIL pre-fix). Family lineage: FC-041/043/045/048/052, FC-069 item 12 (S1 monitor sync, S3 scanner rewire). Not fixed inside FC-069's sweep because both S2 reviews agreed a live reconcile behavior change cannot ride a behaviorally-inert retirement PR.
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration
