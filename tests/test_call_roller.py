@@ -10,6 +10,7 @@ Test IDs map to docs/plans/fc-078.md §Tests (T-1 .. T-22). Mutation-check
 instructions live on each test that carries one.
 """
 
+import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1166,6 +1167,178 @@ class TestStateDependencyIsDeleted:
                        'rolling_earnings_blackout_days',
                        'is_earnings_within_n_days'):
             assert banned not in text, f"{banned} survived the deletion"
+
+
+# --------------------------------------------------------------------------- #
+# T-11 — the terminal-event taxonomy, exhaustively
+# --------------------------------------------------------------------------- #
+
+class TestTheTerminalTaxonomyIsExhaustive:
+    """DD-5. Every short call evaluated emits EXACTLY ONE terminal event, and
+    the taxonomy has no path outside it.
+
+    This is the FC-066 lesson made executable. Five Fridays of production
+    reported ``rolls_evaluated > 0, rolls_executed = 0`` and nothing else —
+    three ``return None`` branches with no event between them, so the roller's
+    total failure was indistinguishable from "nothing was eligible today".
+    Walking every branch and counting is the only way to know that is fixed.
+    """
+
+    def _drive(self, roller, mock_alpaca, *, open_orders=None,
+               stock_pos=None, dry_run=False):
+        """Run one position all the way to a terminal, return the events."""
+        with patch('src.strategy.call_roller.logger') as log:
+            opp = roller.evaluate_roll_opportunity(
+                call_position(), stock_pos or stock_position(),
+                open_order_symbols=open_orders)
+            if opp is not None:
+                roller.execute_roll(opp)
+            return terminals(log)
+
+    # --- pre-order gates: every one of them ------------------------------- #
+
+    def test_stock_quote_raises(self, roller, mock_alpaca):
+        mock_alpaca.get_stock_quote.side_effect = RuntimeError("down")
+        assert self._drive(roller, mock_alpaca) == ['call_roll_skipped']
+
+    def test_stock_quote_empty(self, roller, mock_alpaca):
+        mock_alpaca.get_stock_quote.return_value = {}
+        assert self._drive(roller, mock_alpaca) == ['call_roll_skipped']
+
+    def test_stock_quote_unusable(self, roller, mock_alpaca):
+        mock_alpaca.get_stock_quote.return_value = {'bid': 0.0, 'ask': 377.0}
+        assert self._drive(roller, mock_alpaca) == ['call_roll_skipped']
+
+    def test_open_order_conflict(self, roller, mock_alpaca):
+        assert self._drive(roller, mock_alpaca,
+                           open_orders={OLD_SYMBOL}) == ['call_roll_skipped']
+
+    def test_not_itm_enough(self, roller, mock_alpaca):
+        mock_alpaca.get_stock_quote.return_value = {'bid': 359.9, 'ask': 360.1}
+        assert self._drive(roller, mock_alpaca) == ['call_roll_skipped']
+
+    def test_cost_basis_unresolved(self, roller, mock_alpaca):
+        pos = stock_position()
+        pos.pop('avg_entry_price')
+        assert self._drive(roller, mock_alpaca, stock_pos=pos) == \
+            ['call_roll_skipped_cost_basis_unresolved']
+
+    def test_cost_basis_divergent(self, roller, mock_alpaca):
+        with patch.object(roller.cost_basis_resolver, '_lookup_assignment_basis',
+                          return_value={'expected_basis_per_share': 290.0,
+                                        'reconstructed_shares': 100, 'lots': []}):
+            got = self._drive(roller, mock_alpaca,
+                              stock_pos=stock_position(avg_entry_price='320.00'))
+        assert got == ['call_roll_skipped_cost_basis_divergent']
+
+    def test_btc_quote_unavailable(self, roller, mock_alpaca):
+        mock_alpaca.get_option_quote.side_effect = _quote_book({})
+        assert self._drive(roller, mock_alpaca) == ['call_roll_skipped']
+
+    def test_earnings_unknown(self, roller, mock_alpaca, mock_earnings):
+        mock_earnings.next_earnings_info.return_value = ('unknown', None)
+        assert self._drive(roller, mock_alpaca) == ['call_roll_skipped']
+
+    def test_no_suitable_replacement(self, roller, mock_alpaca,
+                                     mock_market_data):
+        mock_market_data.find_suitable_calls.return_value = []
+        assert self._drive(roller, mock_alpaca) == ['call_roll_skipped']
+
+    def test_no_credit_candidate(self, roller, mock_alpaca, mock_market_data):
+        debit = candidate(375.0, bid=1.00, ask=1.20)
+        mock_market_data.find_suitable_calls.return_value = [debit]
+        mock_alpaca.get_option_quote.side_effect = _quote_book({
+            OLD_SYMBOL: {'bid': 8.00, 'ask': 8.40}, debit['symbol']: debit})
+        assert self._drive(roller, mock_alpaca) == ['call_roll_skipped']
+
+    def test_invalid_expiry(self, roller, mock_alpaca):
+        """A parseable strike with an unparseable expiry: no horizon to bound
+        the replacement by, so fail closed rather than roll unbounded."""
+        with patch('src.strategy.call_roller.coerce_expiry_date',
+                   side_effect=[None]):
+            with patch('src.strategy.call_roller.logger') as log:
+                assert roller.evaluate_roll_opportunity(
+                    call_position(), stock_position()) is None
+        assert terminals(log) == ['call_roll_skipped']
+
+    # --- order-lifecycle terminals ---------------------------------------- #
+
+    def test_credit_gone_at_execution(self, roller, mock_alpaca):
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.get_option_quote.side_effect = _quote_book(
+            {C375['symbol']: {'bid': 1.00, 'ask': 1.20}})
+        with patch('src.strategy.call_roller.logger') as log:
+            roller.execute_roll(opp)
+        assert terminals(log) == ['call_roll_skipped']
+
+    def test_btc_rejected(self, roller, mock_alpaca):
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.return_value = {'success': False}
+        with patch('src.strategy.call_roller.logger') as log:
+            roller.execute_roll(opp)
+        assert terminals(log) == ['call_roll_btc_rejected']
+
+    def test_btc_timeout_canceled(self, roller, mock_alpaca):
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.side_effect = [accepted('btc-1')]
+        polls = {}
+
+        def by_id(oid):
+            polls[oid] = polls.get(oid, 0) + 1
+            return (order(oid, 'new', 0) if polls[oid] == 1
+                    else order(oid, 'canceled', 0))
+
+        mock_alpaca.get_order_by_id.side_effect = by_id
+        with patch('src.strategy.call_roller.logger') as log:
+            roller.execute_roll(opp)
+        assert terminals(log) == ['call_roll_btc_timeout_canceled']
+
+    def test_naked_exposure(self, roller, mock_alpaca):
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.side_effect = [
+            accepted('btc-1'), accepted('sto-1'), accepted('sto-2'),
+            accepted('sto-3'), accepted('sto-4')]
+        mock_alpaca.get_order_by_id.side_effect = lambda oid: (
+            order('btc-1', 'filled', 1, 8.40) if oid == 'btc-1'
+            else order(oid, 'canceled', 0))
+        with patch('src.strategy.call_roller.logger') as log:
+            roller.execute_roll(opp)
+        assert terminals(log) == ['call_roll_naked_exposure']
+
+    def test_completed(self, roller, mock_alpaca):
+        opp = roller.evaluate_roll_opportunity(call_position(), stock_position())
+        mock_alpaca.place_option_order.side_effect = [
+            accepted('btc-1'), accepted('sto-1')]
+        mock_alpaca.get_order_by_id.side_effect = lambda oid: (
+            order('btc-1', 'filled', 1, 8.40) if oid == 'btc-1'
+            else order('sto-1', 'filled', 1, 10.90))
+        with patch('src.strategy.call_roller.logger') as log:
+            roller.execute_roll(opp)
+        assert terminals(log) == ['call_roll_completed']
+
+    def test_dry_run(self, roller, mock_alpaca, rolling_config):
+        rolling_config.roller_dry_run = True
+        assert self._drive(roller, mock_alpaca) == ['call_roll_dry_run']
+
+    # --- and the taxonomy has no members outside the contract -------------- #
+
+    def test_the_source_emits_no_terminal_outside_the_taxonomy(self):
+        """Any new ``call_roll_*`` event added to the roller must be classified
+        as terminal or non-terminal deliberately — not discovered in
+        production."""
+        source = (Path(__file__).resolve().parent.parent / 'src' / 'strategy'
+                  / 'call_roller.py').read_text()
+        emitted = set(re.findall(r'"(call_roll_[a-z_]+)"', source))
+        non_terminal = {
+            'call_roll_evaluated', 'call_roll_btc_placed', 'call_roll_btc_filled',
+            'call_roll_stc_placed', 'call_roll_stc_filled',
+            'call_roll_partial_fill', 'call_roll_stc_unfilled',
+            'call_roll_stc_rejected', 'call_roll_order_refetch_failed',
+        }
+        unclassified = emitted - TERMINAL_EVENTS - non_terminal
+        assert not unclassified, (
+            f"unclassified roll events: {sorted(unclassified)} — classify each "
+            f"as terminal or non-terminal in TERMINAL_EVENTS")
 
 
 # --------------------------------------------------------------------------- #
