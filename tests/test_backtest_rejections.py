@@ -245,3 +245,34 @@ class TestTheEarningsGateEventsAreNamed:
         """
         assert event not in _REASONS
         assert self._one(event) == {}
+
+
+class TestTheExistingPositionSkipIsNamed:
+    """FC-069 item 12 ride-along.
+
+    BACKTEST_ENGINE.md's accepted gap #7: the put-side "we already hold this
+    underlying" skip was silent, so a replay day it blocked read as a symbol
+    that did nothing — the FC-057 failure mode. The live scanner now emits, so
+    the replay (same scanner since FC-068) emits too, and it gets a bucket.
+    """
+
+    def _one(self, event_dict):
+        tally = RejectionTally()
+        with clock.frozen(datetime(2026, 7, 30, 16, 0)):
+            tally.processor(None, "info", event_dict)
+        return tally.summary()
+
+    def test_the_skip_becomes_a_named_reason(self):
+        """Fails against the pre-FC-069 table, where this event did not exist
+        at all — neither emitted nor mapped."""
+        assert self._one({"event_type": "put_scan_skipped_existing_position",
+                          "symbol": "F", "reason": "option_position"}) == {
+            "already holds this underlying (scan, put)": 1}
+
+    def test_the_api_error_sibling_is_deliberately_unmapped(self):
+        """Do not "fix" this either: `position_check_failed` means the
+        positions call failed, not that a position exists. Sharing a bucket
+        would file an outage under "we already hold it"."""
+        assert "position_check_failed" not in _REASONS
+        assert self._one({"event_type": "position_check_failed",
+                          "symbol": "F"}) == {}

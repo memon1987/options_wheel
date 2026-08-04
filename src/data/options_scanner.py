@@ -16,6 +16,7 @@ from ..api.market_data import MarketDataManager
 from ..utils.config import Config
 from ..utils import clock
 from ..utils.logging_events import log_performance_metric, log_error_event
+from ..utils.option_symbols import parse_option_symbol
 from ..utils.positions import get_stock_positions
 from ..strategy.cost_basis import CostBasisResolver, SOURCE_DIVERGENT
 from .decision_record import (
@@ -975,33 +976,97 @@ class OptionsScanner:
             logger.error("Failed to calculate call attractiveness score", event_category="error", event_type="call_score_calculation_failed", error=str(e))
             return 0
     
+    def _option_position_matches(self, position_symbol: str, symbol: str) -> bool:
+        """Whether an option position is written on ``symbol``.
+
+        FC-069 item 12. This used to be ``symbol in position['symbol']`` — a
+        substring test over the whole OCC contract symbol, the 7th member of
+        the OCC-substring bug family (FC-041/043/045/048/052, plus the engine's
+        dead copy FC-068 deleted). It over-blocked: a held ``PFE260821P…``
+        contains ``'F'``, so it suppressed every F put. The canonical parser
+        answers the actual question — same primitive and same idiom as
+        ``ExecutionEngine._available_shares``.
+
+        Fail-closed on an unparseable symbol (returns ``True``): an option
+        position we cannot identify might be on ``symbol``, and this method's
+        whole error posture is "when in doubt, do not write another position."
+        Under-blocking here would break the per-underlying invariant; the cost
+        of over-blocking is one skipped put. "Unparseable" means the parser
+        found no contract structure at all — no underlying, or no date part.
+        ``parse_option_symbol`` degrades gracefully rather than raising, and its
+        leading-letters fallback still resolves adjusted roots
+        (``AAPL1260821C…`` -> ``AAPL``), which is the answer we want; it is the
+        no-structure case (``''``, ``'NOT_AN_OCC'``) where trusting the
+        fallback would mean guessing.
+        """
+        try:
+            parsed = parse_option_symbol(position_symbol or '')
+            underlying = parsed.get('underlying') or ''
+            structured = bool(parsed.get('expiration_date'))
+        except (TypeError, ValueError, AttributeError):
+            underlying, structured = '', False
+        if not underlying or not structured:
+            return True
+        return underlying == symbol
+
     def _has_existing_position(self, symbol: str) -> bool:
-        """Check if we already have positions in a stock.
-        
+        """Check if we already have positions in a stock. Emits the skip event.
+
         Args:
             symbol: Stock symbol
-            
+
         Returns:
             True if we have existing positions
         """
         try:
             positions = self.alpaca.get_positions()
-            
+
             # Check for direct stock positions
             for position in positions:
                 if position['symbol'] == symbol:
+                    self._log_existing_position_skip(
+                        symbol, position['symbol'], 'stock_position')
                     return True
-                    
-                # Check option positions (simplified check)
-                if position['asset_class'] == 'us_option' and symbol in position['symbol']:
+
+                # Option positions — parsed, never substring-matched (item 12).
+                if (position['asset_class'] == 'us_option'
+                        and self._option_position_matches(position['symbol'], symbol)):
+                    self._log_existing_position_skip(
+                        symbol, position['symbol'], 'option_position')
                     return True
-            
+
             return False
-            
+
         except Exception as e:
+            # Fail-closed, unchanged. Deliberately NOT also emitting the skip
+            # event: an outage and a genuine holding demand different operator
+            # responses (the FC-013 lesson), and a tally that files "the API
+            # was down" under "we already hold this symbol" is the kind of
+            # dishonest metric FC-057/FC-068 exist to remove. This path has its
+            # own named event — `position_check_failed`, below — and that is
+            # the one to alert on.
             logger.error("Failed to check existing positions", event_category="error", event_type="position_check_failed", symbol=symbol, error=str(e))
             return True  # Conservative assumption
-    
+
+    @staticmethod
+    def _log_existing_position_skip(symbol: str, position_symbol: str,
+                                    reason: str) -> None:
+        """Emit the put-side existing-position skip (FC-069 item 12 ride-along).
+
+        This skip was silent since inception — FC-068 §5 documented the replay
+        tally as blind to it "until FC-069 item 12 rewires that check". A gate
+        on the money path that logs nothing cannot be counted, replayed, or
+        argued with. ``reason`` says which limb fired: ``stock_position`` (the
+        exact equity match) or ``option_position`` (the parsed-underlying
+        match).
+        """
+        logger.info("Skipping put scan - existing position",
+                    event_category="trade",
+                    event_type="put_scan_skipped_existing_position",
+                    symbol=symbol,
+                    reason=reason,
+                    position_symbol=position_symbol)
+
     def get_market_overview(self) -> Dict[str, Any]:
         """Get market overview for wheel strategy context.
         

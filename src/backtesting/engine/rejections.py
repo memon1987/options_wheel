@@ -71,6 +71,14 @@ _REASONS = {
     # day with a reason.
     "put_scan_skipped_earnings_blackout": "earnings blackout (scan, put)",
     "call_scan_skipped_earnings_blackout": "earnings span emptied the chain (scan, call)",
+    # FC-069 item 12 closes BACKTEST_ENGINE.md's accepted gap #7: the put-side
+    # "we already hold this underlying" skip was silent, so a replay day it
+    # blocked showed as a symbol that simply did nothing. It now emits, on the
+    # live path and therefore in the replay (same scanner since FC-068). The
+    # skip's fail-closed API-error sibling, `position_check_failed`, is
+    # deliberately NOT mapped here: it means the positions call failed, not
+    # that a position exists, and the two must not share a bucket.
+    "put_scan_skipped_existing_position": "already holds this underlying (scan, put)",
     # Execution-stage failures (FC-048). Without these the tally cannot see an
     # opportunity that was found and ranked but died at the router or in the
     # wrong seller -- which is exactly how the covered-call misroute stayed

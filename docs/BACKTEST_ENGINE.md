@@ -165,13 +165,18 @@ failure mode: it cannot flatter a symbol into looking tradeable.
    `config_hash`, which is a **second non-comparability boundary** on `backtest_runs`
    alongside the `engine_version` one above: hashes computed before and after 2026-08-04
    differ even when every surviving parameter is identical.
-7. **The put-side "already have a position on this symbol" skip is silent.** The scanner
-   returns early with no log line (`options_scanner.py:_has_existing_position`), so the
-   rejection tally cannot count it — production emits nothing there either, and inventing
-   a synthetic event the live path does not emit would be a worse lie. The old stage-6
-   bucket has no replacement until FC-069 item 12 rewires that check. (It also uses a
-   substring match, `symbol in position['symbol']`, which over-blocks; the replay now
-   reproduces that bug faithfully, which is the point of a replay.)
+7. **~~The put-side "already have a position on this symbol" skip is silent.~~ CLOSED by
+   FC-069 item 12 (2026-08-04).** `_has_existing_position` now emits
+   `put_scan_skipped_existing_position` (`reason`: `stock_position` / `option_position`)
+   on the live path, so the replay emits it too and the tally counts it as "already holds
+   this underlying (scan, put)" — the old stage-6 bucket's replacement. The same change
+   replaced the substring match (`symbol in position['symbol']`, which over-blocked: a
+   held `PFE…` contract suppressed every F put) with `parse_option_symbol(...)
+   ['underlying'] == symbol`, so replays from 2026-08-04 forward reproduce the *fixed*
+   check. Two residual limits: the API-error limb still fails closed under its own
+   `position_check_failed` event, which is deliberately unmapped (an outage is not a
+   holding); and the skip remains positions-based, so a submitted-but-unfilled put is
+   invisible to it (FC-009 territory).
 8. **The drawdown pause does not exist.** It was never on the live path, and FC-065 OQ-3
    decided it never will be. A replay showing a call written on an underwater position is
    reproducing production, not missing a guard — the cost-basis floor is the guard.
