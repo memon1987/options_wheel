@@ -1555,6 +1555,35 @@ FC-050 added `opportunity_floor_per_share()` — a third place encoding shape kn
 
 ---
 
+### FC-080: roller duration drift — consecutive rolls compound the horizon; evaluate roll-count and absolute-DTE controls
+
+**Status:** Consideration — **bookmark filed 2026-08-04 by operator** after the first live occurrence; revisit deliberately, not presumed a bug
+**Size estimate:** S–M (research first; any rails are small config/gate diffs but money-path → full two-reviewer gate)
+**Owner:** zeshan + Claude
+**Plan file:** not yet
+
+**What happened (2026-08-04, GOOGL trading up all day):** the roller rolled the same position **twice in one day**, both credit-positive and strike-improving — morning supervised cycle: C370 8/07 → C375 8/21 (+$235); scheduled 15:30 ET cycle: C375 8/21 → **C380 9/04 (+$60)** (`call_roll_completed` 19:32:40Z). Day net: strike +$10, +$295 collected — and the covered call went from 3 DTE to **31 DTE in one trading day**. Both rolls were legal and worked as designed: the FC-078 replacement-horizon rail is `old expiry + 14 days`, and it **re-anchors on the current contract at each roll**, so a trending week can walk the expiry out ~14 days per day with no structural limit.
+
+**Why it may matter (the case for controls):**
+- **Duration drift vs. the strategy's identity:** this is a 7-DTE rapid-theta wheel; a month-out call has a different theta/gamma profile, locks the shares in a covered state longer, delays the next put-side redeployment of that capital, and spans more event risk (earnings spans are gated, but not macro).
+- **Structural bias toward the horizon edge:** longer-dated replacements mechanically carry more absolute premium, and selection is **max-net-credit** — so the roller will systematically prefer the far end of the horizon window whenever the chain allows. The compounding rail turns that preference into a ratchet.
+- **Diminishing credit per day of extension:** roll 1 collected ~$16.8/day of added duration; roll 2 ~$4.3/day. Nothing prices the extension.
+
+**Why it may be fine (the case for leaving it):** both rolls banked certain dollars and raised the strike toward the runaway — exactly the GOOGL-class rescue FC-078 was built for; assignment at 380 beats assignment at 370. Credit-only remains the structural floor. This FC exists to *evaluate*, not to presume.
+
+**Controls to evaluate (non-exclusive):**
+1. **Per-position roll-count cap** (e.g., max N rolls per underlying per week or per contract chain).
+2. **Absolute horizon cap** — anchor the DTE limit to *today* (e.g., never hold a covered call > X DTE), not to the current contract's expiry; kills the ratchet directly.
+3. **Cooldown** — no re-roll of a position rolled within the last N sessions (would have limited today to one roll).
+4. **Credit-per-extension-day floor** — require `net_credit / added_days ≥ threshold`, pricing the duration instead of capping it.
+5. Leave as-is + monitoring (a `roll_chain_length`/`total_dte_extension` label on `call_roll_completed` would make the drift measurable either way).
+
+**Research before deciding:** realized outcomes of multi-roll chains vs. taking assignment (backtest + the live chain as it plays out); how often trending weeks would trigger 3+ consecutive rolls; whether max-net-credit vs. max-strike selection changes the drift; interaction with the documented re-pin-near-the-money behavior (rolled positions generate daily roll candidates while trending — the noise and the ratchet share a cause).
+
+**Links:** FC-078 (the rails as built: credit-only, `old_expiry+14`, Δ ≤ 0.60, span gate, max-net-credit), docs/releases/RELEASE_2026-08-04.md (first roll), the 2026-08-04 `call_roll_completed` events (both rolls), FC-072 (call-side pricing — touches the same economics).
+
+---
+
 ### FC-076: Structural account interlock in AlpacaClient — guard every entry point, not just HTTP routes
 
 **Status:** Consideration
